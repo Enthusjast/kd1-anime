@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Workspace (runtime generated)
+workspace/scenes/*
+workspace/logs/*
+workspace/videos/*
+!workspace/scenes/.gitkeep
+!workspace/logs/.gitkeep
+!workspace/videos/.gitkeep
+
+# Environment
+.env
+.env.local
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output
+output_final.mp4
+filelist.txt
