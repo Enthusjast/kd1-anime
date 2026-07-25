@@ -9,75 +9,44 @@ from pydantic import BaseModel
 
 from agents.base import BaseAgent
 
-REVIEWER_SYSTEM_PROMPT = r"""你是一个 Manim 代码审查专家.你的任务是严格审查 Manim 动画代码,确保其正确性和可渲染性.
+REVIEWER_SYSTEM_PROMPT = r"""你是 Manim 代码审查专家.
 
-## 审查清单 (逐项检查)
+## 审查清单
+(略, 同原 28 项检查)
 
-### A. 版本与导入 (致命)
-1. 是否使用 `from manim import *` (Community Edition)?
-2. 是否错误使用了 `from manimlib import *` (3b1b 版本)?
-3. 是否包含 `if __name__ == "__main__"` 入口代码?
+## 问题分级 — 关键
 
-### B. 类结构 (致命)
-4. 是否继承了 `Scene` (或 `ThreeDScene`/`MovingCameraScene`)?
-5. 是否实现了 `construct(self)` 方法?
-6. 类名是否合法 (无连字符、无空格)?
+对每个发现的问题, 判断严重程度:
+- **minor**: 局部修改即可修复 (如改个类名、加个参数、删一行). 给出精确的查找替换指令.
+- **major**: 需要重写大段逻辑、调整整体结构、或问题太多无法逐条修. 给出详细反馈交给 Coder 重写.
 
-### C. 废弃 API (致命)
-7. 是否使用了 `ShowCreation`? → 应改为 `Create`
-8. 是否使用了 `TextMobject`? → 应改为 `MathTex`/`Tex`
-9. 是否使用了 `PointwiseMovingFunction`? → 已移除
-
-### D. LaTeX 语法 (致命)
-10. `MathTex` 中的 LaTeX 命令是否正确? (如 `\frac`, `\int`, `\sqrt`)
-11. 括号是否匹配? `{` 和 `}` 是否成对?
-12. 是否在 Python raw string 中正确转义? (`r"\frac"` 而非 `"\\frac"`)
-13. 希腊字母是否正确? (`\alpha`, `\beta`, `\pi`)
-
-### E. 动画逻辑 (严重)
-14. `Transform` 的源和目标对象类型是否兼容?
-15. `TransformMatchingTex` 的 TeX 子串是否存在于两端?
-16. 是否有未定义的变量或错误的方法调用?
-17. 动画参数是否正确? (`run_time`, `rate_func`)
-
-### F. 布局与视觉 (中等)
-18. 对象是否可能超出画面范围? (场景坐标约 [-7,7]×[-4,4])
-19. 对象是否重叠?
-20. 颜色使用是否一致 (已知=BLUE, 结果=GREEN, 高亮=YELLOW)?
-21. 是否有适当的停顿 (`self.wait()`) 给观众消化时间?
-
-### G. 代码质量 (轻微)
-22. 是否有冗余的对象创建?
-23. 动画顺序是否符合叙事逻辑?
-24. 是否使用了 `.animate` 语法而非冗长的 `Transform`?
-
-### H. 常见错误模式
-25. `Tex("中文")` 而未指定字体 → 应为 `Text("中文", font="Noto Sans CJK SC")`
-26. `np.sin` 而非 `np.sin` — 确保 numpy 已通过 `from manim import *` 导入
-27. 在 `construct` 外使用 `self.play()` — 所有动画必须在 `construct` 内
-28. 忘记 `from manim import *` — 即使有此导入,某些类可能不在命名空间中
-
-## 输出格式
-
-请输出严格的 JSON 格式:
-```json
+## 输出 JSON
 {
   "is_valid": true,
-  "feedback": ""
+  "severity": "major",
+  "feedback": "问题描述 (major 时必须填)",
+  "fixes": []
 }
-```
 
-如果 `is_valid` 为 false,`feedback` 必须:
-1. 指出具体问题 (引用代码行号或变量名)
-2. 说明原因
-3. 给出明确的修复建议
+fixes 每条: {"find": "原代码片段(唯一匹配)", "replace": "替换后代码", "reason": "原因"}
+find 必须是原代码中唯一切实的片段 (建议包含上下文 2-3 行), 否则替换会失败.
+如果一个修改需要在多处执行 (如全局替换类名), 给多个 fix 条目.
 """
+
+
+class FixSuggestion(BaseModel):
+    """单条查找替换"""
+    find: str
+    replace: str
+    reason: str = ""
 
 
 class ReviewResult(BaseModel):
     """审查结果"""
     is_valid: bool
-    feedback: str
+    severity: str = "minor"  # "minor" → 自动修复 | "major" → 交给 Coder
+    feedback: str = ""
+    fixes: list[FixSuggestion] = []
 
 
 class ReviewerAgent(BaseAgent):

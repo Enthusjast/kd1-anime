@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     # --- Slurm 集群配置 ---
     SLURM_PARTITION: str = "Students"
+    SLURM_ACCOUNT: str = ""            # Slurm 账户名 (部分集群强制要求)
     SLURM_QOS: str = "qos_stu_default"
     SLURM_CONDA_ENV: str = "manim_env"
     SLURM_TIME_LIMIT: str = "01:00:00"
@@ -54,6 +55,7 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 4096
     LLM_MAX_RETRIES: int = 3
     LLM_RETRY_BASE_DELAY: float = 2.0  # 指数退避基础延迟 (秒)
+    LLM_DEBUG: bool = False            # 开启后在控制台输出 LLM 请求/响应全文
 
     def require_llm_key(self) -> None:
         """

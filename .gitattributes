@@ -1,0 +1,5 @@
+# 强制 LF 换行 — 这些文件在 Linux 集群上执行, CRLF 会导致 "cannot execute"
+*.sh    text eol=lf
+*.py    text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf

@@ -501,7 +501,13 @@ class GraphAnimation(Scene):
 ```
 """
 
-CODER_SYSTEM_PROMPT = f"""你是一个 Manim 动画编程专家.你的任务是根据场景描述编写高质量的 Manim Python 代码.
+CODER_SYSTEM_PROMPT = f"""你是一个 Manim 动画编程专家.你的任务是根据导演分镜编写高质量的 Manim Python 代码.
+
+## 你的角色
+
+你收到的不是伪代码,而是导演的视觉设计描述 (画面设计/运镜/流程/关键时刻/数学规格).
+你需要自己判断用哪些 Manim 类 (Axes/Dot/Circle/MathTex/ParametricFunction 等)
+和动画方法 (FadeIn/Transform/Write/MoveAlongPath 等) 来最好地实现导演的意图.
 
 ## 核心要求
 
@@ -538,30 +544,53 @@ class CoderAgent(BaseAgent):
     """代码生成 Agent"""
     name = "Coder"
 
-    def generate_code(self, scene_plan: ScenePlan, feedback: str = "") -> str:
+    def generate_code(
+        self, scene_plan: ScenePlan, feedback: str = "", previous_code: str = ""
+    ) -> str:
         """
         根据场景规划生成 Manim 代码
 
         Args:
             scene_plan: 场景规划
             feedback: 可选的 Reviewer 反馈,用于修正
+            previous_code: 上一版代码 (供修正时参考)
 
         Returns:
             生成的 Python 代码字符串
         """
         self._log(f"正在为 Scene {scene_plan.scene_id} [{scene_plan.title}] 生成代码...")
 
-        user_msg = f"""## 场景信息
+        user_msg = f"""## 场景导演分镜
 
 - **Scene ID**: {scene_plan.scene_id}
 - **标题**: {scene_plan.title}
 - **预估时长**: {scene_plan.duration_seconds} 秒
-- **目的**: {scene_plan.purpose}
+- **叙事作用**: {scene_plan.purpose}
 - **数学概念**: {scene_plan.math_concept}
-- **视觉元素**: {', '.join(scene_plan.visual_elements)}
-- **动画序列**: {' → '.join(scene_plan.animation_sequence)}
-- **讲解要点**: {scene_plan.narration_notes}
-- **技术备注**: {scene_plan.technical_notes}
+
+### 画面设计
+{scene_plan.visual_design}
+
+### 运镜方案
+{scene_plan.camera_movement}
+
+### 视觉流程
+{chr(10).join(f"- {step}" for step in scene_plan.visual_flow)}
+
+### 关键时刻
+{chr(10).join(f"- {moment}" for moment in scene_plan.key_moments)}
+
+### 数学/物理规格
+{scene_plan.computation}
+"""
+
+        if previous_code:
+            user_msg += f"""
+## 上一版代码 (请在此基础上修改, 保留好的部分)
+
+```python
+{previous_code}
+```
 """
 
         if feedback:
@@ -576,6 +605,7 @@ class CoderAgent(BaseAgent):
         code = self.call_llm(
             system_prompt=CODER_SYSTEM_PROMPT,
             user_message=user_msg,
+            stream=True,  # DS 非流式可能超时
         )
 
         extracted = self._extract_code_block(code)

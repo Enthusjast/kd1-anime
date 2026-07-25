@@ -14,6 +14,7 @@ from typing import Type, TypeVar
 from openai import (
     OpenAI,
     APIError,
+    APIConnectionError,
     BadRequestError,
     RateLimitError,
     APITimeoutError,
@@ -44,15 +45,19 @@ class BaseAgent:
     def client(self) -> OpenAI:
         """懒加载 OpenAI client"""
         if self._client is None:
+            import httpx
             self._client = OpenAI(
                 api_key=settings.LLM_API_KEY,
                 base_url=settings.LLM_BASE_URL,
+                timeout=httpx.Timeout(120.0, connect=30.0, read=120.0),
             )
         return self._client
 
     def _log(self, message: str, style: str = "bold cyan") -> None:
         """打印 Agent 思考过程"""
-        console.print(f"[{style}][{self.name}][/] {message}")
+        safe_msg = str(message).replace("[", "\\[")
+        safe_name = str(self.name).replace("[", "\\[")
+        console.print(f"[{style}]{safe_name}[/] {safe_msg}")
 
     def _log_panel(self, title: str, content: str, style: str = "blue") -> None:
         """用 Panel 展示详细内容"""
@@ -114,22 +119,57 @@ class BaseAgent:
 
         last_error: Exception | None = None
         json_fallback_used = False
+        temp_fallback_used = False
+        max_tokens_fallback_used = False
 
-        for attempt in range(1, settings.LLM_MAX_RETRIES + 1):
+        attempt = 0
+        while attempt < settings.LLM_MAX_RETRIES:
+            attempt += 1
             try:
                 self._log(f"LLM 调用中... (尝试 {attempt}/{settings.LLM_MAX_RETRIES})")
+                if getattr(settings, "LLM_DEBUG", False):
+                    for i, msg in enumerate(messages):
+                        role = msg["role"]
+                        body = msg["content"]
+                        preview = body[:500] + ("..." if len(body) > 500 else "")
+                        console.print(f"[dim]DEBUG [{role} #{i}]: {preview}[/]", markup=False)
                 if stream:
-                    return self._stream_llm(kwargs)
-                response = self.client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content
+                    content = self._stream_llm(kwargs)
+                else:
+                    response = self.client.chat.completions.create(**kwargs)
+                    content = response.choices[0].message.content or ""
+                    content = content.strip()
                 if not content:
-                    raise RuntimeError("LLM 返回空响应")
-                return content.strip()
+                    finish = ""
+                    if not stream:
+                        finish = getattr(response.choices[0], "finish_reason", "N/A")
+                    else:
+                        finish = "stream_empty"
+                    if finish == "length":
+                        raise RuntimeError(
+                            f"[{self.name}] LLM 输出被 max_tokens={kwargs.get('max_tokens', '?' )} "
+                            "截断且内容为空. 请在 .env 中增大 LLM_MAX_TOKENS (建议 8192+)."
+                        )
+                    self._log(
+                        f"LLM 返回空响应, 将重试... (finish_reason={finish})",
+                        style="bold yellow",
+                    )
+                    last_error = RuntimeError("LLM 返回空响应")
+                    delay = settings.LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    time.sleep(delay)
+                    continue
+                # 有内容: 即使是 finish_reason=length (截断) 也直接返回, 不重试
+                if getattr(settings, "LLM_DEBUG", False) and not stream:
+                    preview = content[:500] + ("..." if len(content) > 500 else "")
+                    console.print(f"[dim]DEBUG [response]: {preview}[/]", markup=False)
+                return content
 
-            except (RateLimitError, APITimeoutError) as e:
+            except (RateLimitError, APITimeoutError, APIConnectionError) as e:
                 last_error = e
+                # 关闭 client 重建, 避免 httpx 连接池复用死连接
+                self._client = None
                 delay = settings.LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                self._log(f"API 限流/超时, {delay:.1f}s 后重试... ({e})", style="bold yellow")
+                self._log(f"API 限流/超时/连接错误, {delay:.1f}s 后重试... ({e})", style="bold yellow")
                 time.sleep(delay)
 
             except BadRequestError as e:
@@ -144,14 +184,47 @@ class BaseAgent:
                     self._log("端点不支持 response_format, 降级为 prompt-only JSON 重试", style="yellow")
                     kwargs.pop("response_format", None)
                     json_fallback_used = True
+                    attempt -= 1  # 参数修复, 不消耗重试次数
+                    continue
+                # Kimi 等推理模型只允许 temperature=1
+                if (
+                    not temp_fallback_used
+                    and ("temperature" in msg or "only 1 is allowed" in msg)
+                ):
+                    self._log("模型仅支持 temperature=1, 降级重试", style="yellow")
+                    kwargs["temperature"] = 1.0
+                    temp_fallback_used = True
+                    attempt -= 1  # 参数修复, 不消耗重试次数
+                    continue
+                # 模型拒绝 max_tokens 参数
+                if (
+                    not max_tokens_fallback_used
+                    and "max_tokens" in msg
+                    and "max_tokens" in kwargs
+                ):
+                    self._log("模型不支持 max_tokens 参数, 移除后重试", style="yellow")
+                    kwargs.pop("max_tokens", None)
+                    max_tokens_fallback_used = True
+                    attempt -= 1  # 参数修复, 不消耗重试次数
                     continue
                 # 其他 400 直接失败, 不重试
                 raise RuntimeError(f"[{self.name}] 请求被拒绝 (400): {e}") from e
 
             except APIError as e:
+                # 打印完整错误详情 (含 HTTP 状态码和响应体)
+                self._log(
+                    f"API 错误 (status={e.status_code}, type={e.type}): {e.message}",
+                    style="bold yellow",
+                )
+                # 请求被拒绝 / 被封 — 不可重试
+                blocked_keywords = ["blocked", "rejected", "denied", "forbidden"]
+                msg_lower = str(e).lower()
+                if any(kw in msg_lower for kw in blocked_keywords):
+                    raise RuntimeError(
+                        f"[{self.name}] API 请求被拒绝 (不可重试): {e}"
+                    ) from e
                 last_error = e
                 delay = settings.LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                self._log(f"API 错误, {delay:.1f}s 后重试... ({e})", style="bold yellow")
                 time.sleep(delay)
 
             except Exception as e:
@@ -162,23 +235,109 @@ class BaseAgent:
         )
 
     def _stream_llm(self, kwargs: dict) -> str:
-        """流式调用 LLM, 边生成边打印, 收集完整文本返回"""
+        """流式调用 LLM, 边生成边打印, 收集完整文本返回.
+        按 ESC 可提前截断 (保留已生成内容).
+        空响应返回 "" 而非抛异常, 由 call_llm 统一处理重试."""
+        import sys
+        import threading
+        import select
+
         kwargs = {**kwargs, "stream": True}
         chunks: list[str] = []
+        reasoning_chunks = 0
+        content_chunks = 0
+        empty_chunks = 0
+
+        # --- ESC 检测线程 ---
+        cancelled = threading.Event()
+        esc_buffer: list[bytes] = []
+
+        def _watch_esc() -> None:
+            """监控 stdin, 检测裸 ESC (非 Esc+Enter 等组合键)"""
+            try:
+                while not cancelled.is_set():
+                    r, _, _ = select.select([sys.stdin], [], [], 0.2)
+                    if not r:
+                        continue
+                    b = sys.stdin.buffer.read(1)
+                    if not b:
+                        break
+                    if b == b"\x1b":
+                        esc_buffer.append(b)
+                        # 等 80ms 看是否有后续字节 (组合键如 Esc+Enter)
+                        import time as _time
+                        _time.sleep(0.08)
+                        r2, _, _ = select.select([sys.stdin], [], [], 0)
+                        if r2:
+                            # 有后续字节 → 是组合键，不触发取消
+                            esc_buffer.clear()
+                            sys.stdin.buffer.read(1)  # 吞掉后续字节
+                        else:
+                            # 裸 ESC → 取消
+                            cancelled.set()
+                            break
+            except (OSError, ValueError):
+                pass
+
+        watcher = threading.Thread(target=_watch_esc, daemon=True)
+        watcher.start()
+        # ---
+
         stream = self.client.chat.completions.create(**kwargs)
         for chunk in stream:
+            if cancelled.is_set():
+                console.print("\n[dim](ESC 截断)[/]")
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                break
+
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
             text = getattr(delta, "content", None)
+            reasoning = getattr(delta, "reasoning_content", None)
+            finish = getattr(chunk.choices[0], "finish_reason", None)
+            if reasoning:
+                if reasoning_chunks == 0:
+                    console.print("[dim]思考:[/] ", end="")
+                reasoning_chunks += 1
+                if reasoning_chunks % 20 == 0:
+                    console.print("[dim].[/]", end="")
             if text:
+                content_chunks += 1
                 chunks.append(text)
                 console.print(text, end="", soft_wrap=True, highlight=False)
-        console.print()  # 换行
-        content = "".join(chunks).strip()
-        if not content:
-            raise RuntimeError("LLM 流式返回空响应")
-        return content
+            elif not reasoning and not finish:
+                empty_chunks += 1
+                if empty_chunks <= 3 and getattr(settings, "LLM_DEBUG", False):
+                    delta_fields = {
+                        k: v for k, v in delta.__dict__.items() if v is not None
+                    }
+                    console.print(
+                        f"\n[dim]DEBUG 空 chunk delta: {delta_fields}[/]", markup=False
+                    )
+            elif finish:
+                from datetime import datetime
+                now = datetime.now().strftime("%H:%M:%S")
+                console.print(
+                    f"\n[dim]({now} 流结束: {finish}, "
+                    f"思考 {reasoning_chunks}, 内容 {content_chunks}, 空 {empty_chunks})[/]"
+                )
+
+        cancelled.set()  # 通知 watcher 退出
+        if content_chunks == 0 and getattr(settings, "LLM_DEBUG", False):
+            console.print(
+                f"[bold red]诊断:[/] 无 content. reasoning={reasoning_chunks}, 可能是推理模型耗尽 token 或 API 异常."
+            )
+        if reasoning_chunks > 0 and content_chunks == 0:
+            console.print(
+                f"[bold yellow]警告:[/] 推理消耗了所有 token, 未生成内容. "
+                f"请大幅增大 LLM_MAX_TOKENS (建议 16384+)."
+            )
+        console.print()
+        return "".join(chunks).strip()
 
     def call_llm_json(
         self,
@@ -186,20 +345,17 @@ class BaseAgent:
         user_message: str,
         response_model: Type[T],
         temperature: float | None = None,
+        stream: bool = False,
     ) -> T:
         """
         调用 LLM 并将响应解析为 Pydantic 模型
-
-        结构化提取默认使用 temperature=0.0 以保证确定性.
 
         Args:
             system_prompt: 系统提示词
             user_message: 用户消息
             response_model: 期望的 Pydantic 模型类型
             temperature: 温度参数 (默认 0.0)
-
-        Returns:
-            校验后的 Pydantic 模型实例
+            stream: 是否使用流式传输 (部分 API 非流式可能超时)
         """
         temp = 0.0 if temperature is None else temperature
 
@@ -208,14 +364,18 @@ class BaseAgent:
             user_message=user_message,
             temperature=temp,
             json_mode=True,
+            stream=stream,
         )
 
         json_str = self._extract_json(raw)
 
+        # 修复 LLM 输出中 LaTeX 命令导致的非法 JSON 转义 (如 \mathbb, \exists)
+        json_str = self._fix_latex_escapes_in_json(json_str)
+
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
-            self._log_panel("JSON 解析失败", f"原始响应:\n{raw}\n\n错误: {e}", style="red")
+            self._log_panel("JSON 解析失败", f"原始响应:\n{raw}\n\n修复后:\n{json_str}\n\n错误: {e}", style="red")
             raise RuntimeError(f"[{self.name}] LLM 返回了无效的 JSON: {e}") from e
 
         try:
@@ -251,6 +411,9 @@ class BaseAgent:
 
         json_str = self._extract_json(raw)
 
+        # 修复 LLM 输出中 LaTeX 命令导致的非法 JSON 转义
+        json_str = self._fix_latex_escapes_in_json(json_str)
+
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
@@ -282,6 +445,57 @@ class BaseAgent:
     # ------------------------------------------------------------------
     # 提取工具 (健壮版)
     # ------------------------------------------------------------------
+
+    # JSON 合法转义字符 (RFC 8259 §7)
+    _VALID_JSON_ESCAPE = set('"\\/bfnrtu')
+
+    # 合法但会被误认为 LaTeX 命令前缀的 JSON 转义 (如 \not 中的 \n, \text 中的 \t)
+    _AMBIGUOUS_JSON_ESCAPE = set("ntfrb")
+
+    @staticmethod
+    def _fix_latex_escapes_in_json(json_str: str) -> str:
+        """
+        修复 JSON 字符串内 LaTeX 命令反斜杠导致的解析失败.
+
+        问题:
+        1. \\m, \\e, \\R 等不是合法 JSON 转义 → json.loads 直接崩溃
+        2. \\n, \\t, \\f, \\r, \\b 是合法转义, 但在 \\not \\text \\forall
+           \\beta \\neq \\neg 中是 LaTeX 命令前缀, 会被错误解析为控制字符
+
+        策略: 扫描 JSON, 在字符串内部:
+        - \\x 且 x 不在合法转义集中 → 必然修复
+        - \\x 且 x 在 {n,t,f,r,b} 且后一个字符是字母 → LaTeX, 修复
+        """
+        result: list[str] = []
+        in_string = False
+        escape = False
+        i = 0
+        n = len(json_str)
+
+        while i < n:
+            ch = json_str[i]
+            result.append(ch)
+
+            if in_string:
+                if escape:
+                    if ch not in BaseAgent._VALID_JSON_ESCAPE:
+                        # 非法转义: 必定修复
+                        result.insert(-1, "\\")
+                    elif ch in BaseAgent._AMBIGUOUS_JSON_ESCAPE and i + 1 < n:
+                        # 合法转义但后跟字母 → LaTeX 命令 (如 \not, \text, \forall)
+                        if json_str[i + 1].isalpha():
+                            result.insert(-1, "\\")
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+
+            i += 1
+
+        return "".join(result)
 
     @staticmethod
     def _extract_json(text: str) -> str:

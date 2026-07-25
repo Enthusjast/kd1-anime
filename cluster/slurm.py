@@ -10,6 +10,7 @@ Slurm 调度模块
 """
 
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -88,6 +89,9 @@ class SlurmDispatcher:
         lines.append("#!/bin/bash")
         lines.append(f"#SBATCH --qos={settings.SLURM_QOS}")
         lines.append(f"#SBATCH -p {settings.SLURM_PARTITION}")
+        # 部分集群强制要求 --account (如 stu)
+        if settings.SLURM_ACCOUNT:
+            lines.append(f"#SBATCH --account={settings.SLURM_ACCOUNT}")
         lines.append(f"#SBATCH -J manim-scene-{scene_id}")
         lines.append("#SBATCH -N 1")
         lines.append(f"#SBATCH --cpus-per-task={settings.SLURM_CPUS_PER_TASK}")
@@ -110,9 +114,16 @@ class SlurmDispatcher:
         lines.append("set -eo pipefail")
         lines.append("")
 
-        # Conda 环境激活
-        lines.append("eval \"$(conda shell.bash hook)\"")
-        lines.append(f"conda activate {settings.SLURM_CONDA_ENV}")
+        # Conda 环境激活 — 兼容 module 系统损坏 / PYTHONHOME 污染
+        lines.append("# 激活 conda 环境")
+        lines.append("CONDA_BASE=/public/app/miniconda3/py312_24.4.0-0")
+        lines.append("if [ -x \"$CONDA_BASE/bin/conda\" ]; then")
+        lines.append("    export PATH=\"$CONDA_BASE/bin:$PATH\"")
+        lines.append("else")
+        lines.append("    module load miniconda/py312 2>/dev/null || true")
+        lines.append("fi")
+        lines.append("unset PYTHONHOME")
+        lines.append(f"source \"$CONDA_BASE/bin/activate\" {settings.SLURM_CONDA_ENV}")
         lines.append("")
 
         # 环境信息
@@ -167,22 +178,48 @@ class SlurmDispatcher:
         """
         console.print(f"[bold blue][Slurm][/] 正在提交任务: {script_path}")
 
+        # 脚本文件不存在则直接报错 (带路径)
+        if not script_path.is_file():
+            raise RuntimeError(
+                f"渲染脚本不存在: {script_path}\n"
+                f"请检查 SCENES_DIR ({settings.SCENES_DIR}) 是否正确, "
+                f"或前一步代码生成是否成功."
+            )
+
+        # 用完整路径, 避免 conda env 下 PATH 不包含 /usr/bin
+        sbatch_path = shutil.which("sbatch")
+        if sbatch_path is None:
+            for guess in ["/usr/bin/sbatch", "/opt/slurm/bin/sbatch"]:
+                if Path(guess).is_file():
+                    sbatch_path = guess
+                    break
+        if sbatch_path is None:
+            raise RuntimeError(
+                "未找到 sbatch 命令,请确认 Slurm 已安装并配置.\n"
+                f"查找路径: {shutil.which('sbatch') or '无'}, "
+                "/usr/bin/sbatch, /opt/slurm/bin/sbatch"
+            )
+
         last_err = ""
         for attempt in range(1, settings.LLM_MAX_RETRIES + 1):
             try:
                 result = subprocess.run(
-                    ["sbatch", str(script_path)],
+                    [sbatch_path, str(script_path)],
                     capture_output=True,
                     text=True,
                     timeout=30,
                 )
             except subprocess.TimeoutExpired:
                 last_err = "sbatch 命令超时"
-                console.print(f"[yellow][Slurm][/] {last_err}, 重试 {attempt}/{settings.LLM_MAX_RETRIES}[/]")
+                console.print(f"[yellow][Slurm][/] {last_err}, 重试 {attempt}/{settings.LLM_MAX_RETRIES}")
                 time.sleep(settings.LLM_RETRY_BASE_DELAY * attempt)
                 continue
             except FileNotFoundError:
-                raise RuntimeError("未找到 sbatch 命令,请确认 Slurm 已安装并配置")
+                raise RuntimeError(
+                    f"sbatch 可执行文件不存在: {sbatch_path}\n"
+                    f"脚本路径: {script_path}\n"
+                    "请确认 Slurm 客户端已正确安装."
+                )
 
             if result.returncode == 0:
                 match = re.search(r"Submitted batch job (\d+)", result.stdout)
@@ -192,10 +229,28 @@ class SlurmDispatcher:
                 console.print(f"[bold green][Slurm][/] 任务已提交, Job ID: {job_id}")
                 return job_id
 
-            # 非零退出: 瞬态调度器错误, 退避重试
-            last_err = f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            # 非零退出: 辨别配置错误 (不可重试) 和瞬态错误 (可重试)
+            stderr_text = result.stderr.strip()
+            stderr_lower = stderr_text.lower()
+            fatal_keywords = [
+                "invalid account", "invalid partition", "invalid qos",
+                "account/partition", "permission denied", "access denied",
+            ]
+            is_fatal = any(kw in stderr_lower for kw in fatal_keywords)
+
+            # 立即显示真实的 sbatch 错误 (不等重试结束)
+            console.print("[bold red][Slurm] sbatch 错误:[/]")
+            console.print(stderr_text, markup=False)
+
+            if is_fatal:
+                raise RuntimeError(
+                    f"Slurm 配置错误 (不可重试):\n{stderr_text}\n"
+                    "请检查 .env 中的 SLURM_PARTITION 和 SLURM_QOS."
+                )
+
+            last_err = stderr_text
             console.print(
-                f"[yellow][Slurm][/] sbatch 非零退出, 重试 {attempt}/{settings.LLM_MAX_RETRIES}[/]"
+                f"[yellow][Slurm][/] 瞬态错误, 重试 {attempt}/{settings.LLM_MAX_RETRIES}"
             )
             time.sleep(settings.LLM_RETRY_BASE_DELAY * attempt)
 
@@ -282,7 +337,7 @@ class SlurmDispatcher:
         timeout: int | None = None,
     ) -> bool:
         """
-        等待任务完成
+        等待任务完成，运行中自动转发 Slurm stdout 到当前终端
 
         Args:
             job_id: Slurm Job ID
@@ -299,6 +354,11 @@ class SlurmDispatcher:
         unknown_streak = 0
         max_unknown = getattr(settings, "MONITOR_MAX_UNKNOWN", 5)
 
+        # 日志转发
+        log_path = settings.LOGS_DIR / f"scene_{scene_id}_{job_id}.out"
+        last_pos = 0
+        was_running = False
+
         console.print(f"[bold blue][Monitor][/] 开始监控 Scene {scene_id} (Job {job_id})...")
 
         while True:
@@ -308,6 +368,40 @@ class SlurmDispatcher:
                 return False
 
             status = self.poll_status(job_id)
+
+            # 运行中: 转发 stdout 新增内容到当前终端
+            if status == "RUNNING":
+                if not was_running:
+                    console.print(f"[bold blue][Monitor][/] Scene {scene_id} 开始运行, 转发 Manim 输出:")
+                    was_running = True
+                try:
+                    if log_path.exists():
+                        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                            f.seek(last_pos)
+                            new = f.read()
+                            if new:
+                                # 每行加缩进, 与 Rich 输出区分
+                                for line in new.rstrip().split("\n"):
+                                    if line.strip():
+                                        console.print(f"  [dim]{line}[/]", markup=False)
+                                last_pos = f.tell()
+                except Exception:
+                    pass  # 文件读写竞争, 下次再读
+            else:
+                unknown_streak = 0
+                # 结束时再读一次, 捞残留输出
+                if was_running and log_path.exists():
+                    try:
+                        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                            f.seek(last_pos)
+                            new = f.read()
+                            if new:
+                                for line in new.rstrip().split("\n"):
+                                    if line.strip():
+                                        console.print(f"  [dim]{line}[/]", markup=False)
+                    except Exception:
+                        pass
+                    was_running = False
 
             if status == "COMPLETED":
                 console.print(f"[bold green][Monitor][/] Scene {scene_id} 渲染成功!")
@@ -372,7 +466,7 @@ class SlurmDispatcher:
             tail = lines[-settings.LOG_TAIL_LINES:]
             return "\n".join(tail)
         except Exception as e:
-            console.print(f"[bold yellow][Monitor][/] 读取日志失败: {e}")
+            console.print(f"[bold yellow][Monitor][/] 读取日志失败: {e}", markup=False)
             return None
 
     def submit_scene(
@@ -392,7 +486,13 @@ class SlurmDispatcher:
         Returns:
             SlurmJob 信息
         """
+        console.print(
+            f"[dim][Slurm][/] DEBUG submit_scene: py={python_file} exists={python_file.exists()}, "
+            f"SCENES_DIR={settings.SCENES_DIR.resolve()}, sbatch={shutil.which('sbatch')}",
+            markup=False,
+        )
         script_path = self.generate_script(scene_id, python_file, scene_class_name)
+        console.print(f"[dim][Slurm][/] DEBUG: script_path={script_path} exists={script_path.exists()}")
         job_id = self.submit(script_path)
 
         return SlurmJob(

@@ -167,7 +167,7 @@ class VideoMerger:
             raise RuntimeError("未找到 ffmpeg 命令,请确认 FFmpeg 已安装")
 
         if result.returncode != 0 or not output.exists():
-            console.print(f"[red][Merger][/] ffmpeg {label} 失败: {result.stderr[-500:]}")
+            console.print(f"[red][Merger][/] ffmpeg {label} 失败: {result.stderr[-500:]}", markup=False)
             return False
 
         size_mb = output.stat().st_size / (1024 * 1024)

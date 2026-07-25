@@ -151,6 +151,7 @@ class AutoFixerAgent(BaseAgent):
         code = self.call_llm(
             system_prompt=AUTO_FIXER_SYSTEM_PROMPT,
             user_message=user_msg,
+            stream=True,
         )
 
         extracted = self._extract_code_block(code)
