@@ -5,33 +5,60 @@ TUI 交互模块
 
 输入方式:
   使用 prompt_toolkit (multiline=True):
-  - Enter 换行, Esc+Enter 或 Alt+Enter 提交
+  - Enter 提交, Shift+Enter 或 Ctrl+Enter 换行
   - 粘贴多行文本不会被截断
 """
 
+import locale
 import sys
+from contextlib import suppress
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
-from rich.panel import Panel
-from rich.rule import Rule
-from rich.prompt import Confirm
-from rich.status import Status
-from rich.table import Table
 from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Confirm
+from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
-from config import settings
+from kd1_anime.config import settings
 
 console = Console()
 
 # ---------------------------------------------------------------------------
 # 多行输入 — prompt_toolkit (multiline=True)
-# Enter 换行, Esc+Enter 或 Alt+Enter 提交, 粘贴多行不截断
+# Enter 提交, Shift+Enter 或 Ctrl+Enter 换行, 粘贴多行不截断
 # ---------------------------------------------------------------------------
 
-from prompt_toolkit import PromptSession
+_MODIFIED_ENTER_DATA = {
+    "\x1b[13;2u",
+    "\x1b[13;5u",
+    "\x1b[27;2;13~",
+    "\x1b[27;5;13~",
+}
 
-_prompt_session = PromptSession(multiline=True)
+_input_bindings = KeyBindings()
+
+
+@_input_bindings.add("enter")
+def _submit_input(event) -> None:
+    if getattr(event, "data", "") in _MODIFIED_ENTER_DATA:
+        _insert_newline(event)
+        return
+    event.current_buffer.validate_and_handle()
+
+
+@_input_bindings.add("c-j")
+@_input_bindings.add("escape", "enter")
+@_input_bindings.add("escape", "[", "1", "3", ";", "2", "u")
+@_input_bindings.add("escape", "[", "1", "3", ";", "5", "u")
+def _insert_newline(event) -> None:
+    event.current_buffer.insert_text("\n")
+
+
+_prompt_session = PromptSession(multiline=True, key_bindings=_input_bindings)
 
 
 def _read_multiline(prompt_text: str = "") -> str:
@@ -42,15 +69,17 @@ def _read_multiline(prompt_text: str = "") -> str:
     except KeyboardInterrupt:
         raise
 
+
 CLARIFIER_SYSTEM_PROMPT = """你是一个专业的数学动画需求分析师.用户想用 Manim 制作数学动画,你的任务是通过对话明确他们的需求.
 
 ## 工作流程 — 每轮对话遵循以下步骤
 
-### 第一步: 评估信息缺口
-阅读用户的初始描述和所有历史对话,列出:
+### 第一步: 在内部评估信息缺口
+阅读用户的初始描述和所有历史对话,在内部判断:
 - 已明确的信息有哪些
 - 还缺什么关键信息来生成高质量动画规划
 - 不要问用户已经明确说过的事情
+- 不要向用户展示分析过程、已明确列表或信息缺口列表
 
 ### 第二步: 提一个问题
 从信息缺口中选择当前最关键的一个提问.
@@ -85,7 +114,7 @@ class Clarifier:
     """需求澄清对话管理"""
 
     def __init__(self):
-        from agents.base import BaseAgent
+        from kd1_anime.agents.base import BaseAgent
 
         class _Agent(BaseAgent):
             name = "Clarifier"
@@ -96,15 +125,17 @@ class Clarifier:
         ]
 
     def ask(self, user_input: str) -> str:
-        """发送用户输入,获取 LLM 回复 (流式输出, 带重试询问)"""
+        """发送用户输入；内部 READY 载荷缓冲解析，不展示给用户。"""
         self.history.append({"role": "user", "content": user_input})
 
         while True:
             try:
-                console.print("[dim cyan]AI:[/] ", end="")
-                response = self.agent.call_llm(messages=self.history, stream=True)
-                console.print()
+                # 澄清回复很短，先完整接收才能区分用户问题和内部 READY JSON。
+                response = self.agent.call_llm(messages=self.history, stream=False)
                 self.history.append({"role": "assistant", "content": response})
+                if self.extract_ready(response) is None:
+                    console.print("[dim cyan]AI:[/] ", end="")
+                    console.print(response, markup=False)
                 return response
             except Exception as e:
                 console.print(f"\n[yellow]Clarifier LLM 错误: {e}[/]", markup=False)
@@ -143,28 +174,45 @@ class Clarifier:
         except json.JSONDecodeError:
             return None
 
-        if isinstance(data, dict) and data.get("READY"):
-            return data.get("prompt", "") or None
+        if not isinstance(data, dict) or data.get("READY") is not True:
+            return None
 
-        return None
+        prompt = data.get("prompt")
+        if not isinstance(prompt, str):
+            return None
+        prompt = prompt.strip()
+        if not prompt or len(prompt) > settings.MAX_PROMPT_CHARS:
+            return None
+
+        return prompt
+
+    def build_fallback_prompt(self, initial_prompt: str) -> str:
+        """在模型未输出 READY 时保留所有用户实际提供的信息。"""
+
+        additions: list[str] = []
+        initial_normalized = initial_prompt.strip()
+        for message in self.history:
+            if message.get("role") != "user":
+                continue
+            content = str(message.get("content", "")).strip()
+            if content and content != initial_normalized and content not in additions:
+                additions.append(content)
+        if not additions:
+            return initial_normalized
+        details = "\n\n".join(f"- {content}" for content in additions)
+        return f"{initial_normalized}\n\n用户在澄清过程中补充的信息：\n{details}"
 
 
 def _setup_terminal() -> None:
     """配置终端以正确处理多字节字符输入."""
-    import locale
-
     # 1. 确保 locale 正确 (Python I/O 据此选择编码)
-    try:
+    with suppress(locale.Error):
         locale.setlocale(locale.LC_ALL, "")
-    except locale.Error:
-        pass
 
     # 2. 确保 stdin 使用 UTF-8 (修复损坏的 surrogate 字节)
     if hasattr(sys.stdin, "buffer"):
-        try:
+        with suppress(AttributeError, OSError):
             sys.stdin.reconfigure(encoding="utf-8", errors="surrogateescape")
-        except (AttributeError, OSError):
-            pass
 
 
 def _clean_input(text: str) -> str:
@@ -206,15 +254,13 @@ class ChatSession:
         try:
             self._show_banner()
 
-            # 检查 API Key (先于任何 Agent 构造)
-            if not settings.LLM_API_KEY:
+            # 在构造 Agent 前检查完整的 OpenAI-compatible 配置。
+            try:
+                settings.require_llm_key()
+            except ValueError as exc:
                 console.print(
                     Panel(
-                        "[bold red]未设置 LLM_API_KEY[/]\n\n"
-                        "请通过以下方式之一设置:\n"
-                        "  1. .env 文件: LLM_API_KEY=your_key\n"
-                        "  2. 环境变量: export LLM_API_KEY=your_key\n"
-                        "  3. 命令行参数: --api-key your_key",
+                        str(exc),
                         title="配置错误",
                         border_style="red",
                     )
@@ -268,19 +314,15 @@ class ChatSession:
         banner.append("  ╚═══════════════════════════════════════╝", style="bold cyan")
         console.print(banner)
         console.print(
-            "  输入你想制作的数学动画描述,我会帮你生成.\n"
-            "  输入 [bold cyan]quit[/] 退出.\n",
+            "  输入你想制作的数学动画描述,我会帮你生成.\n  输入 [bold cyan]quit[/] 退出.\n",
         )
 
     def _get_initial_prompt(self) -> str | None:
         """获取用户的初始需求描述
 
-        使用 prompt_toolkit (若可用), 支持多行粘贴和 Alt+Enter 换行.
-        回退到原生 input().
+        使用 prompt_toolkit, 支持多行粘贴和 Alt+Enter 换行.
         """
         console.print(Rule("描述你的需求", style="dim"))
-        console.print()
-        console.print("[dim]提示: 可直接粘贴多行文本; Enter 换行, Esc+Enter 提交[/]")
         console.print()
         while True:
             try:
@@ -300,6 +342,12 @@ class ChatSession:
             if not user_input:
                 # 空输入不退出, 重新提示
                 continue
+            if len(user_input) > settings.MAX_PROMPT_CHARS:
+                console.print(
+                    f"[yellow]输入过长：{len(user_input)} 字符，"
+                    f"最大允许 {settings.MAX_PROMPT_CHARS} 字符。[/]"
+                )
+                continue
 
             return user_input
 
@@ -315,9 +363,7 @@ class ChatSession:
             response = self.clarifier.ask(initial_prompt)
         except RuntimeError:
             # Clarifier 失败, 用户选择退出 → 直接用初始 prompt 走 pipeline
-            console.print(
-                "[yellow]跳过需求澄清, 使用原始描述继续.[/]"
-            )
+            console.print("[yellow]跳过需求澄清, 使用原始描述继续.[/]")
             self._show_refined(initial_prompt)
             return initial_prompt
 
@@ -330,7 +376,7 @@ class ChatSession:
         # 开始多轮对话
         console.print()
 
-        for round_num in range(1, max_rounds + 1):
+        for _round_num in range(1, max_rounds + 1):
             try:
                 raw = _read_multiline("? ")
             except EOFError:
@@ -347,16 +393,18 @@ class ChatSession:
 
             if not user_input:
                 continue
+            if len(user_input) > settings.MAX_PROMPT_CHARS:
+                console.print(
+                    f"[yellow]本轮输入过长，最大允许 {settings.MAX_PROMPT_CHARS} 字符。[/]"
+                )
+                continue
 
             try:
                 response = self.clarifier.ask(user_input)
             except RuntimeError:
-                fallback = (
-                    f"{initial_prompt}\n\n澄清过程因 LLM 错误中断,"
-                    f"已收集到 {round_num} 轮对话信息."
-                )
+                fallback = self.clarifier.build_fallback_prompt(initial_prompt)
                 console.print(
-                    f"\n[yellow]Clarifier 失败, 使用已收集到的信息继续.[/]",
+                    "\n[yellow]Clarifier 失败, 使用已收集到的信息继续.[/]",
                     markup=False,
                 )
                 self._show_refined(fallback)
@@ -370,10 +418,8 @@ class ChatSession:
             console.print()
 
         # 达到最大轮次仍未 READY
-        console.print(
-            f"[yellow]已达到最大澄清轮次 ({max_rounds}), 使用当前收集到的信息继续.[/]"
-        )
-        fallback = f"{initial_prompt}\n\n澄清过程中补充的细节:\n{response}"
+        console.print(f"[yellow]已达到最大澄清轮次 ({max_rounds}), 使用当前收集到的信息继续.[/]")
+        fallback = self.clarifier.build_fallback_prompt(initial_prompt)
         self._show_refined(fallback)
         return fallback
 
@@ -407,13 +453,15 @@ class ChatSession:
         console.print(Rule("开始生成", style="bold magenta"))
         console.print()
 
-        from orchestrator import Orchestrator
+        from kd1_anime.orchestrator import Orchestrator
 
         orchestrator = Orchestrator()
 
         try:
             final_video = orchestrator.run(
-                prompt, callback=self._pipeline_callback, dry_run=self.dry_run,
+                prompt,
+                callback=self._pipeline_callback,
+                dry_run=self.dry_run,
                 interactive=True,
             )
             self._show_completion(final_video)
@@ -435,6 +483,11 @@ class ChatSession:
         """流水线状态回调 — 简洁输出当前步骤"""
         esc = ChatSession._escape_markup
         match event:
+            case "run_started":
+                console.print(
+                    f"[dim]Run {esc(data.get('run_id', '?'))} · {esc(data.get('run_dir', ''))}[/]"
+                )
+
             case "stage_start":
                 stage = data.get("stage", "")
                 match stage:
@@ -455,6 +508,9 @@ class ChatSession:
                     case "merging":
                         console.print(Rule("[bold magenta]视频拼接[/]", style="magenta"))
 
+            case "security_warning":
+                console.print(f"[bold yellow]安全警告:[/] {esc(data.get('message', ''))}")
+
             case "plan_complete":
                 scenes = data.get("scenes", [])
                 table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
@@ -466,10 +522,10 @@ class ChatSession:
                 for scene in scenes:
                     table.add_row(
                         str(scene.scene_id),
-                        scene.title,
+                        Text(scene.title),
                         f"{scene.duration_seconds}s",
-                        scene.math_concept,
-                        scene.purpose,
+                        Text(scene.math_concept),
+                        Text(scene.purpose),
                     )
                 console.print(table)
                 console.print()
@@ -477,16 +533,20 @@ class ChatSession:
             case "scene_detailing":
                 scene_id = data.get("scene_id", "?")
                 title = data.get("title", "")
-                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]{esc(title)}[/] 导演分镜...", end="")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]{esc(title)}[/] 开始生成分镜")
+
+            case "scene_detailed":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]分镜完成 ✓[/]")
 
             case "scene_coding":
                 scene_id = data.get("scene_id", "?")
                 title = data.get("title", "")
-                console.print(f"  [dim]▸[/] Scene {scene_id}: [green]{esc(title)}[/] 代码生成...", end="")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [green]{esc(title)}[/] 开始生成代码")
 
             case "scene_coded":
                 file_path = data.get("file_path", "")
-                console.print(f" [bold green]✓[/] [dim]{file_path}[/]")
+                console.print(f"  [bold green]✓[/] [dim]{esc(file_path)}[/]")
 
             case "scene_review_pass":
                 scene_id = data.get("scene_id", "?")
@@ -514,10 +574,26 @@ class ChatSession:
                 attempt = data.get("attempt", 0)
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]修复尝试 {attempt}[/]")
 
+            case "scene_give_up":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", "已放弃"))
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]已放弃[/] {reason}")
+
+            case "partial_output_blocked":
+                console.print(
+                    f"[bold red]部分场景未完成，已阻止生成不完整视频: {data.get('incomplete', [])}[/]"
+                )
+
+            case "dry_run_complete":
+                console.print(
+                    f"[bold green]Dry-run 完成[/]，文件位于 {esc(data.get('run_dir', ''))}"
+                )
+
             case "merge_complete":
                 path = data.get("path", "")
                 size_mb = data.get("size_mb", 0)
-                console.print(f"\n  [bold]输出:[/] {path} [dim]({size_mb:.1f} MB)[/]")
+                partial = " [yellow](部分输出)[/]" if data.get("partial") else ""
+                console.print(f"\n  [bold]输出:[/] {esc(path)} [dim]({size_mb:.1f} MB)[/]{partial}")
 
     @staticmethod
     def _show_completion(output_path) -> None:
@@ -529,8 +605,7 @@ class ChatSession:
         size_mb = output_path.stat().st_size / (1024 * 1024)
         console.print(
             Panel(
-                f"[bold]{output_path}[/]\n"
-                f"[dim]{size_mb:.1f} MB[/]",
+                f"[bold]{output_path}[/]\n[dim]{size_mb:.1f} MB[/]",
                 title="[bold green]✓ 最终视频[/]",
                 border_style="green",
             )

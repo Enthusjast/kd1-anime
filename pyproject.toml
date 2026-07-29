@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling>=1.18.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kd1-anime"
+version = "0.3.0"
+description = "AI Agent 驱动的 Manim 数学动画自动渲染流水线"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Enthusjast"},
+]
+keywords = ["manim", "animation", "math", "llm", "agent", "slurm", "hpc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "openai>=1.0.0,<3",
+    "httpx>=0.27,<1",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "rich>=13.0.0",
+    "typer>=0.9.0",
+    "prompt_toolkit>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2,<2",
+    "pytest>=8,<10",
+    "ruff>=0.6,<1",
+]
+
+[project.scripts]
+# 安装后提供 kd1-anime 命令 (pip install . 或 pipx install .)
+kd1-anime = "kd1_anime.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/Enthusjast/kd1-anime"
+Repository = "https://github.com/Enthusjast/kd1-anime"
+
+[tool.hatch.build.targets.wheel]
+# PyPI 包只含纯 Python 核心逻辑.
+# install.sh (原生依赖安装) 和 workspace/ (运行时产物) 不进 wheel —
+# 原生依赖由 install.sh、文档和可选 Apptainer 镜像处理.
+packages = ["src/kd1_anime"]
+
+[tool.hatch.build.targets.sdist]
+# sdist 同样不含 install.sh — 它是集群环境配置, 与 Python 包正交.
+include = [
+    "src/kd1_anime", "main.py",
+    "requirements.txt", ".env.example",
+    "README.md", "LICENSE", "ARCHITECTURE.md", "CLAUDE.md", "AGENTS.md",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PLW"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/kd1_anime/cli.py" = ["B008", "BLE001"]
+"src/kd1_anime/orchestrator.py" = ["BLE001"]

@@ -5,8 +5,8 @@ Coder Agent
 知识库来源: adithya-s-k/manim_skill 的 22 个规则文件 + 5 个工作示例 + 3 个场景模板
 """
 
-from agents.base import BaseAgent
-from agents.planner import ScenePlan
+from kd1_anime.agents.base import BaseAgent
+from kd1_anime.agents.planner import ScenePlan
 
 # =============================================================================
 # Manim Community Edition 完整知识库
@@ -22,6 +22,10 @@ from manim import *
 
 class Scene1_Introduction(Scene):
     def construct(self):
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        tex_template.add_to_preamble(r"\usepackage{ctex}")
+        config.tex_template = tex_template
+
         # SETUP - 创建对象
         # ANIMATION - 播放动画
         # CLEANUP - 清理场景
@@ -139,14 +143,19 @@ CSS 风格: `ease_in_sine`, `ease_out_bounce`, `ease_in_out_cubic`, `ease_out_el
 
 ## LaTeX / 数学公式
 ```python
+# 每个 construct() 开头都必须初始化并注册此模板。
+tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+tex_template.add_to_preamble(r"\usepackage{ctex}")
+config.tex_template = tex_template
+
 # MathTex — 自动进入数学模式
-eq = MathTex(r"\frac{d}{dx}f(x) = f'(x)")
+eq = MathTex(r"\frac{d}{dx}f(x) = f'(x)", tex_template=tex_template)
 
 # Tex — 原始 LaTeX
-text = Tex(r"This is \textbf{bold}")
+text = Tex(r"This is \textbf{bold}", tex_template=tex_template)
 
 # 多段公式 (用于部分着色/变换)
-eq = MathTex("a", "^2", "+", "b", "^2", "=", "c", "^2")
+eq = MathTex("a", "^2", "+", "b", "^2", "=", "c", "^2", tex_template=tex_template)
 eq[0].set_color(BLUE)   # "a"
 eq[6].set_color(RED)    # "c"
 
@@ -155,19 +164,28 @@ eq.set_color_by_tex("a", BLUE)
 eq.set_color_by_tex("b", RED)
 
 # substrings_to_isolate — 隔离子串用于独立着色
-eq = MathTex("x^2 + y^2 = r^2", substrings_to_isolate=["x^2", "y^2", "r^2"])
+eq = MathTex(
+    "x^2 + y^2 = r^2",
+    substrings_to_isolate=["x^2", "y^2", "r^2"],
+    tex_template=tex_template,
+)
 eq.set_color_by_tex("x^2", BLUE)
 eq.set_color_by_tex("y^2", GREEN)
 eq.set_color_by_tex("r^2", YELLOW)
 
 # tex_to_color_map — 一步到位
-eq = MathTex(r"E = mc^2", tex_to_color_map={"E": BLUE, "m": GREEN, "c": YELLOW})
+eq = MathTex(
+    r"E = mc^2",
+    tex_to_color_map={"E": BLUE, "m": GREEN, "c": YELLOW},
+    tex_template=tex_template,
+)
 
 # 多行对齐 (&= 对齐等号, \\ 换行)
 eq = MathTex(
     r"(a+b)^2", r"&=", r"a^2 + 2ab + b^2", r"\\",
     r"&=", r"a^2", r"+", r"2ab", r"+", r"b^2",
     substrings_to_isolate=["a^2", "2ab", "b^2"],
+    tex_template=tex_template,
 )
 ```
 
@@ -230,7 +248,7 @@ self.play(arrow.animate.shift(RIGHT))  # dot 自动跟随
 
 # always_redraw — 每帧重新创建
 label = always_redraw(lambda: Tex(
-    f"x = {tracker.get_value():.1f}"
+    f"x = {tracker.get_value():.1f}", tex_template=tex_template
 ).next_to(dot, UP))
 
 # ValueTracker — 动态参数
@@ -454,26 +472,37 @@ from manim import *
 
 class EquationDerivation(Scene):
     def construct(self):
-        title = Tex(r"Deriving the Quadratic Formula", font_size=42)
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        tex_template.add_to_preamble(r"\usepackage{ctex}")
+        config.tex_template = tex_template
+
+        title = Tex(
+            r"Deriving the Quadratic Formula",
+            font_size=42,
+            tex_template=tex_template,
+        )
         title.to_edge(UP)
         self.play(Write(title))
 
-        eq1 = MathTex(r"ax^2 + bx + c = 0")
+        eq1 = MathTex(r"ax^2 + bx + c = 0", tex_template=tex_template)
         self.play(Write(eq1))
         self.wait(0.5)
 
         eq2 = MathTex(r"x^2 + \frac{b}{a}x + \frac{c}{a} = 0",
-                       tex_to_color_map={r"\frac{b}{a}": BLUE, r"\frac{c}{a}": GREEN})
+                       tex_to_color_map={r"\frac{b}{a}": BLUE, r"\frac{c}{a}": GREEN},
+                       tex_template=tex_template)
         self.play(TransformMatchingTex(eq1, eq2))
         self.wait(0.5)
 
         eq3 = MathTex(r"\left(x + \frac{b}{2a}\right)^2 = \frac{b^2 - 4ac}{4a^2}",
-                       tex_to_color_map={r"b^2 - 4ac": YELLOW})
+                       tex_to_color_map={r"b^2 - 4ac": YELLOW},
+                       tex_template=tex_template)
         self.play(TransformMatchingTex(eq2, eq3))
         self.wait(0.5)
 
         result = MathTex(r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}",
-                          tex_to_color_map={r"b^2 - 4ac": YELLOW})
+                          tex_to_color_map={r"b^2 - 4ac": YELLOW},
+                          tex_template=tex_template)
         box = SurroundingRectangle(result, color=YELLOW)
         self.play(TransformMatchingTex(eq3, result))
         self.play(Create(box))
@@ -486,6 +515,10 @@ from manim import *
 
 class GraphAnimation(Scene):
     def construct(self):
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        tex_template.add_to_preamble(r"\usepackage{ctex}")
+        config.tex_template = tex_template
+
         axes = Axes(x_range=[-3, 3], y_range=[-2, 2],
                      axis_config={"color": BLUE})
         graph = axes.plot(lambda x: np.sin(x), color=GREEN)
@@ -516,7 +549,11 @@ CODER_SYSTEM_PROMPT = f"""你是一个 Manim 动画编程专家.你的任务是�
 3. 代码必须可直接渲染,不要包含任何解释性文字
 4. 只输出纯 Python 代码,包裹在 ```python ``` 中
 5. 视觉效果要丰富、流畅,避免单调的文字展示
-6. 数学公式使用 `MathTex`,中文文字使用 `Text` 并指定中文字体
+6. 数学公式使用 `MathTex`; 中文文字优先使用 `Text(..., font="Noto Sans CJK SC")`
+7. 只允许导入 manim、numpy、math 和纯计算型标准库; 禁止文件、网络、shell、subprocess、eval/exec
+8. 每个 `construct()` 开头必须创建 `TexTemplate(tex_compiler="xelatex", output_format=".xdv")`,
+   用 `add_to_preamble(r"\\usepackage{{ctex}}")` 加载中文支持,并赋给 `config.tex_template`
+9. 每个 `Tex`/`MathTex` 调用都必须显式传入 `tex_template=tex_template`; 禁止依赖默认的 latex/pdflatex
 
 ## 视觉设计原则
 
@@ -542,10 +579,16 @@ CODER_SYSTEM_PROMPT = f"""你是一个 Manim 动画编程专家.你的任务是�
 
 class CoderAgent(BaseAgent):
     """代码生成 Agent"""
+
     name = "Coder"
 
     def generate_code(
-        self, scene_plan: ScenePlan, feedback: str = "", previous_code: str = ""
+        self,
+        scene_plan: ScenePlan,
+        feedback: str = "",
+        previous_code: str = "",
+        *,
+        stream: bool = True,
     ) -> str:
         """
         根据场景规划生成 Manim 代码
@@ -605,7 +648,7 @@ class CoderAgent(BaseAgent):
         code = self.call_llm(
             system_prompt=CODER_SYSTEM_PROMPT,
             user_message=user_msg,
-            stream=True,  # DS 非流式可能超时
+            stream=stream,
         )
 
         extracted = self._extract_code_block(code)
