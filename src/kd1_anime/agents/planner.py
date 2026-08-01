@@ -172,7 +172,6 @@ class PlannerAgent(BaseAgent):
                 f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符"
             )
         self._log("拆解场景概要...")
-        self._log_panel("用户需求", user_prompt, style="green")
         outlines = self.call_llm_json_list(
             system_prompt=OUTLINE_PROMPT,
             user_message=(
