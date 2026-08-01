@@ -70,6 +70,7 @@ class State(Enum):
     MONITORING = auto()
     FIXING = auto()
     MERGING = auto()
+    EVALUATING = auto()  # 新增：评估状态
     DONE = auto()
     ERROR = auto()
 
@@ -120,6 +121,7 @@ class SceneState:
 @dataclass
 class PipelineContext:
     user_prompt: str
+    original_prompt: str | None = None  # 原始用户提示，用于评估
     paths: RunPaths = field(default_factory=RunPaths.create)
     dry_run: bool = False
     interactive: bool = False
@@ -135,6 +137,10 @@ class PipelineContext:
     base_manifest: RunManifest | None = None
     scenes_to_render: list[int] = field(default_factory=list)
     scenes_to_reuse: list[int] = field(default_factory=list)
+    
+    # 评估-改进循环支持
+    eval_round: int = 0
+    scenes_to_improve: list[int] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -552,6 +558,7 @@ class Orchestrator:
                     State.MONITORING: self._handle_monitoring,
                     State.FIXING: self._handle_fixing,
                     State.MERGING: self._handle_merging,
+                    State.EVALUATING: self._handle_evaluating,
                 }[state](ctx)
                 self._checkpoint(ctx, state)
         except KeyboardInterrupt:
@@ -736,11 +743,27 @@ class Orchestrator:
 
     def _handle_coding(self, ctx: PipelineContext) -> State:
         self._emit("stage_start", stage="coding")
-        pending = [
-            (sid, state)
-            for sid, state in ctx.scene_states.items()
-            if not state.code and not state.failed and not state.give_up
-        ]
+        
+        # 确定需要生成代码的场景
+        # 如果是评估改进循环，只处理需要改进的场景
+        if ctx.scenes_to_improve:
+            # 评估改进模式：只处理低分场景
+            pending = [
+                (sid, ctx.scene_states[sid])
+                for sid in ctx.scenes_to_improve
+                if sid in ctx.scene_states and not ctx.scene_states[sid].failed
+            ]
+            self._emit("eval_improvement_mode", scenes=ctx.scenes_to_improve)
+            # 清空改进列表，避免下次重复处理
+            ctx.scenes_to_improve = []
+        else:
+            # 正常模式：处理所有未生成代码的场景
+            pending = [
+                (sid, state)
+                for sid, state in ctx.scene_states.items()
+                if not state.code and not state.failed and not state.give_up
+            ]
+        
         if not pending:
             return State.REVIEWING
         workers = min(settings.LLM_PARALLEL_WORKERS, len(pending))
@@ -1242,4 +1265,7 @@ class Orchestrator:
             partial=bool(incomplete),
             incomplete=incomplete,
         )
+        # 如果启用了评估，进入评估状态；否则直接完成
+        if settings.ENABLE_AUTO_EVAL:
+            return State.EVALUATING
         return State.DONE

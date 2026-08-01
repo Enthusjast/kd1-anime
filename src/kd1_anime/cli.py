@@ -13,6 +13,7 @@ kd1-anime CLI 入口
 
 import re
 import shutil
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -596,3 +597,172 @@ def _start_chat(dry_run: bool = False) -> None:
 
 if __name__ == "__main__":
     app()
+
+
+@app.command()
+def evaluate(
+    run_id: Optional[str] = typer.Argument(None, help="运行 ID (留空则评估最近的运行)"),
+    code: Optional[str] = typer.Option(None, "--code", "-c", help="直接评估代码字符串"),
+    code_file: Optional[Path] = typer.Option(None, "--code-file", "-f", help="评估代码文件"),
+    image: Optional[Path] = typer.Option(None, "--image", "-i", help="评估渲染截图"),
+    description: str = typer.Option("", "--desc", "-d", help="动画描述"),
+    visual: bool = typer.Option(True, "--visual/--no-visual", help="是否进行视觉评估"),
+    visual_model: Optional[str] = typer.Option(None, "--visual-model", help="视觉评估模型"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="输出报告路径"),
+    compare: Optional[str] = typer.Option(None, "--compare", help="对比的基准运行 ID"),
+    json_output: bool = typer.Option(False, "--json", help="JSON 格式输出"),
+):
+    """评估动画生成质量
+    
+    支持多种评估模式：
+    - 评估完整运行: kd1-anime evaluate <run-id>
+    - 评估代码: kd1-anime evaluate --code "..." 或 --code-file scene.py
+    - 评估截图: kd1-anime evaluate --image screenshot.png
+    - 对比运行: kd1-anime evaluate <run-id> --compare <baseline-id>
+    """
+    from kd1_anime.eval import Evaluator
+    
+    evaluator = Evaluator(
+        enable_visual_eval=visual and image is not None,
+        visual_eval_model=visual_model,
+    )
+    
+    try:
+        # 对比模式
+        if compare and run_id:
+            console.print(f"[bold]对比运行 {compare} 和 {run_id}[/]")
+            comparison = evaluator.compare_runs(compare, run_id)
+            
+            if json_output:
+                console.print_json(json.dumps(comparison.to_dict(), indent=2))
+            else:
+                _print_comparison(comparison)
+            return
+        
+        # 评估代码字符串
+        if code:
+            console.print("[bold]评估代码质量[/]")
+            result = evaluator.evaluate_code(code)
+        
+        # 评估代码文件
+        elif code_file:
+            if not code_file.exists():
+                console.print(f"[red]文件不存在: {code_file}[/]")
+                raise typer.Exit(1)
+            
+            console.print(f"[bold]评估代码文件: {code_file}[/]")
+            code_content = code_file.read_text(encoding='utf-8')
+            result = evaluator.evaluate_code(code_content)
+        
+        # 评估截图
+        elif image:
+            if not image.exists():
+                console.print(f"[red]图片不存在: {image}[/]")
+                raise typer.Exit(1)
+            
+            console.print(f"[bold]评估视觉效果: {image}[/]")
+            result = evaluator.evaluate_visual(image, description)
+        
+        # 评估运行
+        elif run_id:
+            console.print(f"[bold]评估运行: {run_id}[/]")
+            result = evaluator.evaluate_run(run_id, description=description, enable_visual=visual)
+        
+        # 评估最近的运行
+        else:
+            # 查找最近的运行
+            runs_dir = Path("workspace/runs")
+            if not runs_dir.exists():
+                console.print("[red]没有找到运行记录[/]")
+                raise typer.Exit(1)
+            
+            run_dirs = sorted(runs_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True)
+            if not run_dirs:
+                console.print("[red]没有找到运行记录[/]")
+                raise typer.Exit(1)
+            
+            recent_run = run_dirs[0].name
+            console.print(f"[bold]评估最近的运行: {recent_run}[/]")
+            result = evaluator.evaluate_run(recent_run, description=description, enable_visual=visual)
+        
+        # 输出结果
+        if json_output:
+            console.print_json(json.dumps(result.to_dict(), indent=2))
+        else:
+            _print_eval_result(result)
+        
+        # 保存报告
+        if output:
+            result.save(output)
+            console.print(f"\n[dim]报告已保存到: {output}[/]")
+        
+    except Exception as e:
+        console.print(f"[red]评估失败: {e}[/]")
+        raise typer.Exit(1)
+
+
+def _print_eval_result(result: 'EvalResult'):
+    """打印评估结果"""
+    from rich.table import Table
+    from rich.panel import Panel
+    
+    # 总分面板
+    score_color = "green" if result.overall_score >= 4 else "yellow" if result.overall_score >= 3 else "red"
+    panel = Panel(
+        f"[bold {score_color}]{result.overall_score:.2f}[/] / 5.00",
+        title="总分",
+        border_style=score_color,
+    )
+    console.print(panel)
+    
+    # 详细分数表格
+    table = Table(title="详细评分")
+    table.add_column("指标", style="cyan")
+    table.add_column("分数", justify="center")
+    table.add_column("等级", justify="center")
+    table.add_column("说明")
+    
+    for score in result.scores:
+        score_str = f"{score.score}/5"
+        if score.score >= 4:
+            score_str = f"[green]{score_str}[/]"
+        elif score.score >= 3:
+            score_str = f"[yellow]{score_str}[/]"
+        else:
+            score_str = f"[red]{score_str}[/]"
+        
+        table.add_row(
+            score.metric.value,
+            score_str,
+            score.level.value,
+            score.justification[:50] + "..." if len(score.justification) > 50 else score.justification,
+        )
+    
+    console.print(table)
+    
+    # 摘要
+    if result.summary:
+        console.print(f"\n[dim]{result.summary}[/]")
+
+
+def _print_comparison(comparison: 'ComparisonResult'):
+    """打印对比结果"""
+    from rich.table import Table
+    
+    diff = comparison.score_diff
+    diff_color = "green" if diff > 0 else "red" if diff < 0 else "white"
+    diff_str = f"+{diff:.2f}" if diff > 0 else f"{diff:.2f}"
+    
+    console.print(f"\n[bold]基准:[/] {comparison.baseline_run_id} ({comparison.baseline_result.overall_score:.2f})")
+    console.print(f"[bold]当前:[/] {comparison.current_run_id} ({comparison.current_result.overall_score:.2f})")
+    console.print(f"[bold {diff_color}]差异:[/] {diff_str}")
+    
+    if comparison.improvements:
+        console.print("\n[green]改进:[/]")
+        for item in comparison.improvements:
+            console.print(f"  ✓ {item}")
+    
+    if comparison.regressions:
+        console.print("\n[red]退化:[/]")
+        for item in comparison.regressions:
+            console.print(f"  ✗ {item}")
