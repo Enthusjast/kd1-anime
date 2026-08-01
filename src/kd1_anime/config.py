@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int | None = Field(default=None)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("LLM_MAX_TOKENS", mode="before")
+    @classmethod
+    def validate_max_tokens(cls, value):
+        if value is None or value == "":
+            return None
+        return value
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)
     LLM_DEBUG: bool = False
