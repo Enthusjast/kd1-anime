@@ -373,7 +373,7 @@ class Orchestrator:
         with lock_run(ctx.paths.root):
             return self._execute(ctx, State.INIT)
 
-        def run(
+    def run(
         self,
         user_prompt: str,
         callback: Callback | None = None,
@@ -979,7 +979,7 @@ class Orchestrator:
             f"{len(scenes_to_reuse)} 个场景可复用"
         )
 
-        def _handle_dispatching(self, ctx: PipelineContext) -> State:
+    def _handle_dispatching(self, ctx: PipelineContext) -> State:
         self._emit("stage_start", stage="dispatching")
         active = [
             state

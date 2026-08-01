@@ -217,7 +217,7 @@ class VideoMerger:
             return max(candidates, key=lambda path: path.stat().st_mtime)
         return None
 
-        def merge_jobs(
+    def merge_jobs(
         self,
         jobs: list[SlurmJob],
         *,
