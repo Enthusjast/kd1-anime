@@ -131,12 +131,12 @@ class Clarifier:
 
         while True:
             try:
-                # 澄清回复很短，先完整接收才能区分用户问题和内部 READY JSON。
-                response = self.agent.call_llm(messages=self.history, stream=False)
+                # 使用流式输出，边生成边显示；同时收集完整响应用于 READY 检测
+                response = self.agent.call_llm(messages=self.history, stream=True)
                 self.history.append({"role": "assistant", "content": response})
                 if self.extract_ready(response) is None:
-                    console.print("[dim cyan]AI:[/]")
-                    console.print(Markdown(response))
+                    # 流式输出已在 _stream_llm 中完成显示，无需重复打印
+                    pass
                 return response
             except Exception as e:
                 console.print()

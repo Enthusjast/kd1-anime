@@ -883,7 +883,7 @@ class Orchestrator:
             if self._ask_retry_or_skip(scene_id, initial_error):
                 try:
                     plan = self.planner.plan_detail(
-                        outline, ctx.outlines, ctx.user_prompt, stream=True
+                        outline, ctx.outlines, ctx.user_prompt, stream=False
                     )
                     ctx.scene_states[scene_id] = SceneState(plan=plan)
                     self._checkpoint(ctx, State.DETAILING)
@@ -974,7 +974,7 @@ class Orchestrator:
             final_error = initial_error
             if self._ask_retry_or_skip(scene_id, initial_error):
                 try:
-                    code, class_name = self._generate_validated_code(state.plan, stream=True)
+                    code, class_name = self._generate_validated_code(state.plan, stream=False)
                     state.code = code
                     state.class_name = class_name
                     path = ctx.paths.scenes / f"scene_{scene_id}.py"
