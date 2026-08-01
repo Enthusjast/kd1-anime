@@ -80,6 +80,12 @@ def generate(
         "-i",
         help="增量渲染模式：基于指定的 run-id 只渲染变化的场景",
     ),
+    resume: str = typer.Option(
+        None,
+        "--resume",
+        "-r",
+        help="恢复中断的运行：指定 run-id 继续生成",
+    ),
     file: Path = typer.Option(
         None,
         "--file",
@@ -119,7 +125,10 @@ def generate(
 
     orchestrator = Orchestrator()
     try:
-        if incremental:
+        if resume:
+            console.print(f"[cyan]恢复运行[/] {resume}")
+            final_video = orchestrator.resume(resume, interactive=True)
+        elif incremental:
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
             final_video = orchestrator.run_incremental(
                 prompt, incremental, dry_run=dry_run
