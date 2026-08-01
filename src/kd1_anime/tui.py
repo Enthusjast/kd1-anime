@@ -138,7 +138,8 @@ class Clarifier:
                     console.print(response, markup=False)
                 return response
             except Exception as e:
-                console.print(f"\n[yellow]Clarifier LLM 错误: {e}[/]", markup=False)
+                console.print()
+                console.print(f"Clarifier LLM 错误: {e}", style="yellow", markup=False)
                 try:
                     answer = Confirm.ask(
                         "[bold]再试一次?[/] (y = 重试, n = 退出)",
@@ -310,7 +311,7 @@ class ChatSession:
         banner.append("kd1-anime", style="bold white")
         banner.append(" · ", style="dim cyan")
         banner.append("Manim 动画生成器", style="bold cyan")
-        banner.append("       ║\n", style="bold cyan")
+        banner.append("    ║\n", style="bold cyan")
         banner.append("  ╚═══════════════════════════════════════╝", style="bold cyan")
         console.print(banner)
         console.print(
@@ -404,8 +405,8 @@ class ChatSession:
             except RuntimeError:
                 fallback = self.clarifier.build_fallback_prompt(initial_prompt)
                 console.print(
-                    "\n[yellow]Clarifier 失败, 使用已收集到的信息继续.[/]",
-                    markup=False,
+                    "\nClarifier 失败, 使用已收集到的信息继续.",
+                    style="yellow",
                 )
                 self._show_refined(fallback)
                 return fallback
@@ -455,9 +456,8 @@ class ChatSession:
 
         from kd1_anime.orchestrator import Orchestrator
 
-        orchestrator = Orchestrator()
-
         try:
+            orchestrator = Orchestrator()
             final_video = orchestrator.run(
                 prompt,
                 callback=self._pipeline_callback,
@@ -469,9 +469,10 @@ class ChatSession:
             console.print("\n[bold yellow]用户中断,正在清理...[/]")
             raise
         except Exception as e:
-            # 错误消息可能包含 [/] 等 Rich markup 标记, 必须关闭 markup
-            console.print(f"\n[bold red]生成失败:[/] {e}", markup=False)
-            raise
+            console.print()
+            console.print(f"生成失败: {e}", style="bold red", markup=False)
+            if settings.LLM_DEBUG:
+                console.print_exception()
 
     @staticmethod
     def _escape_markup(text: str) -> str:

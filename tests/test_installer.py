@@ -259,6 +259,31 @@ missing_tex_packages {shlex.quote(str(tex_bin))}
     assert "scheme-full" not in packages
 
 
+def test_completion_message_renders_ansi_escape_sequences(tmp_path):
+    config_file = tmp_path / "config" / ".env"
+    user_bin = tmp_path / "bin"
+    script = f"""
+source {shlex.quote(str(INSTALLER))}
+CONFIG_FILE={shlex.quote(str(config_file))}
+USER_BIN_DIR={shlex.quote(str(user_bin))}
+print_completion
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "\x1b[0;32m安装完成\x1b[0m" in result.stdout
+    assert r"\033" not in result.stdout
+    assert f"3. 编辑配置: {config_file}" in result.stdout
+    assert f"命令目录: {user_bin}" in result.stdout
+
+
 def test_installer_creates_runnable_wrappers_and_idempotent_shell_config(tmp_path):
     conda_base = tmp_path / "conda"
     conda_sh = conda_base / "etc" / "profile.d" / "conda.sh"
