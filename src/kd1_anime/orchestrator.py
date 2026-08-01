@@ -432,14 +432,30 @@ class Orchestrator:
                 stream=stream,
             )
             
-            # 自动修复 TexTemplate 问题
-            code = fix_tex_template(code)
-            
             validation = self._validate(code)
             if validation.is_valid:
                 return code, validation.scene_classes[0]
             last_validation = validation
-            current_feedback = f"确定性校验未通过，必须修复以下问题：\n{validation.feedback}"
+            # 提供详细的修复指导
+            feedback_parts = [f"确定性校验未通过，必须修复以下问题：\n{validation.feedback}"]
+            
+            # 如果是 TexTemplate 相关错误，提供正确示例
+            if any("TexTemplate" in err or "tex_template" in err for err in validation.errors):
+                feedback_parts.append("""
+\n=== 正确的 TexTemplate 配置示例 ===
+你必须在 construct() 方法开头添加以下代码：
+
+    tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+    tex_template.add_to_preamble(r"\\usepackage{ctex}")
+    config.tex_template = tex_template
+
+然后每个 Tex/MathTex 调用都必须传入 tex_template=tex_template：
+
+    eq = MathTex(r"\\frac{a}{b}", tex_template=tex_template)
+    text = Tex(r"中文文本", tex_template=tex_template)
+""")
+            
+            current_feedback = "".join(feedback_parts)
             current_previous = code
         raise ValidationError(
             "生成代码未通过确定性校验：\n"
