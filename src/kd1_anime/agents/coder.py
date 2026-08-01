@@ -534,7 +534,7 @@ class GraphAnimation(Scene):
 ```
 """
 
-CODER_SYSTEM_PROMPT = f"""你是一个 Manim 动画编程专家.你的任务是根据导演分镜编写高质量的 Manim Python 代码.
+CODER_SYSTEM_PROMPT = r"""你是一个 Manim 动画编程专家.你的任务是根据导演分镜编写高质量的 Manim Python 代码.
 
 ## 你的角色
 
@@ -554,7 +554,7 @@ CODER_SYSTEM_PROMPT = f"""你是一个 Manim 动画编程专家.你的任务是�
 8. **必须**在每个 `construct()` 方法开头添加以下模板代码（不可省略）:
 ```python
 tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
-tex_template.add_to_preamble(r"\\usepackage{ctex}")
+tex_template.add_to_preamble(r"\usepackage{ctex}")
 config.tex_template = tex_template
 ```
 9. **必须**在每个 `Tex`/`MathTex` 调用中显式传入 `tex_template=tex_template`; 禁止依赖默认的 latex/pdflatex
@@ -581,8 +581,7 @@ config.tex_template = tex_template
 
 ## Manim API 完整参考
 
-{MANIM_API_KNOWLEDGE}
-"""
+""" + MANIM_API_KNOWLEDGE
 
 
 class CoderAgent(BaseAgent):
