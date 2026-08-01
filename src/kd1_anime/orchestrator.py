@@ -905,6 +905,15 @@ class Orchestrator:
 
     def _handle_reviewing(self, ctx: PipelineContext) -> State:
         self._emit("stage_start", stage="reviewing")
+        
+        # 如果配置为跳过审查，直接进入下一阶段
+        if settings.SKIP_REVIEW:
+            self._emit("review_skipped", reason="SKIP_REVIEW enabled")
+            for state in ctx.scene_states.values():
+                if state.code and not state.failed:
+                    state.reviewed = True
+            return State.DONE if ctx.dry_run else State.DISPATCHING
+        
         pending = [
             (sid, state)
             for sid, state in ctx.scene_states.items()
