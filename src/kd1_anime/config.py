@@ -15,6 +15,23 @@ USER_CONFIG_DIR = XDG_CONFIG_HOME / "kd1-anime"
 USER_ENV_FILE = USER_CONFIG_DIR / ".env"
 
 
+def _current_working_directory() -> Path:
+    return Path.cwd()
+
+
+def resolve_runtime_path(path: Path) -> Path:
+    """Resolve configured paths even when the process working directory was removed."""
+
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded.resolve()
+    try:
+        base = _current_working_directory()
+    except OSError:
+        base = Path.home()
+    return (base / expanded).resolve()
+
+
 class Settings(BaseSettings):
     """全局配置；系统环境变量优先于当前目录和用户级 .env。"""
 
@@ -134,18 +151,36 @@ class Settings(BaseSettings):
     def require_llm_key(self) -> None:
         """兼容旧方法名：验证调用 OpenAI-compatible API 所需的完整配置。"""
         missing: list[str] = []
-        if not self.LLM_API_KEY or self.LLM_API_KEY == "sk-your-key-here":
+        placeholder_values = {"sk-your-key-here", "your-model-name", ""}
+        
+        if not self.LLM_API_KEY or self.LLM_API_KEY in placeholder_values:
             missing.append("LLM_API_KEY")
-        if not self.LLM_BASE_URL.strip():
+        if not self.LLM_BASE_URL.strip() or self.LLM_BASE_URL == "https://api.openai.com/v1":
             missing.append("LLM_BASE_URL")
-        if not self.LLM_MODEL.strip() or self.LLM_MODEL == "your-model-name":
+        if not self.LLM_MODEL.strip() or self.LLM_MODEL in placeholder_values:
             missing.append("LLM_MODEL")
+        
         if missing:
-            raise ValueError(
-                "LLM 配置不完整（缺少或仍为占位值：" + ", ".join(missing) + "）。请编辑：\n"
-                f"  {self.user_env_file}\n"
-                "或在当前目录创建 .env，或设置同名系统环境变量。"
-            )
+            config_path = self.user_env_file
+            example_path = Path.cwd() / ".env.example"
+            
+            error_msg = f"""LLM 配置不完整（缺少或仍为占位值：{', '.join(missing)}）
+
+配置方法（按优先级）：
+1. 设置环境变量：
+   export LLM_API_KEY=your-api-key
+   export LLM_BASE_URL=your-api-url
+   export LLM_MODEL=your-model-name
+
+2. 编辑配置文件：
+   {config_path}
+
+3. 在项目目录创建 .env：
+   {Path.cwd() / '.env'}
+
+配置示例见：{example_path}
+            """
+            raise ValueError(error_msg)
 
 
 settings = Settings()
