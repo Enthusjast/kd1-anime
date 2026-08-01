@@ -435,6 +435,18 @@ class BaseAgent:
                 )
                 raise RuntimeError(f"[{self.name}] LLM 返回了无效的 JSON: {first_error}") from error
 
+        # 修正常见拼写错误
+        if isinstance(data, dict):
+            typo_map = {
+                "key_momens": "key_moments",
+                "key_moment": "key_moments",
+                "visual_desgin": "visual_design",
+                "camera_movment": "camera_movement",
+                "visual_flwo": "visual_flow",
+                "computaiton": "computation",
+            }
+            data = {typo_map.get(k, k): v for k, v in data.items()}
+        
         try:
             return response_model.model_validate(data)
         except ValidationError as e:
