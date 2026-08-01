@@ -67,101 +67,63 @@ def fix_tex_template(code: str) -> str:
     """
     自动修复 Manim 代码中的 TexTemplate 问题。
     """
-    # 检查是否已经有正确的 TexTemplate 配置
-    has_tex_template_config = (
-        'TexTemplate(tex_compiler="xelatex"' in code or 
-        "TexTemplate(tex_compiler='xelatex'" in code
-    )
-    has_config_assignment = 'config.tex_template' in code
+    lines = code.split('\n')
+    new_lines = []
     
-    # 检查是否有 Tex 或 MathTex 的使用
-    has_tex = bool(re.search(r'\b(Tex|MathTex)\s*\(', code))
-    if not has_tex:
-        return code
+    # 检查是否已经有 TexTemplate 配置
+    has_tex_config = False
+    tex_template_var = None
     
-    # 找到 tex_template 变量名（如果存在）
-    template_var = None
-    if has_tex_template_config:
-        template_var_match = re.search(r'(\w+)\s*=\s*TexTemplate\(tex_compiler', code)
-        if template_var_match:
-            template_var = template_var_match.group(1)
+    for line in lines:
+        if 'TexTemplate' in line and 'xelatex' in line:
+            has_tex_config = True
+            match = re.match(r'\s*(\w+)\s*=\s*TexTemplate', line)
+            if match:
+                tex_template_var = match.group(1)
     
-    # 检查是否所有 Tex/MathTex 都有 tex_template 参数
-    tex_calls = list(re.finditer(r'\b(Tex|MathTex)\s*\(', code))
-    all_have_template = True
-    for call_match in tex_calls:
-        start = call_match.end()
-        paren_count = 1
-        pos = start
-        while pos < len(code) and paren_count > 0:
-            if code[pos] == '(':
-                paren_count += 1
-            elif code[pos] == ')':
-                paren_count -= 1
-            pos += 1
+    # 如果没有配置，在 construct 方法开头添加
+    if not has_tex_config or not tex_template_var:
+        tex_template_var = 'tex_template'
+        in_construct = False
+        added = False
         
-        call_content = code[call_match.start():pos]
-        if template_var and template_var not in call_content:
-            all_have_template = False
-            break
-        elif not template_var and 'tex_template' not in call_content:
-            all_have_template = False
-            break
-    
-    # 如果配置完整且所有调用都有参数，直接返回
-    if has_tex_template_config and has_config_assignment and all_have_template:
-        return code
-    
-    # 需要修复
-    new_code = code
-    
-    # 如果没有 TexTemplate 配置，添加它
-    if not has_tex_template_config or not has_config_assignment:
-        construct_match = re.search(r'def construct\(self\):', code)
-        if construct_match:
-            construct_start = construct_match.end()
-            lines = code[construct_start:].split('\n')
-            insert_pos = construct_start
+        for i, line in enumerate(lines):
+            if 'def construct(self):' in line:
+                in_construct = True
+                new_lines.append(line)
+                continue
             
-            for i, line in enumerate(lines):
+            if in_construct and not added:
                 stripped = line.strip()
                 if stripped and not stripped.startswith('#'):
-                    insert_pos = construct_start + sum(len(l) + 1 for l in lines[:i])
-                    break
+                    indent = line[:len(line) - len(line.lstrip())]
+                    new_lines.append(f'{indent}# TexTemplate 配置（自动添加）')
+                    new_lines.append(f'{indent}tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")')
+                    new_lines.append(f'{indent}tex_template.add_to_preamble(r"\\usepackage{{ctex}}")')
+                    new_lines.append(f'{indent}config.tex_template = tex_template')
+                    added = True
+                    in_construct = False
             
-            tex_config = """
-        # TexTemplate 配置（自动添加）
-        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
-        tex_template.add_to_preamble(r"\\usepackage{ctex}")
-        config.tex_template = tex_template
-"""
-            new_code = code[:insert_pos] + tex_config + code[insert_pos:]
-            template_var = 'tex_template'
+            new_lines.append(line)
+        
+        lines = new_lines
+        new_lines = []
     
     # 为所有 Tex/MathTex 调用添加 tex_template 参数
-    if template_var:
-        def add_tex_template_to_call(match):
-            full_match = match.group(0)
-            if template_var in full_match:
-                return full_match
-            
-            last_paren = full_match.rfind(')')
-            if last_paren == -1:
-                return full_match
-            
-            if last_paren > 0 and full_match[last_paren-1] == '(':
-                return full_match[:last_paren] + f'{template_var}={template_var})'
-            else:
-                return full_match[:last_paren] + f', {template_var}={template_var})'
+    for line in lines:
+        if re.search(r'\b(?:Tex|MathTex)\s*\(', line):
+            if tex_template_var not in line:
+                stripped = line.rstrip()
+                if stripped.endswith(')'):
+                    before_paren = stripped[:-1].rstrip()
+                    if before_paren.endswith('('):
+                        line = stripped[:-1] + f'{tex_template_var}={tex_template_var})'
+                    else:
+                        line = stripped[:-1] + f', {tex_template_var}={tex_template_var})'
         
-        new_code = re.sub(
-            r'\b(?:Tex|MathTex)\s*\([^)]*(?:\([^)]*\)[^)]*)*\)',
-            add_tex_template_to_call,
-            new_code,
-            flags=re.DOTALL
-        )
+        new_lines.append(line)
     
-    return new_code
+    return '\n'.join(new_lines)
 
 
 
@@ -431,6 +393,9 @@ class Orchestrator:
                 previous_code=current_previous,
                 stream=stream,
             )
+            
+            # 自动修复 TexTemplate 问题
+            code = fix_tex_template(code)
             
             validation = self._validate(code)
             if validation.is_valid:
