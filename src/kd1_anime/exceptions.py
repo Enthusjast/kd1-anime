@@ -134,8 +134,8 @@ class DependencyError(InstallError):
     """缺少必要的依赖（conda、ffmpeg、texlive 等）。"""
 
 
-class EnvironmentError(InstallError):
+class EnvironmentConfigError(InstallError):
     """环境配置错误（conda 环境损坏、路径问题等）。
     
-    注意：不覆盖内置 EnvironmentError，使用更具体的名称。
+    注意：原名 EnvironmentError 会遮蔽内置异常，已重命名为 EnvironmentConfigError。
     """
