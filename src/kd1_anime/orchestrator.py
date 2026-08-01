@@ -66,7 +66,6 @@ import re
 def fix_tex_template(code: str) -> str:
     """
     自动修复 Manim 代码中的 TexTemplate 问题。
-    更健壮的版本。
     """
     # 检查是否已经有正确的 TexTemplate 配置
     has_tex_template_config = (
@@ -75,70 +74,92 @@ def fix_tex_template(code: str) -> str:
     )
     has_config_assignment = 'config.tex_template' in code
     
-    if has_tex_template_config and has_config_assignment:
-        # 检查是否所有 Tex/MathTex 都有 tex_template 参数
-        template_var_match = re.search(r'(\w+)\s*=\s*TexTemplate\(tex_compiler', code)
-        if template_var_match:
-            template_var = template_var_match.group(1)
-            tex_calls = re.findall(r'\b(Tex|MathTex)\s*\([^)]*\)', code, re.DOTALL)
-            all_have_template = all(f'{template_var}' in call for call in tex_calls)
-            if all_have_template:
-                return code  # 完全正确，不需要修复
-    
     # 检查是否有 Tex 或 MathTex 的使用
     has_tex = bool(re.search(r'\b(Tex|MathTex)\s*\(', code))
     if not has_tex:
         return code
     
-    # 找到 construct 方法的位置
-    construct_match = re.search(r'def construct\(self\):', code)
-    if not construct_match:
-        return code
+    # 找到 tex_template 变量名（如果存在）
+    template_var = None
+    if has_tex_template_config:
+        template_var_match = re.search(r'(\w+)\s*=\s*TexTemplate\(tex_compiler', code)
+        if template_var_match:
+            template_var = template_var_match.group(1)
     
-    # 获取 construct 方法体的开始位置
-    construct_start = construct_match.end()
-    lines = code[construct_start:].split('\n')
-    insert_pos = construct_start
-    
-    # 找到合适的插入位置
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped and not stripped.startswith('#'):
-            insert_pos = construct_start + sum(len(l) + 1 for l in lines[:i])
+    # 检查是否所有 Tex/MathTex 都有 tex_template 参数
+    tex_calls = list(re.finditer(r'\b(Tex|MathTex)\s*\(', code))
+    all_have_template = True
+    for call_match in tex_calls:
+        start = call_match.end()
+        paren_count = 1
+        pos = start
+        while pos < len(code) and paren_count > 0:
+            if code[pos] == '(':
+                paren_count += 1
+            elif code[pos] == ')':
+                paren_count -= 1
+            pos += 1
+        
+        call_content = code[call_match.start():pos]
+        if template_var and template_var not in call_content:
+            all_have_template = False
+            break
+        elif not template_var and 'tex_template' not in call_content:
+            all_have_template = False
             break
     
-    # TexTemplate 配置代码
-    tex_config = """
+    # 如果配置完整且所有调用都有参数，直接返回
+    if has_tex_template_config and has_config_assignment and all_have_template:
+        return code
+    
+    # 需要修复
+    new_code = code
+    
+    # 如果没有 TexTemplate 配置，添加它
+    if not has_tex_template_config or not has_config_assignment:
+        construct_match = re.search(r'def construct\(self\):', code)
+        if construct_match:
+            construct_start = construct_match.end()
+            lines = code[construct_start:].split('\n')
+            insert_pos = construct_start
+            
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#'):
+                    insert_pos = construct_start + sum(len(l) + 1 for l in lines[:i])
+                    break
+            
+            tex_config = """
         # TexTemplate 配置（自动添加）
         tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
         tex_template.add_to_preamble(r"\\usepackage{ctex}")
         config.tex_template = tex_template
 """
-    
-    # 在 construct 方法开头插入配置
-    new_code = code[:insert_pos] + tex_config + code[insert_pos:]
+            new_code = code[:insert_pos] + tex_config + code[insert_pos:]
+            template_var = 'tex_template'
     
     # 为所有 Tex/MathTex 调用添加 tex_template 参数
-    def add_tex_template_to_call(match):
-        full_match = match.group(0)
-        if 'tex_template' in full_match:
-            return full_match
+    if template_var:
+        def add_tex_template_to_call(match):
+            full_match = match.group(0)
+            if template_var in full_match:
+                return full_match
+            
+            last_paren = full_match.rfind(')')
+            if last_paren == -1:
+                return full_match
+            
+            if last_paren > 0 and full_match[last_paren-1] == '(':
+                return full_match[:last_paren] + f'{template_var}={template_var})'
+            else:
+                return full_match[:last_paren] + f', {template_var}={template_var})'
         
-        last_paren = full_match.rfind(')')
-        if last_paren == -1:
-            return full_match
-        
-        if last_paren > 0 and full_match[last_paren-1] == '(':
-            return full_match[:last_paren] + 'tex_template=tex_template)'
-        else:
-            return full_match[:last_paren] + ', tex_template=tex_template)'
-    
-    new_code = re.sub(
-        r'\b(?:Tex|MathTex)\s*\([^)]*(?:\([^)]*\)[^)]*)*\)',
-        add_tex_template_to_call,
-        new_code,
-        flags=re.DOTALL
-    )
+        new_code = re.sub(
+            r'\b(?:Tex|MathTex)\s*\([^)]*(?:\([^)]*\)[^)]*)*\)',
+            add_tex_template_to_call,
+            new_code,
+            flags=re.DOTALL
+        )
     
     return new_code
 
