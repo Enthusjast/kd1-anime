@@ -1269,3 +1269,115 @@ class Orchestrator:
         if settings.ENABLE_AUTO_EVAL:
             return State.EVALUATING
         return State.DONE
+
+
+    def _handle_evaluating(self, ctx: PipelineContext) -> State:
+        """评估渲染结果，如果质量不达标则触发改进"""
+        self._emit("stage_start", stage="evaluating")
+        
+        # 检查评估轮数限制
+        eval_round = getattr(ctx, 'eval_round', 0)
+        if eval_round >= settings.MAX_EVAL_ROUNDS:
+            self._emit(
+                "eval_max_rounds_reached",
+                rounds=eval_round,
+                max_rounds=settings.MAX_EVAL_ROUNDS,
+            )
+            return State.DONE
+        
+        try:
+            from kd1_anime.eval import Evaluator
+            
+            evaluator = Evaluator(
+                enable_visual_eval=settings.ENABLE_VISUAL_EVAL,
+            )
+            
+            # 评估最终视频
+            if ctx.final_video and ctx.final_video.exists():
+                # 评估代码质量
+                code_scores = []
+                for scene_id, state in ctx.scene_states.items():
+                    if state.code:
+                        code_result = evaluator.evaluate_code(state.code)
+                        code_scores.append(code_result)
+                
+                # 计算平均代码分数
+                avg_code_score = sum(r.overall_score for r in code_scores) / len(code_scores) if code_scores else 0
+                
+                # 尝试评估视觉效果（如果有截图）
+                visual_score = 5.0  # 默认满分
+                if settings.ENABLE_VISUAL_EVAL:
+                    screenshot_paths = list(ctx.paths.root.glob("**/*.png"))
+                    if screenshot_paths:
+                        try:
+                            visual_result = evaluator.evaluate_visual(
+                                screenshot_paths[0],
+                                ctx.original_prompt or "Mathematical animation",
+                            )
+                            visual_score = visual_result.overall_score
+                        except Exception as e:
+                            self._emit("visual_eval_failed", error=str(e))
+                
+                # 计算综合分数
+                overall_score = (avg_code_score + visual_score) / 2
+                
+                self._emit(
+                    "eval_complete",
+                    overall_score=overall_score,
+                    code_score=avg_code_score,
+                    visual_score=visual_score,
+                    threshold=settings.EVAL_THRESHOLD,
+                )
+                
+                # 保存评估结果
+                from kd1_anime.eval.metrics import EvalResult
+                eval_result = EvalResult(
+                    run_id=ctx.paths.run_id,
+                    summary=f"Auto-evaluation: {overall_score:.2f}/5.00",
+                )
+                eval_result.save(ctx.paths.root / "eval_result.json")
+                
+                # 检查是否需要改进
+                if overall_score < settings.EVAL_THRESHOLD:
+                    self._emit(
+                        "eval_below_threshold",
+                        score=overall_score,
+                        threshold=settings.EVAL_THRESHOLD,
+                        action="triggering_improvement",
+                    )
+                    
+                    # 增加评估轮数
+                    ctx.eval_round = eval_round + 1
+                    
+                    # 找出低分的场景需要改进
+                    low_score_scenes = []
+                    for scene_id, state in ctx.scene_states.items():
+                        if state.code:
+                            scene_eval = evaluator.evaluate_code(state.code)
+                            if scene_eval.overall_score < settings.EVAL_THRESHOLD:
+                                low_score_scenes.append(scene_id)
+                    
+                    # 标记需要改进的场景
+                    ctx.scenes_to_improve = low_score_scenes
+                    
+                    # 重置场景状态以便重新生成
+                    for scene_id in low_score_scenes:
+                        state = ctx.scene_states[scene_id]
+                        state.rendered = False
+                        state.reviewed = False
+                    
+                    return State.CODING  # 返回到 CODING 阶段重新生成
+                else:
+                    self._emit(
+                        "eval_passed",
+                        score=overall_score,
+                        threshold=settings.EVAL_THRESHOLD,
+                    )
+            else:
+                self._emit("eval_skipped", reason="no_final_video")
+            
+        except Exception as e:
+            self._emit("eval_error", error=str(e))
+            # 评估失败不阻塞流程
+        
+        return State.DONE
