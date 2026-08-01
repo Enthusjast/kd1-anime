@@ -73,6 +73,12 @@ def generate(
     partition: str = typer.Option(None, "--partition", "-p", help="Slurm 分区"),
     max_fix: int = typer.Option(None, "--max-fix", min=0, help="最大自动修复尝试次数 (默认: 3)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成场景规划和代码,不提交 Slurm 任务"),
+    incremental: str = typer.Option(
+        None,
+        "--incremental",
+        "-i",
+        help="增量渲染模式：基于指定的 run-id 只渲染变化的场景",
+    ),
     file: Path = typer.Option(
         None,
         "--file",
@@ -112,7 +118,14 @@ def generate(
 
     orchestrator = Orchestrator()
     try:
-        final_video = orchestrator.run(prompt, dry_run=dry_run)
+        if incremental:
+            console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
+            final_video = orchestrator.run_incremental(
+                prompt, incremental, dry_run=dry_run
+            )
+        else:
+            final_video = orchestrator.run(prompt, dry_run=dry_run)
+        
         if dry_run:
             console.print("\n[bold green]Dry-run 完成[/]")
         else:
@@ -393,6 +406,75 @@ def clean(
             skipped += 1
             console.print(f"跳过 {manifest.run_id}: {exc}", markup=False, style="yellow")
     console.print(f"清理完成: 删除 {removed}, 跳过 {skipped}")
+
+
+@app.command()
+def batch(
+    prompts_file: Path = typer.Argument(
+        ...,
+        help="包含 prompts 的文件路径（每行一个 prompt 或 JSON 格式）",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    max_parallel: int = typer.Option(
+        3,
+        "--max-parallel",
+        "-j",
+        help="最大并行任务数",
+        min=1,
+        max=10,
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="只生成场景代码，不提交 Slurm 渲染",
+    ),
+    output_dir: Path = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="输出目录",
+    ),
+):
+    """批量并行处理多个动画项目。"""
+    try:
+        settings.require_llm_key()
+    except ValueError as e:
+        console.print(f"[bold red]错误:[/] {e}", markup=False)
+        raise typer.Exit(1) from e
+    
+    from kd1_anime.batch import BatchProcessor, BatchConfig
+    
+    # 加载 prompts
+    try:
+        config = BatchConfig(
+            max_parallel=max_parallel,
+            dry_run=dry_run,
+            output_dir=output_dir,
+        )
+        processor = BatchProcessor(config)
+        processor.load_tasks_from_file(prompts_file)
+        
+        console.print(f"[cyan]加载了 {len(processor.tasks)} 个任务[/]")
+        
+        # 执行批量处理
+        tasks = processor.execute_all()
+        
+        # 输出摘要
+        summary = processor.generate_summary(tasks)
+        console.print(summary)
+        
+        # 检查是否有失败的任务
+        failed_count = sum(1 for t in tasks if t.status == "failed")
+        if failed_count > 0:
+            console.print(f"[bold red]{failed_count} 个任务失败[/]")
+            raise typer.Exit(1)
+    
+    except Exception as e:
+        console.print(f"[bold red]批量处理失败:[/] {e}", markup=False)
+        raise typer.Exit(1) from e
 
 
 @app.command(name="version")

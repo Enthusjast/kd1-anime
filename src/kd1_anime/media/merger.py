@@ -161,7 +161,63 @@ class VideoMerger:
         )
         return True
 
-    def merge_jobs(
+    def collect_incremental_videos(
+        self,
+        scene_states: dict,
+        current_root: Path,
+        base_manifest=None,
+        base_root: Path | None = None,
+    ) -> list[Path]:
+        """收集增量渲染的视频，包括新渲染的和复用的旧视频。"""
+        videos: list[Path] = []
+        
+        for scene_id in sorted(scene_states.keys()):
+            state = scene_states[scene_id]
+            
+            if state.slurm_job is None:
+                raise RuntimeError(f"Scene {scene_id} 没有 Slurm Job")
+            
+            # 检查是否是复用的作业
+            if state.slurm_job.job_id.startswith("reused-"):
+                # 复用的作业，视频在旧 run 目录中
+                if base_root and base_manifest:
+                    base_scene = base_manifest.scenes.get(scene_id)
+                    if base_scene and base_scene.slurm_job:
+                        from kd1_anime.run_store import restore_run_path
+                        old_media_dir = restore_run_path(base_root, base_scene.slurm_job.media_dir)
+                        old_video = self._find_video_in_dir(old_media_dir, state.class_name)
+                        if old_video:
+                            videos.append(old_video)
+                            console.print(f"[dim][Merger][/] Scene {scene_id}: 复用旧视频 {old_video}")
+                            continue
+                
+                # 如果无法复用，尝试从当前 job 查找
+                video = self.find_job_video(state.slurm_job)
+            else:
+                # 新渲染的作业
+                video = self.find_job_video(state.slurm_job)
+            
+            videos.append(video)
+            console.print(f"[dim][Merger][/] Scene {scene_id}: {video}")
+        
+        return videos
+    
+    def _find_video_in_dir(self, media_dir: Path, class_name: str) -> Path | None:
+        """在指定目录中查找视频文件。"""
+        if not media_dir.exists():
+            return None
+        
+        candidates = [
+            path
+            for path in media_dir.rglob(f"{class_name}.mp4")
+            if "partial_movie_files" not in path.parts and path.stat().st_size > 0
+        ]
+        
+        if candidates:
+            return max(candidates, key=lambda path: path.stat().st_mtime)
+        return None
+
+        def merge_jobs(
         self,
         jobs: list[SlurmJob],
         *,
