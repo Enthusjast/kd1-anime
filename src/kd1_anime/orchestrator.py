@@ -800,7 +800,7 @@ class Orchestrator:
             missing = [
                 name for name in ("sbatch", "ffmpeg") if not __import__("shutil").which(name)
             ]
-            if settings.SLURM_CONTAINER_IMAGE and not __import__("shutil").which("apptainer"):
+            if settings.SLURM_REQUIRE_CONTAINER and not __import__("shutil").which("apptainer"):
                 missing.append("apptainer")
             if missing:
                 raise RuntimeError("运行环境缺少命令: " + ", ".join(missing))
