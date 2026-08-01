@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.planner import ScenePlan
@@ -102,6 +102,14 @@ class ReviewResult(BaseModel):
     severity: Literal["info", "minor", "major"] = "minor"
     feedback: str = ""
     fixes: list[FixSuggestion] = Field(default_factory=list)
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def normalize_severity(cls, v):
+        """处理 LLM 返回 null 或空字符串的情况"""
+        if v is None or v == "":
+            return "minor"  # 默认值，后续 model_validator 会根据 is_valid 调整
+        return v
 
     @model_validator(mode="after")
     def validate_contract(self) -> "ReviewResult":
