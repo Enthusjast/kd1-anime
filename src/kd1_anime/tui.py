@@ -134,8 +134,8 @@ class Clarifier:
                 response = self.agent.call_llm(messages=self.history, stream=False)
                 self.history.append({"role": "assistant", "content": response})
                 if self.extract_ready(response) is None:
-                    console.print("[dim cyan]AI:[/] ", end="")
-                    console.print(response, markup=False)
+                    console.print("[dim cyan]AI:[/]")
+                    console.print(Markdown(response))
                 return response
             except Exception as e:
                 console.print()
