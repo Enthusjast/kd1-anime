@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = ""
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
-    LLM_MAX_TOKENS: int = Field(default=8192, ge=256)
+    LLM_MAX_TOKENS: int | None = Field(default=None)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)

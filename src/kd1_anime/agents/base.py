@@ -155,10 +155,17 @@ class BaseAgent:
                     else:
                         finish = "stream_empty"
                     if finish == "length":
-                        raise RuntimeError(
-                            f"[{self.name}] LLM 输出被 max_tokens={kwargs.get('max_tokens', '?')} "
-                            "截断且内容为空. 请在 .env 中增大 LLM_MAX_TOKENS (建议 8192+)."
-                        )
+                        max_tokens_val = kwargs.get('max_tokens')
+                        if max_tokens_val:
+                            raise RuntimeError(
+                                f"[{self.name}] LLM 输出被 max_tokens={max_tokens_val} "
+                                "截断且内容为空. 请在 .env 中增大 LLM_MAX_TOKENS (建议 8192+)."
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"[{self.name}] LLM 输出被截断且内容为空. "
+                                "请尝试简化输入或检查模型能力."
+                            )
                     if json_mode and "response_format" in kwargs and not json_fallback_used:
                         self._log(
                             "端点在 response_format 模式返回空内容，"
