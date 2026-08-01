@@ -107,7 +107,7 @@ class Settings(BaseSettings):
     MAX_REVIEW_ROUNDS: int = Field(default=3, ge=1, le=10)
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
     MAX_FIX_ATTEMPTS: int = Field(default=3, ge=0, le=10)
-    MAX_CLARIFY_ROUNDS: int = Field(default=6, ge=1, le=20)
+    MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
     
     # --- 自动评估配置 ---
     ENABLE_AUTO_EVAL: bool = Field(
