@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
+import re
 from uuid import uuid4
 
 from rich.console import Console
@@ -60,70 +61,154 @@ Callback = Callable[[str, dict], None]
 FIXABLE_RENDER_STATES = {"FAILED", "TIMEOUT", "OUT_OF_MEMORY", "RUN_TIMEOUT"}
 
 
-import re
 
 
 def fix_tex_template(code: str) -> str:
+    """自动修复 Manim 代码中缺失的 TexTemplate 配置。
+
+    策略:
+    1. 用 AST 精确定位 Tex/MathTex 调用（避免字符串/注释误匹配）
+    2. 用 AST 查找是否已有 XeLaTeX 模板配置
+    3. 仅在真正缺失时添加配置，避免重复添加
     """
-    自动修复 Manim 代码中的 TexTemplate 问题。
-    """
-    lines = code.split('\n')
-    new_lines = []
-    
-    # 检查是否已经有 TexTemplate 配置
-    has_tex_config = False
-    tex_template_var = None
-    
+    import ast as _ast
+
+    # 如果代码不包含任何 Tex/MathTex，直接返回
+    if not re.search(r"\b(?:Tex|MathTex)\b", code):
+        return code
+
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError:
+        # 语法错误的代码无法可靠修复，原样返回让校验器报错
+        return code
+
+    # --- 检查是否已有完整配置 ---
+    has_xelatex_template = False
+    has_ctex = False
+    has_config_assignment = False
+    template_var_name: str | None = None
+
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            func_name = ""
+            if isinstance(node.func, _ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, _ast.Attribute):
+                func_name = node.func.attr
+            if func_name == "TexTemplate":
+                for kw in node.keywords:
+                    if kw.arg == "tex_compiler" and isinstance(kw.value, _ast.Constant):
+                        if kw.value.value == "xelatex":
+                            has_xelatex_template = True
+        if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute):
+            if node.func.attr == "add_to_preamble":
+                for arg in node.args:
+                    if isinstance(arg, _ast.Constant) and "ctex" in str(arg.value):
+                        has_ctex = True
+        if isinstance(node, _ast.Assign):
+            for target in node.targets:
+                if isinstance(target, _ast.Attribute) and target.attr == "tex_template":
+                    if isinstance(target.value, _ast.Name) and target.value.id == "config":
+                        has_config_assignment = True
+
+    # 找到模板变量名（第一个 tex_template = TexTemplate(...) 的赋值）
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, _ast.Name) and isinstance(node.value, _ast.Call):
+                func_name = ""
+                if isinstance(node.value.func, _ast.Name):
+                    func_name = node.value.func.id
+                elif isinstance(node.value.func, _ast.Attribute):
+                    func_name = node.value.func.attr
+                if func_name == "TexTemplate":
+                    template_var_name = target.id
+                    break
+
+    # 如果配置完整，只需检查 tex_template 参数
+    if has_xelatex_template and has_ctex and has_config_assignment and template_var_name:
+        return _ensure_tex_template_param(code, template_var_name)
+
+    # --- 配置不完整，需要添加 ---
+    lines = code.split("\n")
+    new_lines: list[str] = []
+    in_construct = False
+    added = False
+
     for line in lines:
-        if 'TexTemplate' in line and 'xelatex' in line:
-            has_tex_config = True
-            match = re.match(r'\s*(\w+)\s*=\s*TexTemplate', line)
-            if match:
-                tex_template_var = match.group(1)
-    
-    # 如果没有配置，在 construct 方法开头添加
-    if not has_tex_config or not tex_template_var:
-        tex_template_var = 'tex_template'
-        in_construct = False
-        added = False
-        
-        for i, line in enumerate(lines):
-            if 'def construct(self):' in line:
-                in_construct = True
-                new_lines.append(line)
-                continue
-            
-            if in_construct and not added:
-                stripped = line.strip()
-                if stripped and not stripped.startswith('#'):
-                    indent = line[:len(line) - len(line.lstrip())]
-                    new_lines.append(f'{indent}# TexTemplate 配置（自动添加）')
-                    new_lines.append(f'{indent}tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")')
-                    new_lines.append(f'{indent}tex_template.add_to_preamble(r"\\usepackage{{ctex}}")')
-                    new_lines.append(f'{indent}config.tex_template = tex_template')
-                    added = True
-                    in_construct = False
-            
+        if re.match(r"\s*def construct\(self\)", line):
+            in_construct = True
             new_lines.append(line)
-        
-        lines = new_lines
-        new_lines = []
-    
-    # 为所有 Tex/MathTex 调用添加 tex_template 参数
-    for line in lines:
-        if re.search(r'\b(?:Tex|MathTex)\s*\(', line):
-            if tex_template_var not in line:
-                stripped = line.rstrip()
-                if stripped.endswith(')'):
-                    before_paren = stripped[:-1].rstrip()
-                    if before_paren.endswith('('):
-                        line = stripped[:-1] + f'{tex_template_var}={tex_template_var})'
-                    else:
-                        line = stripped[:-1] + f', {tex_template_var}={tex_template_var})'
-        
+            continue
+
+        if in_construct and not added:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                indent = line[: len(line) - len(line.lstrip())]
+                new_lines.append(f"{indent}# TexTemplate 配置（自动添加）")
+                new_lines.append(
+                    f'{indent}tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")'
+                )
+                new_lines.append(f'{indent}tex_template.add_to_preamble(r"\\usepackage{{ctex}}")')
+                new_lines.append(f"{indent}config.tex_template = tex_template")
+                added = True
+                in_construct = False
+
         new_lines.append(line)
-    
-    return '\n'.join(new_lines)
+
+    result = "\n".join(new_lines)
+    return _ensure_tex_template_param(result, "tex_template")
+
+
+def _ensure_tex_template_param(code: str, template_var: str) -> str:
+    """为缺少 tex_template= 参数的 Tex/MathTex 调用添加该参数。
+
+    使用 AST 定位需要修复的调用行号，然后做精准的行级替换。
+    """
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError:
+        return code
+
+    lines = code.split("\n")
+    lines_to_fix: set[int] = set()  # 0-indexed
+
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        func_name = ""
+        if isinstance(node.func, _ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, _ast.Attribute):
+            func_name = node.func.attr
+        if func_name not in ("Tex", "MathTex"):
+            continue
+        # 检查是否已有 tex_template 参数
+        has_param = any(kw.arg == "tex_template" for kw in node.keywords if kw.arg)
+        if not has_param:
+            lines_to_fix.add(node.lineno - 1)  # 转为 0-indexed
+
+    if not lines_to_fix:
+        return code
+
+    for idx in sorted(lines_to_fix):
+        line = lines[idx]
+        stripped = line.rstrip()
+        # 简单情况: Tex(...) 或 MathTex(...) 在同一行，以 ) 结尾
+        if stripped.endswith(")"):
+            before = stripped[:-1].rstrip()
+            if before.endswith("("):
+                lines[idx] = stripped[:-1] + f"{template_var}={template_var})"
+            else:
+                lines[idx] = stripped[:-1] + f", {template_var}={template_var})"
+        # 多行调用: 在行尾添加参数（不完美的启发式，但比不修复好）
+        else:
+            lines[idx] = stripped + f"  # TODO: 需添加 {template_var}={template_var}"
+
+    return "\n".join(lines)
 
 
 
@@ -184,6 +269,7 @@ class SceneState:
     failed: bool = False
     failure_reason: str = ""
 
+    reviewed: bool = False
 
 @dataclass
 class PipelineContext:
@@ -1393,12 +1479,14 @@ class Orchestrator:
             
             # 评估最终视频
             if ctx.final_video and ctx.final_video.exists():
-                # 评估代码质量
+                # 评估代码质量（存储每个场景的评估结果以便后续复用）
                 code_scores = []
+                scene_eval_results: dict[int, object] = {}
                 for scene_id, state in ctx.scene_states.items():
                     if state.code:
                         code_result = evaluator.evaluate_code(state.code)
                         code_scores.append(code_result)
+                        scene_eval_results[scene_id] = code_result
                 
                 # 计算平均代码分数
                 avg_code_score = sum(r.overall_score for r in code_scores) / len(code_scores) if code_scores else 0
@@ -1448,13 +1536,12 @@ class Orchestrator:
                     # 增加评估轮数
                     ctx.eval_round = eval_round + 1
                     
-                    # 找出低分的场景需要改进
-                    low_score_scenes = []
-                    for scene_id, state in ctx.scene_states.items():
-                        if state.code:
-                            scene_eval = evaluator.evaluate_code(state.code)
-                            if scene_eval.overall_score < settings.EVAL_THRESHOLD:
-                                low_score_scenes.append(scene_id)
+                    # 找出低分的场景需要改进（复用已有评估结果）
+                    low_score_scenes = [
+                        scene_id
+                        for scene_id, scene_eval in scene_eval_results.items()
+                        if scene_eval.overall_score < settings.EVAL_THRESHOLD
+                    ]
                     
                     # 标记需要改进的场景
                     ctx.scenes_to_improve = low_score_scenes
