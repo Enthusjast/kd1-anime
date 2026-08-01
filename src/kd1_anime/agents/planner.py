@@ -15,7 +15,8 @@ Planner 只需要用 Manim 的术语确认可行性就行.
 阶段 2: 对每个 outline 单独调用 LLM 填充导演细节 → ScenePlan
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+import json
 
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.config import settings
@@ -64,6 +65,16 @@ class SceneDetail(BaseModel):
     visual_flow: list[str] = Field(min_length=1, max_length=100)
     key_moments: list[str] = Field(min_length=1, max_length=100)
     computation: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("visual_design", "computation", mode="before")
+    @classmethod
+    def ensure_string(cls, v):
+        """LLM 有时返回对象而非字符串，自动转换为 JSON 字符串"""
+        if isinstance(v, dict):
+            return json.dumps(v, ensure_ascii=False, indent=2)
+        if isinstance(v, list):
+            return json.dumps(v, ensure_ascii=False, indent=2)
+        return v
 
 
 # ---------------------------------------------------------------------------
