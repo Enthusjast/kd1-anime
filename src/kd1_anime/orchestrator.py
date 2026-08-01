@@ -699,7 +699,34 @@ class Orchestrator:
             except KeyError as exc:
                 raise ValueError(f"运行清单包含未知 FSM 状态: {manifest.state}") from exc
             if state is State.ERROR:
-                raise RuntimeError("该运行已进入不可恢复的 ERROR 状态，请创建新运行")
+                # 允许从 ERROR 状态恢复：重置失败场景，回到 CODING 阶段重试
+                has_renderable = any(
+                    scene.code and not scene.give_up
+                    for scene in ctx.scene_states.values()
+                )
+                has_pending = any(
+                    not scene.code and not scene.failed and not scene.give_up
+                    for scene in ctx.scene_states.values()
+                )
+                if has_renderable or has_pending:
+                    # 重置失败状态，允许重试
+                    for scene in ctx.scene_states.values():
+                        if scene.failed:
+                            scene.failed = False
+                            scene.failure_reason = ""
+                    # 根据场景状态决定从哪个阶段恢复
+                    if has_pending:
+                        state = State.CODING
+                    else:
+                        state = State.REVIEWING
+                    self._emit("run_resuming_from_error", run_id=run_id, state=state.name)
+                else:
+                    raise RuntimeError(
+                        "该运行已进入 ERROR 状态且无可用场景，请创建新运行。"
+                        f"\n失败原因: {manifest.error[:200]}"
+                    )
+
+
 
             cancelled_jobs = False
             for scene in ctx.scene_states.values():
