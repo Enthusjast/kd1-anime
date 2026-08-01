@@ -766,3 +766,77 @@ def _print_comparison(comparison: 'ComparisonResult'):
         console.print("\n[red]退化:[/]")
         for item in comparison.regressions:
             console.print(f"  ✗ {item}")
+
+
+@app.command()
+def test_llm(
+    json_mode: bool = typer.Option(True, "--json-mode/--no-json-mode", help="测试 JSON 模式"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细输出"),
+):
+    """测试 LLM 端点连接和功能
+    
+    检测当前配置的 LLM 端点是否正常工作，包括 JSON 模式支持。
+    """
+    from kd1_anime.agents.base import BaseAgent
+    
+    console.print(Rule("LLM 端点测试", style="bold blue"))
+    console.print()
+    
+    # 显示配置
+    console.print("[bold]当前配置:[/]")
+    console.print(f"  模型: {settings.LLM_MODEL}")
+    console.print(f"  Base URL: {settings.LLM_BASE_URL}")
+    console.print(f"  JSON 模式: {'启用' if json_mode else '禁用'}")
+    console.print()
+    
+    # 创建测试 Agent
+    class TestAgent(BaseAgent):
+        name = "TestAgent"
+    
+    agent = TestAgent()
+    
+    # 测试 1: 基本连接
+    console.print("[bold]测试 1: 基本连接[/]")
+    try:
+        response = agent.call_llm(
+            system_prompt="你是一个助手。",
+            user_message="回复 'OK' 两个字母。",
+            temperature=0.0,
+            max_tokens=10,
+        )
+        if response.strip():
+            console.print(f"  [green]✓ 连接成功[/] 响应: {response.strip()[:50]}")
+        else:
+            console.print("  [red]✗ 响应为空[/]")
+            return
+    except Exception as e:
+        console.print(f"  [red]✗ 连接失败: {e}[/]")
+        return
+    
+    console.print()
+    
+    # 测试 2: JSON 模式
+    if json_mode:
+        console.print("[bold]测试 2: JSON 模式[/]")
+        try:
+            # 使用 call_llm_json 测试
+            from pydantic import BaseModel
+            
+            class TestResponse(BaseModel):
+                status: str
+                message: str
+            
+            result = agent.call_llm_json(
+                system_prompt="返回一个 JSON 对象，包含 status 和 message 字段。",
+                user_message="status 设为 'ok'，message 设为 '测试成功'。",
+                response_model=TestResponse,
+                temperature=0.0,
+            )
+            console.print(f"  [green]✓ JSON 模式正常[/]")
+            console.print(f"    解析结果: status={result.status}, message={result.message}")
+        except Exception as e:
+            console.print(f"  [yellow]⚠ JSON 模式异常: {e}[/]")
+            console.print("    建议: 在 .env 中设置 LLM_USE_JSON_MODE=false")
+    
+    console.print()
+    console.print("[bold green]测试完成[/]")

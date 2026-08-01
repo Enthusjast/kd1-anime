@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)
     LLM_DEBUG: bool = False
+    LLM_USE_JSON_MODE: bool = Field(
+        default=True,
+        description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级"
+    )
 
     # --- Slurm 集群 ---
     SLURM_PARTITION: str = ""

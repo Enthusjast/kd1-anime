@@ -121,7 +121,7 @@ class BaseAgent:
         # 部分 (推理类) 模型拒绝 max_tokens; 通过设置可关闭
         if getattr(settings, "LLM_SEND_MAX_TOKENS", True) and tokens:
             kwargs["max_tokens"] = tokens
-        if json_mode:
+        if json_mode and getattr(settings, "LLM_USE_JSON_MODE", True):
             kwargs["response_format"] = {"type": "json_object"}
 
         last_error: Exception | None = None
@@ -167,6 +167,11 @@ class BaseAgent:
                         )
                         kwargs.pop("response_format", None)
                         json_fallback_used = True
+                        # 在系统提示中添加明确的 JSON 输出要求
+                        for msg in kwargs.get("messages", []):
+                            if msg.get("role") == "system":
+                                msg["content"] += "\n\n重要：你必须返回有效的 JSON 格式。不要包含任何其他文本，只返回 JSON。"
+                                break
                         attempt -= 1  # 参数兼容性降级，不消耗业务重试次数
                         continue
                     if not stream and not use_stream_transport and not stream_fallback_used:
@@ -222,6 +227,11 @@ class BaseAgent:
                     )
                     kwargs.pop("response_format", None)
                     json_fallback_used = True
+                    # 在系统提示中添加明确的 JSON 输出要求
+                    for msg_item in kwargs.get("messages", []):
+                        if msg_item.get("role") == "system":
+                            msg_item["content"] += "\n\n重要：你必须返回有效的 JSON 格式。不要包含任何其他文本，只返回 JSON。"
+                            break
                     attempt -= 1  # 参数修复, 不消耗重试次数
                     continue
                 # Kimi 等推理模型只允许 temperature=1
