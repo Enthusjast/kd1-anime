@@ -408,22 +408,22 @@ class _SafetyVisitor(ast.NodeVisitor):
         if not self.tex_calls:
             return
         first_call = self.tex_calls[0][0]
+        HINT = " (修复: 参考 coder.py 提示词中的 TexTemplate 模板)"
         if not self.xelatex_templates:
             self.error(
                 first_call,
-                "Tex/MathTex 必须使用 TexTemplate(tex_compiler='xelatex', "
-                "output_format='.xdv')",
+                "Tex/MathTex 必须使用 TexTemplate(tex_compiler='xelatex', output_format='.xdv') (修复: 参考 coder.py 提示词中的 TexTemplate 模板)",
             )
         if not (self.xelatex_templates & self.ctex_templates):
-            self.error(first_call, r"XeLaTeX 模板必须加载 \usepackage{ctex}")
+            self.error(first_call, r"XeLaTeX 模板必须加载 \usepackage{ctex}" + HINT)
         if not (self.xelatex_templates & self.configured_templates):
-            self.error(first_call, "必须将 XeLaTeX 模板赋给 config.tex_template")
+            self.error(first_call, "必须将 XeLaTeX 模板赋给 config.tex_template" + HINT)
 
         for call, template_name in self.tex_calls:
             if template_name is None:
-                self.error(call, "每个 Tex/MathTex 调用都必须显式传入 tex_template=tex_template")
+                self.error(call, "每个 Tex/MathTex 调用都必须显式传入 tex_template=tex_template" + HINT)
             elif template_name not in self.xelatex_templates:
-                self.error(call, "Tex/MathTex 的 tex_template 必须引用 XeLaTeX .xdv 模板")
+                self.error(call, "Tex/MathTex 的 tex_template 必须引用 XeLaTeX .xdv 模板" + HINT)
 
 
 def validate_manim_code(code: str) -> CodeValidationResult:

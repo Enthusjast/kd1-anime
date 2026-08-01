@@ -234,3 +234,13 @@
 - **添加 LLM 测试命令**：
   - `kd1-anime test-llm`: 测试 LLM 端点连接和 JSON 模式支持
   - 帮助用户诊断端点兼容性问题
+
+### 改进 - TexTemplate 校验反馈
+
+- **改进 validator.py**：
+  - 在 TexTemplate 校验错误消息中添加修复提示
+  - 引导 LLM 参考 coder.py 中的 TexTemplate 模板
+
+- **改进 coder.py**：
+  - 在核心要求中添加强制性的 TexTemplate 模板代码块
+  - 强调 TexTemplate 是不可省略的强制要求

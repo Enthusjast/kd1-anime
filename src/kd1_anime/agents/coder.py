@@ -551,9 +551,17 @@ CODER_SYSTEM_PROMPT = f"""你是一个 Manim 动画编程专家.你的任务是�
 5. 视觉效果要丰富、流畅,避免单调的文字展示
 6. 数学公式使用 `MathTex`; 中文文字优先使用 `Text(..., font="Noto Sans CJK SC")`
 7. 只允许导入 manim、numpy、math 和纯计算型标准库; 禁止文件、网络、shell、subprocess、eval/exec
-8. 每个 `construct()` 开头必须创建 `TexTemplate(tex_compiler="xelatex", output_format=".xdv")`,
-   用 `add_to_preamble(r"\\usepackage{{ctex}}")` 加载中文支持,并赋给 `config.tex_template`
-9. 每个 `Tex`/`MathTex` 调用都必须显式传入 `tex_template=tex_template`; 禁止依赖默认的 latex/pdflatex
+8. **必须**在每个 `construct()` 方法开头添加以下模板代码（不可省略）:
+```python
+tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+tex_template.add_to_preamble(r"\\usepackage{ctex}")
+config.tex_template = tex_template
+```
+9. **必须**在每个 `Tex`/`MathTex` 调用中显式传入 `tex_template=tex_template`; 禁止依赖默认的 latex/pdflatex
+10. 中文文本必须使用 `Tex(r"中文", tex_template=tex_template)` 而不是 `Text()`
+
+## ⚠️ 特别注意：TexTemplate 是强制要求
+如果你的代码包含任何 Tex 或 MathTex，但没有正确配置 TexTemplate，代码将无法通过校验！
 
 ## 视觉设计原则
 
