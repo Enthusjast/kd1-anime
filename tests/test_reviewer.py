@@ -17,9 +17,9 @@ def test_severity_is_closed_enum():
         ReviewResult(is_valid=False, severity="unexpected", feedback="x")
 
 
-def test_minor_requires_fixes():
-    with pytest.raises(ValidationError):
-        ReviewResult(is_valid=False, severity="minor", feedback="x")
+def test_minor_without_fixes_upgrades_to_major():
+    result = ReviewResult(is_valid=False, severity="minor", feedback="some issue")
+    assert result.severity == "major"
 
 
 def test_major_requires_feedback():
@@ -34,7 +34,7 @@ def test_valid_result_is_normalized():
         feedback="ignored",
         fixes=[FixSuggestion(find="a", replace="b")],
     )
-    assert result.severity == "minor"
+    assert result.severity == "info"
     assert result.feedback == ""
     assert result.fixes == []
 

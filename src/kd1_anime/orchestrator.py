@@ -1059,19 +1059,28 @@ class Orchestrator:
                 self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
                 continue
 
+            # 构建完整反馈：保留原始审查意见，用于后续传给 Coder
+            original_feedback = effective_result.feedback or ""
+            fix_details = "\n".join(
+                f"- [{fix.reason}] {fix.find!r} → {fix.replace!r}"
+                for fix in effective_result.fixes
+            )
+
             if effective_result.severity == "minor":
                 candidate = state.code
+                applied_count = 0
                 for fix in effective_result.fixes:
-                    if candidate.count(fix.find) != 1:
-                        candidate = ""
-                        break
-                    candidate = candidate.replace(fix.find, fix.replace, 1)
-                validation = (
-                    self._validate(candidate)
-                    if candidate
-                    else CodeValidationResult(False, ["fix.find 不是唯一匹配"])
-                )
-                if validation.is_valid:
+                    # 尝试精确匹配，失败则尝试首次出现
+                    if candidate.count(fix.find) == 1:
+                        candidate = candidate.replace(fix.find, fix.replace, 1)
+                        applied_count += 1
+                    elif fix.find in candidate:
+                        # find 出现多次，只替换首次出现
+                        candidate = candidate.replace(fix.find, fix.replace, 1)
+                        applied_count += 1
+                    # 如果 find 不存在则跳过该 fix
+                validation = self._validate(candidate) if applied_count > 0 else None
+                if validation and validation.is_valid:
                     state.code = candidate
                     state.class_name = validation.scene_classes[0]
                     self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
@@ -1079,19 +1088,28 @@ class Orchestrator:
                     self._checkpoint(ctx, State.REVIEWING)
                     self._emit("scene_review_fail", scene_id=scene_id, severity="minor")
                     continue
+                # minor 修复失败，升级为 major，但保留原始反馈
                 effective_result = ReviewResult(
                     is_valid=False,
                     severity="major",
                     feedback=(
-                        "Reviewer 的局部修复无法安全应用，请重写。\n"
-                        f"确定性校验：\n{validation.feedback}"
+                        f"## Reviewer 审查意见（minor 修复未能全部应用）\n"
+                        f"{original_feedback}\n\n"
+                        f"## 修复建议详情\n{fix_details}\n\n"
+                        f"## 确定性校验\n{validation.feedback if validation else '未生成有效代码'}"
                     ),
                 )
 
+            # severity=major：将完整审查反馈传给 Coder 重写
+            rewrite_feedback = (
+                f"## Reviewer 审查意见\n{original_feedback}\n\n"
+                f"## 需修复的问题\n{fix_details}\n\n"
+                f"请根据以上反馈逐项修正代码，保留正确部分，只修复指出的问题。"
+            )
             try:
                 code, class_name = self._generate_validated_code(
                     state.plan,
-                    feedback=effective_result.feedback,
+                    feedback=rewrite_feedback,
                     previous_code=state.code,
                     stream=False,
                 )
