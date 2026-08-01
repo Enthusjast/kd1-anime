@@ -10,6 +10,7 @@ TUI 交互模块
 """
 
 import locale
+import signal
 import sys
 from contextlib import suppress
 
@@ -251,6 +252,12 @@ class ChatSession:
 
     def run(self) -> None:
         """启动完整的交互会话"""
+        # 设置信号处理，避免退出时的 threading 警告
+        def _signal_handler(signum, frame):
+            raise KeyboardInterrupt()
+        
+        signal.signal(signal.SIGINT, _signal_handler)
+        
         _setup_terminal()
         try:
             self._show_banner()
