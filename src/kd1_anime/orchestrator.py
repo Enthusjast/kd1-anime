@@ -66,36 +66,44 @@ import re
 def fix_tex_template(code: str) -> str:
     """
     自动修复 Manim 代码中的 TexTemplate 问题。
-    
-    如果代码包含 Tex/MathTex 但没有正确配置 TexTemplate，自动添加配置。
+    更健壮的版本。
     """
     # 检查是否已经有正确的 TexTemplate 配置
-    if 'TexTemplate(tex_compiler="xelatex"' in code or "TexTemplate(tex_compiler='xelatex'" in code:
-        if 'config.tex_template' in code:
-            return code  # 已经有正确配置
+    has_tex_template_config = (
+        'TexTemplate(tex_compiler="xelatex"' in code or 
+        "TexTemplate(tex_compiler='xelatex'" in code
+    )
+    has_config_assignment = 'config.tex_template' in code
+    
+    if has_tex_template_config and has_config_assignment:
+        # 检查是否所有 Tex/MathTex 都有 tex_template 参数
+        template_var_match = re.search(r'(\w+)\s*=\s*TexTemplate\(tex_compiler', code)
+        if template_var_match:
+            template_var = template_var_match.group(1)
+            tex_calls = re.findall(r'\b(Tex|MathTex)\s*\([^)]*\)', code, re.DOTALL)
+            all_have_template = all(f'{template_var}' in call for call in tex_calls)
+            if all_have_template:
+                return code  # 完全正确，不需要修复
     
     # 检查是否有 Tex 或 MathTex 的使用
     has_tex = bool(re.search(r'\b(Tex|MathTex)\s*\(', code))
     if not has_tex:
-        return code  # 没有使用 Tex，不需要修复
+        return code
     
     # 找到 construct 方法的位置
     construct_match = re.search(r'def construct\(self\):', code)
     if not construct_match:
-        return code  # 没有 construct 方法
+        return code
     
     # 获取 construct 方法体的开始位置
     construct_start = construct_match.end()
-    
-    # 找到 construct 方法体的第一行非空行
     lines = code[construct_start:].split('\n')
     insert_pos = construct_start
     
-    # 找到合适的插入位置（跳过空行和注释）
+    # 找到合适的插入位置
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped and not stripped.startswith('#'):
-            # 找到了第一个有效行，在它之前插入
             insert_pos = construct_start + sum(len(l) + 1 for l in lines[:i])
             break
     
@@ -110,36 +118,24 @@ def fix_tex_template(code: str) -> str:
     # 在 construct 方法开头插入配置
     new_code = code[:insert_pos] + tex_config + code[insert_pos:]
     
-    # 现在需要为所有 Tex/MathTex 调用添加 tex_template 参数
-    def add_tex_template_arg(match):
+    # 为所有 Tex/MathTex 调用添加 tex_template 参数
+    def add_tex_template_to_call(match):
         full_match = match.group(0)
-        # 检查是否已经有 tex_template 参数
         if 'tex_template' in full_match:
             return full_match
         
-        # 在括号内添加 tex_template 参数
-        # 找到右括号的位置
-        paren_count = 0
-        for i, char in enumerate(full_match):
-            if char == '(':
-                paren_count += 1
-            elif char == ')':
-                paren_count -= 1
-                if paren_count == 0:
-                    # 找到了匹配的右括号
-                    if full_match[i-1] == '(':
-                        # 空括号 Tex()
-                        return full_match[:-1] + 'tex_template=tex_template)'
-                    else:
-                        # 有参数 Tex("...")
-                        return full_match[:-1] + ', tex_template=tex_template)'
+        last_paren = full_match.rfind(')')
+        if last_paren == -1:
+            return full_match
         
-        return full_match
+        if last_paren > 0 and full_match[last_paren-1] == '(':
+            return full_match[:last_paren] + 'tex_template=tex_template)'
+        else:
+            return full_match[:last_paren] + ', tex_template=tex_template)'
     
-    # 匹配 Tex( 和 MathTex( 调用（包括跨行的情况）
     new_code = re.sub(
-        r'\b(Tex|MathTex)\s*\([^)]*\)',
-        add_tex_template_arg,
+        r'\b(?:Tex|MathTex)\s*\([^)]*(?:\([^)]*\)[^)]*)*\)',
+        add_tex_template_to_call,
         new_code,
         flags=re.DOTALL
     )
