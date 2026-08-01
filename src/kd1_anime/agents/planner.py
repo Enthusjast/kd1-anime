@@ -28,7 +28,7 @@ from kd1_anime.config import settings
 class ScenePlan(BaseModel):
     """单个场景的完整导演规划。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     scene_id: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=200)
@@ -45,7 +45,7 @@ class ScenePlan(BaseModel):
 class SceneOutline(BaseModel):
     """阶段 1 输出：场景概要。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     scene_id: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=200)
@@ -57,7 +57,7 @@ class SceneOutline(BaseModel):
 class SceneDetail(BaseModel):
     """阶段 2 输出：单个场景的导演细节。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     visual_design: str = Field(min_length=1, max_length=20_000)
     camera_movement: str = Field(min_length=1, max_length=10_000)
