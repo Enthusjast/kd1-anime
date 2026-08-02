@@ -8,6 +8,7 @@ import pytest
 from kd1_anime.run_store import (
     RunManifest,
     StoredSceneState,
+    StoredSlurmJob,
     compute_scene_changes,
     find_base_run_for_incremental,
     get_latest_completed_run,
@@ -34,12 +35,19 @@ def sample_manifest():
                 computation="Test",
             ),
             code_file="scenes/scene_1.py",
-            code_sha256="abc123",
+            code_sha256="a" * 64,
             class_name="Scene1",
             rendered=True,
-            slurm_job=MagicMock(
+            slurm_job=StoredSlurmJob(
                 job_id="12345",
+                scene_id=1,
+                script_path="scripts/scene_1.sh",
+                log_out="logs/scene_1.out",
+                log_err="logs/scene_1.err",
                 media_dir="videos/scene_1",
+                scene_class_name="Scene1",
+                submitted_at=1000.0,
+                status="COMPLETED",
             ),
         ),
         2: StoredSceneState(
@@ -56,7 +64,7 @@ def sample_manifest():
                 computation="Test",
             ),
             code_file="scenes/scene_2.py",
-            code_sha256="def456",
+            code_sha256="b" * 64,
             class_name="Scene2",
             rendered=True,
         ),

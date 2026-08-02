@@ -173,7 +173,7 @@ class AutoFixerAgent(BaseAgent):
         code = self.call_llm(
             system_prompt=AUTO_FIXER_SYSTEM_PROMPT,
             user_message=user_msg,
-            stream=True,
+            stream=False,
         )
 
         extracted = self._extract_code_block(code)
@@ -193,8 +193,10 @@ class AutoFixerAgent(BaseAgent):
             return "属性错误 — 检查方法名是否正确 (如 .set_color 而非 .setColor)"
         elif "typeerror" in log_lower:
             return "参数错误 — 检查方法调用的参数数量和类型"
-        elif "timeout" in log_lower or "oom" in log_lower or "killed" in log_lower:
-            return "资源超限 — 简化动画效果,减少对象数量"
+        elif "timeout" in log_lower or "killed" in log_lower or "timed out" in log_lower:
+            return "渲染超时 — 动画过于复杂，简化效果、减少对象数量、缩短时长"
+        elif "oom" in log_lower or "out of memory" in log_lower or "memory error" in log_lower:
+            return "内存不足 (OOM) — 减少同时存在的对象数量，简化动画效果"
         elif "recursion" in log_lower:
             return "递归错误 — 检查 updater 是否创建了循环引用"
         elif "pango" in log_lower or "font" in log_lower:

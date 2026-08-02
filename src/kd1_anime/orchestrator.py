@@ -381,6 +381,7 @@ class Orchestrator:
                     if scene.slurm_job
                     else None
                 ),
+                reviewed=scene.reviewed,
                 rendered=scene.rendered,
                 give_up=scene.give_up,
                 failed=scene.failed,
@@ -441,6 +442,7 @@ class Orchestrator:
                 review_round=stored.review_round,
                 fix_attempts=stored.fix_attempts,
                 slurm_job=job,
+                reviewed=stored.reviewed,
                 rendered=stored.rendered,
                 give_up=stored.give_up,
                 failed=stored.failed,
@@ -699,7 +701,51 @@ class Orchestrator:
             except KeyError as exc:
                 raise ValueError(f"运行清单包含未知 FSM 状态: {manifest.state}") from exc
             if state is State.ERROR:
-                raise RuntimeError("该运行已进入不可恢复的 ERROR 状态，请创建新运行")
+                # 允许从 ERROR 状态恢复：重置失败场景，回到 CODING 阶段重试
+                has_renderable = any(
+                    scene.code and not scene.give_up
+                    for scene in ctx.scene_states.values()
+                )
+                has_pending = any(
+                    not scene.code and not scene.failed and not scene.give_up
+                    for scene in ctx.scene_states.values()
+                )
+                if has_renderable or has_pending:
+                    # 重置失败状态，允许重试
+                    for scene in ctx.scene_states.values():
+                        if scene.failed:
+                            scene.failed = False
+                            scene.failure_reason = ""
+                    # 根据场景状态决定从哪个阶段恢复
+                    if has_pending:
+                        state = State.CODING
+                    else:
+                        state = State.REVIEWING
+                    self._emit("run_resuming_from_error", run_id=run_id, state=state.name)
+                else:
+                    raise RuntimeError(
+                        "该运行已进入 ERROR 状态且无可用场景，请创建新运行。"
+                        f"\n失败原因: {manifest.error[:200]}"
+                    )
+
+
+
+            # 重置 give_up 场景，允许 resume 后重试审查/生成
+            reset_give_up = False
+            for scene in ctx.scene_states.values():
+                if scene.give_up:
+                    scene.give_up = False
+                    scene.review_round = 0
+                    scene.fix_attempts = 0
+                    scene.failure_reason = ""
+                    reset_give_up = True
+            if reset_give_up:
+                console.print(
+                    "[yellow]发现已放弃的场景，将重置并重试[/]",
+                )
+                if state not in {State.CODING, State.REVIEWING, State.DISPATCHING}:
+                    # 回到审查阶段重新评估已生成的代码
+                    state = State.REVIEWING
 
             cancelled_jobs = False
             for scene in ctx.scene_states.values():
@@ -1499,7 +1545,7 @@ class Orchestrator:
             if ctx.final_video and ctx.final_video.exists():
                 # 评估代码质量（存储每个场景的评估结果以便后续复用）
                 code_scores = []
-                scene_eval_results: dict[int, object] = {}
+                scene_eval_results: dict[int, EvalResult] = {}
                 for scene_id, state in ctx.scene_states.items():
                     if state.code:
                         code_result = evaluator.evaluate_code(state.code)

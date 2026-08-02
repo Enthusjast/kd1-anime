@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     VIDEOS_DIR: Path = Path("workspace/videos")
 
     # --- Agent 与监控 ---
-    MAX_REVIEW_ROUNDS: int = Field(default=3, ge=1, le=10)
+    MAX_REVIEW_ROUNDS: int = Field(default=5, ge=1, le=10)
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
     MAX_FIX_ATTEMPTS: int = Field(default=3, ge=0, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)

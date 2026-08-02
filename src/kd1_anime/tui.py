@@ -575,6 +575,13 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]审查通过 ✓[/]")
 
+            case "scene_rewriting":
+                scene_id = data.get("scene_id", "?")
+                reason = data.get("reason", "")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]Coder 正在修正...[/]")
+                if reason:
+                    console.print(f"    [dim]原因: {reason}[/]")
+
             case "scene_review_fail":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]需修正[/]")
