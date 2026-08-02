@@ -399,21 +399,38 @@ class ChatSession:
             console.print(f"[dim]检查历史运行时出错: {e}[/]")
 
     def _resume_run(self, run_id: str) -> None:
-        """恢复指定的运行"""
-        try:
-            from kd1_anime.orchestrator import Orchestrator
-            orchestrator = Orchestrator()
-            
-            def callback(event: str, data: dict) -> None:
+        """恢复指定的运行 (与 _run_pipeline 一样带 Live 场景仪表盘)"""
+        from kd1_anime.dashboard import SceneDashboard
+        from kd1_anime.orchestrator import Orchestrator
+
+        dashboard = SceneDashboard()
+        dashboard_active = dashboard.start()
+
+        def callback(event: str, data: dict) -> None:
+            if dashboard_active:
+                dashboard.on_event(event, data)
+            else:
                 self._pipeline_callback(event, data)
-            
-            final_video = orchestrator.resume(run_id, callback=callback, interactive=True)
+
+        try:
+            orchestrator = Orchestrator()
+            final_video = orchestrator.resume(
+                run_id, callback=callback, interactive=True
+            )
+            if dashboard_active:
+                dashboard.stop()
             self._show_completion(final_video)
-            
+
         except KeyboardInterrupt:
+            if dashboard_active:
+                dashboard.stop()
             console.print("\n[yellow]用户中断[/]")
         except Exception as e:
+            if dashboard_active:
+                dashboard.stop()
             console.print(f"\n[bold red]恢复失败:[/] {e}", markup=False)
+            if settings.LLM_DEBUG:
+                console.print_exception()
 
     def _get_initial_prompt(self) -> str | None:
         """获取用户的初始需求描述
