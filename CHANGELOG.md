@@ -109,3 +109,46 @@
 
 - [GitHub Releases](https://github.com/Enthusjast/kd1-anime/releases)
 - [完整变更历史](https://github.com/Enthusjast/kd1-anime/compare/v0.2.0...main)
+
+## [0.4.0] - 2026-08-01
+
+### 新增
+
+- **增量渲染功能**：
+  - 添加 `--incremental` CLI 选项，支持基于上一次运行只渲染变化的场景
+  - 添加 `run_incremental()` 方法到 Orchestrator
+  - 修改 manifest 支持记录增量渲染信息（`incremental`, `base_run_id`）
+  - 添加场景变化计算和视频复用逻辑
+  - VideoMerger 支持混合使用新旧视频
+  - 自动检测代码 hash 变化，跳过未变化的场景
+
+- **批量并行处理功能**：
+  - 添加 `batch` CLI 命令，支持从文件读取多个 prompt
+  - 添加 `BatchProcessor` 类，支持并行执行多个动画项目
+  - 支持纯文本和 JSON 格式的 prompts 文件
+  - 可配置最大并行任务数（`--max-parallel`）
+  - 支持批量 dry-run 模式
+  - 生成批量处理摘要报告
+
+- **新模块**：
+  - `src/kd1_anime/batch.py` - 批量并行处理模块
+
+- **新测试**：
+  - `tests/test_batch.py` - 批量处理功能测试
+  - `tests/test_incremental.py` - 增量渲染功能测试
+
+### 改进
+
+- **CLI 增强**：
+  - `generate` 命令添加 `--incremental` 选项
+  - 新增 `batch` 命令用于批量处理
+
+- **Orchestrator 改进**：
+  - PipelineContext 添加增量渲染支持字段
+  - _checkpoint 方法记录增量渲染信息
+  - _handle_merging 方法支持增量渲染视频合并
+
+- **VideoMerger 改进**：
+  - 添加 `collect_incremental_videos()` 方法
+  - 支持从不同 run 目录收集视频
+

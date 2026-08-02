@@ -128,6 +128,13 @@ class PipelineContext:
     scenes: list[ScenePlan] = field(default_factory=list)
     scene_states: dict[int, SceneState] = field(default_factory=dict)
     final_video: Path | None = None
+    
+    # 增量渲染支持
+    incremental: bool = False
+    base_run_id: str | None = None
+    base_manifest: RunManifest | None = None
+    scenes_to_render: list[int] = field(default_factory=list)
+    scenes_to_reuse: list[int] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -234,6 +241,8 @@ class Orchestrator:
             scenes=scenes,
             final_video=str(ctx.final_video) if ctx.final_video else None,
             error=error[-50_000:],
+            incremental=ctx.incremental,
+            base_run_id=ctx.base_run_id,
         )
         write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
         self._manifest = manifest
@@ -288,6 +297,8 @@ class Orchestrator:
             scenes=[scene_states[key].plan for key in sorted(scene_states)],
             scene_states=scene_states,
             final_video=Path(manifest.final_video) if manifest.final_video else None,
+            incremental=manifest.incremental,
+            base_run_id=manifest.base_run_id,
         )
 
     def _generate_validated_code(
@@ -320,6 +331,47 @@ class Orchestrator:
             + (last_validation.feedback if last_validation else "未知错误"),
             hint="尝试简化场景或调整 prompt"
         )
+
+    def run_incremental(
+        self,
+        user_prompt: str,
+        base_run_id: str,
+        callback: Callback | None = None,
+        dry_run: bool = False,
+        interactive: bool = False,
+    ) -> Path | None:
+        """增量渲染：只重新渲染受 prompt 变化影响的场景。"""
+        if len(user_prompt) > settings.MAX_PROMPT_CHARS:
+            raise ValueError(
+                f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符\n"
+                f"提示：可以将需求拆分为多个较短的动画，或使用更简洁的描述"
+            )
+        
+        # 加载基础运行的 manifest
+        repository = RunRepository(settings.WORKSPACE_DIR)
+        try:
+            base_manifest = repository.load(base_run_id)
+        except (OSError, ValueError) as exc:
+            raise RunNotFoundError(f"无法加载基础运行 {base_run_id}: {exc}") from exc
+        
+        if base_manifest.status not in ("completed", "dry_run_complete"):
+            raise RunError(f"基础运行 {base_run_id} 未完成（状态：{base_manifest.status}）")
+        
+        self._callback = callback
+        ctx = PipelineContext(
+            user_prompt=user_prompt,
+            dry_run=dry_run,
+            interactive=interactive,
+            incremental=True,
+            base_run_id=base_run_id,
+            base_manifest=base_manifest,
+        )
+        self._ctx = ctx
+        ctx.paths.root.mkdir(parents=True, exist_ok=True)
+        ctx.paths.root.chmod(0o700)
+        
+        with lock_run(ctx.paths.root):
+            return self._execute(ctx, State.INIT)
 
     def run(
         self,
@@ -569,6 +621,12 @@ class Orchestrator:
                 missing.append("apptainer")
             if missing:
                 raise RuntimeError("运行环境缺少命令: " + ", ".join(missing))
+        
+        # 增量渲染分析
+        if ctx.incremental:
+            logger.info("增量渲染模式：分析场景变化...")
+            self._emit("incremental_start", base_run_id=ctx.base_run_id)
+        
         return State.PLANNING
 
     def _handle_planning(self, ctx: PipelineContext) -> State:
@@ -844,7 +902,82 @@ class Orchestrator:
             return State.REVIEWING
         if ctx.dry_run:
             return State.DONE
+        
+        # 增量渲染分析：在代码生成完成后比较变化
+        if ctx.incremental and ctx.base_manifest:
+            self._compute_incremental_changes(ctx)
+        
         return State.DISPATCHING
+
+    def _compute_incremental_changes(self, ctx: PipelineContext) -> None:
+        """计算增量渲染的变化，确定哪些场景需要重新渲染。"""
+        if not ctx.incremental or not ctx.base_manifest:
+            return
+        
+        base_root = RunRepository(settings.WORKSPACE_DIR).run_root(ctx.base_run_id)
+        scenes_to_render = []
+        scenes_to_reuse = []
+        
+        for scene_id, state in ctx.scene_states.items():
+            base_scene = ctx.base_manifest.scenes.get(scene_id)
+            if base_scene is None:
+                # 新场景，需要渲染
+                scenes_to_render.append(scene_id)
+                logger.info(f"Scene {scene_id}: 新场景，需要渲染")
+                continue
+            
+            # 比较代码 hash
+            current_hash = sha256_text(state.code) if state.code else ""
+            base_hash = base_scene.code_sha256
+            
+            if current_hash == base_hash and base_scene.rendered:
+                # 代码未变化且已渲染，可以复用
+                scenes_to_reuse.append(scene_id)
+                logger.info(f"Scene {scene_id}: 代码未变化，复用旧视频")
+                
+                # 尝试复用旧视频
+                old_video = get_reusable_video_path(
+                    ctx.base_manifest,
+                    scene_id,
+                    base_root,
+                )
+                if old_video:
+                    state.rendered = True
+                    state.slurm_job = SlurmJob(
+                        job_id=f"reused-{scene_id}",
+                        scene_id=scene_id,
+                        script_path=ctx.paths.scenes / f"scene_{scene_id}.py",
+                        log_out=ctx.paths.logs / f"scene_{scene_id}_reused.out",
+                        log_err=ctx.paths.logs / f"scene_{scene_id}_reused.err",
+                        media_dir=old_video.parent,
+                        scene_class_name=base_scene.class_name,
+                        submitted_at=0,
+                        status="REUSED",
+                    )
+                else:
+                    # 无法复用，需要重新渲染
+                    scenes_to_render.append(scene_id)
+                    scenes_to_reuse.remove(scene_id)
+                    logger.warning(f"Scene {scene_id}: 无法复用旧视频，需要重新渲染")
+            else:
+                # 代码变化，需要渲染
+                scenes_to_render.append(scene_id)
+                logger.info(f"Scene {scene_id}: 代码变化，需要重新渲染")
+        
+        ctx.scenes_to_render = scenes_to_render
+        ctx.scenes_to_reuse = scenes_to_reuse
+        
+        self._emit(
+            "incremental_analysis",
+            total=len(ctx.scene_states),
+            to_render=len(scenes_to_render),
+            to_reuse=len(scenes_to_reuse),
+        )
+        
+        logger.info(
+            f"增量渲染分析完成: {len(scenes_to_render)} 个场景需要渲染, "
+            f"{len(scenes_to_reuse)} 个场景可复用"
+        )
 
     def _handle_dispatching(self, ctx: PipelineContext) -> State:
         self._emit("stage_start", stage="dispatching")
@@ -1070,6 +1203,7 @@ class Orchestrator:
                     state.failure_reason = "场景未成功渲染"
             self._emit("partial_output_blocked", incomplete=incomplete)
             return State.ERROR
+        
         resolved_output = ctx.paths.output.expanduser().resolve()
         output_is_run_local = resolved_output == ctx.paths.root.resolve() or (
             ctx.paths.root.resolve() in resolved_output.parents
@@ -1084,10 +1218,22 @@ class Orchestrator:
             # 当前 run 内已存在的非空目标就是完成产物，可直接补写 DONE 检查点。
             ctx.final_video = resolved_output
         else:
-            ctx.final_video = self.merger.merge_jobs(
-                rendered_jobs,
-                output_path=ctx.paths.output,
-            )
+            # 增量渲染模式：使用支持复用旧视频的方法
+            if ctx.incremental and ctx.base_manifest and ctx.base_run_id:
+                from kd1_anime.run_store import RunRepository
+                base_root = RunRepository(settings.WORKSPACE_DIR).run_root(ctx.base_run_id)
+                video_paths = self.merger.collect_incremental_videos(
+                    ctx.scene_states,
+                    ctx.paths.root,
+                    ctx.base_manifest,
+                    base_root,
+                )
+                ctx.final_video = self.merger.merge(video_paths, ctx.paths.output)
+            else:
+                ctx.final_video = self.merger.merge_jobs(
+                    rendered_jobs,
+                    output_path=ctx.paths.output,
+                )
         self._checkpoint(ctx, State.MERGING)
         self._emit(
             "merge_complete",

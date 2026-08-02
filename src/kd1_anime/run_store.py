@@ -87,6 +87,10 @@ class RunManifest(BaseModel):
     scenes: dict[int, StoredSceneState] = Field(default_factory=dict)
     final_video: str | None = None
     error: str = Field(default="", max_length=50_000)
+    
+    # 增量渲染支持
+    incremental: bool = False
+    base_run_id: str | None = Field(default=None, pattern=r"^(?:\d{8}-\d{6}-[0-9a-f]{8})?$")
 
     @field_validator("run_id")
     @classmethod
@@ -241,3 +245,87 @@ def lock_run(root: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+def get_latest_completed_run(repository: RunRepository) -> RunManifest | None:
+    """获取最近一次完成的运行，用于增量渲染。"""
+    manifests = repository.list()
+    for manifest in manifests:
+        if manifest.status in ("completed", "dry_run_complete"):
+            return manifest
+    return None
+
+
+def find_base_run_for_incremental(
+    repository: RunRepository,
+    user_prompt: str,
+) -> RunManifest | None:
+    """查找适合增量渲染的基础运行。
+    
+    优先查找：
+    1. 最近一次完成的运行
+    2. prompt 相似的运行（未来可以添加相似度匹配）
+    """
+    return get_latest_completed_run(repository)
+
+
+def compute_scene_changes(
+    old_manifest: RunManifest,
+    new_scenes: dict[int, ScenePlan],
+) -> dict[str, list[int]]:
+    """计算场景变化，返回需要渲染和可以复用的场景列表。
+    
+    Returns:
+        dict with keys:
+        - "to_render": list of scene_ids that need re-rendering
+        - "to_reuse": list of scene_ids that can reuse old videos
+    """
+    to_render = []
+    to_reuse = []
+    
+    for scene_id in sorted(new_scenes.keys()):
+        old_scene = old_manifest.scenes.get(scene_id)
+        if old_scene is None:
+            # 新场景，需要渲染
+            to_render.append(scene_id)
+        elif old_scene.rendered and old_scene.code_sha256:
+            # 旧场景已渲染且有代码 hash
+            # 这里我们假设代码 hash 已经在 orchestrator 中计算过
+            # 实际比较在 orchestrator 中进行
+            to_reuse.append(scene_id)
+        else:
+            # 旧场景未渲染或无 hash，需要渲染
+            to_render.append(scene_id)
+    
+    return {"to_render": to_render, "to_reuse": to_reuse}
+
+
+def get_reusable_video_path(
+    old_manifest: RunManifest,
+    scene_id: int,
+    old_root: Path,
+) -> Path | None:
+    """获取可复用的旧视频路径。"""
+    old_scene = old_manifest.scenes.get(scene_id)
+    if old_scene is None or not old_scene.rendered:
+        return None
+    
+    old_job = old_scene.slurm_job
+    if old_job is None:
+        return None
+    
+    # 构建旧视频路径
+    old_media_dir = restore_run_path(old_root, old_job.media_dir)
+    video_candidates = list(old_media_dir.rglob(f"{old_scene.class_name}.mp4"))
+    
+    # 排除 partial 文件
+    valid_videos = [
+        v for v in video_candidates
+        if "partial_movie_files" not in v.parts and v.stat().st_size > 0
+    ]
+    
+    if valid_videos:
+        # 返回最新的视频
+        return max(valid_videos, key=lambda v: v.stat().st_mtime)
+    
+    return None
