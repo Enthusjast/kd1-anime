@@ -354,15 +354,18 @@ class Orchestrator:
     def _ask_retry_or_skip(self, scene_id: int, error: str) -> bool:
         if not self._ctx or not self._ctx.interactive:
             return False
-        console.print(
-            f"Scene {scene_id} 操作失败：\n{error}",
-            markup=False,
-            style="yellow",
-        )
-        try:
-            return Confirm.ask("再重试一次？", default=False, console=console)
-        except (EOFError, KeyboardInterrupt):
-            return False
+        # 交互式询问前暂停 Live 仪表盘，避免输入冲突
+        from kd1_anime.dashboard import suspend_all
+        with suspend_all():
+            console.print(
+                f"Scene {scene_id} 操作失败：\n{error}",
+                markup=False,
+                style="yellow",
+            )
+            try:
+                return Confirm.ask("再重试一次？", default=False, console=console)
+            except (EOFError, KeyboardInterrupt):
+                return False
 
     @staticmethod
     def _mark_failed(state: SceneState, reason: str) -> None:

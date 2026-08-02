@@ -551,21 +551,38 @@ class ChatSession:
         console.print(Rule("开始生成", style="bold magenta"))
         console.print()
 
+        from kd1_anime.dashboard import SceneDashboard
         from kd1_anime.orchestrator import Orchestrator
+
+        # 并行阶段使用 Rich Live 仪表盘；非 TTY 自动降级为普通输出
+        dashboard = SceneDashboard()
+        dashboard_active = dashboard.start()
+
+        def callback(event: str, data: dict) -> None:
+            if dashboard_active:
+                dashboard.on_event(event, data)
+            else:
+                self._pipeline_callback(event, data)
 
         try:
             orchestrator = Orchestrator()
             final_video = orchestrator.run(
                 prompt,
-                callback=self._pipeline_callback,
+                callback=callback,
                 dry_run=self.dry_run,
                 interactive=True,
             )
+            if dashboard_active:
+                dashboard.stop()
             self._show_completion(final_video)
         except KeyboardInterrupt:
+            if dashboard_active:
+                dashboard.stop()
             console.print("\n[bold yellow]用户中断,正在清理...[/]")
             raise
         except Exception as e:
+            if dashboard_active:
+                dashboard.stop()
             console.print()
             console.print(f"生成失败: {e}", style="bold red", markup=False)
             if settings.LLM_DEBUG:

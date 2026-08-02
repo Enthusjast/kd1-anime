@@ -61,7 +61,11 @@ class BaseAgent:
         return self._client
 
     def _log(self, message: str, style: str = "bold cyan") -> None:
-        """打印 Agent 思考过程"""
+        """打印 Agent 思考过程（仪表盘激活时抑制，避免破坏 Live 渲染）"""
+        # 延迟导入避免循环依赖
+        from kd1_anime.dashboard import suppress_agent_logs
+        if suppress_agent_logs():
+            return
         safe_msg = str(message).replace("[", "\\[")
         safe_name = str(self.name).replace("[", "\\[")
         console.print(f"[{style}]{safe_name}[/] {safe_msg}")
