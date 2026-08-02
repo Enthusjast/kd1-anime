@@ -405,7 +405,7 @@ class ChatSession:
             orchestrator = Orchestrator()
             
             def callback(event: str, data: dict) -> None:
-                self._handle_callback(event, data)
+                self._pipeline_callback(event, data)
             
             final_video = orchestrator.resume(run_id, callback=callback, interactive=True)
             self._show_completion(final_video)
