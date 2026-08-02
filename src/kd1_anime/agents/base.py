@@ -56,7 +56,11 @@ class BaseAgent:
             self._client = OpenAI(
                 api_key=settings.LLM_API_KEY,
                 base_url=settings.LLM_BASE_URL,
-                timeout=httpx.Timeout(120.0, connect=30.0, read=120.0),
+                timeout=httpx.Timeout(
+                    settings.LLM_TIMEOUT_READ,
+                    connect=settings.LLM_TIMEOUT_CONNECT,
+                    read=settings.LLM_TIMEOUT_READ,
+                ),
             )
         return self._client
 
@@ -71,7 +75,11 @@ class BaseAgent:
         console.print(f"[{style}]{safe_name}[/] {safe_msg}")
 
     def _log_panel(self, title: str, content: str, style: str = "blue") -> None:
-        """用 Panel 展示详细内容"""
+        """用 Panel 展示详细内容 (仪表盘激活时抑制, 避免破坏 Live 渲染)"""
+        # 延迟导入避免循环依赖
+        from kd1_anime.dashboard import suppress_agent_logs
+        if suppress_agent_logs():
+            return
         console.print(Panel(content, title=title, border_style=style))
 
     # ------------------------------------------------------------------
@@ -131,9 +139,13 @@ class BaseAgent:
         last_error: Exception | None = None
         json_fallback_used = False
         stream_fallback_used = False
-        use_stream_transport = stream
+        # 静默流式: stream=False(不展示内容)时仍使用流式传输, 避免长生成超时
+        use_stream_transport = stream or (
+            not stream and getattr(settings, "LLM_SILENT_STREAM", False)
+        )
         temp_fallback_used = False
         max_tokens_fallback_used = False
+        max_tokens_boosted = False
 
         attempt = 0
         while attempt < settings.LLM_MAX_RETRIES:
@@ -147,17 +159,14 @@ class BaseAgent:
                         preview = body[:500] + ("..." if len(body) > 500 else "")
                         console.print(f"[dim]DEBUG [{role} #{i}]: {preview}[/]", markup=False)
                 if use_stream_transport:
-                    content = self._stream_llm(kwargs, display=stream)
+                    content, finish_reason = self._stream_llm(kwargs, display=stream)
                 else:
                     response = self.client.chat.completions.create(**kwargs)
                     content = response.choices[0].message.content or ""
+                    finish_reason = getattr(response.choices[0], "finish_reason", None)
                     content = content.strip()
                 if not content:
-                    finish = ""
-                    if not use_stream_transport:
-                        finish = getattr(response.choices[0], "finish_reason", "N/A")
-                    else:
-                        finish = "stream_empty"
+                    finish = finish_reason or "stream_empty"
                     if finish == "length":
                         max_tokens_val = kwargs.get('max_tokens')
                         if max_tokens_val:
@@ -194,6 +203,19 @@ class BaseAgent:
                         stream_fallback_used = True
                         attempt -= 1  # 传输兼容性降级，不消耗业务重试次数
                         continue
+                    # 推理模型空响应：常因 reasoning_content 耗尽服务端默认输出上限。
+                    # 补上充足 max_tokens 后重试, 避免反复拿到空响应。
+                    if "max_tokens" not in kwargs and not max_tokens_boosted:
+                        boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
+                        self._log(
+                            f"空响应: 补充 max_tokens={boost} 后重试 "
+                            "(推理模型可能耗尽输出预算)",
+                            style="yellow",
+                        )
+                        kwargs["max_tokens"] = boost
+                        max_tokens_boosted = True
+                        attempt -= 1  # 参数修复, 不消耗业务重试次数
+                        continue
                     self._log(
                         f"LLM 返回空响应, 将重试... (finish_reason={finish})",
                         style="bold yellow",
@@ -204,7 +226,9 @@ class BaseAgent:
                         time.sleep(delay)
                     continue
                 # 有内容: 即使是 finish_reason=length (截断) 也直接返回, 不重试
-                if getattr(settings, "LLM_DEBUG", False) and not use_stream_transport:
+                if getattr(settings, "LLM_DEBUG", False) and (
+                    not use_stream_transport or not stream
+                ):
                     preview = content[:500] + ("..." if len(content) > 500 else "")
                     console.print(f"[dim]DEBUG [response]: {preview}[/]", markup=False)
                 return content
@@ -302,8 +326,13 @@ class BaseAgent:
         base = settings.LLM_RETRY_BASE_DELAY * (2 ** max(0, attempt - 1))
         return min(300.0, base + random.uniform(0, settings.LLM_RETRY_BASE_DELAY))
 
-    def _stream_llm(self, kwargs: dict, *, display: bool = True) -> str:
-        """流式调用 LLM；可静默收集，显示时 ESC 可取消。"""
+    def _stream_llm(self, kwargs: dict, *, display: bool = True) -> tuple[str, str | None]:
+        """流式调用 LLM；可静默收集，显示时 ESC 可取消。
+
+        Returns:
+            (content, finish_reason): finish_reason 为流中最后出现的值，
+            用于空响应时区分 length/stop/stream_empty。
+        """
         import select
         import sys
         import threading
@@ -314,6 +343,7 @@ class BaseAgent:
         content_chunks = 0
         empty_chunks = 0
         cancelled = threading.Event()
+        last_finish: str | None = None
 
         def _watch_esc() -> None:
             try:
@@ -361,6 +391,8 @@ class BaseAgent:
                 text = getattr(delta, "content", None)
                 reasoning = getattr(delta, "reasoning_content", None)
                 finish = getattr(chunk.choices[0], "finish_reason", None)
+                if finish:
+                    last_finish = finish
                 if reasoning:
                     if display and reasoning_chunks == 0:
                         console.print("[dim]思考:[/] ", end="")
@@ -410,7 +442,7 @@ class BaseAgent:
             )
         if display:
             console.print()
-        return "".join(chunks).strip()
+        return "".join(chunks).strip(), last_finish
 
     def call_llm_json(
         self,

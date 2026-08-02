@@ -81,6 +81,22 @@ SCENE_BASES = {"Scene", "ThreeDScene", "MovingCameraScene"}
 TEX_MOBJECTS = {"Tex", "MathTex"}
 
 
+def _find_camera_frame_access(node: ast.AST) -> list[ast.Attribute]:
+    """查找 self.camera.frame 属性访问节点 (仅在 MovingCameraScene 中合法)。"""
+    found: list[ast.Attribute] = []
+    for child in ast.walk(node):
+        if (
+            isinstance(child, ast.Attribute)
+            and child.attr == "frame"
+            and isinstance(child.value, ast.Attribute)
+            and child.value.attr == "camera"
+            and isinstance(child.value.value, ast.Name)
+            and child.value.value.id == "self"
+        ):
+            found.append(child)
+    return found
+
+
 def _is_static_expression(node: ast.AST | None) -> bool:
     """模块/类定义阶段允许求值的无副作用表达式。"""
 
@@ -282,6 +298,16 @@ class _SafetyVisitor(ast.NodeVisitor):
             )
             if construct is None:
                 self.error(node, f"Scene 类 {node.name!r} 缺少 construct() 方法")
+            # self.camera.frame 只在 MovingCameraScene 中可用
+            # (manim 0.20 普通 Camera / OpenGL 的 OpenGLCamera 都没有 frame 属性)
+            if "MovingCameraScene" not in bases and construct is not None:
+                for frame_node in _find_camera_frame_access(construct):
+                    self.error(
+                        frame_node,
+                        "self.camera.frame 只在 MovingCameraScene 中可用；"
+                        "普通 Scene 的相机(Camera/OpenGLCamera)没有 frame 属性。"
+                        "需要推近/缩放镜头时请继承 MovingCameraScene",
+                    )
         self.generic_visit(node)
 
     def validate_tex_configuration(self) -> None:

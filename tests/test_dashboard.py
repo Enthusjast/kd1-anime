@@ -78,3 +78,83 @@ class TestSceneDashboard:
 
 def test_suppress_flag_off_by_default():
     assert suppress_agent_logs() is False
+
+
+class TestSceneDashboardEvents:
+    def test_reused_scene(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("scene_reused", {"scene_id": 1})
+        assert dash.scenes[1].state == "completed"
+        assert dash.scenes[1].stage == "渲染"
+        assert dash.scenes[1].message == "复用旧视频"
+
+    def test_run_started_sets_run_id_and_timer(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("run_started", {"run_id": "20260802-000000-1234abcd"})
+        assert dash.run_id == "20260802-000000-1234abcd"
+        assert dash.started_at > 0
+
+    def test_running_phase_aggregation(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event(
+            "plan_complete",
+            {"scenes": [MagicMock(scene_id=i, title=f"S{i}") for i in (1, 2, 3)]},
+        )
+        dash.on_event("scene_detailing", {"scene_id": 1, "title": "S1"})
+        dash.on_event("scene_coding", {"scene_id": 2, "title": "S2"})
+        dash.on_event("scene_coding", {"scene_id": 3, "title": "S3"})
+        assert dash._running_phases() == {"分镜": 1, "编码": 2}
+
+    def test_header_shows_phase_aggregation(self):
+        import io
+
+        from rich.console import Console as RichConsole
+
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event(
+            "plan_complete",
+            {"scenes": [MagicMock(scene_id=i, title=f"S{i}") for i in (1, 2)]},
+        )
+        dash.on_event("scene_coding", {"scene_id": 1, "title": "S1"})
+        dash.on_event("scene_rendered", {"scene_id": 2})
+        panel = dash._render()
+        buf = io.StringIO()
+        RichConsole(file=buf, width=120, force_terminal=False).print(panel)
+        text = buf.getvalue()
+        assert "运行中" in text
+        assert "编码×1" in text
+        assert "完成 1/2" in text
+
+    def test_rendering_scene_shows_elapsed(self):
+        import time
+
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("scene_submitted", {"scene_id": 1, "job_id": "42"})
+        dash.scenes[1].started_at = time.time() - 12
+        row = dash.scenes[1].render_row()
+        assert "12s" in str(row[-1])
+
+
+def test_quiet_flag_follows_activation():
+    from kd1_anime.dashboard import _state, quiet
+
+    assert quiet() is False
+    dash = SceneDashboard()
+    dash.live = MagicMock()  # 模拟已激活
+    with _state.lock:
+        _state.active = True
+        _state.current = dash
+    try:
+        assert quiet() is True
+        assert suppress_agent_logs() is True
+    finally:
+        with _state.lock:
+            _state.active = False
+            _state.current = None

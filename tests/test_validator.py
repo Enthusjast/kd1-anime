@@ -117,3 +117,25 @@ def test_rejects_xelatex_template_without_ctex_or_global_registration():
     assert not result.is_valid
     assert "ctex" in result.feedback
     assert "config.tex_template" in result.feedback
+
+
+def test_rejects_camera_frame_in_plain_scene():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.camera.frame.set(width=14, height=6.5)\n"
+    )
+    assert not result.is_valid
+    assert "camera.frame" in result.feedback
+    assert "MovingCameraScene" in result.feedback
+
+
+def test_accepts_camera_frame_in_moving_camera_scene():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(MovingCameraScene):\n"
+        "    def construct(self):\n"
+        "        self.camera.frame.set(width=14, height=6.5)\n"
+    )
+    assert result.is_valid

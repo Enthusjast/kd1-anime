@@ -113,6 +113,15 @@ config.tex_template = tex_template
 9. **必须**在每个 `Tex`/`MathTex` 调用中显式传入 `tex_template=tex_template`; 禁止依赖默认的 latex/pdflatex
 10. 中文文本必须使用 `Tex(r"中文", tex_template=tex_template)` 而不是 `Text()`
 
+## ⚠️ 相机与画面缩放 (高频错误)
+- `self.camera.frame` **只在 `MovingCameraScene` 中可用**。普通 `Scene` 的相机
+  (Cairo 的 `Camera` / OpenGL 的 `OpenGLCamera`) **没有 frame 属性**，
+  使用 `self.camera.frame.set(...)` 或 `self.camera.frame.animate...` 会直接
+  AttributeError 崩溃。
+- 需要推近/缩放/平移镜头时: 让类继承 `MovingCameraScene` (可配合
+  `self.play(self.camera.frame.animate.scale(...))`)。
+- 不需要移动镜头时: 直接用普通 `Scene`, 不要碰 self.camera.frame。
+
 ## ⚠️ 特别注意：TexTemplate 是强制要求
 如果你的代码包含任何 Tex 或 MathTex，但没有正确配置 TexTemplate，代码将无法通过校验！
 
