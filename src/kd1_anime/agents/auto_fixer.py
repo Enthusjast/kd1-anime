@@ -24,6 +24,12 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
   赋给 `config.tex_template`，并在每个 Tex/MathTex 中传入 `tex_template=tex_template`
 - 如果日志提示找不到 pdflatex，说明代码仍依赖错误的默认编译器；改为上述 XeLaTeX 模板
 
+### 1.5 相机 frame 属性错误 (高频)
+**症状**: `AttributeError: 'OpenGLCamera' object has no attribute 'frame'`
+        或 `'Camera' object has no attribute 'frame'`, 位置在 self.camera.frame
+**原因**: 在普通 Scene 里用了只有 MovingCameraScene 才有的 self.camera.frame
+**修复**: 要么把类改为继承 `MovingCameraScene`, 要么删掉 self.camera.frame 相关代码
+
 ### 2. ImportError / NameError
 **症状**: `NameError: name 'Create' is not defined`, `ImportError`
 **原因**: 缺少导入或使用了错误的 API 名称
@@ -202,7 +208,12 @@ class AutoFixerAgent(BaseAgent):
         """根据错误日志内容分类错误类型"""
         log_lower = error_log.lower()
 
-        if "latex" in log_lower or "emergency stop" in log_lower or "missing $" in log_lower:
+        if "attributeerror" in log_lower and "frame" in log_lower and "camera" in log_lower:
+            return (
+                "相机 frame 属性错误 — self.camera.frame 只在 MovingCameraScene 中可用，"
+                "普通 Scene 的相机没有 frame 属性。将类改为继承 MovingCameraScene 或删除该用法"
+            )
+        elif "latex" in log_lower or "emergency stop" in log_lower or "missing $" in log_lower:
             return "LaTeX 编译错误 — 检查 MathTex 中的 LaTeX 语法、括号匹配、转义字符"
         elif "importerror" in log_lower or "nameerror" in log_lower:
             return "导入/命名错误 — 检查 from manim import * 和 API 名称拼写"
