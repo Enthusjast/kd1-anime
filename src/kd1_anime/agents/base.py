@@ -75,7 +75,11 @@ class BaseAgent:
         console.print(f"[{style}]{safe_name}[/] {safe_msg}")
 
     def _log_panel(self, title: str, content: str, style: str = "blue") -> None:
-        """用 Panel 展示详细内容"""
+        """用 Panel 展示详细内容 (仪表盘激活时抑制, 避免破坏 Live 渲染)"""
+        # 延迟导入避免循环依赖
+        from kd1_anime.dashboard import suppress_agent_logs
+        if suppress_agent_logs():
+            return
         console.print(Panel(content, title=title, border_style=style))
 
     # ------------------------------------------------------------------

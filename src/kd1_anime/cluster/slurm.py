@@ -16,6 +16,17 @@ from kd1_anime.config import settings
 
 console = Console()
 
+
+def _dashboard_quiet() -> bool:
+    """Live 仪表盘激活时抑制普通输出, 避免破坏 Rich Live 渲染。"""
+    try:
+        from kd1_anime.dashboard import quiet
+
+        return quiet()
+    except Exception:
+        return False
+
+
 TERMINAL_STATES = {
     "COMPLETED",
     "FAILED",
@@ -59,7 +70,7 @@ class JobMonitor:
 
     def __init__(
         self,
-        dispatcher: "SlurmDispatcher",
+        dispatcher: SlurmDispatcher,
         *,
         queue_timeout: int | None = None,
         run_timeout: int | None = None,
@@ -92,12 +103,7 @@ class JobMonitor:
 
     def _quiet(self) -> bool:
         """Live 仪表盘激活时抑制 Monitor 文本输出, 避免破坏 Rich Live。"""
-        try:
-            from kd1_anime.dashboard import is_active
-
-            return is_active()
-        except Exception:
-            return False
+        return _dashboard_quiet()
 
     def poll_once(self) -> bool:
         """单次轮询所有 pending 作业, 更新状态; 返回本轮是否有作业结束。"""
@@ -203,7 +209,8 @@ class SlurmDispatcher:
         )
         script_path.write_text(content, encoding="utf-8")
         script_path.chmod(0o700)
-        console.print(f"[bold blue][Slurm][/] 已生成渲染脚本: {script_path}")
+        if not _dashboard_quiet():
+            console.print(f"[bold blue][Slurm][/] 已生成渲染脚本: {script_path}")
         return script_path, log_out, log_err, media_dir
 
     def _build_script(
@@ -376,7 +383,8 @@ class SlurmDispatcher:
                     if not match:
                         raise RuntimeError(f"无法解析 sbatch Job ID: {result.stdout}")
                     job_id = match.group(1)
-                    console.print(f"[bold green][Slurm][/] 任务已提交, Job ID: {job_id}")
+                    if not _dashboard_quiet():
+                        console.print(f"[bold green][Slurm][/] 任务已提交, Job ID: {job_id}")
                     return job_id
                 last_err = (result.stderr or result.stdout).strip()
                 fatal = (
@@ -390,14 +398,16 @@ class SlurmDispatcher:
                     raise RuntimeError(f"Slurm 配置错误（不可重试）:\n{last_err}")
             if attempt < settings.SLURM_SUBMIT_RETRIES:
                 delay = settings.SLURM_SUBMIT_RETRY_DELAY * attempt
-                console.print(f"[yellow][Slurm][/] 提交失败，{delay:.1f}s 后重试: {last_err}")
+                if not _dashboard_quiet():
+                    console.print(f"[yellow][Slurm][/] 提交失败，{delay:.1f}s 后重试: {last_err}")
                 time.sleep(delay)
         raise RuntimeError(f"sbatch 提交失败:\n{last_err}")
 
     def cancel_job(self, job_id: str) -> bool:
         scancel = shutil.which("scancel")
         if not scancel:
-            console.print(f"[yellow][Slurm][/] 未找到 scancel，无法取消 Job {job_id}")
+            if not _dashboard_quiet():
+                console.print(f"[yellow][Slurm][/] 未找到 scancel，无法取消 Job {job_id}")
             return False
         try:
             result = subprocess.run(
@@ -408,18 +418,20 @@ class SlurmDispatcher:
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            console.print(f"[yellow][Slurm][/] 取消 Job {job_id} 超时")
+            if not _dashboard_quiet():
+                console.print(f"[yellow][Slurm][/] 取消 Job {job_id} 超时")
             return False
         if result.returncode != 0:
-            console.print(
-                f"[yellow][Slurm][/] 取消 Job {job_id} 失败: {result.stderr.strip()}",
-                markup=False,
-            )
+            if not _dashboard_quiet():
+                console.print(
+                    f"[yellow][Slurm][/] 取消 Job {job_id} 失败: {result.stderr.strip()}",
+                    markup=False,
+                )
             return False
-        console.print(f"[yellow][Slurm][/] 已取消 Job {job_id}")
+        if not _dashboard_quiet():
+            console.print(f"[yellow][Slurm][/] 已取消 Job {job_id}")
         return True
 
-    @staticmethod
     @staticmethod
     def _normalize_state(raw: str) -> str:
         return raw.strip().split()[0].upper() if raw.strip() else "UNKNOWN"
@@ -448,9 +460,9 @@ class SlurmDispatcher:
                 continue
             raw_id, raw_state = parts[0], parts[1]
             if raw_id == job_id:
-                return self._normalize_state(raw_state)
+                return SlurmDispatcher._normalize_state(raw_state)
             if fallback == "UNKNOWN" and raw_state:
-                fallback = self._normalize_state(raw_state)
+                fallback = SlurmDispatcher._normalize_state(raw_state)
         return fallback
 
     def poll_status(self, job_id: str) -> str:
@@ -615,9 +627,10 @@ class SlurmDispatcher:
                 handle.seek(last_pos)
                 new = handle.read()
                 positions[job.job_id] = handle.tell()
-            for line in new.rstrip().splitlines():
-                if line.strip():
-                    console.print(f"  {line}", markup=False, style="dim")
+            if not _dashboard_quiet():
+                for line in new.rstrip().splitlines():
+                    if line.strip():
+                        console.print(f"  {line}", markup=False, style="dim")
         except OSError:
             return
 

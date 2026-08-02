@@ -800,9 +800,12 @@ class Orchestrator:
                     scene.failure_reason = ""
                     reset_give_up = True
             if reset_give_up:
-                console.print(
-                    "[yellow]发现已放弃的场景，将重置并重试[/]",
-                )
+                # resume 时仪表盘可能已激活, 避免直接打印破坏 Live 渲染
+                with suppress(Exception):
+                    from kd1_anime.dashboard import quiet
+
+                    if not quiet():
+                        console.print("[yellow]发现已放弃的场景，将重置并重试[/]")
                 if state not in {State.CODING, State.REVIEWING, State.DISPATCHING}:
                     # 回到审查阶段重新评估已生成的代码
                     state = State.REVIEWING
