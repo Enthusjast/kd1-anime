@@ -8,19 +8,38 @@ env/
 venv/
 .venv/
 *.egg-info/
+*.egg
 dist/
 build/
+pip-wheel-metadata/
+.hatch/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.bak
+*.tmp
+
+# Test / lint / type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
 
 # Workspace (runtime generated)
 workspace/scenes/*
 workspace/logs/*
 workspace/videos/*
+workspace/runs/
 !workspace/scenes/.gitkeep
 !workspace/logs/.gitkeep
 !workspace/videos/.gitkeep
@@ -36,5 +55,12 @@ workspace/videos/*
 Thumbs.db
 
 # Output
+/media/
+*.mp4
+*.mov
+*.webm
+*.sif
 output_final.mp4
 filelist.txt
+concat.txt
+*.log
