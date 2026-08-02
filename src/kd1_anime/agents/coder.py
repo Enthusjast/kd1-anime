@@ -29,13 +29,14 @@ class MyScene(Scene):
 ```
 
 ## 常用场景类型
-- `Scene`: 默认 2D
-- `ThreeDScene`: 3D 场景
-- `MovingCameraScene`: 可缩放/平移
+- `Scene`: 默认 2D, 相机不可缩放/平移
+- `ThreeDScene`: 3D 场景, 用 self.set_camera_orientation(...) 控制视角
+- `MovingCameraScene`: 可缩放/平移镜头, 通过 self.camera.frame.animate 操作
+  (self.camera.frame 只在 MovingCameraScene 中可用, 普通 Scene 没有 frame)
 
 ## 常用动画
 ```python
-self.play(Create(obj))           # 绘制
+self.play(Create(obj))           # 绘制 (不是 ShowCreation)
 self.play(Write(text))           # 书写
 self.play(FadeIn(obj))           # 淡入
 self.play(FadeOut(obj))          # 淡出
@@ -44,7 +45,10 @@ self.play(ReplacementTransform(a, b))  # 替换变换
 self.play(obj.animate.shift(RIGHT))    # 移动
 self.play(obj.animate.scale(2))        # 缩放
 self.play(obj.animate.set_color(RED))  # 变色
+self.play(self.camera.frame.animate.scale(0.5))  # 仅 MovingCameraScene 推近
 ```
+所有 self.play(...) 的对象必须先 self.add(...) 加入场景; 已被 FadeOut /
+ReplacementTransform 移除的对象不要继续动画或引用。
 
 ## 常用对象
 ```python
@@ -53,8 +57,8 @@ square = Square(side_length=2)
 line = Line(start, end)
 arrow = Arrow(start, end)
 dot = Dot(point=ORIGIN)
-text = Text("Hello", font="Noto Sans CJK SC")
-tex = Tex(r"E=mc^2", tex_template=tex_template)
+text = Text("Hello")                     # 英文文本
+tex = Tex(r"中文", tex_template=tex_template)      # 中文一律用 Tex + ctex
 math = MathTex(r"\frac{a}{b}", tex_template=tex_template)
 axes = Axes(x_range=[-3,3], y_range=[-2,2])
 graph = axes.plot(lambda x: x**2)
@@ -74,17 +78,22 @@ group.arrange(RIGHT, buff=0.5)
 RED, GREEN, BLUE, YELLOW, WHITE, ORANGE, PURPLE, PINK
 color="#FF6B6B" (自定义)
 
-## 3D
+## 3D (ThreeDScene)
 ```python
 axes = ThreeDAxes()
-sphere = SurfaceSphere()
 self.set_camera_orientation(phi=75*DEGREES, theta=30*DEGREES)
 ```
 
+## 已废弃 API (不要使用)
+- ShowCreation → Create
+- TextMobject / TexMobject → MathTex / Tex
+- setColor / moveToEdge / beside → set_color / to_edge / next_to
+
 ## 提示
-- 每个场景一个类
+- 每个场景一个类, 文件中只能有一个 Scene 类, 不要写 if __name__ == "__main__"
+- 中文必须用 Tex + ctex (TexTemplate 已加载), 不要用 Text 渲染中文
 - 使用 tex_template 配置 XeLaTeX
-- 中文用 Text(..., font="Noto Sans CJK SC")
+- 数学公式用 MathTex, 纯中文/混合说明文字用 Tex
 """
 
 CODER_SYSTEM_PROMPT = r"""你是一个 Manim 动画编程专家.你的任务是根据导演分镜编写高质量的 Manim Python 代码.
@@ -102,7 +111,7 @@ CODER_SYSTEM_PROMPT = r"""你是一个 Manim 动画编程专家.你的任务是�
 3. 代码必须可直接渲染,不要包含任何解释性文字
 4. 只输出纯 Python 代码,包裹在 ```python ``` 中
 5. 视觉效果要丰富、流畅,避免单调的文字展示
-6. 数学公式使用 `MathTex`; 中文文字优先使用 `Text(..., font="Noto Sans CJK SC")`
+6. 数学公式使用 `MathTex`; 中文一律使用 `Tex(r"中文", tex_template=tex_template)`, 不要用 `Text` 渲染中文
 7. 只允许导入 manim、numpy、math 和纯计算型标准库; 禁止文件、网络、shell、subprocess、eval/exec
 8. **必须**在每个 `construct()` 方法开头添加以下模板代码（不可省略）:
 ```python
@@ -111,7 +120,10 @@ tex_template.add_to_preamble(r"\usepackage{ctex}")
 config.tex_template = tex_template
 ```
 9. **必须**在每个 `Tex`/`MathTex` 调用中显式传入 `tex_template=tex_template`; 禁止依赖默认的 latex/pdflatex
-10. 中文文本必须使用 `Tex(r"中文", tex_template=tex_template)` 而不是 `Text()`
+10. 不要使用已废弃 API: ShowCreation / TextMobject / TexMobject / setColor / moveToEdge / beside
+11. 不要写 `if __name__ == "__main__"`; 文件中只能有一个 Scene 类
+12. 所有 `self.play(...)` 的对象必须先 `self.add(...)`; 已被 FadeOut/ReplacementTransform 移除的对象不要继续动画
+13. 修改/重写代码时保持 Scene 类名不变, 除非明确要求改名
 
 ## ⚠️ 相机与画面缩放 (高频错误)
 - `self.camera.frame` **只在 `MovingCameraScene` 中可用**。普通 `Scene` 的相机
@@ -124,6 +136,21 @@ config.tex_template = tex_template
 
 ## ⚠️ 特别注意：TexTemplate 是强制要求
 如果你的代码包含任何 Tex 或 MathTex，但没有正确配置 TexTemplate，代码将无法通过校验！
+
+## 动画一致性
+- Transform / TransformMatchingTex 的两端应是同构对象; TransformMatchingTex 依赖两端
+  可匹配的 TeX 子串, 必要时用 substrings_to_isolate 显式分段; 不确定时改用 Transform
+- 颜色编码遵循分镜: 已知=BLUE, 结果=GREEN, 高亮=YELLOW, 错误=RED
+- run_time 与分镜预估时长大致吻合, 不要出现整段 wait(0) 或动画戛然而止
+
+## 输出前自查清单 (逐条确认后再输出)
+- [ ] 恰好一个继承 Scene/ThreeDScene/MovingCameraScene 的类
+- [ ] 无 if __name__ == "__main__"
+- [ ] construct() 开头有 TexTemplate 模板, 所有 Tex/MathTex 都传了 tex_template
+- [ ] 普通 Scene 中没有 self.camera.frame
+- [ ] 没有文件/网络/shell/eval/exec 等危险调用
+- [ ] 所有动画对象都已 add, 没有对已移除对象继续操作
+- [ ] 没有已废弃 API
 
 ## 收到 Reviewer 反馈时的修正原则
 
@@ -151,6 +178,87 @@ config.tex_template = tex_template
 
 ## Manim API 完整参考
 
+
+# Manim Community Edition API 参考 (精简版)
+
+## 基本结构
+```python
+from manim import *
+
+class MyScene(Scene):
+    def construct(self):
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        tex_template.add_to_preamble(r"\usepackage{ctex}")
+        config.tex_template = tex_template
+        # 代码...
+```
+
+## 常用场景类型
+- `Scene`: 默认 2D, 相机不可缩放/平移
+- `ThreeDScene`: 3D 场景, 用 self.set_camera_orientation(...) 控制视角
+- `MovingCameraScene`: 可缩放/平移镜头, 通过 self.camera.frame.animate 操作
+  (self.camera.frame 只在 MovingCameraScene 中可用, 普通 Scene 没有 frame)
+
+## 常用动画
+```python
+self.play(Create(obj))           # 绘制 (不是 ShowCreation)
+self.play(Write(text))           # 书写
+self.play(FadeIn(obj))           # 淡入
+self.play(FadeOut(obj))          # 淡出
+self.play(Transform(a, b))       # 变换
+self.play(ReplacementTransform(a, b))  # 替换变换
+self.play(obj.animate.shift(RIGHT))    # 移动
+self.play(obj.animate.scale(2))        # 缩放
+self.play(obj.animate.set_color(RED))  # 变色
+self.play(self.camera.frame.animate.scale(0.5))  # 仅 MovingCameraScene 推近
+```
+所有 self.play(...) 的对象必须先 self.add(...) 加入场景; 已被 FadeOut /
+ReplacementTransform 移除的对象不要继续动画或引用。
+
+## 常用对象
+```python
+circle = Circle(radius=1, color=BLUE)
+square = Square(side_length=2)
+line = Line(start, end)
+arrow = Arrow(start, end)
+dot = Dot(point=ORIGIN)
+text = Text("Hello")                     # 英文文本
+tex = Tex(r"中文", tex_template=tex_template)      # 中文一律用 Tex + ctex
+math = MathTex(r"\frac{a}{b}", tex_template=tex_template)
+axes = Axes(x_range=[-3,3], y_range=[-2,2])
+graph = axes.plot(lambda x: x**2)
+```
+
+## 布局
+```python
+obj.next_to(other, RIGHT, buff=0.5)
+obj.to_edge(UP)
+obj.move_to(ORIGIN)
+obj.shift(RIGHT * 2)
+group = VGroup(obj1, obj2)
+group.arrange(RIGHT, buff=0.5)
+```
+
+## 颜色
+RED, GREEN, BLUE, YELLOW, WHITE, ORANGE, PURPLE, PINK
+color="#FF6B6B" (自定义)
+
+## 3D (ThreeDScene)
+```python
+axes = ThreeDAxes()
+self.set_camera_orientation(phi=75*DEGREES, theta=30*DEGREES)
+```
+
+## 已废弃 API (不要使用)
+- ShowCreation → Create
+- TextMobject / TexMobject → MathTex / Tex
+- setColor / moveToEdge / beside → set_color / to_edge / next_to
+
+## 提示
+- 每个场景一个类, 文件中只能有一个 Scene 类, 不要写 if __name__ == "__main__"
+- 中文必须用 Tex + ctex (TexTemplate 已加载), 不要用 Text 渲染中文
+- 使用 tex_template 配置 XeLaTeX
+- 数学公式用 MathTex, 纯中文/混合说明文字用 Tex
 """ + MANIM_API_KNOWLEDGE
 
 
