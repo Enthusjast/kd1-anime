@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int | None = Field(default=None)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("LLM_MAX_TOKENS", mode="before")
+    @classmethod
+    def validate_max_tokens(cls, value):
+        if value is None or value == "":
+            return None
+        return value
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)
     LLM_DEBUG: bool = False
@@ -100,7 +107,7 @@ class Settings(BaseSettings):
     MAX_REVIEW_ROUNDS: int = Field(default=3, ge=1, le=10)
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
     MAX_FIX_ATTEMPTS: int = Field(default=3, ge=0, le=10)
-    MAX_CLARIFY_ROUNDS: int = Field(default=6, ge=1, le=20)
+    MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
     
     # --- 自动评估配置 ---
     ENABLE_AUTO_EVAL: bool = Field(

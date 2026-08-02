@@ -38,7 +38,7 @@ class StoredSlurmJob(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str = Field(pattern=r"^\d+$")
+    job_id: str = Field(pattern=r"^(?:\d+|reused-\d+)$")
     scene_id: int = Field(ge=1)
     script_path: str
     log_out: str

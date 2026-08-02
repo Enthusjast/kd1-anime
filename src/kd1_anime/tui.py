@@ -10,6 +10,7 @@ TUI 交互模块
 """
 
 import locale
+import time
 import signal
 import sys
 from contextlib import suppress
@@ -131,12 +132,21 @@ class Clarifier:
 
         while True:
             try:
-                # 澄清回复很短，先完整接收才能区分用户问题和内部 READY JSON。
+                # 非流式接收，以便区分用户问题和内部 READY JSON
                 response = self.agent.call_llm(messages=self.history, stream=False)
                 self.history.append({"role": "assistant", "content": response})
                 if self.extract_ready(response) is None:
+                    # 非 READY 响应：逐字打印模拟流式效果
                     console.print("[dim cyan]AI:[/]")
-                    console.print(Markdown(response))
+                    for char in response:
+                        console.print(char, end="", highlight=False)
+                        if char in "，。！？、；：""''（）":
+                            time.sleep(0.05)
+                        elif char == "\n":
+                            time.sleep(0.08)
+                        else:
+                            time.sleep(0.015)
+                    console.print()  # 最后换行
                 return response
             except Exception as e:
                 console.print()
