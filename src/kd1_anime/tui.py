@@ -335,10 +335,85 @@ class ChatSession:
         # 显示当前模型
         model_name = settings.LLM_MODEL or "未配置"
         console.print(f"  模型: [dim]{model_name}[/]")
+
+        # 检查是否有可恢复的中断运行
+        self._check_interrupted_runs()
         
         console.print(
             "\n  输入你想制作的数学动画描述,我会帮你生成.\n  输入 [bold cyan]quit[/] 退出.\n",
         )
+
+    def _check_interrupted_runs(self) -> None:
+        """检查并提示恢复中断的运行"""
+        try:
+            from kd1_anime.run_store import RunRepository
+            repository = RunRepository(settings.WORKSPACE_DIR)
+            manifests = repository.list()[:10]
+            
+            resumable = []
+            for manifest in manifests:
+                if manifest.status == "interrupted":
+                    resumable.append(manifest)
+                elif manifest.status == "failed":
+                    rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
+                    if rendered > 0 and rendered < len(manifest.scenes):
+                        resumable.append(manifest)
+            
+            if not resumable:
+                return
+            
+            console.print()
+            console.print(Rule("发现中断的运行", style="yellow"))
+            
+            table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+            table.add_column("#", style="cyan", justify="center")
+            table.add_column("Run ID", style="dim")
+            table.add_column("时间", style="dim")
+            table.add_column("状态", style="yellow")
+            table.add_column("进度", style="green")
+            
+            for i, manifest in enumerate(resumable[:5], 1):
+                rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
+                total = len(manifest.scenes)
+                updated = manifest.updated_at.astimezone().strftime("%m-%d %H:%M")
+                status_color = "yellow" if manifest.status == "interrupted" else "red"
+                
+                table.add_row(
+                    str(i),
+                    manifest.run_id[:16] + "...",
+                    updated,
+                    f"[{status_color}]{manifest.status}[/]",
+                    f"{rendered}/{total} 场景",
+                )
+            
+            console.print(table)
+            console.print()
+            
+            choice = input("  输入编号恢复运行 (直接回车跳过): ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(resumable):
+                selected = resumable[int(choice) - 1]
+                console.print(f"\n  [cyan]正在恢复运行 {selected.run_id}...[/]")
+                self._resume_run(selected.run_id)
+            
+        except Exception as e:
+            console.print(f"[dim]检查历史运行时出错: {e}[/]")
+
+    def _resume_run(self, run_id: str) -> None:
+        """恢复指定的运行"""
+        try:
+            from kd1_anime.orchestrator import Orchestrator
+            orchestrator = Orchestrator()
+            
+            def callback(event: str, data: dict) -> None:
+                self._handle_callback(event, data)
+            
+            final_video = orchestrator.resume(run_id, callback=callback, interactive=True)
+            self._show_completion(final_video)
+            
+        except KeyboardInterrupt:
+            console.print("\n[yellow]用户中断[/]")
+        except Exception as e:
+            console.print(f"\n[bold red]恢复失败:[/] {e}", markup=False)
 
     def _get_initial_prompt(self) -> str | None:
         """获取用户的初始需求描述
