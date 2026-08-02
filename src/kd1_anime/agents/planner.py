@@ -76,6 +76,30 @@ class SceneDetail(BaseModel):
             return json.dumps(v, ensure_ascii=False, indent=2)
         return v
 
+    @field_validator("key_moments", "visual_flow", mode="before")
+    @classmethod
+    def ensure_string_list(cls, v):
+        """LLM 有时返回对象数组而非字符串数组，自动转换为字符串列表"""
+        if isinstance(v, list):
+            converted = []
+            for item in v:
+                if isinstance(item, str):
+                    converted.append(item)
+                elif isinstance(item, dict):
+                    # 将 {time, event, pause} 合并为单个字符串
+                    parts = []
+                    for key in ("time", "event", "pause", "description"):
+                        if key in item and item[key]:
+                            parts.append(str(item[key]))
+                    if parts:
+                        converted.append(" - ".join(parts))
+                    else:
+                        converted.append(json.dumps(item, ensure_ascii=False))
+                else:
+                    converted.append(str(item))
+            return converted
+        return v
+
 
 # ---------------------------------------------------------------------------
 # 阶段 1 提示词 — 只需概要
