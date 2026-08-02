@@ -59,3 +59,18 @@ def test_relative_runtime_paths_fall_back_to_home_when_cwd_is_missing(monkeypatc
     expected_runs = (config_module.Path.home() / "workspace" / "runs").resolve()
     assert paths.root.parent == expected_runs
     assert paths.output == paths.root / "output_final.mp4"
+
+
+def test_llm_timeout_and_silent_stream_defaults():
+    config = Settings(_env_file=None)
+    assert config.LLM_TIMEOUT_CONNECT == 30.0
+    assert config.LLM_TIMEOUT_READ == 600.0
+    assert config.LLM_SILENT_STREAM is True
+    assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
+
+
+def test_llm_timeout_and_silent_stream_validation():
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, LLM_TIMEOUT_READ=5.0)  # 低于下限 10s
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, LLM_EMPTY_RETRY_MAX_TOKENS=100)  # 低于下限

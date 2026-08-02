@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -51,6 +51,21 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int | None = Field(default=None)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+    # 单次 LLM 请求的连接/读取超时(秒)。读取超时对非流式是"等待完整响应"，
+    # 对流式是"等待下一个 chunk"——静默流式下 600s 只是兜底，不会拖慢任何请求。
+    LLM_TIMEOUT_CONNECT: float = Field(default=30.0, ge=1.0, le=300.0)
+    LLM_TIMEOUT_READ: float = Field(default=600.0, ge=10.0, le=3600.0)
+    # 非流式(stream=False)调用是否仍使用流式传输但静默收集(不打印内容)。
+    # 推理模型(reasoning_content)在完整响应生成完之前不会返回任何字节，
+    # 非流式 + 短读超时会导致"超时→重头生成"的级联；静默流式按 chunk 计超时，
+    # 内容一开始生成就能收到，终端表现与非流式完全一致。
+    LLM_SILENT_STREAM: bool = Field(
+        default=True,
+        description="stream=False 时仍走流式传输但静默收集，避免长生成超时"
+    )
+    # 空响应重试时补上的 max_tokens 兜底值：推理模型常把输出预算耗尽在思考上，
+    # 导致 content 为空；补足预算后重试可避免反复拿到空响应。
+    LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=16384, ge=1024, le=65536)
 
     @field_validator("LLM_MAX_TOKENS", mode="before")
     @classmethod
@@ -130,7 +145,7 @@ class Settings(BaseSettings):
         le=5,
         description="最大评估-改进轮数"
     )
-    EVAL_VISUAL_MODEL: Optional[str] = Field(
+    EVAL_VISUAL_MODEL: str | None = Field(
         default=None,
         description="视觉评估使用的模型（默认使用 LLM_MODEL）"
     )
