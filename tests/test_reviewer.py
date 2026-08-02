@@ -10,6 +10,8 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "LaTeX" in REVIEWER_SYSTEM_PROMPT
     assert "xelatex" in REVIEWER_SYSTEM_PROMPT
     assert "config.tex_template" in REVIEWER_SYSTEM_PROMPT
+    assert "E 类问题一律不阻塞" in REVIEWER_SYSTEM_PROMPT
+    assert "fixes 必须可匹配" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_severity_is_closed_enum():
