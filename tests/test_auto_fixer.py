@@ -338,6 +338,12 @@ class TestAutoFixerSystemPrompt:
         assert "PangoError" in AUTO_FIXER_SYSTEM_PROMPT
         assert "Noto Sans CJK SC" in AUTO_FIXER_SYSTEM_PROMPT
 
+    def test_prompt_contains_repair_locator_principles(self):
+        """测试提示包含修复定位原则。"""
+        assert "修复定位原则" in AUTO_FIXER_SYSTEM_PROMPT
+        assert "多段" in AUTO_FIXER_SYSTEM_PROMPT
+        assert "保留 Scene 类名" in AUTO_FIXER_SYSTEM_PROMPT
+
     def test_prompt_contains_fix_principles(self):
         """测试提示包含修复原则。"""
         assert "最小改动" in AUTO_FIXER_SYSTEM_PROMPT
