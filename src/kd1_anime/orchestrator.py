@@ -13,13 +13,34 @@ from uuid import uuid4
 from rich.console import Console
 from rich.prompt import Confirm
 
+from kd1_anime.exceptions import (
+    ConfigError,
+    LLMError,
+    LLMResponseError,
+    PipelineAbortedError,
+    PipelineExhaustedError,
+    RenderError,
+    RunError,
+    RunIntegrityError,
+    RunLockError,
+    RunNotFoundError,
+    SlurmError,
+    SlurmSubmitError,
+    SlurmTimeoutError,
+    ValidationError,
+    VideoNotFoundError,
+)
+from kd1_anime.logging import get_logger
+
+logger = get_logger(__name__)
+
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.planner import PlannerAgent, SceneOutline, ScenePlan
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewResult
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
 from kd1_anime.cluster.slurm import FAILURE_STATES, MONITOR_ABORT_STATES, SlurmDispatcher, SlurmJob
-from kd1_anime.config import settings
+from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.media.merger import VideoMerger
 from kd1_anime.run_store import (
     MANIFEST_NAME,
@@ -66,12 +87,12 @@ class RunPaths:
     def create(cls) -> RunPaths:
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
         run_id = f"{stamp}-{uuid4().hex[:8]}"
-        root = settings.WORKSPACE_DIR.expanduser().resolve() / "runs" / run_id
+        root = resolve_runtime_path(settings.WORKSPACE_DIR) / "runs" / run_id
         configured_output = settings.OUTPUT_FILE.expanduser()
         if configured_output == Path("output_final.mp4"):
             output = root / "output_final.mp4"
         else:
-            output = configured_output.resolve()
+            output = resolve_runtime_path(configured_output)
         return cls(
             run_id=run_id,
             root=root,
@@ -294,9 +315,10 @@ class Orchestrator:
             last_validation = validation
             current_feedback = f"确定性校验未通过，必须修复以下问题：\n{validation.feedback}"
             current_previous = code
-        raise RuntimeError(
+        raise ValidationError(
             "生成代码未通过确定性校验：\n"
-            + (last_validation.feedback if last_validation else "未知错误")
+            + (last_validation.feedback if last_validation else "未知错误"),
+            hint="尝试简化场景或调整 prompt"
         )
 
     def run(
@@ -308,7 +330,7 @@ class Orchestrator:
     ) -> Path | None:
         if len(user_prompt) > settings.MAX_PROMPT_CHARS:
             raise ValueError(
-                f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符"
+                f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符\n提示：可以将需求拆分为多个较短的动画，或使用更简洁的描述"
             )
         self._callback = callback
         ctx = PipelineContext(
@@ -555,16 +577,24 @@ class Orchestrator:
             try:
                 ctx.outlines = self.planner.plan_outline(ctx.user_prompt)
                 break
-            except Exception as exc:
+            except LLMError as exc:
+                logger.error(f"LLM 调用失败: {exc}")
                 if not self._ask_retry_or_skip(0, str(exc)):
-                    raise RuntimeError(f"场景概要规划失败: {exc}") from exc
+                    raise LLMResponseError(
+                        f"场景概要规划失败: {exc}",
+                        hint="检查 LLM API 配置和网络连接"
+                    ) from exc
+            except Exception as exc:
+                logger.error(f"场景概要规划时发生未知错误: {exc}")
+                if not self._ask_retry_or_skip(0, str(exc)):
+                    raise PipelineError(f"场景概要规划失败: {exc}") from exc
         return State.DETAILING
 
     def _handle_detailing(self, ctx: PipelineContext) -> State:
         self._emit("stage_start", stage="detailing")
         if len(ctx.outlines) > settings.MAX_SCENES:
             raise RuntimeError(
-                f"Planner 生成了 {len(ctx.outlines)} 个场景，超过 MAX_SCENES={settings.MAX_SCENES}"
+                f"Planner 生成了 {len(ctx.outlines)} 个场景，超过 MAX_SCENES={settings.MAX_SCENES}\n提示：可以在需求中明确指定场景数量，或增加 MAX_SCENES 配置"
             )
         if not ctx.outlines:
             raise RuntimeError("Planner 没有生成任何场景概要")
@@ -582,7 +612,11 @@ class Orchestrator:
                     stream=False,
                 )
                 return outline.scene_id, plan, None
+            except LLMError as exc:
+                logger.error(f"Scene {outline.scene_id} 详细规划 LLM 调用失败: {exc}")
+                return outline.scene_id, None, str(exc)
             except Exception as exc:
+                logger.error(f"Scene {outline.scene_id} 详细规划时发生未知错误: {exc}")
                 return outline.scene_id, None, str(exc)
 
         for outline in pending_outlines:

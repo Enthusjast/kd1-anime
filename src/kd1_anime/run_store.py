@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kd1_anime.agents.planner import SceneOutline, ScenePlan
 from kd1_anime.cluster.slurm import SlurmJob
+from kd1_anime.config import resolve_runtime_path
 
 MANIFEST_NAME = "manifest.json"
 MANIFEST_SCHEMA_VERSION = 1
@@ -183,7 +184,7 @@ class RunRepository:
     """在配置的 workspace 下定位运行，且不接受任意路径。"""
 
     def __init__(self, workspace_dir: Path) -> None:
-        self.runs_root = workspace_dir.expanduser().resolve() / "runs"
+        self.runs_root = resolve_runtime_path(workspace_dir) / "runs"
 
     def run_root(self, run_id: str) -> Path:
         if not RUN_ID_PATTERN.fullmatch(run_id):

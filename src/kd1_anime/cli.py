@@ -88,7 +88,7 @@ def generate(
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
     if not prompt:
-        console.print("[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件")
+        console.print("[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助")
         raise typer.Exit(1)
     try:
         if partition:
@@ -143,7 +143,7 @@ def plan(
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
     if not prompt:
-        console.print("[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件")
+        console.print("[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助")
         raise typer.Exit(1)
     try:
         settings.require_llm_key()
@@ -329,7 +329,7 @@ def resume(
         console.print("\n[yellow]用户中断 (已记录恢复点并清理 Slurm 任务)[/]")
         raise typer.Exit(130) from exc
     except (OSError, ValueError, RuntimeError) as exc:
-        console.print(f"[bold red]恢复失败:[/] {exc}", markup=False)
+        console.print(f"[bold red]恢复失败:[/] {exc}\n使用 kd1-anime status 查看可用运行", markup=False)
         raise typer.Exit(1) from exc
     if manifest.dry_run:
         console.print(f"[bold green]Dry-run 已完成[/] 运行目录: {repository.run_root(run_id)}")
@@ -365,7 +365,7 @@ def clean(
     try:
         retention = _parse_retention(older_than)
     except ValueError as exc:
-        console.print(f"[bold red]参数错误:[/] {exc}", markup=False)
+        console.print(f"[bold red]参数错误:[/] {exc}\n示例: kd1-anime clean --older-than 30d", markup=False)
         raise typer.Exit(2) from exc
     repository = RunRepository(settings.WORKSPACE_DIR)
     cutoff = datetime.now(timezone.utc) - retention
@@ -406,6 +406,102 @@ def version_cmd():
         current_version = "0.3.0-dev"
     console.print(f"kd1-anime v{current_version}")
     console.print("AI Agent 驱动的 Manim 数学动画自动渲染流水线")
+
+
+
+@app.command()
+def doctor():
+    """检查环境依赖和配置是否完整。"""
+    import shutil
+    import subprocess
+    
+    console.print("[bold]kd1-anime 环境检查[/]\n")
+    
+    checks = []
+    
+    # 检查 Python 版本
+    import sys
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    py_ok = sys.version_info >= (3, 10)
+    checks.append(("Python >= 3.10", py_ok, py_version))
+    
+    # 检查 conda
+    conda_path = shutil.which("conda")
+    conda_ok = conda_path is not None
+    checks.append(("conda", conda_ok, conda_path or "未找到"))
+    
+    # 检查 manim
+    manim_ok = False
+    manim_version = "未安装"
+    try:
+        result = subprocess.run(
+            ["python3", "-c", "import manim; print(manim.__version__)"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            manim_ok = True
+            manim_version = result.stdout.strip()
+    except Exception:
+        pass
+    checks.append(("manim", manim_ok, manim_version))
+    
+    # 检查 ffmpeg
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffmpeg_ok = ffmpeg_path is not None
+    ffmpeg_version = "未找到"
+    if ffmpeg_ok:
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-version"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                ffmpeg_version = result.stdout.split("\n")[0][:50]
+        except Exception:
+            ffmpeg_version = "已找到"
+    checks.append(("ffmpeg", ffmpeg_ok, ffmpeg_version))
+    
+    # 检查 sbatch (Slurm)
+    sbatch_path = shutil.which("sbatch")
+    sbatch_ok = sbatch_path is not None
+    checks.append(("sbatch (Slurm)", sbatch_ok, sbatch_path or "未找到"))
+    
+    # 检查 xelatex
+    xelatex_path = shutil.which("xelatex")
+    xelatex_ok = xelatex_path is not None
+    checks.append(("xelatex", xelatex_ok, xelatex_path or "未找到"))
+    
+    # 检查 apptainer (可选)
+    apptainer_path = shutil.which("apptainer")
+    apptainer_ok = apptainer_path is not None
+    checks.append(("apptainer (可选)", apptainer_ok, apptainer_path or "未找到"))
+    
+    # 检查 LLM 配置
+    llm_ok = bool(settings.LLM_API_KEY and settings.LLM_MODEL)
+    llm_info = "已配置" if llm_ok else "未配置 (需要 LLM_API_KEY 和 LLM_MODEL)"
+    checks.append(("LLM 配置", llm_ok, llm_info))
+    
+    # 显示结果
+    table = Table(title="环境检查结果")
+    table.add_column("检查项", style="cyan")
+    table.add_column("状态", justify="center")
+    table.add_column("详情", style="dim")
+    
+    all_ok = True
+    for name, ok, detail in checks:
+        status = "[green]✓[/]" if ok else "[red]✗[/]"
+        if not ok and name not in ["apptainer (可选)"]:
+            all_ok = False
+        table.add_row(name, status, detail)
+    
+    console.print(table)
+    console.print()
+    
+    if all_ok:
+        console.print("[bold green]所有必要依赖已就绪！[/]")
+    else:
+        console.print("[bold yellow]部分依赖缺失，请参考文档安装：[/]")
+        console.print("  https://github.com/Enthusjast/kd1-anime#readme")
 
 
 def _start_chat(dry_run: bool = False) -> None:

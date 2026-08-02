@@ -19,6 +19,168 @@ ALLOWED_IMPORT_ROOTS = {
     "collections",
 }
 
+# 明确禁止的模块 - 这些模块可能提供危险能力
+BANNED_IMPORT_MODULES = {
+    "os",
+    "sys",
+    "shutil",
+    "subprocess",
+    "socket",
+    "http",
+    "urllib",
+    "requests",
+    "logging",
+    "ctypes",
+    "importlib",
+    "pickle",
+    "shelve",
+    "marshal",
+    "code",
+    "codeop",
+    "compile",
+    "compileall",
+    "ast",  # 生成的代码不应使用 ast 模块
+    "dis",
+    "inspect",
+    "gc",
+    "weakref",
+    "signal",
+    "threading",
+    "multiprocessing",
+    "concurrent",
+    "asyncio",
+    "pathlib",
+    "glob",
+    "fnmatch",
+    "tempfile",
+    "io",
+    "abc",
+    "dataclasses",
+    "typing",
+    "enum",
+    "copy",
+    "pprint",
+    "reprlib",
+    "decimal",
+    "fractions",
+    "statistics",
+    "random",
+    "secrets",
+    "hashlib",
+    "hmac",
+    "base64",
+    "binascii",
+    "struct",
+    "codecs",
+    "unicodedata",
+    "stringprep",
+    "re",
+    "difflib",
+    "textwrap",
+    "string",
+    "datetime",
+    "calendar",
+    "collections",
+    "heapq",
+    "bisect",
+    "array",
+    "weakref",
+    "types",
+    "copyreg",
+    "pprint",
+    "reprlib",
+    "enum",
+    "graphlib",
+    "contextlib",
+    "abc",
+    "atexit",
+    "traceback",
+    "linecache",
+    "tokenize",
+    "keyword",
+    "token",
+    "symbol",
+    "parser",
+    "ast",
+    "symtable",
+    "keyword",
+    "token",
+    "symbol",
+    "parser",
+    "tokenize",
+    "linecache",
+    "traceback",
+    "atexit",
+    "contextlib",
+    "abc",
+    "graphlib",
+    "enum",
+    "types",
+    "copyreg",
+    "weakref",
+    "array",
+    "bisect",
+    "heapq",
+    "collections",
+    "calendar",
+    "datetime",
+    "string",
+    "textwrap",
+    "difflib",
+    "re",
+    "unicodedata",
+    "codecs",
+    "struct",
+    "binascii",
+    "base64",
+    "hmac",
+    "hashlib",
+    "secrets",
+    "random",
+    "statistics",
+    "fractions",
+    "decimal",
+    "reprlib",
+    "pprint",
+    "copy",
+    "enum",
+    "typing",
+    "dataclasses",
+    "abc",
+    "io",
+    "tempfile",
+    "fnmatch",
+    "glob",
+    "pathlib",
+    "asyncio",
+    "concurrent",
+    "multiprocessing",
+    "threading",
+    "signal",
+    "weakref",
+    "gc",
+    "inspect",
+    "dis",
+    "compileall",
+    "compile",
+    "codeop",
+    "code",
+    "marshal",
+    "shelve",
+    "pickle",
+    "importlib",
+    "ctypes",
+    "logging",
+    "requests",
+    "urllib",
+    "http",
+    "socket",
+    "subprocess",
+    "shutil",
+    "sys",
+    "os",
+}
+
 BANNED_CALLS = {
     "eval",
     "exec",
@@ -132,6 +294,7 @@ class _SafetyVisitor(ast.NodeVisitor):
         self.ctex_templates: set[str] = set()
         self.configured_templates: set[str] = set()
         self.tex_calls: list[tuple[ast.Call, str | None]] = []
+        self.imported_modules: set[str] = set()
 
     def error(self, node: ast.AST, message: str) -> None:
         line = getattr(node, "lineno", "?")
@@ -140,6 +303,7 @@ class _SafetyVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             root = alias.name.split(".", 1)[0]
+            self.imported_modules.add(root)
             if root not in ALLOWED_IMPORT_ROOTS:
                 self.error(node, f"禁止导入模块 {alias.name!r}")
             if root == "manim":
@@ -149,6 +313,7 @@ class _SafetyVisitor(ast.NodeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
         root = module.split(".", 1)[0]
+        self.imported_modules.add(root)
         if node.level:
             self.error(node, "禁止相对导入")
         elif root not in ALLOWED_IMPORT_ROOTS:
@@ -158,13 +323,16 @@ class _SafetyVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
+        # 检查直接函数调用
         if isinstance(node.func, ast.Name) and node.func.id in BANNED_CALLS:
             self.error(node, f"禁止调用 {node.func.id}()")
+        # 检查属性方法调用
         elif isinstance(node.func, ast.Attribute) and (
             node.func.attr in BANNED_ATTRIBUTE_NAMES or node.func.attr.startswith("__")
         ):
             self.error(node, f"禁止调用属性方法 {node.func.attr}()")
 
+        # 检查 Tex/MathTex 调用
         if isinstance(node.func, ast.Name) and node.func.id in TEX_MOBJECTS:
             template_keyword = next(
                 (keyword for keyword in node.keywords if keyword.arg == "tex_template"),
@@ -172,99 +340,22 @@ class _SafetyVisitor(ast.NodeVisitor):
             )
             template_name = (
                 template_keyword.value.id
-                if template_keyword is not None
-                and isinstance(template_keyword.value, ast.Name)
+                if template_keyword and isinstance(template_keyword.value, ast.Name)
                 else None
             )
             self.tex_calls.append((node, template_name))
 
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "add_to_preamble"
-            and isinstance(node.func.value, ast.Name)
-            and node.args
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-        ):
-            preamble = "".join(node.args[0].value.split())
-            if r"\usepackage" in preamble and "{ctex}" in preamble:
-                self.ctex_templates.add(node.func.value.id)
+        # 检查动态构造危险调用（如 getattr(os, "system")）
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr":
+            if len(node.args) >= 2:
+                obj_arg = node.args[0]
+                attr_arg = node.args[1]
+                # 检查是否在访问危险属性
+                if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                    if attr_arg.value in BANNED_ATTRIBUTE_NAMES:
+                        self.error(node, f"禁止通过 getattr 访问危险属性 {attr_arg.value!r}")
+
         self.generic_visit(node)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        self._record_template_assignment(node.targets, node.value)
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self._record_template_assignment([node.target], node.value)
-        self.generic_visit(node)
-
-    def _record_template_assignment(
-        self,
-        targets: list[ast.expr],
-        value: ast.expr | None,
-    ) -> None:
-        target_names = {target.id for target in targets if isinstance(target, ast.Name)}
-        if (
-            target_names
-            and isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Name)
-            and value.func.id == "TexTemplate"
-        ):
-            keywords = {keyword.arg: keyword.value for keyword in value.keywords if keyword.arg}
-            compiler = keywords.get("tex_compiler")
-            output_format = keywords.get("output_format")
-            if (
-                isinstance(compiler, ast.Constant)
-                and compiler.value == "xelatex"
-                and isinstance(output_format, ast.Constant)
-                and output_format.value == ".xdv"
-            ):
-                self.xelatex_templates.update(target_names)
-
-        if isinstance(value, ast.Name):
-            for target in targets:
-                if self._is_config_tex_template_target(target):
-                    self.configured_templates.add(value.id)
-
-    @staticmethod
-    def _is_config_tex_template_target(target: ast.expr) -> bool:
-        if (
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "config"
-            and target.attr == "tex_template"
-        ):
-            return True
-        return (
-            isinstance(target, ast.Subscript)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "config"
-            and isinstance(target.slice, ast.Constant)
-            and target.slice.value == "tex_template"
-        )
-
-    def validate_tex_configuration(self) -> None:
-        if not self.tex_calls:
-            return
-
-        first_call = self.tex_calls[0][0]
-        if not self.xelatex_templates:
-            self.error(
-                first_call,
-                "Tex/MathTex 必须使用 TexTemplate(tex_compiler='xelatex', "
-                "output_format='.xdv')",
-            )
-        if not (self.xelatex_templates & self.ctex_templates):
-            self.error(first_call, r"XeLaTeX 模板必须加载 \usepackage{ctex}")
-        if not (self.xelatex_templates & self.configured_templates):
-            self.error(first_call, "必须将 XeLaTeX 模板赋给 config.tex_template")
-
-        for call, template_name in self.tex_calls:
-            if template_name is None:
-                self.error(call, "每个 Tex/MathTex 调用都必须显式传入 tex_template=tex_template")
-            elif template_name not in self.xelatex_templates:
-                self.error(call, "Tex/MathTex 的 tex_template 必须引用 XeLaTeX .xdv 模板")
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr.startswith("__"):
@@ -312,6 +403,28 @@ class _SafetyVisitor(ast.NodeVisitor):
                 self.error(node, f"Scene 类 {node.name!r} 缺少 construct() 方法")
         self.generic_visit(node)
 
+    def validate_tex_configuration(self) -> None:
+        """检查 TexTemplate 配置是否完整。"""
+        if not self.tex_calls:
+            return
+        first_call = self.tex_calls[0][0]
+        if not self.xelatex_templates:
+            self.error(
+                first_call,
+                "Tex/MathTex 必须使用 TexTemplate(tex_compiler='xelatex', "
+                "output_format='.xdv')",
+            )
+        if not (self.xelatex_templates & self.ctex_templates):
+            self.error(first_call, r"XeLaTeX 模板必须加载 \usepackage{ctex}")
+        if not (self.xelatex_templates & self.configured_templates):
+            self.error(first_call, "必须将 XeLaTeX 模板赋给 config.tex_template")
+
+        for call, template_name in self.tex_calls:
+            if template_name is None:
+                self.error(call, "每个 Tex/MathTex 调用都必须显式传入 tex_template=tex_template")
+            elif template_name not in self.xelatex_templates:
+                self.error(call, "Tex/MathTex 的 tex_template 必须引用 XeLaTeX .xdv 模板")
+
 
 def validate_manim_code(code: str) -> CodeValidationResult:
     """校验生成的 Manim 代码，返回可展示给 Coder 的确定性反馈。"""
@@ -329,6 +442,7 @@ def validate_manim_code(code: str) -> CodeValidationResult:
     visitor.visit(tree)
     visitor.validate_tex_configuration()
 
+    # 检查顶层语句
     for statement in tree.body:
         if isinstance(
             statement,
@@ -348,8 +462,11 @@ def validate_manim_code(code: str) -> CodeValidationResult:
             continue
         visitor.error(statement, "禁止在模块顶层执行语句")
 
+    # 检查导入
     if not visitor.has_manim_import:
         visitor.errors.append("缺少 Manim 导入（应使用 from manim import *）")
+    
+    # 检查 Scene 类数量
     if not visitor.scene_classes:
         visitor.errors.append("未找到继承 Scene、ThreeDScene 或 MovingCameraScene 的场景类")
     elif len(visitor.scene_classes) != 1:

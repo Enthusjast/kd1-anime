@@ -6,9 +6,10 @@ import pytest
 from prompt_toolkit.keys import Keys
 from rich.console import Console
 
+import kd1_anime.orchestrator as orchestrator_module
 import kd1_anime.tui as tui_module
 from kd1_anime.config import settings
-from kd1_anime.tui import Clarifier, _input_bindings, _insert_newline, _submit_input
+from kd1_anime.tui import ChatSession, Clarifier, _input_bindings, _insert_newline, _submit_input
 
 
 def test_clarifier_fallback_keeps_all_user_answers():
@@ -141,3 +142,21 @@ def test_clarifier_displays_question_after_buffering(monkeypatch):
     rendered = output.getvalue()
     assert "AI:" in rendered
     assert "你希望视频时长是多少？" in rendered
+
+
+def test_pipeline_error_is_concise_and_does_not_render_markup(monkeypatch):
+    class BrokenOrchestrator:
+        def run(self, *args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory")
+
+    output = StringIO()
+    monkeypatch.setattr(orchestrator_module, "Orchestrator", BrokenOrchestrator)
+    monkeypatch.setattr(tui_module, "console", Console(file=output, force_terminal=False))
+    monkeypatch.setattr(settings, "LLM_DEBUG", False)
+
+    ChatSession()._run_pipeline("test prompt")
+
+    rendered = output.getvalue()
+    assert "生成失败: [Errno 2] No such file or directory" in rendered
+    assert "[bold red]" not in rendered
+    assert "Traceback" not in rendered

@@ -487,6 +487,15 @@ export LANG=C.UTF-8
 EOF
 }
 
+print_completion() {
+    printf '\n%b安装完成%b\n' "$GREEN" "$NC"
+    printf '%s\n' \
+        "1. 进入 Manim 环境: manim-env" \
+        "2. 启动程序: kd1-anime" \
+        "3. 编辑配置: $CONFIG_FILE" \
+        "   命令目录: $USER_BIN_DIR"
+}
+
 main() {
 echo -e "${CYAN}=== kd1-anime 环境安装 ===${NC}"
 find_conda
@@ -541,14 +550,7 @@ env_python -c 'from manim import *; print("Python + Manim: OK")'
 env_python -c 'import shutil; assert shutil.which("ffmpeg"); print("FFmpeg: OK")'
 "$USER_BIN_DIR/kd1-anime" version
 
-cat <<EOF
-
-${GREEN}安装完成${NC}
-1. 启动程序: kd1-anime
-2. 进入 Manim 环境: manim-env
-3. 编辑配置: $CONFIG_FILE
-   命令目录: $USER_BIN_DIR
-EOF
+print_completion
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
