@@ -61,7 +61,11 @@ class BaseAgent:
         return self._client
 
     def _log(self, message: str, style: str = "bold cyan") -> None:
-        """打印 Agent 思考过程"""
+        """打印 Agent 思考过程（仪表盘激活时抑制，避免破坏 Live 渲染）"""
+        # 延迟导入避免循环依赖
+        from kd1_anime.dashboard import suppress_agent_logs
+        if suppress_agent_logs():
+            return
         safe_msg = str(message).replace("[", "\\[")
         safe_name = str(self.name).replace("[", "\\[")
         console.print(f"[{style}]{safe_name}[/] {safe_msg}")
@@ -321,8 +325,17 @@ class BaseAgent:
                     if not byte:
                         break
                     if byte == b"\x1b":
-                        cancelled.set()
-                        break
+                        # ESC 是转义序列起始字节（方向键 ^[[D、鼠标事件等）。
+                        # 等待一小段窗口：若后面紧跟其他字节则是转义序列（忽略），
+                        # 只有"独立 ESC"（用户按 ESC）才取消流式输出。
+                        r2, _, _ = select.select([sys.stdin], [], [], 0.1)
+                        if not r2:
+                            # 没有后续字节 → 独立 ESC，用户取消
+                            cancelled.set()
+                            break
+                        # 有后续字节 → 转义序列，丢弃它
+                        with suppress(OSError):
+                            sys.stdin.buffer.read1(8)
             except (OSError, ValueError):
                 return
 
