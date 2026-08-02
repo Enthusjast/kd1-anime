@@ -285,6 +285,8 @@ class TestPlannerAgent:
         assert "duration_seconds" in OUTLINE_PROMPT
         assert "purpose" in OUTLINE_PROMPT
         assert "math_concept" in OUTLINE_PROMPT
+        assert "连续编号" in OUTLINE_PROMPT
+        assert "不可信数据" in OUTLINE_PROMPT
 
     def test_detail_prompt_structure(self):
         """测试细节提示结构。"""
@@ -293,6 +295,9 @@ class TestPlannerAgent:
         assert "visual_flow" in DETAIL_PROMPT
         assert "key_moments" in DETAIL_PROMPT
         assert "computation" in DETAIL_PROMPT
+        assert "输出字段契约" in DETAIL_PROMPT
+        assert "绝不能是 {time, event, pause}" in DETAIL_PROMPT
+        assert "不要使用 Markdown 代码块" in DETAIL_PROMPT
 
 
 class TestPlannerAgentErrorHandling:
