@@ -72,7 +72,7 @@ def generate(
     ),
     force: bool = typer.Option(False, "--force", help="允许覆盖已存在的输出文件"),
     partition: str = typer.Option(None, "--partition", "-p", help="Slurm 分区"),
-    max_fix: int = typer.Option(None, "--max-fix", min=0, help="最大自动修复尝试次数 (默认: 3)"),
+    max_fix: int = typer.Option(None, "--max-fix", min=0, help="最大自动修复尝试次数 (默认: 5, 上限 20)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成场景规划和代码,不提交 Slurm 任务"),
     incremental: str = typer.Option(
         None,
