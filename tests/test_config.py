@@ -85,3 +85,10 @@ def test_max_fix_attempts_default_and_upper_bound():
     # 赋值校验同样生效
     with pytest.raises(ValueError):
         config.MAX_FIX_ATTEMPTS = 21
+
+
+def test_max_fix_identical_errors_default():
+    config = Settings(_env_file=None)
+    assert config.MAX_FIX_IDENTICAL_ERRORS == 2
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, MAX_FIX_IDENTICAL_ERRORS=0)

@@ -457,3 +457,60 @@ def test_execute_full_pipeline_with_merge(monkeypatch, tmp_path):
     import json
     data = json.loads((run_paths.root / "manifest.json").read_text(encoding="utf-8"))
     assert data["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# 10) 连续相同渲染错误 → 判定环境问题提前放弃, 并附错误日志尾部
+# ---------------------------------------------------------------------------
+def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    error_log = (
+        "Rendering:   0%|          | 0/60 [00:00<?, ?it/s]\n"
+        "Traceback (most recent call last):\n"
+        "  File \"scene_1.py\", line 42, in construct\n"
+        "ValueError: something deterministic\n"
+    )
+    slurm = FakeSlurm(
+        run_paths,
+        status_map=lambda job_id: "FAILED",
+        error_log=error_log,
+    )
+    autofixer = FakeAutoFixer()
+    orchestrator = make_orchestrator(
+        monkeypatch, tmp_path, run_paths, slurm=slurm, autofixer=autofixer,
+    )
+    monkeypatch.setattr(module.settings, "MAX_FIX_IDENTICAL_ERRORS", 2)
+
+    ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1)])
+    ctx.scene_states[1] = SceneState(
+        plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
+        plan_ready=True, reviewed=True,
+    )
+    (run_paths.scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
+
+    orchestrator._run_scheduler(ctx)
+
+    state = ctx.scene_states[1]
+    assert state.give_up is True
+    # 相同错误只修复 1 次就放弃 (第 2 次相同 → 提前放弃)
+    assert autofixer.fix_calls == 1
+    assert "连续 2 次渲染错误完全相同" in state.failure_reason
+    # 放弃原因里带错误日志尾部, 方便直接定位根因
+    assert "ValueError: something deterministic" in state.failure_reason
+
+
+def test_error_fingerprint_normalizes_digits(monkeypatch, tmp_path):
+    from kd1_anime.orchestrator import Orchestrator
+
+    fp1 = Orchestrator._error_fingerprint(
+        "Traceback line 42: ValueError at frame 1234"
+    )
+    fp2 = Orchestrator._error_fingerprint(
+        "Traceback line 99: ValueError at frame 9999"
+    )
+    assert fp1 == fp2  # 数字不同 → 指纹相同
+
+    fp3 = Orchestrator._error_fingerprint(
+        "Traceback line 42: KeyError at frame 1234"
+    )
+    assert fp1 != fp3  # 错误类型不同 → 指纹不同

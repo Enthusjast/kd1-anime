@@ -123,6 +123,9 @@ class Settings(BaseSettings):
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
     # 渲染失败后的最大自动修复次数。autofixer 每轮会调用 LLM 重写代码并重新提交 Slurm。
     MAX_FIX_ATTEMPTS: int = Field(default=5, ge=0, le=20)
+    # 连续 N 次渲染错误日志指纹相同 → 判定为环境/配置问题而非代码问题,
+    # 提前放弃, 避免 LLM 反复"修复"同一个环境错误浪费尝试次数。
+    MAX_FIX_IDENTICAL_ERRORS: int = Field(default=2, ge=1, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
     
     # --- 自动评估配置 ---

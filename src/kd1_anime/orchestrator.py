@@ -308,6 +308,9 @@ class SceneState:
     plan_ready: bool = False
     # Reviewer major 反馈待重写时暂存; 调度器据此把场景重新排入编码阶段。
     rewrite_feedback: str = ""
+    # 渲染错误指纹: 连续相同错误 → 环境问题, 提前放弃
+    last_error_fp: str = ""
+    identical_error_count: int = 0
 
     reviewed: bool = False
 
@@ -437,6 +440,8 @@ class Orchestrator:
                 failure_reason=scene.failure_reason,
                 plan_ready=scene.plan_ready,
                 rewrite_feedback=scene.rewrite_feedback,
+                last_error_fp=scene.last_error_fp,
+                identical_error_count=scene.identical_error_count,
             )
         manifest = RunManifest(
             run_id=ctx.paths.run_id,
@@ -501,6 +506,8 @@ class Orchestrator:
                 failure_reason=stored.failure_reason,
                 plan_ready=getattr(stored, "plan_ready", False),
                 rewrite_feedback=getattr(stored, "rewrite_feedback", ""),
+                last_error_fp=getattr(stored, "last_error_fp", ""),
+                identical_error_count=getattr(stored, "identical_error_count", 0),
             )
         return PipelineContext(
             user_prompt=manifest.user_prompt,
@@ -1970,15 +1977,39 @@ class Orchestrator:
         )
         return False
 
+    @staticmethod
+    def _error_fingerprint(error_log: str) -> str:
+        """渲染错误日志的稳定指纹: 数字统一归一化、跳过进度行。
+
+        同一环境/代码错误即使时间戳、帧号、进度百分比不同, 指纹也应相同,
+        用于判断"修复后错误是否仍然一样"。
+        """
+        import hashlib
+
+        normalized: list[str] = []
+        for line in error_log.splitlines():
+            low = line.lower()
+            # 跳过 Manim 进度条行 (含 % 和 |) 与纯时间行
+            if "%" in low and "|" in low:
+                continue
+            low = re.sub(r"\d+", "#", low).strip()
+            if low:
+                normalized.append(low)
+        return hashlib.sha256("\n".join(normalized).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    def _give_up_reason(self, base: str, error_log: str) -> str:
+        """放弃原因附带最近错误日志尾部, 方便用户直接定位根因。"""
+        if not error_log:
+            return base
+        excerpt = "\n".join(error_log.splitlines()[-8:]).strip()
+        if len(excerpt) > 600:
+            excerpt = excerpt[-600:]
+        return f"{base}\n最近错误日志(尾部):\n{excerpt}"
+
     def _scene_fix(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         self._phase_emit("fixing")
         job = state.slurm_job
         if job is None:
-            return
-        if state.fix_attempts >= settings.MAX_FIX_ATTEMPTS:
-            state.give_up = True
-            state.failure_reason = "达到最大渲染修复次数"
-            self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
         error_log = self.slurm.get_error_log(job=job)
         if not error_log:
@@ -1988,7 +2019,29 @@ class Orchestrator:
             return
         if self.auto_fixer.is_infrastructure_error(error_log):
             state.give_up = True
-            state.failure_reason = "检测到环境或 Slurm 配置错误，未让 LLM 重写业务代码"
+            state.failure_reason = self._give_up_reason(
+                "检测到环境或 Slurm 配置错误，未让 LLM 重写业务代码", error_log
+            )
+            self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
+            return
+        # 连续相同错误 → 判定为环境/配置问题, 提前放弃, 不再浪费修复次数
+        fp = self._error_fingerprint(error_log)
+        if fp and fp == state.last_error_fp:
+            state.identical_error_count += 1
+        else:
+            state.identical_error_count = 1
+            state.last_error_fp = fp
+        if state.identical_error_count >= settings.MAX_FIX_IDENTICAL_ERRORS:
+            state.give_up = True
+            state.failure_reason = self._give_up_reason(
+                f"连续 {state.identical_error_count} 次渲染错误完全相同，"
+                "判定为环境/配置问题而非代码问题", error_log
+            )
+            self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
+            return
+        if state.fix_attempts >= settings.MAX_FIX_ATTEMPTS:
+            state.give_up = True
+            state.failure_reason = self._give_up_reason("达到最大渲染修复次数", error_log)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
         state.fix_attempts += 1
@@ -2017,6 +2070,8 @@ class Orchestrator:
         state.class_name = class_name
         state.review_round = 0
         state.slurm_job = None
+        # 注意: identical_error_count 不在这里重置 —— 只有当"错误指纹变化"时才重置
+        # (见上面的 else 分支), 从而让"修复后错误完全相同"能在第 2 次相同错误时提前放弃。
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
         self._checkpoint(ctx, State.FIXING)
 

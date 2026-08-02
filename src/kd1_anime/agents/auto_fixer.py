@@ -123,19 +123,36 @@ class AutoFixerAgent(BaseAgent):
     name = "AutoFixer"
 
     INFRASTRUCTURE_MARKERS = (
+        # 环境/调度
         "conda: command not found",
         "could not find conda environment",
         "environmentnamenotfound",
         "module: command not found",
-        "apptainer: command not found",
-        "failed to open image",
-        "no such file or directory: 'xelatex'",
-        "dvisvgm: command not found",
-        "egl_not_initialized",
-        "cannot connect to display",
         "invalid account",
         "invalid partition",
         "invalid qos",
+        "permission denied",
+        "disk quota exceeded",
+        # Apptainer / 容器
+        "apptainer: command not found",
+        "failed to open image",
+        "unable to find image",
+        "image not found",
+        "sif not found",
+        # LaTeX / 渲染环境
+        "xelatex: command not found",
+        "no such file or directory: 'xelatex'",
+        "latex: command not found",
+        "dvisvgm: command not found",
+        "lualatex: command not found",
+        # 图形/显示/字体
+        "egl_not_initialized",
+        "cannot connect to display",
+        "fontconfig",
+        "cannot open font",
+        "font not found",
+        "no module named 'manim'",
+        "no module named manim",
     )
 
     def fix(self, original_code: str, error_log: str) -> str:
