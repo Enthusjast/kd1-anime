@@ -49,11 +49,15 @@ class Settings(BaseSettings):
     LLM_MODEL: str = ""
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
-    LLM_MAX_TOKENS: int = Field(default=4096, ge=256)
+    LLM_MAX_TOKENS: int | None = Field(default=None)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)
     LLM_DEBUG: bool = False
+    LLM_USE_JSON_MODE: bool = Field(
+        default=True,
+        description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级"
+    )
 
     # --- Slurm 集群 ---
     SLURM_PARTITION: str = ""

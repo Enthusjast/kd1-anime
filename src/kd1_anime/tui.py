@@ -10,6 +10,7 @@ TUI 交互模块
 """
 
 import locale
+import signal
 import sys
 from contextlib import suppress
 
@@ -134,8 +135,8 @@ class Clarifier:
                 response = self.agent.call_llm(messages=self.history, stream=False)
                 self.history.append({"role": "assistant", "content": response})
                 if self.extract_ready(response) is None:
-                    console.print("[dim cyan]AI:[/] ", end="")
-                    console.print(response, markup=False)
+                    console.print("[dim cyan]AI:[/]")
+                    console.print(Markdown(response))
                 return response
             except Exception as e:
                 console.print()
@@ -251,6 +252,12 @@ class ChatSession:
 
     def run(self) -> None:
         """启动完整的交互会话"""
+        # 设置信号处理，避免退出时的 threading 警告
+        def _signal_handler(signum, frame):
+            raise KeyboardInterrupt()
+        
+        signal.signal(signal.SIGINT, _signal_handler)
+        
         _setup_terminal()
         try:
             self._show_banner()

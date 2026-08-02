@@ -220,3 +220,27 @@
   - `eval_improvement_mode`: 进入改进模式
   - `eval_passed`: 评估通过
   - `eval_max_rounds_reached`: 达到最大轮数
+
+### 改进 - JSON 模式兼容性
+
+- **添加 JSON 模式配置选项**：
+  - `LLM_USE_JSON_MODE`: 控制是否使用 response_format=json_object (默认 True)
+  - 某些 LLM 端点不支持此参数时可禁用
+
+- **改进降级逻辑**：
+  - 当端点返回空内容时，自动在系统提示中添加明确的 JSON 输出要求
+  - 提高降级后的 JSON 输出成功率
+
+- **添加 LLM 测试命令**：
+  - `kd1-anime test-llm`: 测试 LLM 端点连接和 JSON 模式支持
+  - 帮助用户诊断端点兼容性问题
+
+### 改进 - TexTemplate 校验反馈
+
+- **改进 validator.py**：
+  - 在 TexTemplate 校验错误消息中添加修复提示
+  - 引导 LLM 参考 coder.py 中的 TexTemplate 模板
+
+- **改进 coder.py**：
+  - 在核心要求中添加强制性的 TexTemplate 模板代码块
+  - 强调 TexTemplate 是不可省略的强制要求
