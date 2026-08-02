@@ -728,6 +728,23 @@ class Orchestrator:
 
 
 
+            # 重置 give_up 场景，允许 resume 后重试审查/生成
+            reset_give_up = False
+            for scene in ctx.scene_states.values():
+                if scene.give_up:
+                    scene.give_up = False
+                    scene.review_round = 0
+                    scene.fix_attempts = 0
+                    scene.failure_reason = ""
+                    reset_give_up = True
+            if reset_give_up:
+                console.print(
+                    "[yellow]发现已放弃的场景，将重置并重试[/]",
+                )
+                if state not in {State.CODING, State.REVIEWING, State.DISPATCHING}:
+                    # 回到审查阶段重新评估已生成的代码
+                    state = State.REVIEWING
+
             cancelled_jobs = False
             for scene in ctx.scene_states.values():
                 if scene.slurm_job and (
