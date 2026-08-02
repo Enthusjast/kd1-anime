@@ -61,6 +61,8 @@ class StoredSceneState(BaseModel):
     review_round: int = Field(default=0, ge=0)
     fix_attempts: int = Field(default=0, ge=0)
     reviewed: bool = False
+    plan_ready: bool = False
+    rewrite_feedback: str = Field(default="", max_length=50_000)
     slurm_job: StoredSlurmJob | None = None
     rendered: bool = False
     give_up: bool = False

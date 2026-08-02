@@ -46,6 +46,128 @@ class SlurmJob:
     cancelled: bool = False
 
 
+class JobMonitor:
+    """可增量推进的 Slurm 作业监控器（非阻塞轮询）。
+
+    与 wait_for_all_jobs 不同, 它把"轮询一次"与"等待"解耦:
+    - add_job(): 加入新提交的作业 (调度器可以边提交边监控)
+    - poll_once(): 推进一次轮询, 返回本轮是否有作业结束
+    - pending/results: 查询未结束/已结束作业
+
+    供 orchestrator 的场景级调度器使用, 让渲染与其他场景的 LLM 阶段并行推进。
+    """
+
+    def __init__(
+        self,
+        dispatcher: "SlurmDispatcher",
+        *,
+        queue_timeout: int | None = None,
+        run_timeout: int | None = None,
+        poll_interval: int | None = None,
+    ) -> None:
+        self.dispatcher = dispatcher
+        self.queue_timeout = queue_timeout or settings.MONITOR_QUEUE_TIMEOUT
+        self.run_timeout = run_timeout or settings.MONITOR_RUN_TIMEOUT
+        self.poll_interval = poll_interval or settings.MONITOR_POLL_INTERVAL
+        # 兼容只设置旧 MONITOR_TIMEOUT 的配置；显式修改新的拆分项时以新项为准。
+        legacy_timeout = settings.MONITOR_TIMEOUT
+        if legacy_timeout is not None:
+            if self.queue_timeout == 3600:
+                self.queue_timeout = legacy_timeout
+            if self.run_timeout == 3600:
+                self.run_timeout = legacy_timeout
+        self.pending: dict[str, SlurmJob] = {}
+        self.results: dict[str, bool] = {}
+        self.jobs: dict[str, SlurmJob] = {}
+        self.unknown_streaks: dict[str, int] = {}
+        self.running_since: dict[str, float] = {}
+        self.log_positions: dict[str, int] = {}
+
+    def add_job(self, job: SlurmJob) -> None:
+        if job.job_id in self.results:
+            return
+        self.pending.setdefault(job.job_id, job)
+        self.jobs[job.job_id] = job
+        self.unknown_streaks.setdefault(job.job_id, 0)
+
+    def _quiet(self) -> bool:
+        """Live 仪表盘激活时抑制 Monitor 文本输出, 避免破坏 Rich Live。"""
+        try:
+            from kd1_anime.dashboard import is_active
+
+            return is_active()
+        except Exception:
+            return False
+
+    def poll_once(self) -> bool:
+        """单次轮询所有 pending 作业, 更新状态; 返回本轮是否有作业结束。"""
+        if not self.pending:
+            return False
+        now = time.time()
+        statuses = self.dispatcher.poll_all_statuses(list(self.pending))
+        finished: list[str] = []
+        quiet = self._quiet()
+        for job_id, job in self.pending.items():
+            status = statuses.get(job_id, "UNKNOWN")
+            job.status = status
+
+            if status == "COMPLETED":
+                self.unknown_streaks[job_id] = 0
+                self.dispatcher._forward_log(job, self.log_positions)
+                self.results[job_id] = True
+                finished.append(job_id)
+                if not quiet:
+                    console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
+            elif status in FAILURE_STATES:
+                self.unknown_streaks[job_id] = 0
+                self.dispatcher._forward_log(job, self.log_positions)
+                job.failure_reason = f"Slurm 状态: {status}"
+                self.results[job_id] = False
+                finished.append(job_id)
+                if not quiet:
+                    console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败: {status}")
+            elif status == "UNKNOWN":
+                self.unknown_streaks[job_id] += 1
+                if self.unknown_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
+                    self.dispatcher._cancel_for_monitor_failure(
+                        job,
+                        status="UNKNOWN_TIMEOUT",
+                        reason="状态连续未知，已停止监控并尝试取消远端任务",
+                    )
+                    self.results[job_id] = False
+                    finished.append(job_id)
+            else:
+                self.unknown_streaks[job_id] = 0
+                if status in RUNNING_STATES:
+                    self.running_since.setdefault(job_id, now)
+                if job_id in self.running_since:
+                    self.dispatcher._forward_log(job, self.log_positions)
+                    if now - self.running_since[job_id] > self.run_timeout:
+                        self.dispatcher._cancel_for_monitor_failure(
+                            job,
+                            status="RUN_TIMEOUT",
+                            reason=f"运行超过 {self.run_timeout} 秒",
+                        )
+                        self.results[job_id] = False
+                        finished.append(job_id)
+                        continue
+                elif now - job.submitted_at > self.queue_timeout:
+                    self.dispatcher._cancel_for_monitor_failure(
+                        job,
+                        status="QUEUE_TIMEOUT",
+                        reason=f"排队超过 {self.queue_timeout} 秒",
+                    )
+                    self.results[job_id] = False
+                    finished.append(job_id)
+                    continue
+                if not quiet:
+                    console.print(f"[dim][Monitor][/] Scene {job.scene_id}: {status}")
+
+        for job_id in finished:
+            self.pending.pop(job_id, None)
+        return bool(finished)
+
+
 class SlurmDispatcher:
     """Slurm 任务调度器。"""
 
@@ -298,10 +420,12 @@ class SlurmDispatcher:
         return True
 
     @staticmethod
+    @staticmethod
     def _normalize_state(raw: str) -> str:
         return raw.strip().split()[0].upper() if raw.strip() else "UNKNOWN"
 
-    def _check_final_status(self, job_id: str) -> str:
+    @staticmethod
+    def _check_final_status(job_id: str) -> str:
         sacct = shutil.which("sacct")
         if not sacct:
             return "UNKNOWN"

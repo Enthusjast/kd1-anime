@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
 import re
+import threading
+import time
 from uuid import uuid4
 
 from rich.console import Console
@@ -20,6 +23,7 @@ from kd1_anime.exceptions import (
     LLMResponseError,
     PipelineAbortedError,
     PipelineExhaustedError,
+    PipelineError,
     RenderError,
     RunError,
     RunIntegrityError,
@@ -40,7 +44,13 @@ from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.planner import PlannerAgent, SceneOutline, ScenePlan
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewResult
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
-from kd1_anime.cluster.slurm import FAILURE_STATES, MONITOR_ABORT_STATES, SlurmDispatcher, SlurmJob
+from kd1_anime.cluster.slurm import (
+    FAILURE_STATES,
+    MONITOR_ABORT_STATES,
+    JobMonitor,
+    SlurmDispatcher,
+    SlurmJob,
+)
 from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.media.merger import VideoMerger
 from kd1_anime.run_store import (
@@ -48,6 +58,7 @@ from kd1_anime.run_store import (
     RunManifest,
     RunRepository,
     StoredSceneState,
+    get_reusable_video_path,
     lock_run,
     restore_run_path,
     restore_slurm_job,
@@ -293,6 +304,10 @@ class SceneState:
     give_up: bool = False
     failed: bool = False
     failure_reason: str = ""
+    # 导演分镜是否已完成(区别于占位 plan)。场景独立推进时据此判断下一步。
+    plan_ready: bool = False
+    # Reviewer major 反馈待重写时暂存; 调度器据此把场景重新排入编码阶段。
+    rewrite_feedback: str = ""
 
     reviewed: bool = False
 
@@ -330,12 +345,18 @@ class Orchestrator:
         self._callback: Callback | None = None
         self._ctx: PipelineContext | None = None
         self._manifest: RunManifest | None = None
+        # 场景级并行调度时多个工作线程会并发写 manifest, 需要串行化
+        self._manifest_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._phase_lock = threading.Lock()
+        self._emitted_phases: set[str] = set()
 
     def _emit(self, event: str, **data) -> None:
         if self._callback:
             self._callback(event, data)
 
     def cancel_all(self) -> None:
+        self._stop_event.set()
         if not self._ctx:
             return
         for state in self._ctx.scene_states.values():
@@ -414,6 +435,8 @@ class Orchestrator:
                 give_up=scene.give_up,
                 failed=scene.failed,
                 failure_reason=scene.failure_reason,
+                plan_ready=scene.plan_ready,
+                rewrite_feedback=scene.rewrite_feedback,
             )
         manifest = RunManifest(
             run_id=ctx.paths.run_id,
@@ -432,8 +455,9 @@ class Orchestrator:
             incremental=ctx.incremental,
             base_run_id=ctx.base_run_id,
         )
-        write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
-        self._manifest = manifest
+        with self._manifest_lock:
+            write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
+            self._manifest = manifest
 
     @staticmethod
     def _context_from_manifest(manifest: RunManifest, root: Path) -> PipelineContext:
@@ -475,6 +499,8 @@ class Orchestrator:
                 give_up=stored.give_up,
                 failed=stored.failed,
                 failure_reason=stored.failure_reason,
+                plan_ready=getattr(stored, "plan_ready", False),
+                rewrite_feedback=getattr(stored, "rewrite_feedback", ""),
             )
         return PipelineContext(
             user_prompt=manifest.user_prompt,
@@ -649,7 +675,13 @@ class Orchestrator:
             key_moments=["由用户提供的代码定义"],
             computation="由用户提供的代码定义",
         )
-        scene_state = SceneState(plan=plan, code=source_code, class_name=class_name)
+        scene_state = SceneState(
+            plan=plan,
+            code=source_code,
+            class_name=class_name,
+            plan_ready=True,
+            reviewed=True,
+        )
         ctx = PipelineContext(
             user_prompt=prompt,
             paths=paths,
@@ -796,21 +828,47 @@ class Orchestrator:
 
     def _execute(self, ctx: PipelineContext, state: State) -> Path | None:
         try:
-            while state not in {State.DONE, State.ERROR}:
-                self._checkpoint(ctx, state)
-                state = {
-                    State.INIT: self._handle_init,
-                    State.PLANNING: self._handle_planning,
-                    State.DETAILING: self._handle_detailing,
-                    State.CODING: self._handle_coding,
-                    State.REVIEWING: self._handle_reviewing,
-                    State.DISPATCHING: self._handle_dispatching,
-                    State.MONITORING: self._handle_monitoring,
-                    State.FIXING: self._handle_fixing,
-                    State.MERGING: self._handle_merging,
-                    State.EVALUATING: self._handle_evaluating,
-                }[state](ctx)
-                self._checkpoint(ctx, state)
+            # ---- 准备: 目录 + 全局概要 (仅全新运行; resume 已从清单加载) ----
+            if not ctx.scene_states:
+                self._handle_init(ctx)
+                self._plan_outline(ctx)
+                ctx.scene_states = {
+                    outline.scene_id: SceneState(plan=self._placeholder_plan(outline))
+                    for outline in ctx.outlines
+                }
+                self._emit("plan_complete", scenes=ctx.scenes)
+            elif ctx.scenes:
+                # resume 等已有 scene_states 的入口: 补发 plan_complete 供 TUI 表格展示
+                self._emit(
+                    "plan_complete",
+                    scenes=[
+                        state.plan
+                        for state in sorted(
+                            ctx.scene_states.values(), key=lambda s: s.plan.scene_id
+                        )
+                    ],
+                )
+
+            # ---- 场景级并行调度主循环 ----
+            improve = True
+            while improve:
+                self._run_scheduler(ctx)
+                if ctx.dry_run:
+                    break
+                self._merge(ctx)
+                improve = self._eval(ctx)
+
+            # ---- 收尾 ----
+            if ctx.dry_run:
+                self._checkpoint(ctx, State.DONE, status="dry_run_complete")
+                self._emit("dry_run_complete", run_dir=str(ctx.paths.root))
+                return None
+            if ctx.final_video is None:
+                message = "流水线结束但没有最终视频"
+                self._checkpoint(ctx, State.ERROR, status="failed", error=message)
+                raise RuntimeError(message)
+            self._checkpoint(ctx, State.DONE, status="completed")
+            return ctx.final_video
         except KeyboardInterrupt:
             self.cancel_all()
             try:
@@ -825,26 +883,6 @@ class Orchestrator:
             except Exception as checkpoint_error:
                 console.print(f"[yellow]写入失败清单失败: {checkpoint_error}[/]", markup=False)
             raise
-
-        if state == State.ERROR:
-            reasons = [
-                f"Scene {sid}: {ss.failure_reason or '未完成'}"
-                for sid, ss in ctx.scene_states.items()
-                if not ss.rendered
-            ]
-            message = "流水线未能完成。\n" + "\n".join(reasons)
-            self._checkpoint(ctx, state, status="failed", error=message)
-            raise RuntimeError(message)
-        if ctx.dry_run:
-            self._checkpoint(ctx, State.DONE, status="dry_run_complete")
-            self._emit("dry_run_complete", run_dir=str(ctx.paths.root))
-            return None
-        if ctx.final_video is None:
-            message = "流水线结束但没有最终视频"
-            self._checkpoint(ctx, State.ERROR, status="failed", error=message)
-            raise RuntimeError(message)
-        self._checkpoint(ctx, State.DONE, status="completed")
-        return ctx.final_video
 
     def _handle_init(self, ctx: PipelineContext) -> State:
         for directory in (
@@ -1659,3 +1697,569 @@ class Orchestrator:
             # 评估失败不阻塞流程
         
         return State.DONE
+
+    # ------------------------------------------------------------------
+    # 场景级并行调度 (per-scene pipeline)
+    # 每个 Scene 独立推进 分镜→编码→审查→提交→渲染→修复, 互不等待。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _placeholder_plan(outline: SceneOutline) -> ScenePlan:
+        """由概要构造占位 ScenePlan (detail 完成前使用)。"""
+        return ScenePlan(
+            scene_id=outline.scene_id,
+            title=outline.title,
+            duration_seconds=outline.duration_seconds,
+            purpose=outline.purpose,
+            math_concept=outline.math_concept,
+            visual_design="…",
+            camera_movement="…",
+            visual_flow=["…"],
+            key_moments=["…"],
+            computation="…",
+        )
+
+    def _plan_outline(self, ctx: PipelineContext) -> None:
+        """全局场景概要 (一次); 带交互重试。"""
+        while True:
+            try:
+                outlines = self.planner.plan_outline(ctx.user_prompt)
+                break
+            except LLMError as exc:
+                logger.error(f"LLM 调用失败: {exc}")
+                if not self._ask_retry_or_skip(0, str(exc)):
+                    raise LLMResponseError(
+                        f"场景概要规划失败: {exc}",
+                        hint="检查 LLM API 配置和网络连接",
+                    ) from exc
+            except Exception as exc:
+                logger.error(f"场景概要规划时发生未知错误: {exc}")
+                if not self._ask_retry_or_skip(0, str(exc)):
+                    raise PipelineError(f"场景概要规划失败: {exc}") from exc
+        ctx.outlines = outlines
+        ctx.scenes = [self._placeholder_plan(o) for o in outlines]
+        if len(outlines) > settings.MAX_SCENES:
+            raise RuntimeError(
+                f"Planner 生成了 {len(outlines)} 个场景，超过 MAX_SCENES={settings.MAX_SCENES}"
+            )
+
+    # ------------------------------------------------------------------
+    # 场景级并行调度 (per-scene pipeline)
+    # 每个 Scene 一个工作线程, 独立推进 分镜→编码→审查→提交→渲染→修复。
+    # LLM 并发受 LLM_PARALLEL_WORKERS 信号量限制; 提交受 SLURM_MAX_IN_FLIGHT 名额限制。
+    # ------------------------------------------------------------------
+
+    def _run_scheduler(self, ctx: PipelineContext) -> None:
+        """启动每个场景的独立流水线线程, 全部结束后返回。"""
+        import threading
+
+        self._llm_sem = threading.Semaphore(max(1, settings.LLM_PARALLEL_WORKERS))
+        self._slot_lock = threading.Lock()
+        self._in_flight = 0
+        self._manifest_lock = threading.Lock()
+        self._stop_event.clear()
+        with self._phase_lock:
+            self._emitted_phases.clear()
+
+        threads: list[threading.Thread] = []
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            if state.rendered or state.failed or state.give_up:
+                continue
+            thread = threading.Thread(
+                target=self._scene_worker,
+                args=(ctx, scene_id, state),
+                name=f"scene-{scene_id}",
+                daemon=True,
+            )
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def _scene_worker(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        """单个 Scene 的完整流水线: 分镜→编码→审查→提交→渲染→(修复→重新提交)。"""
+        acquired = False
+        try:
+            if self._stop_event.is_set():
+                return
+            # 1) 分镜
+            if not state.plan_ready:
+                self._phase_emit("detailing")
+                self._scene_detail(ctx, scene_id, state)
+                if state.failed or state.give_up:
+                    return
+            # 2) 编码 + 审查循环 (直到审查通过)
+            while not state.reviewed:
+                if self._stop_event.is_set() or state.failed or state.give_up:
+                    return
+                if not state.code or state.rewrite_feedback:
+                    self._phase_emit("coding")
+                    self._scene_code(ctx, scene_id, state)
+                    if state.failed or state.give_up:
+                        return
+                self._phase_emit("reviewing")
+                self._scene_review(ctx, scene_id, state)
+            # 3) dry-run: 不提交渲染
+            if ctx.dry_run:
+                return
+            # 4) 提交 + 渲染循环 (直到渲染成功/失败/放弃)
+            while not state.rendered:
+                if self._stop_event.is_set() or state.failed or state.give_up:
+                    return
+                if state.slurm_job is None:
+                    if not acquired:
+                        if not self._try_acquire_slot():
+                            time.sleep(settings.MONITOR_POLL_INTERVAL)
+                            continue
+                        acquired = True
+                    self._scene_submit(ctx, scene_id, state)
+                    if state.slurm_job is None:
+                        # 提交失败 → 释放名额
+                        self._release_slot()
+                        acquired = False
+                        return
+                ok = self._scene_wait_render(ctx, state)
+                if ok:
+                    return
+                if state.failed or state.give_up:
+                    return
+                # 渲染失败 → 修复后重新提交 (名额保留)
+                self._scene_fix(ctx, scene_id, state)
+        except Exception as exc:
+            self._mark_failed(state, f"Scene {scene_id} 流水线异常: {exc}")
+            self._emit("scene_failed", scene_id=scene_id, reason=str(exc))
+        finally:
+            # 无论成功/失败/异常, 都要释放 in-flight 名额, 避免其他场景死等
+            if acquired:
+                self._release_slot()
+            if not self._stop_event.is_set():
+                # 检查点失败不应让工作线程崩溃 (可能导致 join 永久等待)
+                with suppress(Exception):
+                    self._checkpoint(ctx, State.MONITORING)
+
+    def _try_acquire_slot(self) -> bool:
+        limit = settings.SLURM_MAX_IN_FLIGHT
+        with self._slot_lock:
+            if limit and self._in_flight >= limit:
+                return False
+            self._in_flight += 1
+            return True
+
+    def _release_slot(self) -> None:
+        with self._slot_lock:
+            self._in_flight = max(0, self._in_flight - 1)
+
+    def _phase_emit(self, stage: str) -> None:
+        """每个阶段只发一次 stage_start (线程安全), 供 TUI/仪表盘显示阶段标题。"""
+        with self._phase_lock:
+            if stage in self._emitted_phases:
+                return
+            self._emitted_phases.add(stage)
+        self._emit("stage_start", stage=stage)
+
+    def _scene_detail(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        with self._llm_sem:
+            outline = next(o for o in ctx.outlines if o.scene_id == scene_id)
+            plan = PlannerAgent().plan_detail(
+                outline, ctx.outlines, ctx.user_prompt, stream=False
+            )
+        state.plan = plan
+        state.plan_ready = True
+        self._checkpoint(ctx, State.DETAILING)
+        self._emit("scene_detailed", scene_id=scene_id, title=plan.title)
+
+    def _scene_code(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        with self._llm_sem:
+            code, class_name = self._generate_validated_code(
+                state.plan,
+                feedback=state.rewrite_feedback or "",
+                previous_code=state.code if state.rewrite_feedback else "",
+                stream=False,
+            )
+        state.code = code
+        state.class_name = class_name
+        state.rewrite_feedback = ""
+        path = ctx.paths.scenes / f"scene_{scene_id}.py"
+        self._write_private(path, code)
+        self._checkpoint(ctx, State.CODING)
+        self._emit("scene_coded", scene_id=scene_id, file_path=str(path))
+        self._apply_incremental_for_scene(ctx, scene_id, state)
+
+    def _scene_review(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        if settings.SKIP_REVIEW:
+            state.reviewed = True
+            return
+        with self._llm_sem:
+            result = ReviewerAgent().review(state.code, state.plan)
+        self._apply_review_result(ctx, scene_id, state, result)
+
+    def _scene_submit(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        self._phase_emit("dispatching")
+        source_path = ctx.paths.scenes / f"scene_{scene_id}.py"
+        try:
+            on_disk_code = source_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            self._mark_failed(state, f"提交前无法读取场景代码: {exc}")
+            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+            return
+        if on_disk_code != state.code:
+            self._mark_failed(state, "提交前代码一致性校验失败：磁盘文件已在流水线外被修改")
+            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+            return
+        validation = self._validate(on_disk_code)
+        if not validation.is_valid:
+            self._mark_failed(state, "提交前校验失败:\n" + validation.feedback)
+            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+            return
+        state.class_name = validation.scene_classes[0]
+        try:
+            state.slurm_job = self.slurm.submit_scene(
+                scene_id,
+                source_path,
+                state.class_name,
+                scenes_dir=ctx.paths.scenes,
+                logs_dir=ctx.paths.logs,
+                videos_dir=ctx.paths.videos,
+            )
+            self._checkpoint(ctx, State.DISPATCHING)
+            self._emit(
+                "scene_submitted",
+                scene_id=scene_id,
+                job_id=state.slurm_job.job_id,
+            )
+        except Exception as exc:
+            self._mark_failed(state, f"Slurm 提交失败: {exc}")
+            self._checkpoint(ctx, State.DISPATCHING)
+            self._emit("scene_failed", scene_id=scene_id, reason=str(exc))
+
+    def _scene_wait_render(self, ctx: PipelineContext, state: SceneState) -> bool:
+        """阻塞轮询当前作业直到结束; 返回是否渲染成功。"""
+        job = state.slurm_job
+        if job is None:
+            return False
+        self._phase_emit("monitoring")
+        monitor = JobMonitor(self.slurm)
+        monitor.add_job(job)
+        while monitor.pending:
+            if monitor.poll_once():
+                break
+            time.sleep(settings.MONITOR_POLL_INTERVAL)
+        ok = monitor.results.get(job.job_id)
+        if ok is None:
+            state.give_up = True
+            state.failure_reason = "渲染作业状态未知，已放弃"
+            return False
+        if ok:
+            state.rendered = True
+            self._emit("scene_rendered", scene_id=job.scene_id)
+            return True
+        if not ctx.auto_fix:
+            self._mark_failed(state, job.failure_reason or f"Slurm 状态: {job.status}")
+        elif job.status not in FIXABLE_RENDER_STATES:
+            state.give_up = True
+            state.failure_reason = (
+                job.failure_reason or f"基础设施失败，不修改代码: {job.status}"
+            )
+        self._emit(
+            "scene_failed",
+            scene_id=job.scene_id,
+            reason=job.failure_reason or f"Slurm 状态: {job.status}",
+        )
+        return False
+
+    def _scene_fix(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        self._phase_emit("fixing")
+        job = state.slurm_job
+        if job is None:
+            return
+        if state.fix_attempts >= settings.MAX_FIX_ATTEMPTS:
+            state.give_up = True
+            state.failure_reason = "达到最大渲染修复次数"
+            self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
+            return
+        error_log = self.slurm.get_error_log(job=job)
+        if not error_log:
+            state.give_up = True
+            state.failure_reason = "渲染失败且没有错误日志"
+            self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
+            return
+        if self.auto_fixer.is_infrastructure_error(error_log):
+            state.give_up = True
+            state.failure_reason = "检测到环境或 Slurm 配置错误，未让 LLM 重写业务代码"
+            self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
+            return
+        state.fix_attempts += 1
+        self._emit(
+            "scene_fixing",
+            scene_id=scene_id,
+            attempt=state.fix_attempts,
+            max_attempts=settings.MAX_FIX_ATTEMPTS,
+        )
+        with self._llm_sem:
+            candidate = self.auto_fixer.fix(state.code, error_log)
+            validation = self._validate(candidate)
+            if not validation.is_valid:
+                candidate, class_name = self._generate_validated_code(
+                    state.plan,
+                    feedback=(
+                        "AutoFix 结果未通过确定性校验：\n"
+                        f"{validation.feedback}\n\n原始渲染错误：\n{error_log}"
+                    ),
+                    previous_code=candidate,
+                    stream=False,
+                )
+            else:
+                class_name = validation.scene_classes[0]
+        state.code = candidate
+        state.class_name = class_name
+        state.review_round = 0
+        state.slurm_job = None
+        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
+        self._checkpoint(ctx, State.FIXING)
+
+    def _apply_review_result(self, ctx: PipelineContext, scene_id: int, state: SceneState, result: ReviewResult) -> bool:
+        """应用单场景审查结果 (mirror _handle_reviewing 的单场景逻辑)。"""
+        if result.is_valid:
+            state.review_round = 0
+            state.reviewed = True
+            self._checkpoint(ctx, State.REVIEWING)
+            self._emit("scene_review_pass", scene_id=scene_id)
+            return True
+
+        state.review_round += 1
+        original_feedback = result.feedback or ""
+        fix_details = "\n".join(
+            f"- [{fix.reason}] {fix.find!r} → {fix.replace!r}" for fix in result.fixes
+        )
+
+        if state.review_round >= settings.MAX_REVIEW_ROUNDS:
+            state.give_up = True
+            state.failure_reason = "达到最大审查轮次，代码仍未通过"
+            self._checkpoint(ctx, State.REVIEWING)
+            self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
+            return True
+
+        if result.severity == "minor":
+            candidate = state.code
+            applied_count = 0
+            for fix in result.fixes:
+                if candidate.count(fix.find) == 1 or fix.find in candidate:
+                    candidate = candidate.replace(fix.find, fix.replace, 1)
+                    applied_count += 1
+            validation = self._validate(candidate) if applied_count > 0 else None
+            if validation and validation.is_valid:
+                state.code = candidate
+                state.class_name = validation.scene_classes[0]
+                self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
+                self._checkpoint(ctx, State.REVIEWING)
+                self._emit("scene_review_fail", scene_id=scene_id, severity="minor")
+                return True
+            # minor 修复失败 → 升级为 major, 保留原始反馈
+            result = ReviewResult(
+                is_valid=False,
+                severity="major",
+                feedback=(
+                    f"## Reviewer 审查意见（minor 修复未能全部应用）\n{original_feedback}\n\n"
+                    f"## 修复建议详情\n{fix_details}\n\n"
+                    f"## 确定性校验\n{validation.feedback if validation else '未生成有效代码'}"
+                ),
+            )
+
+        # major → 排队重写 (下一轮调度进入编码阶段)
+        state.rewrite_feedback = (
+            f"## Reviewer 审查意见\n{original_feedback}\n\n"
+            f"## 需修复的问题\n{fix_details}\n\n"
+            f"请根据以上反馈逐项修正代码，保留正确部分，只修复指出的问题。"
+        )
+        self._checkpoint(ctx, State.REVIEWING)
+        self._emit("scene_review_fail", scene_id=scene_id, severity="major")
+        return True
+
+    def _apply_incremental_for_scene(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        """增量渲染: 单场景代码就绪后判断是否可复用旧视频。"""
+        if not ctx.incremental or not ctx.base_manifest or not ctx.base_run_id:
+            return
+        base_scene = ctx.base_manifest.scenes.get(scene_id)
+        if base_scene is None:
+            ctx.scenes_to_render.append(scene_id)
+            return
+        if base_scene.rendered and sha256_text(state.code) == base_scene.code_sha256:
+            base_root = RunRepository(settings.WORKSPACE_DIR).run_root(ctx.base_run_id)
+            old_video = get_reusable_video_path(ctx.base_manifest, scene_id, base_root)
+            if old_video:
+                state.rendered = True
+                state.slurm_job = SlurmJob(
+                    job_id=f"reused-{scene_id}",
+                    scene_id=scene_id,
+                    script_path=ctx.paths.scenes / f"scene_{scene_id}.py",
+                    log_out=ctx.paths.logs / f"scene_{scene_id}_reused.out",
+                    log_err=ctx.paths.logs / f"scene_{scene_id}_reused.err",
+                    media_dir=old_video.parent,
+                    scene_class_name=base_scene.class_name,
+                    submitted_at=0,
+                    status="REUSED",
+                )
+                ctx.scenes_to_reuse.append(scene_id)
+                self._emit("scene_reused", scene_id=scene_id)
+                return
+        ctx.scenes_to_render.append(scene_id)
+
+    def _merge(self, ctx: PipelineContext) -> None:
+        """合并所有已渲染场景; 失败条件直接抛错 (mirror _handle_merging)。"""
+        self._emit("stage_start", stage="merging")
+        rendered_jobs = [
+            state.slurm_job
+            for state in ctx.scene_states.values()
+            if state.rendered and state.slurm_job
+        ]
+        incomplete = [sid for sid, state in ctx.scene_states.items() if not state.rendered]
+        if not rendered_jobs:
+            raise RuntimeError("流水线未能完成。\n没有场景成功渲染")
+        if incomplete and not settings.ALLOW_PARTIAL_OUTPUT:
+            for sid in incomplete:
+                state = ctx.scene_states[sid]
+                if not state.failure_reason:
+                    state.failure_reason = "场景未成功渲染"
+            reasons = "\n".join(
+                f"Scene {sid}: {ctx.scene_states[sid].failure_reason or '未完成'}"
+                for sid in incomplete
+            )
+            self._emit("partial_output_blocked", incomplete=incomplete)
+            raise RuntimeError("流水线未能完成。\n" + reasons)
+
+        resolved_output = ctx.paths.output.expanduser().resolve()
+        output_is_run_local = resolved_output == ctx.paths.root.resolve() or (
+            ctx.paths.root.resolve() in resolved_output.parents
+        )
+        # 评估-改进循环的第二次合并必须强制重新拼接, 不能复用上一轮的旧视频
+        force_remerge = getattr(ctx, "eval_round", 0) > 0
+        if (
+            output_is_run_local
+            and resolved_output.is_file()
+            and resolved_output.stat().st_size > 0
+            and not settings.OVERWRITE_OUTPUT
+            and not force_remerge
+        ):
+            ctx.final_video = resolved_output
+        else:
+            if ctx.incremental and ctx.base_manifest and ctx.base_run_id:
+                base_root = RunRepository(settings.WORKSPACE_DIR).run_root(ctx.base_run_id)
+                video_paths = self.merger.collect_incremental_videos(
+                    ctx.scene_states,
+                    ctx.paths.root,
+                    ctx.base_manifest,
+                    base_root,
+                )
+                ctx.final_video = self.merger.merge(video_paths, ctx.paths.output)
+            else:
+                ctx.final_video = self.merger.merge_jobs(
+                    rendered_jobs,
+                    output_path=ctx.paths.output,
+                )
+        self._checkpoint(ctx, State.MERGING)
+        self._emit(
+            "merge_complete",
+            path=str(ctx.final_video),
+            size_mb=ctx.final_video.stat().st_size / (1024 * 1024),
+            partial=bool(incomplete),
+            incomplete=incomplete,
+        )
+
+    def _eval(self, ctx: PipelineContext) -> bool:
+        """评估最终视频; 返回 True 表示触发改进 (需要重新调度低分场景)。"""
+        if not settings.ENABLE_AUTO_EVAL:
+            return False
+        self._emit("stage_start", stage="evaluating")
+        eval_round = getattr(ctx, "eval_round", 0)
+        if eval_round >= settings.MAX_EVAL_ROUNDS:
+            self._emit(
+                "eval_max_rounds_reached",
+                rounds=eval_round,
+                max_rounds=settings.MAX_EVAL_ROUNDS,
+            )
+            return False
+        try:
+            from kd1_anime.eval import Evaluator
+
+            evaluator = Evaluator(enable_visual_eval=settings.ENABLE_VISUAL_EVAL)
+            if not (ctx.final_video and ctx.final_video.exists()):
+                self._emit("eval_skipped", reason="no_final_video")
+                return False
+
+            code_scores = []
+            scene_eval_results: dict[int, object] = {}
+            for scene_id, state in ctx.scene_states.items():
+                if state.code:
+                    code_result = evaluator.evaluate_code(state.code)
+                    code_scores.append(code_result)
+                    scene_eval_results[scene_id] = code_result
+
+            avg_code_score = (
+                sum(r.overall_score for r in code_scores) / len(code_scores)
+                if code_scores
+                else 0
+            )
+            visual_score = 5.0
+            if settings.ENABLE_VISUAL_EVAL:
+                screenshot_paths = list(ctx.paths.root.glob("**/*.png"))
+                if screenshot_paths:
+                    try:
+                        visual_result = evaluator.evaluate_visual(
+                            screenshot_paths[0],
+                            ctx.original_prompt or "Mathematical animation",
+                        )
+                        visual_score = visual_result.overall_score
+                    except Exception as e:
+                        self._emit("visual_eval_failed", error=str(e))
+
+            overall_score = (avg_code_score + visual_score) / 2
+            self._emit(
+                "eval_complete",
+                overall_score=overall_score,
+                code_score=avg_code_score,
+                visual_score=visual_score,
+                threshold=settings.EVAL_THRESHOLD,
+            )
+
+            from kd1_anime.eval.metrics import EvalResult
+
+            eval_result = EvalResult(
+                run_id=ctx.paths.run_id,
+                summary=f"Auto-evaluation: {overall_score:.2f}/5.00",
+            )
+            eval_result.save(ctx.paths.root / "eval_result.json")
+
+            if overall_score >= settings.EVAL_THRESHOLD:
+                self._emit(
+                    "eval_passed",
+                    score=overall_score,
+                    threshold=settings.EVAL_THRESHOLD,
+                )
+                return False
+
+            self._emit(
+                "eval_below_threshold",
+                score=overall_score,
+                threshold=settings.EVAL_THRESHOLD,
+                action="triggering_improvement",
+            )
+            ctx.eval_round = eval_round + 1
+            low_score_scenes = [
+                scene_id
+                for scene_id, scene_eval in scene_eval_results.items()
+                if scene_eval.overall_score < settings.EVAL_THRESHOLD  # type: ignore[attr-defined]
+            ]
+            ctx.scenes_to_improve = low_score_scenes
+            for scene_id in low_score_scenes:
+                state = ctx.scene_states[scene_id]
+                state.rendered = False
+                state.reviewed = False
+                state.code = ""
+                state.class_name = ""
+                state.slurm_job = None
+                state.fix_attempts = 0
+                state.rewrite_feedback = ""
+            return True
+        except Exception as e:
+            self._emit("eval_error", error=str(e))
+            return False
