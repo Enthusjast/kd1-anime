@@ -174,7 +174,8 @@ def _ensure_tex_template_param(code: str, template_var: str) -> str:
         return code
 
     lines = code.split("\n")
-    lines_to_fix: set[int] = set()  # 0-indexed
+    lines_to_fix: set[int] = set()
+    _lines_list: list[int] = []  # 0-indexed
 
     for node in _ast.walk(tree):
         if not isinstance(node, _ast.Call):
@@ -194,19 +195,43 @@ def _ensure_tex_template_param(code: str, template_var: str) -> str:
     if not lines_to_fix:
         return code
 
-    for idx in sorted(lines_to_fix):
+    fix_list = sorted(lines_to_fix)  # 转为有序列表，便于处理插入后的偏移
+    for idx in fix_list:
         line = lines[idx]
         stripped = line.rstrip()
-        # 简单情况: Tex(...) 或 MathTex(...) 在同一行，以 ) 结尾
+        # 单行调用: Tex(...) 或 MathTex(...) 在同一行，以 ) 结尾
         if stripped.endswith(")"):
             before = stripped[:-1].rstrip()
             if before.endswith("("):
                 lines[idx] = stripped[:-1] + f"{template_var}={template_var})"
             else:
                 lines[idx] = stripped[:-1] + f", {template_var}={template_var})"
-        # 多行调用: 在行尾添加参数（不完美的启发式，但比不修复好）
+        # 多行调用: 找到对应的闭合括号行，在最后一个参数后添加
         else:
-            lines[idx] = stripped + f"  # TODO: 需添加 {template_var}={template_var}"
+            # 从当前行向下扫描，找到深度匹配的 ) 所在行
+            depth = 0
+            target_line_idx = idx
+            for j in range(idx, len(lines)):
+                target_line = lines[j]
+                depth += target_line.count("(") - target_line.count(")")
+                if depth <= 0 and j > idx:
+                    target_line_idx = j
+                    break
+            # 在闭合行前插入 tex_template 参数
+            close_line = lines[target_line_idx]
+            if close_line.strip() == ")":
+                indent = close_line[: len(close_line) - len(close_line.lstrip())]
+                lines.insert(target_line_idx, f"{indent}    {template_var}={template_var},")
+                # 修正后续待修复行的行号偏移
+                for k, orig_idx in enumerate(fix_list):
+                    if orig_idx > target_line_idx:
+                        fix_list[k] += 1
+            else:
+                # 闭合行与其他参数同行，直接插入
+                before_close = close_line.rstrip()[:-1].rstrip()
+                lines[target_line_idx] = (
+                    before_close + f", {template_var}={template_var}" + close_line.rstrip()[-1:]
+                )
 
     return "\n".join(lines)
 
