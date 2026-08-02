@@ -69,6 +69,7 @@ def test_stream_is_closed_when_iteration_fails():
 
 def test_empty_json_mode_response_falls_back_to_prompt_only(monkeypatch):
     monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
     monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
     calls = []
 
@@ -100,6 +101,7 @@ def test_empty_json_mode_response_falls_back_to_prompt_only(monkeypatch):
 
 def test_empty_non_stream_response_falls_back_to_silent_stream(monkeypatch):
     monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
     monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
     calls = []
 
@@ -151,6 +153,7 @@ def test_empty_non_stream_response_falls_back_to_silent_stream(monkeypatch):
 
 def test_length_stop_reports_token_limit_without_compatibility_retries(monkeypatch):
     monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
     monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
     calls = []
 
@@ -172,6 +175,6 @@ def test_length_stop_reports_token_limit_without_compatibility_retries(monkeypat
             return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
     with pytest.raises(RuntimeError, match="max_tokens"):
-        LimitedAgent().call_llm(json_mode=True)
+        LimitedAgent().call_llm(json_mode=True, max_tokens=4096)
 
     assert len(calls) == 1

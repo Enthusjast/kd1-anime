@@ -381,6 +381,7 @@ class Orchestrator:
                     if scene.slurm_job
                     else None
                 ),
+                reviewed=scene.reviewed,
                 rendered=scene.rendered,
                 give_up=scene.give_up,
                 failed=scene.failed,
@@ -441,6 +442,7 @@ class Orchestrator:
                 review_round=stored.review_round,
                 fix_attempts=stored.fix_attempts,
                 slurm_job=job,
+                reviewed=stored.reviewed,
                 rendered=stored.rendered,
                 give_up=stored.give_up,
                 failed=stored.failed,
@@ -1543,7 +1545,7 @@ class Orchestrator:
             if ctx.final_video and ctx.final_video.exists():
                 # 评估代码质量（存储每个场景的评估结果以便后续复用）
                 code_scores = []
-                scene_eval_results: dict[int, object] = {}
+                scene_eval_results: dict[int, EvalResult] = {}
                 for scene_id, state in ctx.scene_states.items():
                     if state.code:
                         code_result = evaluator.evaluate_code(state.code)

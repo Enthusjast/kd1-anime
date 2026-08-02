@@ -60,6 +60,7 @@ class StoredSceneState(BaseModel):
     class_name: str = Field(default="", max_length=200)
     review_round: int = Field(default=0, ge=0)
     fix_attempts: int = Field(default=0, ge=0)
+    reviewed: bool = False
     slurm_job: StoredSlurmJob | None = None
     rendered: bool = False
     give_up: bool = False
@@ -284,17 +285,19 @@ def compute_scene_changes(
     to_reuse = []
     
     for scene_id in sorted(new_scenes.keys()):
+        new_plan = new_scenes[scene_id]
         old_scene = old_manifest.scenes.get(scene_id)
         if old_scene is None:
             # 新场景，需要渲染
             to_render.append(scene_id)
-        elif old_scene.rendered and old_scene.code_sha256:
-            # 旧场景已渲染且有代码 hash
-            # 这里我们假设代码 hash 已经在 orchestrator 中计算过
-            # 实际比较在 orchestrator 中进行
+        elif not old_scene.rendered or not old_scene.code_sha256:
+            # 旧场景未渲染或无 hash，需要渲染
+            to_render.append(scene_id)
+        elif old_scene.plan == new_plan:
+            # 计划完全相同，代码不变，可以复用
             to_reuse.append(scene_id)
         else:
-            # 旧场景未渲染或无 hash，需要渲染
+            # 计划变化，需要重新生成和渲染
             to_render.append(scene_id)
     
     return {"to_render": to_render, "to_reuse": to_reuse}
