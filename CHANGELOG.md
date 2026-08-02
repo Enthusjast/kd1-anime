@@ -152,3 +152,71 @@
   - 添加 `collect_incremental_videos()` 方法
   - 支持从不同 run 目录收集视频
 
+
+### 新增 - 评估系统
+
+- **多维度评估模块** (`src/kd1_anime/eval/`)：
+  - `metrics.py`: 评估指标和数据结构定义
+    - `EvalMetric` 枚举：代码质量、视觉效果、生成效率指标
+    - `QualityScore`: 质量评分数据类 (1-5分)
+    - `EvalResult`: 评估结果，支持几何平均分计算
+    - `ComparisonResult`: 运行对比结果
+  - `prompts.py`: LLM 评估提示词模板
+    - 代码质量评估提示词
+    - 视觉效果评估提示词
+    - 渲染结果分析提示词
+    - 场景复杂度评估提示词
+  - `code_eval.py`: 代码质量评估器
+    - AST 语法分析
+    - 安全性检查 (禁止模块、危险函数)
+    - 复杂度计算
+    - 风格检查
+  - `visual_eval.py`: 视觉效果评估器
+    - LLM 截图分析
+    - 多帧合并评估
+    - 视觉相关性、质量、一致性、布局评分
+  - `evaluator.py`: 主评估器
+    - 整合代码和视觉评估
+    - 批量评估支持
+    - 运行对比功能
+    - 评估报告生成
+
+- **CLI evaluate 命令**：
+  - 评估完整运行: `kd1-anime evaluate <run-id>`
+  - 评估代码: `kd1-anime evaluate --code "..."` 或 `--code-file scene.py`
+  - 评估截图: `kd1-anime evaluate --image screenshot.png`
+  - 对比运行: `kd1-anime evaluate <run-id> --compare <baseline-id>`
+  - 支持 JSON 输出: `--json`
+  - 支持保存报告: `--output report.json`
+
+- **测试**：
+  - `tests/test_eval.py`: 评估模块完整测试
+
+### 新增 - 自评估-自改进循环
+
+- **FSM 状态扩展**：
+  - 新增 `EVALUATING` 状态，位于 `MERGING` 之后
+  - 评估完成后根据分数决定是否进入改进循环
+
+- **自动评估-改进流程**：
+  ```
+  MERGING → EVALUATING → (分数达标) → DONE
+                      → (分数不达标) → CODING → ... → MERGING → EVALUATING
+  ```
+  - 最多循环 `MAX_EVAL_ROUNDS` 次
+  - 只重新生成低分场景的代码
+  - 保留高分场景的代码和渲染结果
+
+- **新增配置项**：
+  - `ENABLE_AUTO_EVAL`: 是否启用自动评估-改进循环 (默认 False)
+  - `ENABLE_VISUAL_EVAL`: 是否启用视觉效果评估 (默认 False)
+  - `EVAL_THRESHOLD`: 评估通过阈值 1-5 (默认 3.5)
+  - `MAX_EVAL_ROUNDS`: 最大评估-改进轮数 (默认 2)
+  - `EVAL_VISUAL_MODEL`: 视觉评估使用的模型
+
+- **TUI 事件支持**：
+  - `eval_complete`: 评估完成，显示分数
+  - `eval_below_threshold`: 分数低于阈值，触发改进
+  - `eval_improvement_mode`: 进入改进模式
+  - `eval_passed`: 评估通过
+  - `eval_max_rounds_reached`: 达到最大轮数

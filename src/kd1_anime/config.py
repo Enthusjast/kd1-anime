@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Optional, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -96,6 +96,32 @@ class Settings(BaseSettings):
     MAX_REVIEW_ROUNDS: int = Field(default=3, ge=1, le=10)
     MAX_FIX_ATTEMPTS: int = Field(default=3, ge=0, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=6, ge=1, le=20)
+    
+    # --- 自动评估配置 ---
+    ENABLE_AUTO_EVAL: bool = Field(
+        default=False,
+        description="是否启用自动评估-改进循环"
+    )
+    ENABLE_VISUAL_EVAL: bool = Field(
+        default=False,
+        description="是否启用视觉效果评估（需要 LLM 支持多模态）"
+    )
+    EVAL_THRESHOLD: float = Field(
+        default=3.5,
+        ge=1.0,
+        le=5.0,
+        description="评估通过阈值（1-5分），低于此分数触发改进"
+    )
+    MAX_EVAL_ROUNDS: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="最大评估-改进轮数"
+    )
+    EVAL_VISUAL_MODEL: Optional[str] = Field(
+        default=None,
+        description="视觉评估使用的模型（默认使用 LLM_MODEL）"
+    )
     MAX_SCENES: int = Field(default=12, ge=1, le=100)
     MAX_PROMPT_CHARS: int = Field(default=50_000, ge=100, le=1_000_000)
     MAX_LOG_CHARS: int = Field(default=30_000, ge=1_000, le=1_000_000)
