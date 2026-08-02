@@ -12,6 +12,7 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "config.tex_template" in REVIEWER_SYSTEM_PROMPT
     assert "E 类问题一律不阻塞" in REVIEWER_SYSTEM_PROMPT
     assert "fixes 必须可匹配" in REVIEWER_SYSTEM_PROMPT
+    assert "相对定位" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_severity_is_closed_enum():

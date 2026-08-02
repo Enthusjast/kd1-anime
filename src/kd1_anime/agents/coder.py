@@ -143,6 +143,36 @@ config.tex_template = tex_template
 - 颜色编码遵循分镜: 已知=BLUE, 结果=GREEN, 高亮=YELLOW, 错误=RED
 - run_time 与分镜预估时长大致吻合, 不要出现整段 wait(0) 或动画戛然而止
 
+## 空间布局约束 (强制)
+- 默认画面约 [-7, 7] × [-4, 4] (16:9); 所有对象必须完整落在画面内, 不得越界
+- 优先使用相对定位: `.next_to()`, `.to_edge()`, `.to_corner()`, `.move_to(ORIGIN)`, `VGroup.arrange()`
+- 避免硬编码绝对坐标; 对象之间必须保持间距, 不得重叠
+- 长公式/长文本注意字号与换行, 防止溢出画面
+
+## 代码骨架模板 (按此结构编写, 可扩展)
+```python
+from manim import *
+
+class Scene1(Scene):
+    def construct(self):
+        # ---- 强制模板: XeLaTeX + ctex ----
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        tex_template.add_to_preamble(r"\usepackage{ctex}")
+        config.tex_template = tex_template
+
+        # ---- Stage 1: 构建元素 (相对定位, 不越界) ----
+        title = Tex(r"标题", tex_template=tex_template).to_edge(UP)
+        formula = MathTex(r"a^2 + b^2 = c^2", tex_template=tex_template)
+        formula.next_to(title, DOWN, buff=0.8)
+        self.add(title, formula)
+
+        # ---- Stage 2: 动画 (先 add 再 play, 控制 run_time) ----
+        self.play(Write(title), run_time=1)
+        self.play(Create(formula), run_time=1.5)
+        self.wait(1)
+```
+注意: 以上只是结构示意, 实际内容按导演分镜扩展; 类名保持唯一, 无 __main__, TexTemplate 不可省略。
+
 ## 输出前自查清单 (逐条确认后再输出)
 - [ ] 恰好一个继承 Scene/ThreeDScene/MovingCameraScene 的类
 - [ ] 无 if __name__ == "__main__"
