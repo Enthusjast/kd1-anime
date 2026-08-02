@@ -20,167 +20,6 @@ ALLOWED_IMPORT_ROOTS = {
 }
 
 # 明确禁止的模块 - 这些模块可能提供危险能力
-BANNED_IMPORT_MODULES = {
-    "os",
-    "sys",
-    "shutil",
-    "subprocess",
-    "socket",
-    "http",
-    "urllib",
-    "requests",
-    "logging",
-    "ctypes",
-    "importlib",
-    "pickle",
-    "shelve",
-    "marshal",
-    "code",
-    "codeop",
-    "compile",
-    "compileall",
-    "ast",  # 生成的代码不应使用 ast 模块
-    "dis",
-    "inspect",
-    "gc",
-    "weakref",
-    "signal",
-    "threading",
-    "multiprocessing",
-    "concurrent",
-    "asyncio",
-    "pathlib",
-    "glob",
-    "fnmatch",
-    "tempfile",
-    "io",
-    "abc",
-    "dataclasses",
-    "typing",
-    "enum",
-    "copy",
-    "pprint",
-    "reprlib",
-    "decimal",
-    "fractions",
-    "statistics",
-    "random",
-    "secrets",
-    "hashlib",
-    "hmac",
-    "base64",
-    "binascii",
-    "struct",
-    "codecs",
-    "unicodedata",
-    "stringprep",
-    "re",
-    "difflib",
-    "textwrap",
-    "string",
-    "datetime",
-    "calendar",
-    "collections",
-    "heapq",
-    "bisect",
-    "array",
-    "weakref",
-    "types",
-    "copyreg",
-    "pprint",
-    "reprlib",
-    "enum",
-    "graphlib",
-    "contextlib",
-    "abc",
-    "atexit",
-    "traceback",
-    "linecache",
-    "tokenize",
-    "keyword",
-    "token",
-    "symbol",
-    "parser",
-    "ast",
-    "symtable",
-    "keyword",
-    "token",
-    "symbol",
-    "parser",
-    "tokenize",
-    "linecache",
-    "traceback",
-    "atexit",
-    "contextlib",
-    "abc",
-    "graphlib",
-    "enum",
-    "types",
-    "copyreg",
-    "weakref",
-    "array",
-    "bisect",
-    "heapq",
-    "collections",
-    "calendar",
-    "datetime",
-    "string",
-    "textwrap",
-    "difflib",
-    "re",
-    "unicodedata",
-    "codecs",
-    "struct",
-    "binascii",
-    "base64",
-    "hmac",
-    "hashlib",
-    "secrets",
-    "random",
-    "statistics",
-    "fractions",
-    "decimal",
-    "reprlib",
-    "pprint",
-    "copy",
-    "enum",
-    "typing",
-    "dataclasses",
-    "abc",
-    "io",
-    "tempfile",
-    "fnmatch",
-    "glob",
-    "pathlib",
-    "asyncio",
-    "concurrent",
-    "multiprocessing",
-    "threading",
-    "signal",
-    "weakref",
-    "gc",
-    "inspect",
-    "dis",
-    "compileall",
-    "compile",
-    "codeop",
-    "code",
-    "marshal",
-    "shelve",
-    "pickle",
-    "importlib",
-    "ctypes",
-    "logging",
-    "requests",
-    "urllib",
-    "http",
-    "socket",
-    "subprocess",
-    "shutil",
-    "sys",
-    "os",
-}
-
 BANNED_CALLS = {
     "eval",
     "exec",
@@ -332,6 +171,16 @@ class _SafetyVisitor(ast.NodeVisitor):
         ):
             self.error(node, f"禁止调用属性方法 {node.func.attr}()")
 
+        # 检查 add_to_preamble 调用并提取模板变量名
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "add_to_preamble":
+            # 检查是否加载了 ctex
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and "ctex" in str(arg.value):
+                    # 提取调用对象的变量名
+                    if isinstance(node.func.value, ast.Name):
+                        self.ctex_templates.add(node.func.value.id)
+                    break
+
         # 检查 Tex/MathTex 调用
         if isinstance(node.func, ast.Name) and node.func.id in TEX_MOBJECTS:
             template_keyword = next(
@@ -360,6 +209,38 @@ class _SafetyVisitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr.startswith("__"):
             self.error(node, f"禁止访问双下划线属性 {node.attr}")
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        # 检查 TexTemplate 赋值: tex_template = TexTemplate(tex_compiler='xelatex', ...)
+        if (len(node.targets) == 1 and 
+            isinstance(node.targets[0], ast.Name) and 
+            isinstance(node.value, ast.Call)):
+            func_name = ""
+            if isinstance(node.value.func, ast.Name):
+                func_name = node.value.func.id
+            elif isinstance(node.value.func, ast.Attribute):
+                func_name = node.value.func.attr
+            if func_name == "TexTemplate":
+                # 检查是否使用 xelatex 编译器
+                for kw in node.value.keywords:
+                    if kw.arg == "tex_compiler" and isinstance(kw.value, ast.Constant):
+                        if kw.value.value == "xelatex":
+                            self.xelatex_templates.add(node.targets[0].id)
+                        break
+        
+        # 检查 config.tex_template = ... 赋值
+        if len(node.targets) == 1:
+            target = node.targets[0]
+            if (isinstance(target, ast.Attribute) and 
+                target.attr == "tex_template" and
+                isinstance(target.value, ast.Name) and 
+                target.value.id == "config"):
+                # 找到被赋值的模板变量名
+                if isinstance(node.value, ast.Name):
+                    self.configured_templates.add(node.value.id)
+        
+        # 允许类属性赋值（已在 visit_ClassDef 中检查）
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:

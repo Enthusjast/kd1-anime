@@ -321,8 +321,13 @@ class ChatSession:
         banner.append("    ║\n", style="bold cyan")
         banner.append("  ╚═══════════════════════════════════════╝", style="bold cyan")
         console.print(banner)
+        
+        # 显示当前模型
+        model_name = settings.LLM_MODEL or "未配置"
+        console.print(f"  模型: [dim]{model_name}[/]")
+        
         console.print(
-            "  输入你想制作的数学动画描述,我会帮你生成.\n  输入 [bold cyan]quit[/] 退出.\n",
+            "\n  输入你想制作的数学动画描述,我会帮你生成.\n  输入 [bold cyan]quit[/] 退出.\n",
         )
 
     def _get_initial_prompt(self) -> str | None:
