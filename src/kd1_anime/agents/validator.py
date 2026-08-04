@@ -9,6 +9,8 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 
+from kd1_anime.config import settings
+
 ALLOWED_IMPORT_ROOTS = {
     "manim",
     "math",
@@ -298,10 +300,29 @@ class _SafetyVisitor(ast.NodeVisitor):
             )
             if construct is None:
                 self.error(node, f"Scene 类 {node.name!r} 缺少 construct() 方法")
-            # self.camera.frame 只在 MovingCameraScene 中可用
-            # (manim 0.20 普通 Camera / OpenGL 的 OpenGLCamera 都没有 frame 属性)
-            if "MovingCameraScene" not in bases and construct is not None:
-                for frame_node in _find_camera_frame_access(construct):
+            # self.camera.frame 检查: 扫描整个类体 (含辅助方法, 不只是 construct)。
+            # - OpenGL 渲染器固定使用 OpenGLCamera (没有 frame 属性), 继承
+            #   MovingCameraScene 也无效 → 一律禁止相机运镜, 必须删除。
+            # - Cairo 渲染器下 frame 仅在 MovingCameraScene 中可用。
+            frame_access = _find_camera_frame_access(node)
+            renderer = getattr(settings, "MANIM_RENDERER", "cairo")
+            if renderer == "opengl":
+                if "MovingCameraScene" in bases:
+                    self.error(
+                        node,
+                        "本项目使用 OpenGL 渲染器 (OpenGLCamera 没有 frame 属性), "
+                        "MovingCameraScene 的相机运镜不可用。请删除所有相机移动代码, "
+                        "改用静态布局 (next_to/to_edge/arrange) 或 Transform 动画",
+                    )
+                for frame_node in frame_access:
+                    self.error(
+                        frame_node,
+                        "OpenGL 渲染器 (OpenGLCamera) 没有 frame 属性, 禁止使用 "
+                        "self.camera.frame / 相机运镜。请删除所有相关代码 (含辅助方法), "
+                        "改用静态布局 (next_to/to_edge/arrange) 或 Transform 动画",
+                    )
+            elif "MovingCameraScene" not in bases:
+                for frame_node in frame_access:
                     self.error(
                         frame_node,
                         "self.camera.frame 只在 MovingCameraScene 中可用；"

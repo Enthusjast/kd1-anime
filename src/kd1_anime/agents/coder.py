@@ -31,8 +31,8 @@ class MyScene(Scene):
 ## 常用场景类型
 - `Scene`: 默认 2D, 相机不可缩放/平移
 - `ThreeDScene`: 3D 场景, 用 self.set_camera_orientation(...) 控制视角
-- `MovingCameraScene`: 可缩放/平移镜头, 通过 self.camera.frame.animate 操作
-  (self.camera.frame 只在 MovingCameraScene 中可用, 普通 Scene 没有 frame)
+- `MovingCameraScene`: ⚠️ 本项目用 OpenGL 渲染, OpenGLCamera 没有 frame 属性,
+  不要使用 MovingCameraScene / self.camera.frame 运镜
 
 ## 常用动画
 ```python
@@ -45,7 +45,7 @@ self.play(ReplacementTransform(a, b))  # 替换变换
 self.play(obj.animate.shift(RIGHT))    # 移动
 self.play(obj.animate.scale(2))        # 缩放
 self.play(obj.animate.set_color(RED))  # 变色
-self.play(self.camera.frame.animate.scale(0.5))  # 仅 MovingCameraScene 推近
+# ⚠️ 本项目 OpenGL 渲染下禁止 camera.frame 运镜; 用 Transform / 静态布局代替
 ```
 所有 self.play(...) 的对象必须先 self.add(...) 加入场景; 已被 FadeOut /
 ReplacementTransform 移除的对象不要继续动画或引用。
@@ -126,13 +126,12 @@ config.tex_template = tex_template
 13. 修改/重写代码时保持 Scene 类名不变, 除非明确要求改名
 
 ## ⚠️ 相机与画面缩放 (高频错误)
-- `self.camera.frame` **只在 `MovingCameraScene` 中可用**。普通 `Scene` 的相机
-  (Cairo 的 `Camera` / OpenGL 的 `OpenGLCamera`) **没有 frame 属性**，
-  使用 `self.camera.frame.set(...)` 或 `self.camera.frame.animate...` 会直接
-  AttributeError 崩溃。
-- 需要推近/缩放/平移镜头时: 让类继承 `MovingCameraScene` (可配合
-  `self.play(self.camera.frame.animate.scale(...))`)。
-- 不需要移动镜头时: 直接用普通 `Scene`, 不要碰 self.camera.frame。
+- **本项目以 OpenGL 渲染 (OpenGLCamera 没有 frame 属性)**。`self.camera.frame`
+  无论是否继承 `MovingCameraScene` 都不可用, 使用会直接 AttributeError 崩溃。
+- **禁止**使用 `self.camera.frame` / `camera.frame` / 继承 `MovingCameraScene` /
+  任何相机运镜代码 (含辅助方法里)。
+- 需要"推近/平移"的视觉效果时: 用静态布局 (`next_to` / `to_edge` / `arrange` /
+  `move_to`) 或 `Transform` / 局部缩放动画表达, 不要碰相机。
 
 ## ⚠️ 特别注意：TexTemplate 是强制要求
 如果你的代码包含任何 Tex 或 MathTex，但没有正确配置 TexTemplate，代码将无法通过校验！
@@ -226,8 +225,8 @@ class MyScene(Scene):
 ## 常用场景类型
 - `Scene`: 默认 2D, 相机不可缩放/平移
 - `ThreeDScene`: 3D 场景, 用 self.set_camera_orientation(...) 控制视角
-- `MovingCameraScene`: 可缩放/平移镜头, 通过 self.camera.frame.animate 操作
-  (self.camera.frame 只在 MovingCameraScene 中可用, 普通 Scene 没有 frame)
+- `MovingCameraScene`: ⚠️ 本项目用 OpenGL 渲染, OpenGLCamera 没有 frame 属性,
+  不要使用 MovingCameraScene / self.camera.frame 运镜
 
 ## 常用动画
 ```python
@@ -240,7 +239,7 @@ self.play(ReplacementTransform(a, b))  # 替换变换
 self.play(obj.animate.shift(RIGHT))    # 移动
 self.play(obj.animate.scale(2))        # 缩放
 self.play(obj.animate.set_color(RED))  # 变色
-self.play(self.camera.frame.animate.scale(0.5))  # 仅 MovingCameraScene 推近
+# ⚠️ 本项目 OpenGL 渲染下禁止 camera.frame 运镜; 用 Transform / 静态布局代替
 ```
 所有 self.play(...) 的对象必须先 self.add(...) 加入场景; 已被 FadeOut /
 ReplacementTransform 移除的对象不要继续动画或引用。
