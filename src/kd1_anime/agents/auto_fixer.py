@@ -118,6 +118,18 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
 - 确保系统安装了对应字体
 - 英文用 `Text("Hello")` 即可,无需指定字体
 
+### 11. IndexError / 下标越界 (高频)
+**症状**: `IndexError: list index out of range`, 报错行通常是 `xxx[0]` / `xxx[1]` / `parts[i]`
+**原因**: 对 split / get_part_by_tex / get_parts_by_tex / VGroup 分组的返回结果直接取下标,
+        而实际元素数少于预期 (如 `"a+b".split("+")` 只得到 1 段, 或 TeX 子串不存在返回空)
+**修复**:
+- 定位被索引的容器 `xxx`, 先确认它的元素数量是否可能 < 下标+1
+- 字符串分隔: 分隔结果可能只有 1 段时, 不要直接访问 `[1]`; 用变量接收并 `len()` 判断
+- manim 子串: `get_part_by_tex(...)` / `get_parts_by_tex(...)` 在子串不存在时返回空,
+  访问前先 `if parts:` 判空, 或用 `VGroup(...).arrange()` 逐个摆放
+- 不要凭空假设一定有第二个元素; 用循环、显式长度检查或备选路径
+- 保持分镜的数学内容与视觉设计不变, 只修复取值方式
+
 ## 修复原则
 
 1. **最小改动**: 只修复导致错误的部分,不要重构代码
@@ -240,6 +252,12 @@ class AutoFixerAgent(BaseAgent):
             return "内存不足 (OOM) — 减少同时存在的对象数量，简化动画效果"
         elif "recursion" in log_lower:
             return "递归错误 — 检查 updater 是否创建了循环引用"
+        elif "indexerror" in log_lower or "list index out of range" in log_lower:
+            return (
+                "下标越界 (IndexError) — 对 split / get_part_by_tex / get_parts_by_tex "
+                "或 VGroup 分组的返回结果直接取下标 [0]/[1] 未判空。"
+                "先确认容器实际元素数量, 访问前判断 len() 或改用遍历, 不要凭空假设存在第二个元素"
+            )
         elif "pango" in log_lower or "font" in log_lower:
             return "字体错误 — 检查 Text() 的 font 参数和系统字体安装"
         else:
