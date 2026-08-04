@@ -502,7 +502,8 @@ class BaseAgent:
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError as first_error:
-                repaired = self._fix_latex_escapes_in_json(json_str)
+                repaired = self._escape_control_chars_in_json(json_str)
+                repaired = self._fix_latex_escapes_in_json(repaired)
                 try:
                     data = json.loads(repaired)
                 except json.JSONDecodeError as error:
@@ -590,7 +591,8 @@ class BaseAgent:
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError as first_error:
-                repaired = self._fix_latex_escapes_in_json(json_str)
+                repaired = self._escape_control_chars_in_json(json_str)
+                repaired = self._fix_latex_escapes_in_json(repaired)
                 try:
                     data = json.loads(repaired)
                 except json.JSONDecodeError as error:
@@ -751,6 +753,44 @@ class BaseAgent:
 
             i += 1
 
+        return "".join(result)
+
+    @staticmethod
+    def _escape_control_chars_in_json(json_str: str) -> str:
+        """
+        修复 JSON 字符串内部的裸控制字符 (未转义的换行/制表符/回车等).
+
+        LLM 在长中文 JSON 输出里常把 prompt 等长字符串直接写成多行,
+        而合法 JSON 字符串内不允许出现 ord<0x20 的裸控制字符,
+        json.loads 会报 "Invalid control character"。逐个扫描, 在字符串内部
+        把裸控制字符替换为 \\uXXXX 转义; 引号/反斜杠转义结构保持不变。
+        """
+        result: list[str] = []
+        in_string = False
+        escape = False
+        for ch in json_str:
+            if in_string:
+                if escape:
+                    result.append(ch)
+                    escape = False
+                    continue
+                if ch == "\\":
+                    result.append(ch)
+                    escape = True
+                    continue
+                if ch == '"':
+                    result.append(ch)
+                    in_string = False
+                    continue
+                if ord(ch) < 0x20:
+                    result.append(f"\\u{ord(ch):04x}")
+                    continue
+                result.append(ch)
+                continue
+            # 字符串外
+            if ch == '"':
+                in_string = True
+            result.append(ch)
         return "".join(result)
 
     @staticmethod

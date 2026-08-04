@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from typing import Literal
 
@@ -300,3 +301,19 @@ def test_json_list_schema_error_retries_then_recovers():
 
     assert [r.value for r in result] == [1, 2]
     assert agent.calls == 2
+
+
+def test_escape_control_chars_in_json_repairs_raw_newlines():
+    """JSON 字符串内的裸换行/制表符 → 修复为 \\uXXXX 后仍能正确解析。"""
+    raw = '{"prompt": "第一行\n第二行\t制表"}'
+    repaired = BaseAgent._escape_control_chars_in_json(raw)
+    data = json.loads(repaired)
+    assert data["prompt"] == "第一行\n第二行\t制表"
+
+
+def test_escape_control_chars_in_json_keeps_valid_escapes():
+    """合法的 \\n / \\t / \\" / \\\\ 转义不应被重复转义。"""
+    escaped = '{"prompt": "a\\nb\\t\\"c\\" \\\\d"}'
+    repaired = BaseAgent._escape_control_chars_in_json(escaped)
+    data = json.loads(repaired)
+    assert data["prompt"] == 'a\nb\t"c" \\d'
