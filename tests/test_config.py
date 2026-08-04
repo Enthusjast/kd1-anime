@@ -106,6 +106,6 @@ def test_max_fix_attempts_default_and_upper_bound():
 
 def test_max_fix_identical_errors_default():
     config = Settings(_env_file=None)
-    assert config.MAX_FIX_IDENTICAL_ERRORS == 2
+    assert config.MAX_FIX_IDENTICAL_ERRORS == 3
     with pytest.raises(ValueError):
         Settings(_env_file=None, MAX_FIX_IDENTICAL_ERRORS=0)
