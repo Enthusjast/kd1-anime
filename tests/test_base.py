@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel
@@ -222,3 +223,80 @@ def test_length_empty_raises_only_after_retries_exhausted(monkeypatch):
     # 1 次补充 max_tokens (不消耗业务重试) + LLM_MAX_RETRIES 次业务重试
     assert len(calls) == 2
     assert calls[1]["max_tokens"] == max(4096 * 2, settings.LLM_EMPTY_RETRY_MAX_TOKENS)
+
+
+def test_json_schema_error_retries_then_recovers():
+    """结构化输出不合规 (如 severity='none') → 带错误反馈重试, 重试成功返回解析结果。"""
+
+    class SevModel(BaseModel):
+        is_valid: bool
+        severity: Literal["info", "minor", "major"]
+
+    class RepairAgent(BaseAgent):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.last_user_message = ""
+
+        def call_llm(self, **kwargs):
+            self.calls += 1
+            self.last_user_message = kwargs.get("user_message", "")
+            if self.calls == 1:
+                return '{"is_valid": true, "severity": "none"}'
+            return '{"is_valid": true, "severity": "info"}'
+
+    agent = RepairAgent()
+    result = agent.call_llm_json("system", "user", SevModel)
+
+    assert result.is_valid is True
+    assert result.severity == "info"
+    assert agent.calls == 2
+    assert "未通过结构校验" in agent.last_user_message
+
+
+def test_json_schema_error_raises_after_repair_attempts(monkeypatch):
+    """持续不合规 → 修复重试耗尽后仍抛错 (不无限循环, 不零重试判死)。"""
+    monkeypatch.setattr(settings, "LLM_JSON_REPAIR_ATTEMPTS", 1)
+
+    class SevModel(BaseModel):
+        is_valid: bool
+        severity: Literal["info", "minor", "major"]
+
+    class RepairAgent(BaseAgent):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def call_llm(self, **kwargs):
+            self.calls += 1
+            return '{"is_valid": true, "severity": "none"}'
+
+    agent = RepairAgent()
+    with pytest.raises(RuntimeError, match="输出不符合预期结构"):
+        agent.call_llm_json("system", "user", SevModel)
+
+    assert agent.calls == 2  # 1 次初始 + LLM_JSON_REPAIR_ATTEMPTS 次修复
+
+
+def test_json_list_schema_error_retries_then_recovers():
+    """列表项不合规 → 带错误反馈重试后成功。"""
+
+    class ItemModel(BaseModel):
+        value: int
+
+    class RepairListAgent(BaseAgent):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def call_llm(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return '{"items": [{"value": 1}, {"value": "bad"}]}'
+            return '{"items": [{"value": 1}, {"value": 2}]}'
+
+    agent = RepairListAgent()
+    result = agent.call_llm_json_list("system", "user", ItemModel)
+
+    assert [r.value for r in result] == [1, 2]
+    assert agent.calls == 2

@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # 空响应重试时补上的 max_tokens 兜底值：推理模型常把输出预算耗尽在思考上，
     # 导致 content 为空；补足预算后重试可避免反复拿到空响应。
     LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=16384, ge=1024, le=65536)
+    # 结构化 JSON 输出未通过 Pydantic 校验时, 带错误反馈重试的次数 (0=关闭)。
+    # 模型偶尔会返回不合规的枚举值/缺字段 (如 severity="none"), 直接判死整个
+    # 场景太浪费; 把校验错误喂回模型重试, 通常一次即可修正。
+    LLM_JSON_REPAIR_ATTEMPTS: int = Field(default=2, ge=0, le=5)
 
     @field_validator("LLM_MAX_TOKENS", mode="before")
     @classmethod

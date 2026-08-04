@@ -473,6 +473,10 @@ class BaseAgent:
         """
         调用 LLM 并将响应解析为 Pydantic 模型
 
+        输出未通过 JSON / Pydantic 结构校验时, 会带错误反馈重试
+        (次数由 LLM_JSON_REPAIR_ATTEMPTS 控制), 避免一次输出不合规
+        (如枚举值写错、缺字段) 就杀死整个场景。
+
         Args:
             system_prompt: 系统提示词
             user_message: 用户消息
@@ -482,50 +486,79 @@ class BaseAgent:
         """
         temp = 0.0 if temperature is None else temperature
 
-        raw = self.call_llm(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            temperature=temp,
-            json_mode=True,
-            stream=stream,
-        )
+        repair_attempts = max(0, int(getattr(settings, "LLM_JSON_REPAIR_ATTEMPTS", 2)))
+        current_message = user_message
 
-        json_str = self._extract_json(raw)
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError as first_error:
-            repaired = self._fix_latex_escapes_in_json(json_str)
-            try:
-                data = json.loads(repaired)
-            except json.JSONDecodeError as error:
-                self._log_panel(
-                    "JSON 解析失败",
-                    f"原始响应:\n{raw}\n\n修复后:\n{repaired}\n\n错误: {error}",
-                    style="red",
-                )
-                raise RuntimeError(f"[{self.name}] LLM 返回了无效的 JSON: {first_error}") from error
-
-        # 修正常见拼写错误
-        if isinstance(data, dict):
-            typo_map = {
-                "key_momens": "key_moments",
-                "key_moment": "key_moments",
-                "visual_desgin": "visual_design",
-                "camera_movment": "camera_movement",
-                "visual_flwo": "visual_flow",
-                "computaiton": "computation",
-            }
-            data = {typo_map.get(k, k): v for k, v in data.items()}
-        
-        try:
-            return response_model.model_validate(data)
-        except ValidationError as e:
-            self._log_panel(
-                "Pydantic 校验失败",
-                f"JSON 数据:\n{json.dumps(data, ensure_ascii=False, indent=2)}\n\n错误: {e}",
-                style="red",
+        for attempt in range(repair_attempts + 1):
+            raw = self.call_llm(
+                system_prompt=system_prompt,
+                user_message=current_message,
+                temperature=temp,
+                json_mode=True,
+                stream=stream,
             )
-            raise RuntimeError(f"[{self.name}] LLM 输出不符合预期结构: {e}") from e
+
+            json_str = self._extract_json(raw)
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as first_error:
+                repaired = self._fix_latex_escapes_in_json(json_str)
+                try:
+                    data = json.loads(repaired)
+                except json.JSONDecodeError as error:
+                    if attempt >= repair_attempts:
+                        self._log_panel(
+                            "JSON 解析失败",
+                            f"原始响应:\n{raw}\n\n修复后:\n{repaired}\n\n错误: {error}",
+                            style="red",
+                        )
+                        raise RuntimeError(
+                            f"[{self.name}] LLM 返回了无效的 JSON: {first_error}"
+                        ) from error
+                    current_message = self._append_repair_hint(
+                        current_message,
+                        f"上一次输出无法解析为 JSON:\n{raw[-2000:]}",
+                    )
+                    self._log(
+                        f"JSON 解析失败, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
+                        style="yellow",
+                    )
+                    continue
+
+            # 修正常见拼写错误
+            if isinstance(data, dict):
+                typo_map = {
+                    "key_momens": "key_moments",
+                    "key_moment": "key_moments",
+                    "visual_desgin": "visual_design",
+                    "camera_movment": "camera_movement",
+                    "visual_flwo": "visual_flow",
+                    "computaiton": "computation",
+                }
+                data = {typo_map.get(k, k): v for k, v in data.items()}
+
+            try:
+                return response_model.model_validate(data)
+            except ValidationError as e:
+                if attempt >= repair_attempts:
+                    self._log_panel(
+                        "Pydantic 校验失败",
+                        f"JSON 数据:\n{json.dumps(data, ensure_ascii=False, indent=2)}\n\n错误: {e}",
+                        style="red",
+                    )
+                    raise RuntimeError(f"[{self.name}] LLM 输出不符合预期结构: {e}") from e
+                current_message = self._append_repair_hint(
+                    current_message,
+                    f"上一次输出未通过结构校验:\n"
+                    f"{json.dumps(data, ensure_ascii=False, indent=2)}\n\n校验错误: {e}",
+                )
+                self._log(
+                    f"输出结构不合规, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
+                    style="yellow",
+                )
+
+        # 理论不可达 (循环内要么 return 要么 raise)
+        raise RuntimeError(f"[{self.name}] LLM 输出不符合预期结构")
 
     def call_llm_json_list(
         self,
@@ -538,58 +571,129 @@ class BaseAgent:
         调用 LLM 并将响应解析为 Pydantic 模型列表
 
         期望 LLM 返回 {"items": [...]} 或直接返回 [...]
+        输出未通过结构校验时带错误反馈重试 (LLM_JSON_REPAIR_ATTEMPTS)。
         """
         temp = 0.0 if temperature is None else temperature
 
-        raw = self.call_llm(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            temperature=temp,
-            json_mode=True,
+        repair_attempts = max(0, int(getattr(settings, "LLM_JSON_REPAIR_ATTEMPTS", 2)))
+        current_message = user_message
+
+        for attempt in range(repair_attempts + 1):
+            raw = self.call_llm(
+                system_prompt=system_prompt,
+                user_message=current_message,
+                temperature=temp,
+                json_mode=True,
+            )
+
+            json_str = self._extract_json(raw)
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as first_error:
+                repaired = self._fix_latex_escapes_in_json(json_str)
+                try:
+                    data = json.loads(repaired)
+                except json.JSONDecodeError as error:
+                    if attempt >= repair_attempts:
+                        raise RuntimeError(
+                            f"[{self.name}] LLM 返回了无效的 JSON: {first_error}"
+                        ) from error
+                    current_message = self._append_repair_hint(
+                        current_message,
+                        f"上一次输出无法解析为 JSON:\n{raw[-2000:]}",
+                    )
+                    self._log(
+                        f"JSON 解析失败, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
+                        style="yellow",
+                    )
+                    continue
+
+            # 支持 {"items": [...]} 或直接 [...]
+            if isinstance(data, dict) and "items" in data:
+                items_data = data["items"]
+            elif isinstance(data, list):
+                items_data = data
+            else:
+                if attempt >= repair_attempts:
+                    raise RuntimeError(
+                        f"[{self.name}] 期望 JSON 列表或 {{'items': [...]}}, 收到: {type(data)}"
+                    )
+                current_message = self._append_repair_hint(
+                    current_message,
+                    f"上一次输出不是 JSON 数组, 收到: {type(data).__name__}",
+                )
+                self._log(
+                    f"输出结构不合规, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
+                    style="yellow",
+                )
+                continue
+
+            if not isinstance(items_data, list):
+                if attempt >= repair_attempts:
+                    raise RuntimeError(f"[{self.name}] items 必须是 JSON 数组")
+                current_message = self._append_repair_hint(
+                    current_message,
+                    "上一次输出的 items 字段不是 JSON 数组",
+                )
+                self._log(
+                    f"输出结构不合规, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
+                    style="yellow",
+                )
+                continue
+
+            results = []
+            validation_errors: list[str] = []
+            for i, item in enumerate(items_data):
+                try:
+                    results.append(item_model.model_validate(item))
+                except ValidationError as e:
+                    validation_errors.append(f"第 {i} 项: {e}")
+
+            if validation_errors:
+                preview = "\n".join(validation_errors[:5])
+                if attempt >= repair_attempts:
+                    raise RuntimeError(
+                        f"[{self.name}] 列表中有 {len(validation_errors)} 项未通过结构校验，"
+                        f"拒绝使用残缺结果：\n{preview}"
+                    )
+                current_message = self._append_repair_hint(
+                    current_message,
+                    f"上一次输出列表中有 {len(validation_errors)} 项未通过校验:\n{preview}",
+                )
+                self._log(
+                    f"列表项结构不合规, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
+                    style="yellow",
+                )
+                continue
+
+            if not results:
+                if attempt >= repair_attempts:
+                    raise RuntimeError(f"[{self.name}] 没有任何有效的列表项通过校验")
+                current_message = self._append_repair_hint(
+                    current_message,
+                    "上一次输出中没有有效的列表项",
+                )
+                self._log(
+                    f"列表为空, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
+                    style="yellow",
+                )
+                continue
+
+            return results
+
+        # 理论不可达
+        raise RuntimeError(f"[{self.name}] 列表解析失败")
+
+    @staticmethod
+    def _append_repair_hint(user_message: str, hint: str) -> str:
+        """把上一次的结构校验错误追加到用户消息, 引导模型修正后重试。"""
+        return (
+            f"{user_message}\n\n"
+            "## 上一次输出未通过结构校验, 请修正后重新输出\n"
+            f"{hint}\n\n"
+            "请严格按照要求的 JSON schema 重新输出: 枚举字段必须使用给定取值之一, "
+            "不得缺失必填字段, 不要包含额外字段, 只输出 JSON 本身。"
         )
-
-        json_str = self._extract_json(raw)
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError as first_error:
-            repaired = self._fix_latex_escapes_in_json(json_str)
-            try:
-                data = json.loads(repaired)
-            except json.JSONDecodeError as error:
-                raise RuntimeError(f"[{self.name}] LLM 返回了无效的 JSON: {first_error}") from error
-
-        # 支持 {"items": [...]} 或直接 [...]
-        if isinstance(data, dict) and "items" in data:
-            items_data = data["items"]
-        elif isinstance(data, list):
-            items_data = data
-        else:
-            raise RuntimeError(
-                f"[{self.name}] 期望 JSON 列表或 {{'items': [...]}}, 收到: {type(data)}"
-            )
-
-        if not isinstance(items_data, list):
-            raise RuntimeError(f"[{self.name}] items 必须是 JSON 数组")
-
-        results = []
-        validation_errors: list[str] = []
-        for i, item in enumerate(items_data):
-            try:
-                results.append(item_model.model_validate(item))
-            except ValidationError as e:
-                validation_errors.append(f"第 {i} 项: {e}")
-
-        if validation_errors:
-            preview = "\n".join(validation_errors[:5])
-            raise RuntimeError(
-                f"[{self.name}] 列表中有 {len(validation_errors)} 项未通过结构校验，"
-                f"拒绝使用残缺结果：\n{preview}"
-            )
-
-        if not results:
-            raise RuntimeError(f"[{self.name}] 没有任何有效的列表项通过校验")
-
-        return results
 
     # ------------------------------------------------------------------
     # 提取工具 (健壮版)
