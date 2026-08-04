@@ -170,7 +170,9 @@ def test_non_stream_empty_falls_back_to_silent_stream_when_silent_disabled(monke
     assert calls[1]["stream"] is True
 
 
-def test_length_stop_reports_token_limit_without_compatibility_retries(monkeypatch):
+def test_length_empty_boosts_max_tokens_then_recovers(monkeypatch):
+    # 空内容 + finish=length: 推理模型耗尽输出预算。
+    # 不应立即判死, 而应补充 max_tokens 后重试, 重试成功则返回内容。
     monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
     monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
@@ -179,14 +181,44 @@ def test_length_stop_reports_token_limit_without_compatibility_retries(monkeypat
     class FakeCompletions:
         def create(self, **kwargs):
             calls.append(kwargs.copy())
-            return iter([_chunk(finish="length")])
+            if len(calls) == 1:
+                return iter([_chunk(finish="length")])
+            return iter([_chunk('{"ok": true}', finish="stop")])
 
-    class LimitedAgent(BaseAgent):
+    class CompatibleAgent(BaseAgent):
         @property
         def client(self):
             return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
-    with pytest.raises(RuntimeError, match="max_tokens"):
-        LimitedAgent().call_llm(json_mode=True, max_tokens=4096)
+    result = CompatibleAgent().call_llm(json_mode=True, max_tokens=4096)
 
-    assert len(calls) == 1
+    assert result == '{"ok": true}'
+    assert calls[0]["max_tokens"] == 4096
+    assert calls[1]["max_tokens"] == max(4096 * 2, settings.LLM_EMPTY_RETRY_MAX_TOKENS)
+
+
+def test_length_empty_raises_only_after_retries_exhausted(monkeypatch):
+    # 补充 max_tokens 后仍持续空 + length: 走正常重试, 重试耗尽才抛错,
+    # 而不是第一次空响应就直接把整个场景判死。
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    monkeypatch.setattr(settings, "LLM_MAX_RETRIES", 1)
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs.copy())
+            return iter([_chunk(finish="length")])
+
+    class CompatibleAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    with pytest.raises(RuntimeError, match="仍然失败"):
+        CompatibleAgent().call_llm(json_mode=True, max_tokens=4096)
+
+    # 1 次补充 max_tokens (不消耗业务重试) + LLM_MAX_RETRIES 次业务重试
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] == max(4096 * 2, settings.LLM_EMPTY_RETRY_MAX_TOKENS)

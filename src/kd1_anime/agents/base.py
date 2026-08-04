@@ -168,17 +168,35 @@ class BaseAgent:
                 if not content:
                     finish = finish_reason or "stream_empty"
                     if finish == "length":
-                        max_tokens_val = kwargs.get('max_tokens')
-                        if max_tokens_val:
-                            raise RuntimeError(
-                                f"[{self.name}] LLM 输出被 max_tokens={max_tokens_val} "
-                                "截断且内容为空. 请在 .env 中增大 LLM_MAX_TOKENS (建议 8192+)."
+                        # 空内容 + length: 推理模型常把输出预算耗尽在 reasoning 上,
+                        # 导致 content 为空且 finish=length。先补足 max_tokens 重试
+                        # (不消耗业务重试), 而不是立刻把整个场景判死。
+                        if not max_tokens_boosted:
+                            max_tokens_val = kwargs.get("max_tokens")
+                            boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
+                            if max_tokens_val:
+                                boost = max(int(max_tokens_val) * 2, boost)
+                            boost = min(boost, 65536)
+                            kwargs["max_tokens"] = boost
+                            max_tokens_boosted = True
+                            self._log(
+                                f"空响应(length): 补充 max_tokens={boost} 后重试 "
+                                "(推理模型可能耗尽输出预算)",
+                                style="yellow",
                             )
-                        else:
-                            raise RuntimeError(
-                                f"[{self.name}] LLM 输出被截断且内容为空. "
-                                "请尝试简化输入或检查模型能力."
-                            )
+                            attempt -= 1  # 参数修复, 不消耗业务重试次数
+                            continue
+                        # 已补足过 max_tokens 仍为空 → 走正常重试, 重试耗尽后才报错
+                        self._log(
+                            "LLM 返回空响应(length), 将重试... "
+                            f"(max_tokens={kwargs.get('max_tokens')})",
+                            style="bold yellow",
+                        )
+                        last_error = RuntimeError("LLM 输出被截断且内容为空")
+                        if attempt < settings.LLM_MAX_RETRIES:
+                            delay = self._retry_delay(attempt, last_error)
+                            time.sleep(delay)
+                        continue
                     if json_mode and "response_format" in kwargs and not json_fallback_used:
                         self._log(
                             "端点在 response_format 模式返回空内容，"
