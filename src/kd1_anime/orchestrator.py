@@ -669,7 +669,7 @@ class Orchestrator:
         code_path = paths.scenes / f"scene_{scene_id}.py"
         self._write_private(code_path, source_code)
         prompt = f"Direct render of Scene class {class_name}"
-        self._write_private(paths.root / "prompt.txt", prompt)
+        self._write_private(paths.root / "prompt.md", prompt)
         plan = ScenePlan(
             scene_id=scene_id,
             title=f"Direct render: {class_name}",
@@ -906,7 +906,7 @@ class Orchestrator:
         ctx.paths.root.chmod(0o700)
         for directory in (ctx.paths.scenes, ctx.paths.logs, ctx.paths.videos):
             directory.chmod(0o700)
-        self._write_private(ctx.paths.root / "prompt.txt", ctx.user_prompt)
+        self._write_private(ctx.paths.root / "prompt.md", ctx.user_prompt)
         self._emit("run_started", run_id=ctx.paths.run_id, run_dir=str(ctx.paths.root))
 
         if not ctx.dry_run:

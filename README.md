@@ -146,7 +146,7 @@ kd1-anime clean --older-than 30d --yes
 
 ```text
 workspace/runs/<timestamp>-<uuid>/
-├── prompt.txt
+├── prompt.md
 ├── manifest.json         # FSM、场景状态、代码哈希和 Slurm Job ID
 ├── scenes/              # 生成的 Python 和 sbatch 脚本
 ├── logs/                # Slurm stdout/stderr
