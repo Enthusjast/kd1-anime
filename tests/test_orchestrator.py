@@ -53,6 +53,50 @@ def test_valid_review_after_rewrite_exits_review_loop(monkeypatch, tmp_path):
     assert ctx.scene_states[1].review_round == 0
 
 
+def test_resume_snapshot_emits_state_for_existing_scenes(monkeypatch, tmp_path):
+    """resume 后快照应为已渲染/进行中的场景补发事件, 避免仪表盘显示"未开始"。"""
+    events = []
+    orch = Orchestrator()
+    orch._callback = lambda event, data: events.append((event, data))
+    ctx = PipelineContext("x", paths=paths(tmp_path))
+
+    def make_state(sid, *, rendered=False, reviewed=False, coded=False):
+        p = plan()
+        p.scene_id = sid
+        p.title = f"场景{sid}"
+        return SceneState(
+            plan=p,
+            code=(
+                "from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n"
+                if coded
+                else ""
+            ),
+            class_name="Demo",
+            reviewed=reviewed,
+            rendered=rendered,
+            plan_ready=True,
+        )
+
+    ctx.scene_states = {
+        1: make_state(1, rendered=True, reviewed=True, coded=True),  # 已完成
+        2: make_state(2, reviewed=True, coded=True),        # 已审查、有代码
+        3: make_state(3),                                   # 仅分镜完成
+    }
+
+    orch._emit_scene_snapshot(ctx)
+
+    by_scene: dict[int, list[str]] = {}
+    for event, data in events:
+        by_scene.setdefault(data["scene_id"], []).append(event)
+
+    # 已渲染 → 补完整流水线 + scene_rendered (仪表盘标绿)
+    assert by_scene[1] == ["scene_detailed", "scene_coded", "scene_review_pass", "scene_rendered"]
+    # 已编码+已审查 → 按顺序补 detailed → coded → review_pass
+    assert by_scene[2] == ["scene_detailed", "scene_coded", "scene_review_pass"]
+    # 仅分镜完成 → 只补 scene_detailed
+    assert by_scene[3] == ["scene_detailed"]
+
+
 def test_run_paths_are_unique(monkeypatch, tmp_path):
     from kd1_anime.config import settings
 

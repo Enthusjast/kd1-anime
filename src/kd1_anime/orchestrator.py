@@ -859,6 +859,10 @@ class Orchestrator:
                     ],
                 )
 
+            # resume: 把已有场景的当前进度以事件补发给 TUI/仪表盘, 否则调度器
+            # 会跳过 rendered/failed 场景 (不发任何事件), 仪表盘会误显示为"未开始"。
+            self._emit_scene_snapshot(ctx)
+
             # ---- 场景级并行调度主循环 ----
             improve = True
             while improve:
@@ -1758,6 +1762,32 @@ class Orchestrator:
     # 每个 Scene 一个工作线程, 独立推进 分镜→编码→审查→提交→渲染→修复。
     # LLM 并发受 LLM_PARALLEL_WORKERS 信号量限制; 提交受 SLURM_MAX_IN_FLIGHT 名额限制。
     # ------------------------------------------------------------------
+
+    def _emit_scene_snapshot(self, ctx: PipelineContext) -> None:
+        """resume 后把已有场景的当前进度以事件形式补发给 TUI/仪表盘。
+
+        调度器只对未完成场景发事件, 已 rendered / failed / give_up 的场景会被
+        跳过, 导致仪表盘把它们显示为"未开始"。这里按清单记录的当前状态补发
+        事件, 让仪表盘恢复后立即反映真实进度。
+        """
+        for state in sorted(ctx.scene_states.values(), key=lambda s: s.plan.scene_id):
+            scene_id = state.plan.scene_id
+            # 前置阶段按实际状态补发, 让已渲染场景也显示完整流水线 (分镜✓编码✓审查✓渲染✓)
+            if state.plan_ready:
+                self._emit("scene_detailed", scene_id=scene_id, title=state.plan.title)
+            if state.code:
+                self._emit("scene_coded", scene_id=scene_id)
+            if state.reviewed:
+                self._emit("scene_review_pass", scene_id=scene_id)
+            # 终态事件
+            if state.rendered:
+                self._emit("scene_rendered", scene_id=scene_id)
+            elif state.failed:
+                self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason or "")
+            elif state.give_up:
+                self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason or "")
+            elif state.slurm_job is not None:
+                self._emit("scene_submitted", scene_id=scene_id, job_id=state.slurm_job.job_id)
 
     def _run_scheduler(self, ctx: PipelineContext) -> None:
         """启动每个场景的独立流水线线程, 全部结束后返回。"""
