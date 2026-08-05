@@ -833,6 +833,10 @@ class Orchestrator:
             }:
                 state = State.DISPATCHING
 
+            # 核对恢复的 Slurm 作业: 上次会话提交的作业可能早已结束/已不存在,
+            # 直接监控会得到连续 UNKNOWN → CANCEL_FAILED → 场景永久判死。
+            self._reconcile_restored_jobs(ctx)
+
             self._emit("run_resumed", run_id=run_id, state=state.name)
             return self._execute(ctx, state)
 
@@ -1762,6 +1766,39 @@ class Orchestrator:
     # 每个 Scene 一个工作线程, 独立推进 分镜→编码→审查→提交→渲染→修复。
     # LLM 并发受 LLM_PARALLEL_WORKERS 信号量限制; 提交受 SLURM_MAX_IN_FLIGHT 名额限制。
     # ------------------------------------------------------------------
+
+    def _reconcile_restored_jobs(self, ctx: PipelineContext) -> None:
+        """resume 时核对清单里恢复的 Slurm 作业, 避免监控失效作业导致场景判死。
+
+        中断后再次 resume, 上次会话提交的作业可能早已结束或已从集群消失;
+        若直接监控会得到连续 UNKNOWN → UNKNOWN_TIMEOUT → scancel 失败 →
+        CANCEL_FAILED ("禁止自动重提"), 场景被永久判死。这里在调度前核对:
+        - COMPLETED 且视频存在 → 直接标记渲染完成 (复用上次结果)
+        - COMPLETED 但视频缺失 → 清空, 重跑
+        - UNKNOWN (squeue/sacct 均无记录) → 作业已消失, 清空后重新提交
+        - FAILED/CANCELLED 等终态 → 保留, 交给监控触发自动修复
+        - RUNNING/PENDING → 保留, 继续监控
+        """
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            job = state.slurm_job
+            if job is None or state.rendered or state.failed or state.give_up:
+                continue
+            try:
+                status = self.slurm.poll_all_statuses([job.job_id]).get(job.job_id, "UNKNOWN")
+            except Exception:
+                continue  # 集群查询异常 → 保守保留, 交给监控处理
+            if status == "COMPLETED":
+                video = VideoMerger()._find_video_in_dir(job.media_dir, job.scene_class_name)
+                if video:
+                    state.rendered = True
+                    self._emit("scene_rendered", scene_id=scene_id)
+                else:
+                    # 假成功 (作业退出 0 但无 mp4) → 清空重跑
+                    state.slurm_job = None
+            elif status == "UNKNOWN":
+                # 作业已从集群消失 (squeue 无记录且 sacct 无账务记录):
+                # 无重复作业风险, 清空引用让场景走正常提交路径
+                state.slurm_job = None
 
     def _emit_scene_snapshot(self, ctx: PipelineContext) -> None:
         """resume 后把已有场景的当前进度以事件形式补发给 TUI/仪表盘。
