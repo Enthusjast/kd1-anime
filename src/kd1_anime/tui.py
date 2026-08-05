@@ -278,7 +278,10 @@ class ChatSession:
         
         _setup_terminal()
         try:
-            self._show_banner()
+            # 用户选择了"恢复运行"时 _show_banner 返回 True:
+            # 恢复结束 (成功或失败) 后直接退出会话, 不要落入"描述你的需求"新提示。
+            if self._show_banner():
+                return
 
             # 在构造 Agent 前检查完整的 OpenAI-compatible 配置。
             try:
@@ -328,8 +331,8 @@ class ChatSession:
         except KeyboardInterrupt:
             console.print("\n[dim]已取消[/]")
 
-    def _show_banner(self) -> None:
-        """显示欢迎横幅"""
+    def _show_banner(self) -> bool:
+        """显示欢迎横幅; 返回 True 表示用户选择了恢复运行 (会话应结束)。"""
         banner = Text()
         banner.append("  ╔═══════════════════════════════════════╗\n", style="bold cyan")
         banner.append("  ║       ", style="bold cyan")
@@ -339,20 +342,23 @@ class ChatSession:
         banner.append("    ║\n", style="bold cyan")
         banner.append("  ╚═══════════════════════════════════════╝", style="bold cyan")
         console.print(banner)
-        
+
         # 显示当前模型
         model_name = settings.LLM_MODEL or "未配置"
         console.print(f"  模型: [dim]{model_name}[/]")
 
         # 检查是否有可恢复的中断运行
-        self._check_interrupted_runs()
-        
+        resumed = self._check_interrupted_runs()
+        if resumed:
+            return True
+
         console.print(
             "\n  输入你想制作的数学动画描述,我会帮你生成.\n  输入 [bold cyan]quit[/] 退出.\n",
         )
+        return False
 
-    def _check_interrupted_runs(self) -> None:
-        """检查并提示恢复中断的运行"""
+    def _check_interrupted_runs(self) -> bool:
+        """检查并提示恢复中断的运行; 返回是否选择了恢复 (调用方据此结束会话)。"""
         try:
             from kd1_anime.run_store import RunRepository
             repository = RunRepository(settings.WORKSPACE_DIR)
@@ -402,9 +408,11 @@ class ChatSession:
                 selected = resumable[int(choice) - 1]
                 console.print(f"\n  [cyan]正在恢复运行 {selected.run_id}...[/]")
                 self._resume_run(selected.run_id)
-            
+                return True
+            return False
         except Exception as e:
             console.print(f"[dim]检查历史运行时出错: {e}[/]")
+            return False
 
     def _resume_run(self, run_id: str) -> None:
         """恢复指定的运行 (与 _run_pipeline 一样带 Live 场景仪表盘)"""
