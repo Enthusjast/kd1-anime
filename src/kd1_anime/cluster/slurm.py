@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import re
 import shlex
 import shutil
@@ -530,22 +531,20 @@ class SlurmDispatcher:
         seen: dict[str, str] = {}
         squeue_ok = False
         if squeue:
-            try:
-                result = subprocess.run(
-                    [squeue, "-j", ",".join(job_ids), "-h", "-o", "%i|%T"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
-                result = None
-            if result and result.returncode == 0:
+            result = self._run_squeue([squeue, "-j", ",".join(job_ids), "-h", "-o", "%i|%T"])
+            if result is not None and result.returncode == 0:
                 squeue_ok = True
-                for line in result.stdout.splitlines():
-                    parts = line.strip().split("|", 1)
-                    if len(parts) == 2:
-                        seen[parts[0]] = self._normalize_state(parts[1])
+                self._merge_squeue_output(result.stdout, seen)
+            else:
+                # 部分集群对"已消失的 job id"执行 squeue -j 会非零退出
+                # (例如 Invalid job id specified), 导致活跃作业无法被发现。
+                # 改用 -u 按用户名查询 (不涉及无效 id), 据此判断作业是否仍在队列。
+                uresult = self._run_squeue(
+                    [squeue, "-u", getpass.getuser(), "-h", "-o", "%i|%T"]
+                )
+                if uresult is not None and uresult.returncode == 0:
+                    squeue_ok = True
+                    self._merge_squeue_output(uresult.stdout, seen)
         out: dict[str, str] = {}
         for job_id in job_ids:
             if job_id in seen:
@@ -560,6 +559,28 @@ class SlurmDispatcher:
             else:
                 out[job_id] = "UNKNOWN"
         return out
+
+    @staticmethod
+    def _run_squeue(args: list[str]) -> subprocess.CompletedProcess | None:
+        """执行一条 squeue 查询, 超时返回 None。"""
+        try:
+            return subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+
+    @staticmethod
+    def _merge_squeue_output(stdout: str, seen: dict[str, str]) -> None:
+        """解析 `squeue -o "%i|%T"` 输出到 seen 字典。"""
+        for line in stdout.splitlines():
+            parts = line.strip().split("|", 1)
+            if len(parts) == 2:
+                seen[parts[0]] = SlurmDispatcher._normalize_state(parts[1])
 
     @staticmethod
     def _find_final_video(job: SlurmJob) -> Path | None:

@@ -307,3 +307,45 @@ def test_gone_with_stale_video_is_not_completed(monkeypatch, tmp_path):
 
     assert result == {"123": False}
     assert job.status == "FAILED"
+
+
+def test_poll_all_statuses_squeue_invalid_id_falls_back_to_user_query(monkeypatch):
+    """squeue -j 对已消失的 job id 非零退出时, 改用 squeue -u 兜底判 GONE。"""
+    from types import SimpleNamespace
+
+    dispatcher = SlurmDispatcher()
+    monkeypatch.setattr("kd1_anime.cluster.slurm.shutil.which", lambda name: f"/usr/bin/{name}")
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[0].endswith("squeue") and "-j" in command:
+            # 已消失的 job id 在部分集群上会让 squeue -j 非零退出
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="slurm_load_jobs error: Invalid job id specified",
+            )
+        if command[0].endswith("squeue") and "-u" in command:
+            # 按用户名查询成功, 该作业不在队列 → 已消失
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
+
+    assert dispatcher.poll_all_statuses(["444"]) == {"444": "GONE"}
+    assert any("-u" in c for c in calls)
+
+
+def test_poll_all_statuses_both_squeue_fail_is_unknown(monkeypatch):
+    """squeue -j 与 -u 都失败 (集群不可查) → UNKNOWN, 不能误判 GONE。"""
+    from types import SimpleNamespace
+
+    dispatcher = SlurmDispatcher()
+    monkeypatch.setattr("kd1_anime.cluster.slurm.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="connect refused")
+
+    monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
+    assert dispatcher.poll_all_statuses(["555"]) == {"555": "UNKNOWN"}
