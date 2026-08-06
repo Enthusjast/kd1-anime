@@ -28,6 +28,18 @@ def test_coder_prompt_has_self_check_and_camera_guard():
 
 def test_auto_fixer_preserves_xelatex_invariant():
     assert 'tex_compiler="xelatex"' in AUTO_FIXER_SYSTEM_PROMPT
+
+
+def test_coder_guards_against_blind_subscript_access():
+    assert "IndexError" in CODER_SYSTEM_PROMPT
+    assert "get_part_by_tex" in CODER_SYSTEM_PROMPT
+    assert "len()" in CODER_SYSTEM_PROMPT
+
+
+def test_auto_fixer_has_index_error_pattern():
+    assert "IndexError" in AUTO_FIXER_SYSTEM_PROMPT
+    assert "下标越界" in AUTO_FIXER_SYSTEM_PROMPT
+    assert "get_part_by_tex" in AUTO_FIXER_SYSTEM_PROMPT
     assert "ctex" in AUTO_FIXER_SYSTEM_PROMPT
     assert AutoFixerAgent.is_infrastructure_error(
         "FileNotFoundError: No such file or directory: 'xelatex'"

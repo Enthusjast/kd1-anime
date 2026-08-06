@@ -85,6 +85,20 @@ def test_clarifier_accepts_only_strict_ready_payload():
     )
 
 
+def test_clarifier_accepts_ready_payload_with_raw_newlines():
+    """LLM 在长中文 prompt 里输出未转义的原始换行时也应识别为 READY。
+
+    此前 json.loads 会因 "Invalid control character" 失败, READY 被误判为
+    普通提问打印 "AI:" 并卡在澄清循环。
+    """
+    clarifier = Clarifier()
+    response = '{"READY": true, "prompt": "## 动画目标\n制作一个数学动画视频，面向初中生演示两个代数公式。\n\n## 核心内容\n### 公式一：(a+b)² = a² + 2ab + b²"}'
+    refined = clarifier.extract_ready(response)
+    assert refined is not None
+    assert refined.startswith("## 动画目标")
+    assert "### 公式一" in refined
+
+
 @pytest.mark.parametrize(
     "response",
     [

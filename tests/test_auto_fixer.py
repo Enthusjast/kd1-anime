@@ -111,6 +111,17 @@ PangoError: couldn't load font "Noto Sans CJK SC"
         error_type = fixer._classify_error(error_log)
         assert "字体" in error_type or "font" in error_type.lower()
 
+    def test_classify_index_error(self, fixer):
+        """测试下标越界分类 (split/分组结果直接取下标)。"""
+        error_log = """
+Traceback (most recent call last):
+  File "scene_2.py", line 92, in construct
+    a2 = a_parts[1].get_center()
+IndexError: list index out of range
+        """
+        error_type = fixer._classify_error(error_log)
+        assert "IndexError" in error_type or "下标越界" in error_type
+
     def test_classify_unknown_error(self, fixer):
         """测试未知错误分类。"""
         error_log = """

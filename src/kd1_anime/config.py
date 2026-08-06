@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # 空响应重试时补上的 max_tokens 兜底值：推理模型常把输出预算耗尽在思考上，
     # 导致 content 为空；补足预算后重试可避免反复拿到空响应。
     LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=16384, ge=1024, le=65536)
+    # 结构化 JSON 输出未通过 Pydantic 校验时, 带错误反馈重试的次数 (0=关闭)。
+    # 模型偶尔会返回不合规的枚举值/缺字段 (如 severity="none"), 直接判死整个
+    # 场景太浪费; 把校验错误喂回模型重试, 通常一次即可修正。
+    LLM_JSON_REPAIR_ATTEMPTS: int = Field(default=2, ge=0, le=5)
 
     @field_validator("LLM_MAX_TOKENS", mode="before")
     @classmethod
@@ -123,9 +127,10 @@ class Settings(BaseSettings):
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
     # 渲染失败后的最大自动修复次数。autofixer 每轮会调用 LLM 重写代码并重新提交 Slurm。
     MAX_FIX_ATTEMPTS: int = Field(default=5, ge=0, le=20)
-    # 连续 N 次渲染错误日志指纹相同 → 判定为环境/配置问题而非代码问题,
-    # 提前放弃, 避免 LLM 反复"修复"同一个环境错误浪费尝试次数。
-    MAX_FIX_IDENTICAL_ERRORS: int = Field(default=2, ge=1, le=10)
+    # 连续 N 次渲染错误日志指纹相同 → 提前放弃, 避免 LLM 反复"修复"同一个
+    # 环境错误浪费尝试次数。注意该检查在 _scene_fix 中还要叠加 fix_attempts>=2
+    # 门槛, 确保修复器至少有 2 次真实尝试, 不会因一次修复失败就误判放弃。
+    MAX_FIX_IDENTICAL_ERRORS: int = Field(default=3, ge=1, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
     
     # --- 自动评估配置 ---
