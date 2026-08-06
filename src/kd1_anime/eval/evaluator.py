@@ -8,7 +8,6 @@
 - 批量评估和对比功能
 """
 
-import os
 import json
 from typing import Dict, List, Optional, Any, Union
 from pathlib import Path
@@ -18,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .metrics import EvalMetric, EvalResult, QualityScore, ComparisonResult
 from .code_eval import CodeEvaluator
 from .visual_eval import VisualEvaluator
-from ..config import settings
 from ..exceptions import KD1Error
 
 

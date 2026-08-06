@@ -5,7 +5,6 @@
 参照 TheoremExplainAgent 的视觉评估设计。
 """
 
-import os
 import json
 import base64
 from typing import Dict, List, Optional, Any, Union
@@ -173,7 +172,7 @@ class VisualEvaluator:
                 raw_response=response,
             )
             
-        except (json.JSONDecodeError, KeyError) as e:
+        except (json.JSONDecodeError, KeyError):
             # 解析失败，返回默认结果
             return VisualAnalysisResult(
                 overall_analysis="Failed to parse response",
