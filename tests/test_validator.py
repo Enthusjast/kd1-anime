@@ -1,4 +1,5 @@
 from kd1_anime.agents.validator import validate_manim_code
+from kd1_anime.config import settings
 
 
 def test_valid_manim_scene():
@@ -137,5 +138,45 @@ def test_accepts_camera_frame_in_moving_camera_scene():
         "class Demo(MovingCameraScene):\n"
         "    def construct(self):\n"
         "        self.camera.frame.set(width=14, height=6.5)\n"
+    )
+    assert result.is_valid
+
+
+def test_rejects_camera_frame_in_helper_method():
+    """camera.frame 出现在辅助方法 (非 construct) 时也必须被拦截。"""
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def _set_camera_width(self, width):\n"
+        "        frame = self.camera.frame\n"
+        "        frame.set(width=width)\n"
+        "    def construct(self):\n"
+        "        self._set_camera_width(14)\n"
+    )
+    assert not result.is_valid
+    assert "camera.frame" in result.feedback
+
+
+def test_rejects_camera_frame_under_opengl_even_in_moving_camera_scene(monkeypatch):
+    """OpenGL 渲染器 (OpenGLCamera 无 frame) 下, MovingCameraScene 也无效。"""
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(MovingCameraScene):\n"
+        "    def construct(self):\n"
+        "        self.camera.frame.set(width=14, height=6.5)\n"
+    )
+    assert not result.is_valid
+    assert "OpenGL" in result.feedback
+
+
+def test_accepts_moving_camera_scene_without_frame_under_opengl(monkeypatch):
+    """OpenGL 下不使用 camera.frame 的普通 Scene 仍然合法。"""
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(Circle())\n"
     )
     assert result.is_valid
