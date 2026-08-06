@@ -183,6 +183,21 @@ class Settings(BaseSettings):
             raise ValueError("只能包含字母、数字及 _ . : @ , + / -")
         return value
 
+    @field_validator("SLURM_CONTAINER_IMAGE", mode="before")
+    @classmethod
+    def normalize_container_image(cls, value):
+        """把 .env 中留空/纯空白的 SLURM_CONTAINER_IMAGE 视为未配置。
+
+        否则 Path("") 会解析为 Path(".")（truthy），渲染脚本会误判为
+        "Apptainer 镜像不存在: <当前目录>"。
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("SLURM_TIME_LIMIT")
     @classmethod
     def validate_slurm_time_limit(cls, value: str) -> str:

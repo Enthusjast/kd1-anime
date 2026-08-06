@@ -36,13 +36,14 @@ class TestSceneDashboard:
         assert dash.scenes[1].state == "running"
         assert dash.scenes[1].stage == "编码"
 
-        # coded 完成
+        # coded 完成: 场景仍未完成 (只有渲染完成才置绿)
         dash.on_event("scene_coded", {"scene_id": 1, "file_path": "s1.py"})
-        assert dash.scenes[1].state == "completed"
+        assert dash.scenes[1].state == "running"
+        assert "编码" in dash.scenes[1].done
 
         # review pass
         dash.on_event("scene_review_pass", {"scene_id": 1})
-        assert dash.scenes[1].stage == "审查"
+        assert "审查" in dash.scenes[1].done
 
         # submitted
         dash.on_event("scene_submitted", {"scene_id": 1, "job_id": "123"})
@@ -51,6 +52,45 @@ class TestSceneDashboard:
         # rendered
         dash.on_event("scene_rendered", {"scene_id": 1})
         assert dash.scenes[1].state == "completed"
+
+    def test_scene_stays_in_progress_until_rendered(self):
+        """分镜/编码/审查完成都不应让场景变绿, 只有渲染完成才算完成。"""
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("scene_detailing", {"scene_id": 1})
+        dash.on_event("scene_detailed", {"scene_id": 1})
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].done == ["分镜"]
+
+        dash.on_event("scene_coding", {"scene_id": 1})
+        dash.on_event("scene_coded", {"scene_id": 1})
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].done == ["分镜", "编码"]
+
+        dash.on_event("scene_review_pass", {"scene_id": 1})
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].done == ["分镜", "编码", "审查"]
+
+        dash.on_event("scene_submitted", {"scene_id": 1, "job_id": "9"})
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].stage == "渲染"
+
+        dash.on_event("scene_rendered", {"scene_id": 1})
+        assert dash.scenes[1].state == "completed"
+        assert dash.scenes[1].done == ["分镜", "编码", "审查", "渲染"]
+
+    def test_pipeline_row_shows_done_and_current_stages(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("scene_detailed", {"scene_id": 1})
+        dash.on_event("scene_coding", {"scene_id": 1})
+        row = dash.scenes[1].render_row()
+        pipeline = str(row[2])
+        assert "分镜✓" in pipeline
+        assert "编码⟳" in pipeline
+        assert "渲染·" in pipeline
 
     def test_failed_and_give_up(self):
         dash = SceneDashboard()

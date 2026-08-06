@@ -36,6 +36,23 @@ def test_slurm_identifier_rejects_newline_injection():
         )
 
 
+def test_empty_container_image_is_normalized_to_none():
+    """.env 中 SLURM_CONTAINER_IMAGE= 不应被解析成 truthy 的 Path(".")。"""
+    config = Settings(
+        _env_file=None,
+        SLURM_CONTAINER_IMAGE="",
+        SLURM_REQUIRE_CONTAINER=False,
+    )
+    assert config.SLURM_CONTAINER_IMAGE is None
+
+    config2 = Settings(
+        _env_file=None,
+        SLURM_CONTAINER_IMAGE="   ",
+        SLURM_REQUIRE_CONTAINER=False,
+    )
+    assert config2.SLURM_CONTAINER_IMAGE is None
+
+
 def test_settings_assignment_is_validated():
     config = Settings(_env_file=None)
     with pytest.raises(ValueError):

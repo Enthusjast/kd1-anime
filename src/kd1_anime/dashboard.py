@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -74,16 +74,25 @@ def suppress_agent_logs() -> bool:
     return _state.active
 
 
+STAGES = ("分镜", "编码", "审查", "渲染")
+
+
 @dataclass
 class SceneStatus:
     """单个场景的仪表盘状态。"""
 
     scene_id: int
     title: str = ""
-    stage: str = ""          # 当前阶段: 分镜/编码/审查/渲染/修复
+    stage: str = ""          # 当前活动阶段 ("" = 阶段间隙, 等待下一个事件)
     state: str = "pending"   # pending/running/completed/failed/skipped
     message: str = ""        # 最近事件摘要
     started_at: float = 0.0  # 当前阶段开始时间 (用于显示耗时)
+    done: list[str] = field(default_factory=list)  # 已完成的流水线阶段
+
+    def mark_done(self, stage_name: str) -> None:
+        """记录一个阶段完成 (去重)。"""
+        if stage_name not in self.done:
+            self.done.append(stage_name)
 
     @property
     def icon(self) -> str:
@@ -107,15 +116,27 @@ class SceneStatus:
         }.get(self.state, "white")
 
     def render_row(self) -> list[Text]:
-        """生成表格行 (运行中的阶段附带已耗时长)。"""
+        """生成表格行: 状态图标 + 标题 + 阶段流水线 + 最近事件。"""
         icon = Text(f"  {self.icon}", style=self.color)
         title = Text(self.title, style=self.color)
-        stage_txt = Text(self.stage, style="dim")
+        pipeline = Text()
+        for idx, name in enumerate(STAGES):
+            if name in self.done:
+                pipeline.append(f"{name}✓", style="green")
+            elif name == self.stage:
+                pipeline.append(f"{name}⟳", style="cyan")
+            else:
+                pipeline.append(f"{name}·", style="dim")
+            if idx < len(STAGES) - 1:
+                pipeline.append("  ")
+        if self.stage == "修复":
+            pipeline.append("  ", style="dim")
+            pipeline.append("修复⟳", style="cyan")
         message = self.message
         if self.state == "running" and self.started_at and self.stage:
             message = f"{message} · {int(time.time() - self.started_at)}s"
         msg = Text(message[:40], style="dim")
-        return [icon, title, stage_txt, msg]
+        return [icon, title, pipeline, msg]
 
 
 class SceneDashboard:
@@ -241,20 +262,23 @@ class SceneDashboard:
 
         elif event in ("scene_detailed", "scene_coded"):
             if status:
-                status.state = "completed"
+                # 中间阶段完成: 场景仍处于进行中 (青色), 只累积阶段 ✓
+                status.state = "running"
+                status.stage = ""
                 status.started_at = 0.0
                 if event == "scene_detailed":
-                    status.stage = "分镜"
+                    status.mark_done("分镜")
                     status.message = "分镜完成"
                 else:
-                    status.stage = "编码"
+                    status.mark_done("编码")
                     status.message = "代码就绪"
 
         elif event == "scene_review_pass":
             if status:
-                status.state = "completed"
-                status.stage = "审查"
+                status.state = "running"
+                status.stage = ""
                 status.started_at = 0.0
+                status.mark_done("审查")
                 status.message = "审查通过"
 
         elif event == "scene_review_fail":
@@ -265,20 +289,14 @@ class SceneDashboard:
             if status:
                 self._mark_running(status, "渲染", f"Job {data.get('job_id', '?')}")
 
-        elif event == "scene_reused":
-            # 增量渲染: 复用基础运行的旧视频
+        elif event in ("scene_rendered", "scene_reused"):
+            # 只有渲染完成 (或复用旧视频) 才算整个场景完成, 显示为绿色
             if status:
                 status.state = "completed"
                 status.stage = "渲染"
                 status.started_at = 0.0
-                status.message = "复用旧视频"
-
-        elif event == "scene_rendered":
-            if status:
-                status.state = "completed"
-                status.stage = "渲染"
-                status.started_at = 0.0
-                status.message = "渲染完成"
+                status.mark_done("渲染")
+                status.message = "渲染完成" if event == "scene_rendered" else "复用旧视频"
 
         elif event == "scene_failed":
             if status:
@@ -346,7 +364,7 @@ class SceneDashboard:
         )
         table.add_column("状态", justify="center", width=6)
         table.add_column("场景", style="white")
-        table.add_column("阶段", justify="center", width=6)
+        table.add_column("进度", justify="left", min_width=24)
         table.add_column("最近事件", style="dim", overflow="ellipsis")
 
         if not self.scenes:
