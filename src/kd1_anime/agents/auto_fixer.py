@@ -35,12 +35,15 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
 ### 1.5 相机 frame 属性错误 (高频)
 **症状**: `AttributeError: 'OpenGLCamera' object has no attribute 'frame'`
         或 `'Camera' object has no attribute 'frame'`, 位置在 self.camera.frame
-**原因**: 在普通 Scene 里用了只有 MovingCameraScene 才有的 self.camera.frame
+**原因**: 本项目以 OpenGL 渲染 (OpenGLCamera 没有 frame 属性), 或普通 Scene 误用
+        相机运镜。**OpenGL 渲染器下无论是否继承 MovingCameraScene,
+        camera.frame 都不可用**, 不要尝试切换基类 (那会继续报同样的错)。
 **修复**:
-- 首选: 删除所有 self.camera.frame 相关代码 (如果推近/平移不是分镜的核心要求)
-- 如果分镜确实需要运镜: 把类改为继承 `MovingCameraScene`, 并把
-  `self.camera.frame.set(...)` 改为 `self.play(self.camera.frame.animate.scale(...))` 形式
-- 不要同时保留普通 Scene 的相机写法
+- **唯一可行**: 删除所有 self.camera.frame / camera.frame 相关代码, 包括
+  辅助方法里的 (如 `_set_camera_width` 这类函数内部对 camera.frame 的访问)。
+- 推近/平移的视觉效果改用静态布局 (next_to / to_edge / arrange / move_to)
+  或 Transform / 局部缩放动画表达, 不要碰相机。
+- 不要改为继承 `MovingCameraScene` (OpenGL 下无效)。
 
 ### 2. ImportError / NameError
 **症状**: `NameError: name 'Create' is not defined`, `ImportError`

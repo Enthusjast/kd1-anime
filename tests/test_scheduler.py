@@ -460,6 +460,58 @@ def test_execute_full_pipeline_with_merge(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 9.5) resume 时核对恢复的 Slurm 作业: 已消失的清除重跑, 已完成的复用
+# ---------------------------------------------------------------------------
+def test_reconcile_restored_jobs_clears_gone_and_reuses_completed(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    slurm = FakeSlurm(
+        run_paths,
+        status_map={"1": "UNKNOWN", "2": "COMPLETED", "3": "RUNNING"},
+    )
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, slurm=slurm)
+    ctx = PipelineContext("x", paths=run_paths)
+
+    def make_job(sid, job_id, media_dir):
+        return SlurmJob(
+            job_id=job_id,
+            scene_id=sid,
+            script_path=run_paths.scenes / f"scene_{sid}.py",
+            log_out=run_paths.logs / f"scene_{sid}.out",
+            log_err=run_paths.logs / f"scene_{sid}.err",
+            media_dir=media_dir,
+            scene_class_name="Demo",
+            submitted_at=0,
+        )
+
+    # 场景1: 作业已从集群消失 (UNKNOWN) → 清空引用, resume 后重新提交
+    ctx.scene_states[1] = SceneState(
+        plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
+        plan_ready=True, reviewed=True, slurm_job=make_job(1, "1", run_paths.videos / "s1"),
+    )
+    # 场景2: 上次已完成且视频存在 → 直接复用
+    video_dir = run_paths.videos / "s2"
+    video_dir.mkdir(parents=True)
+    (video_dir / "Demo.mp4").write_bytes(b"fake")
+    ctx.scene_states[2] = SceneState(
+        plan=make_plan(make_outline(2)), code=CODE, class_name="Demo",
+        plan_ready=True, reviewed=True, slurm_job=make_job(2, "2", video_dir),
+    )
+    # 场景3: 仍在运行 → 保留继续监控
+    ctx.scene_states[3] = SceneState(
+        plan=make_plan(make_outline(3)), code=CODE, class_name="Demo",
+        plan_ready=True, reviewed=True, slurm_job=make_job(3, "3", run_paths.videos / "s3"),
+    )
+
+    orchestrator._reconcile_restored_jobs(ctx)
+
+    assert ctx.scene_states[1].slurm_job is None
+    assert ctx.scene_states[2].rendered is True
+    assert ctx.scene_states[2].slurm_job is not None
+    assert ctx.scene_states[3].slurm_job is not None
+    assert ctx.scene_states[3].rendered is False
+
+
+# ---------------------------------------------------------------------------
 # 10) 连续相同渲染错误 → 判定环境问题提前放弃, 并附错误日志尾部
 # ---------------------------------------------------------------------------
 def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
