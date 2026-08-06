@@ -168,3 +168,103 @@ def test_submit_timeout_is_not_retried(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="避免重复提交"):
         dispatcher.submit(script)
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# GONE (作业已从调度器消失) 与 UNKNOWN (集群查询失败) 的解耦
+# ---------------------------------------------------------------------------
+def test_poll_all_statuses_gone_vs_unknown(monkeypatch):
+    from types import SimpleNamespace
+
+    dispatcher = SlurmDispatcher()
+    monkeypatch.setattr("kd1_anime.cluster.slurm.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    # squeue/sacct 都查询成功但都无记录 → GONE
+    def fake_run(command, **kwargs):
+        assert command[0].endswith(("squeue", "sacct"))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
+    assert dispatcher.poll_all_statuses(["111"]) == {"111": "GONE"}
+
+    # squeue 无记录但 sacct 返回终态 → 终态
+    def fake_run2(command, **kwargs):
+        if command[0].endswith("sacct"):
+            return SimpleNamespace(returncode=0, stdout="222|FAILED\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run2)
+    assert dispatcher.poll_all_statuses(["222"]) == {"222": "FAILED"}
+
+    # 集群查询失败 → UNKNOWN
+    def fake_run3(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="error")
+
+    monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run3)
+    assert dispatcher.poll_all_statuses(["333"]) == {"333": "UNKNOWN"}
+
+
+def test_gone_with_video_is_completed(monkeypatch, tmp_path):
+    """作业已消失但视频已产出 → 判定为渲染成功 (不再误杀)。"""
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    job.media_dir.mkdir(parents=True)
+    (job.media_dir / "Demo.mp4").write_bytes(b"fake")
+    monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "GONE"})
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    assert result == {"123": True}
+    assert job.status == "GONE" or job.status == "COMPLETED"
+    assert job.cancelled is False
+
+
+def test_gone_with_error_log_is_failed(monkeypatch, tmp_path):
+    """作业已消失但 .err 有回溯 → 判定为失败, 可走自动修复而非永久判死。"""
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    job.log_err.write_text("Traceback (most recent call last):\n  boom\n")
+    monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "GONE"})
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    assert result == {"123": False}
+    assert job.status == "FAILED"
+    assert "依据日志判定为失败" in job.failure_reason
+
+
+def test_gone_without_artifacts_waits_for_streak(monkeypatch, tmp_path):
+    """作业消失且无任何产物 → 不立即判死, 计数达到阈值后按失败交给修复。"""
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    statuses = iter([{"123": "GONE"}, {"123": "GONE"}])
+    cancelled = []
+    monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: next(statuses))
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: cancelled.append(jid) or True)
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    assert result == {"123": False}
+    assert job.status == "FAILED"
+    assert cancelled == []  # 作业已消失, 无需 scancel
+
+
+def test_cancel_job_invalid_id_is_benign(monkeypatch):
+    """scancel 报 Invalid job id → 作业已不在调度器, 视为取消成功 (无重复作业风险)。"""
+    from types import SimpleNamespace
+
+    dispatcher = SlurmDispatcher()
+    monkeypatch.setattr("kd1_anime.cluster.slurm.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="slurm job 123: Invalid job id specified\n"
+        )
+
+    monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
+    assert dispatcher.cancel_job("123") is True

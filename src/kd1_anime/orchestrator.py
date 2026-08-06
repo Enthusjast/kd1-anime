@@ -1775,7 +1775,8 @@ class Orchestrator:
         CANCEL_FAILED ("禁止自动重提"), 场景被永久判死。这里在调度前核对:
         - COMPLETED 且视频存在 → 直接标记渲染完成 (复用上次结果)
         - COMPLETED 但视频缺失 → 清空, 重跑
-        - UNKNOWN (squeue/sacct 均无记录) → 作业已消失, 清空后重新提交
+        - GONE (squeue 可查但无记录且 sacct 无账务记录) → 作业已消失, 清空后重新提交
+        - UNKNOWN (集群查询失败) → 保守保留, 交给监控轮询处理
         - FAILED/CANCELLED 等终态 → 保留, 交给监控触发自动修复
         - RUNNING/PENDING → 保留, 继续监控
         """
@@ -1795,10 +1796,14 @@ class Orchestrator:
                 else:
                     # 假成功 (作业退出 0 但无 mp4) → 清空重跑
                     state.slurm_job = None
-            elif status == "UNKNOWN":
+            elif status == "GONE":
                 # 作业已从集群消失 (squeue 无记录且 sacct 无账务记录):
                 # 无重复作业风险, 清空引用让场景走正常提交路径
                 state.slurm_job = None
+            elif status == "UNKNOWN":
+                # 集群查询失败 (squeue/sacct 缺失或非零退出) → 保守保留,
+                # 交给监控轮询处理; 若持续未知由 UNKNOWN_TIMEOUT 兜底
+                pass
 
     def _emit_scene_snapshot(self, ctx: PipelineContext) -> None:
         """resume 后把已有场景的当前进度以事件形式补发给 TUI/仪表盘。

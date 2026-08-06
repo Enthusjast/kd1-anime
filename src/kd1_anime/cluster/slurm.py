@@ -132,16 +132,49 @@ class JobMonitor:
                 finished.append(job_id)
                 if not quiet:
                     console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败: {status}")
-            elif status == "UNKNOWN":
+            elif status in ("UNKNOWN", "GONE"):
+                if status == "GONE":
+                    # 作业已确认不在调度器: 依据产物判定结果, 避免秒退/刚结束的作业被误杀。
+                    outcome = self.dispatcher._classify_gone(job)
+                    if outcome == "COMPLETED":
+                        self.unknown_streaks[job_id] = 0
+                        job.status = "COMPLETED"
+                        self.dispatcher._forward_log(job, self.log_positions)
+                        self.results[job_id] = True
+                        finished.append(job_id)
+                        if not quiet:
+                            console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
+                        continue
+                    if outcome == "FAILED":
+                        self.unknown_streaks[job_id] = 0
+                        job.status = "FAILED"
+                        self.dispatcher._forward_log(job, self.log_positions)
+                        self.results[job_id] = False
+                        finished.append(job_id)
+                        if not quiet:
+                            console.print(
+                                f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败（作业已消失，依据日志判定）"
+                            )
+                        continue
+                    # 无任何产物 → 与 UNKNOWN 一样计数延后决断 (可能是刚提交尚未注册)
                 self.unknown_streaks[job_id] += 1
                 if self.unknown_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
-                    self.dispatcher._cancel_for_monitor_failure(
-                        job,
-                        status="UNKNOWN_TIMEOUT",
-                        reason="状态连续未知，已停止监控并尝试取消远端任务",
-                    )
-                    self.results[job_id] = False
-                    finished.append(job_id)
+                    if status == "GONE":
+                        # 作业消失且无日志 → 按失败交给修复流程, 而非永久判死
+                        job.status = "FAILED"
+                        job.failure_reason = "作业已从集群消失且无输出日志，无法确认渲染结果"
+                        self.results[job_id] = False
+                        finished.append(job_id)
+                        if not quiet:
+                            console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败：作业消失且无输出")
+                    else:
+                        self.dispatcher._cancel_for_monitor_failure(
+                            job,
+                            status="UNKNOWN_TIMEOUT",
+                            reason="状态连续未知，已停止监控并尝试取消远端任务",
+                        )
+                        self.results[job_id] = False
+                        finished.append(job_id)
             else:
                 self.unknown_streaks[job_id] = 0
                 if status in RUNNING_STATES:
@@ -425,9 +458,14 @@ class SlurmDispatcher:
                 console.print(f"[yellow][Slurm][/] 取消 Job {job_id} 超时")
             return False
         if result.returncode != 0:
+            err = (result.stderr or "").strip()
+            err_lower = err.lower()
+            # 作业已不在调度器 (已结束/被清理) → 无需取消, 视为成功, 无重复作业风险
+            if any(k in err_lower for k in ("invalid job id", "unknown job", "does not exist")):
+                return True
             if not _dashboard_quiet():
                 console.print(
-                    f"[yellow][Slurm][/] 取消 Job {job_id} 失败: {result.stderr.strip()}",
+                    f"[yellow][Slurm][/] 取消 Job {job_id} 失败: {err}",
                     markup=False,
                 )
             return False
@@ -440,10 +478,15 @@ class SlurmDispatcher:
         return raw.strip().split()[0].upper() if raw.strip() else "UNKNOWN"
 
     @staticmethod
-    def _check_final_status(job_id: str) -> str:
+    def _check_final_status(job_id: str) -> tuple[bool, str]:
+        """查询 sacct 获取已结束作业的终态。
+
+        返回 (ok, state): ok=True 表示 sacct 查询成功 (即使无该作业的记录);
+        ok=True 且 state=="UNKNOWN" 表示查询成功但没有账务记录。
+        """
         sacct = shutil.which("sacct")
         if not sacct:
-            return "UNKNOWN"
+            return False, "UNKNOWN"
         try:
             result = subprocess.run(
                 [sacct, "-j", job_id, "-n", "-o", "JobIDRaw,State", "--parsable2"],
@@ -453,9 +496,9 @@ class SlurmDispatcher:
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return "UNKNOWN"
+            return False, "UNKNOWN"
         if result.returncode != 0:
-            return "UNKNOWN"
+            return False, "UNKNOWN"
         fallback = "UNKNOWN"
         for line in result.stdout.splitlines():
             parts = line.strip().split("|")
@@ -463,19 +506,29 @@ class SlurmDispatcher:
                 continue
             raw_id, raw_state = parts[0], parts[1]
             if raw_id == job_id:
-                return SlurmDispatcher._normalize_state(raw_state)
+                return True, SlurmDispatcher._normalize_state(raw_state)
             if fallback == "UNKNOWN" and raw_state:
                 fallback = SlurmDispatcher._normalize_state(raw_state)
-        return fallback
+        return True, fallback
 
     def poll_status(self, job_id: str) -> str:
         return self.poll_all_statuses([job_id]).get(job_id, "UNKNOWN")
 
     def poll_all_statuses(self, job_ids: list[str]) -> dict[str, str]:
+        """批量查询作业状态。
+
+        返回值区分三种情况:
+        - 调度器状态 (PENDING/RUNNING/COMPLETED/FAILED/...)
+        - "GONE"  : squeue 可查但作业不在队列、且 sacct 无该作业记录
+                    → 作业已确定从调度器消失 (已结束且被清理), 无重复作业风险
+        - "UNKNOWN": 集群查询失败 (squeue/sacct 缺失、超时或非零退出)
+                    → 无法确认作业是否存在, 必须保守处理
+        """
         if not job_ids:
             return {}
         squeue = shutil.which("squeue")
         seen: dict[str, str] = {}
+        squeue_ok = False
         if squeue:
             try:
                 result = subprocess.run(
@@ -488,11 +541,76 @@ class SlurmDispatcher:
             except subprocess.TimeoutExpired:
                 result = None
             if result and result.returncode == 0:
+                squeue_ok = True
                 for line in result.stdout.splitlines():
                     parts = line.strip().split("|", 1)
                     if len(parts) == 2:
                         seen[parts[0]] = self._normalize_state(parts[1])
-        return {job_id: seen.get(job_id) or self._check_final_status(job_id) for job_id in job_ids}
+        out: dict[str, str] = {}
+        for job_id in job_ids:
+            if job_id in seen:
+                out[job_id] = seen[job_id]
+                continue
+            sacct_ok, sacct_state = self._check_final_status(job_id)
+            if sacct_ok and sacct_state != "UNKNOWN":
+                out[job_id] = sacct_state
+            elif squeue_ok:
+                # 调度器可查但该作业不在队列、且无账务记录 → 作业已消失
+                out[job_id] = "GONE"
+            else:
+                out[job_id] = "UNKNOWN"
+        return out
+
+    @staticmethod
+    def _find_final_video(job: SlurmJob) -> Path | None:
+        """在作业 media_dir 顶层查找最终渲染视频 (不含 partial_movie_files)。
+
+        只接受 mtime 不早于作业提交时间的视频, 避免误复用上一次修复尝试的旧产物。
+        """
+        if not job.media_dir.is_dir():
+            return None
+
+        def _fresh(path: Path) -> bool:
+            try:
+                return path.stat().st_mtime >= job.submitted_at - 1.0
+            except OSError:
+                return False
+
+        exact = job.media_dir / f"{job.scene_class_name}.mp4"
+        if exact.is_file() and _fresh(exact):
+            return exact
+        for path in sorted(job.media_dir.glob("*.mp4")):
+            if path.is_file() and _fresh(path):
+                return path
+        return None
+
+    @staticmethod
+    def _job_log_tail(job: SlurmJob, limit: int = 4000) -> str:
+        """合并作业 .out/.err 尾部文本, 用于判定已消失作业的真实结果。"""
+        chunks: list[str] = []
+        for path in (job.log_err, job.log_out):
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    chunks.append("\n".join(lines[-limit:]))
+            except OSError:
+                continue
+        return "\n".join(chunks)[-4000:]
+
+    def _classify_gone(self, job: SlurmJob) -> str | None:
+        """作业已确认不在调度器 (squeue/sacct 均无记录) 时, 依据产物判定结果。
+
+        - 有最终视频 → "COMPLETED" (作业在轮询间隙已结束并成功产出)
+        - 有日志内容 → "FAILED" (作业实际运行过, 失败原因在日志中, 可走自动修复)
+        - 无任何产物 → None (可能是刚提交尚未注册, 交给计数延后决断)
+        """
+        if self._find_final_video(job) is not None:
+            return "COMPLETED"
+        log_tail = self._job_log_tail(job)
+        if log_tail:
+            job.failure_reason = f"作业已从集群消失，依据日志判定为失败:\n{log_tail}"
+            return "FAILED"
+        return None
 
     def wait_for_job(
         self,
@@ -563,16 +681,41 @@ class SlurmDispatcher:
                     results[job_id] = False
                     finished.append(job_id)
                     console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败: {status}")
-                elif status == "UNKNOWN":
+                elif status in ("UNKNOWN", "GONE"):
+                    if status == "GONE":
+                        outcome = self._classify_gone(job)
+                        if outcome == "COMPLETED":
+                            unknown_streaks[job_id] = 0
+                            job.status = "COMPLETED"
+                            self._forward_log(job, log_positions)
+                            results[job_id] = True
+                            finished.append(job_id)
+                            console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
+                            continue
+                        if outcome == "FAILED":
+                            unknown_streaks[job_id] = 0
+                            job.status = "FAILED"
+                            self._forward_log(job, log_positions)
+                            results[job_id] = False
+                            finished.append(job_id)
+                            console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败（作业已消失，依据日志判定）")
+                            continue
                     unknown_streaks[job_id] += 1
                     if unknown_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
-                        self._cancel_for_monitor_failure(
-                            job,
-                            status="UNKNOWN_TIMEOUT",
-                            reason="状态连续未知，已停止监控并尝试取消远端任务",
-                        )
-                        results[job_id] = False
-                        finished.append(job_id)
+                        if status == "GONE":
+                            job.status = "FAILED"
+                            job.failure_reason = "作业已从集群消失且无输出日志，无法确认渲染结果"
+                            results[job_id] = False
+                            finished.append(job_id)
+                            console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败：作业消失且无输出")
+                        else:
+                            self._cancel_for_monitor_failure(
+                                job,
+                                status="UNKNOWN_TIMEOUT",
+                                reason="状态连续未知，已停止监控并尝试取消远端任务",
+                            )
+                            results[job_id] = False
+                            finished.append(job_id)
                 else:
                     unknown_streaks[job_id] = 0
                     if status in RUNNING_STATES:
