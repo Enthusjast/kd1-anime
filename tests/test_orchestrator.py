@@ -106,7 +106,7 @@ def test_run_directories_and_prompt_are_private(monkeypatch, tmp_path):
 
     assert state is State.PLANNING
     assert ctx.paths.root.stat().st_mode & 0o777 == 0o700
-    assert (ctx.paths.root / "prompt.txt").stat().st_mode & 0o777 == 0o600
+    assert (ctx.paths.root / "prompt.md").stat().st_mode & 0o777 == 0o600
 
 
 def test_infrastructure_error_does_not_invoke_auto_fixer(monkeypatch, tmp_path):

@@ -317,6 +317,9 @@ class SlurmDispatcher:
         ]
         if use_gpu:
             lines.append(f"export PYOPENGL_PLATFORM={settings.MANIM_OPENGL_PLATFORM}")
+            # manim 0.20 的 OpenGL 渲染器必须显式传 --write_to_movie 才会写视频文件；
+            # 否则动画照常"播放"、退出码为 0，但不会产出任何 mp4。
+            manim_args.insert(-2, "--write_to_movie")
 
         if container:
             image = str(Path(container).expanduser().resolve())

@@ -40,6 +40,28 @@ def test_opengl_requires_gpu(monkeypatch, tmp_path):
         raise AssertionError("expected RuntimeError")
 
 
+def test_opengl_script_forces_write_to_movie(monkeypatch, tmp_path):
+    """OpenGL 渲染器必须显式传 --write_to_movie，否则 manim 静默不产出视频。"""
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    monkeypatch.setattr(settings, "SLURM_GPU_TYPE", "A100")
+    script = SlurmDispatcher()._build_script(
+        1, tmp_path / "scene.py", "Demo", tmp_path / "media", tmp_path / "out", tmp_path / "err"
+    )
+    assert "--renderer=opengl" in script
+    assert "--write_to_movie" in script
+    assert "--gres=gpu" in script
+
+
+def test_cairo_script_does_not_pass_write_to_movie(monkeypatch, tmp_path):
+    """cairo 渲染器默认写视频，无需 --write_to_movie。"""
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "SLURM_GPU_TYPE", "")
+    script = SlurmDispatcher()._build_script(
+        1, tmp_path / "scene.py", "Demo", tmp_path / "media", tmp_path / "out", tmp_path / "err"
+    )
+    assert "--write_to_movie" not in script
+
+
 def test_queue_timeout_cancels_job(monkeypatch, tmp_path):
     dispatcher = SlurmDispatcher()
     job = make_job(tmp_path, submitted_at=time.time() - 100)

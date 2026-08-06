@@ -141,7 +141,7 @@ VideoMerger 不扫描共享目录猜测产物，而是使用 `SlurmJob.media_dir
 
 ```text
 workspace/runs/<YYYYMMDD-HHMMSS>-<uuid8>/
-├── prompt.txt
+├── prompt.md
 ├── manifest.json
 ├── .run.lock
 ├── scenes/
