@@ -466,7 +466,7 @@ def test_reconcile_restored_jobs_clears_gone_and_reuses_completed(monkeypatch, t
     run_paths = make_paths(tmp_path)
     slurm = FakeSlurm(
         run_paths,
-        status_map={"1": "UNKNOWN", "2": "COMPLETED", "3": "RUNNING"},
+        status_map={"1": "GONE", "2": "COMPLETED", "3": "RUNNING", "4": "UNKNOWN", "5": "UNKNOWN"},
     )
     orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, slurm=slurm)
     ctx = PipelineContext("x", paths=run_paths)
@@ -483,7 +483,7 @@ def test_reconcile_restored_jobs_clears_gone_and_reuses_completed(monkeypatch, t
             submitted_at=0,
         )
 
-    # 场景1: 作业已从集群消失 (UNKNOWN) → 清空引用, resume 后重新提交
+    # 场景1: 作业已从集群消失 (GONE) → 清空引用, resume 后重新提交
     ctx.scene_states[1] = SceneState(
         plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
         plan_ready=True, reviewed=True, slurm_job=make_job(1, "1", run_paths.videos / "s1"),
@@ -501,6 +501,19 @@ def test_reconcile_restored_jobs_clears_gone_and_reuses_completed(monkeypatch, t
         plan=make_plan(make_outline(3)), code=CODE, class_name="Demo",
         plan_ready=True, reviewed=True, slurm_job=make_job(3, "3", run_paths.videos / "s3"),
     )
+    # 场景4: 作业不可见 (UNKNOWN) 且无视频 → 清空引用, 重新提交
+    ctx.scene_states[4] = SceneState(
+        plan=make_plan(make_outline(4)), code=CODE, class_name="Demo",
+        plan_ready=True, reviewed=True, slurm_job=make_job(4, "4", run_paths.videos / "s4"),
+    )
+    # 场景5: 作业不可见 (UNKNOWN) 但已有成品视频 → 直接复用, 标记渲染完成
+    video_dir5 = run_paths.videos / "s5"
+    video_dir5.mkdir(parents=True)
+    (video_dir5 / "Demo.mp4").write_bytes(b"fake")
+    ctx.scene_states[5] = SceneState(
+        plan=make_plan(make_outline(5)), code=CODE, class_name="Demo",
+        plan_ready=True, reviewed=True, slurm_job=make_job(5, "5", video_dir5),
+    )
 
     orchestrator._reconcile_restored_jobs(ctx)
 
@@ -509,6 +522,11 @@ def test_reconcile_restored_jobs_clears_gone_and_reuses_completed(monkeypatch, t
     assert ctx.scene_states[2].slurm_job is not None
     assert ctx.scene_states[3].slurm_job is not None
     assert ctx.scene_states[3].rendered is False
+    # UNKNOWN 且无视频 → 清空重跑; UNKNOWN 但有视频 → 复用
+    assert ctx.scene_states[4].slurm_job is None
+    assert ctx.scene_states[4].rendered is False
+    assert ctx.scene_states[5].slurm_job is not None
+    assert ctx.scene_states[5].rendered is True
 
 
 # ---------------------------------------------------------------------------

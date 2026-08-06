@@ -120,6 +120,34 @@ def test_rejects_xelatex_template_without_ctex_or_global_registration():
     assert "config.tex_template" in result.feedback
 
 
+def test_rejects_custom_mobject_subclass():
+    """自定义 mobject 子类 (class X(VMobject)) 在 OpenGL 下缺 should_render, 必须拦截。"""
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Polygon(VMobject):\n"
+        "    def __init__(self, **kwargs):\n"
+        "        super().__init__(**kwargs)\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(Polygon())\n"
+    )
+    assert not result.is_valid
+    assert "自定义 mobject 子类" in result.feedback
+
+
+def test_allows_helper_class():
+    """非 mobject 的普通辅助类不应被误拦截。"""
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Helper:\n"
+        "    LABEL = \"demo\"\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(Circle())\n"
+    )
+    assert result.is_valid
+
+
 def test_rejects_camera_frame_in_plain_scene():
     result = validate_manim_code(
         "from manim import *\n"
