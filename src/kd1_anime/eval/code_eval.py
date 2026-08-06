@@ -6,8 +6,7 @@
 
 import ast
 import re
-from typing import Dict, List, Optional, Any
-from pathlib import Path
+from typing import Dict, List, Any
 from dataclasses import dataclass
 
 from .metrics import EvalMetric, QualityScore

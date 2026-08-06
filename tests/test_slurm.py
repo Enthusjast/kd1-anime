@@ -349,3 +349,29 @@ def test_poll_all_statuses_both_squeue_fail_is_unknown(monkeypatch):
 
     monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
     assert dispatcher.poll_all_statuses(["555"]) == {"555": "UNKNOWN"}
+
+
+def test_preempted_back_to_pending_resets_run_timeout(monkeypatch, tmp_path):
+    """作业被抢占退回 PENDING 后, 之前累计的运行时长应重置, 不误触发 RUN_TIMEOUT。"""
+    import kd1_anime.cluster.slurm as slurm_mod
+
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path, submitted_at=1000.0)
+    clock = [1000.0]
+    statuses = iter(["RUNNING", "PENDING", "RUNNING", "COMPLETED"])
+    monkeypatch.setattr(slurm_mod.time, "time", lambda: clock[0])
+    monkeypatch.setattr(settings, "MONITOR_RUN_TIMEOUT", 50)
+    monkeypatch.setattr(settings, "MONITOR_QUEUE_TIMEOUT", 100_000)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": next(statuses)})
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+
+    def fake_sleep(_seconds):
+        clock[0] += 40  # 每次轮询间隔推进 40s
+
+    monkeypatch.setattr(slurm_mod.time, "sleep", fake_sleep)
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    # 若不重置 running_since, 第二次 RUNNING 时已累计 80s > 50s 会触发 RUN_TIMEOUT
+    assert result == {"123": True}
+    assert job.status == "COMPLETED"

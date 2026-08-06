@@ -91,7 +91,7 @@ class JobMonitor:
         self.pending: dict[str, SlurmJob] = {}
         self.results: dict[str, bool] = {}
         self.jobs: dict[str, SlurmJob] = {}
-        self.unknown_streaks: dict[str, int] = {}
+        self.indeterminate_streaks: dict[str, int] = {}
         self.running_since: dict[str, float] = {}
         self.log_positions: dict[str, int] = {}
 
@@ -100,7 +100,7 @@ class JobMonitor:
             return
         self.pending.setdefault(job.job_id, job)
         self.jobs[job.job_id] = job
-        self.unknown_streaks.setdefault(job.job_id, 0)
+        self.indeterminate_streaks.setdefault(job.job_id, 0)
 
     def _quiet(self) -> bool:
         """Live 仪表盘激活时抑制 Monitor 文本输出, 避免破坏 Rich Live。"""
@@ -119,14 +119,14 @@ class JobMonitor:
             job.status = status
 
             if status == "COMPLETED":
-                self.unknown_streaks[job_id] = 0
+                self.indeterminate_streaks[job_id] = 0
                 self.dispatcher._forward_log(job, self.log_positions)
                 self.results[job_id] = True
                 finished.append(job_id)
                 if not quiet:
                     console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
             elif status in FAILURE_STATES:
-                self.unknown_streaks[job_id] = 0
+                self.indeterminate_streaks[job_id] = 0
                 self.dispatcher._forward_log(job, self.log_positions)
                 job.failure_reason = f"Slurm 状态: {status}"
                 self.results[job_id] = False
@@ -138,7 +138,7 @@ class JobMonitor:
                     # 作业已确认不在调度器: 依据产物判定结果, 避免秒退/刚结束的作业被误杀。
                     outcome = self.dispatcher._classify_gone(job)
                     if outcome == "COMPLETED":
-                        self.unknown_streaks[job_id] = 0
+                        self.indeterminate_streaks[job_id] = 0
                         job.status = "COMPLETED"
                         self.dispatcher._forward_log(job, self.log_positions)
                         self.results[job_id] = True
@@ -147,7 +147,7 @@ class JobMonitor:
                             console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
                         continue
                     if outcome == "FAILED":
-                        self.unknown_streaks[job_id] = 0
+                        self.indeterminate_streaks[job_id] = 0
                         job.status = "FAILED"
                         self.dispatcher._forward_log(job, self.log_positions)
                         self.results[job_id] = False
@@ -158,8 +158,8 @@ class JobMonitor:
                             )
                         continue
                     # 无任何产物 → 与 UNKNOWN 一样计数延后决断 (可能是刚提交尚未注册)
-                self.unknown_streaks[job_id] += 1
-                if self.unknown_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
+                self.indeterminate_streaks[job_id] += 1
+                if self.indeterminate_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
                     if status == "GONE":
                         # 作业消失且无日志 → 按失败交给修复流程, 而非永久判死
                         job.status = "FAILED"
@@ -177,9 +177,13 @@ class JobMonitor:
                         self.results[job_id] = False
                         finished.append(job_id)
             else:
-                self.unknown_streaks[job_id] = 0
+                self.indeterminate_streaks[job_id] = 0
                 if status in RUNNING_STATES:
                     self.running_since.setdefault(job_id, now)
+                elif job_id in self.running_since:
+                    # 作业被抢占退回排队等非运行状态: 停止累计运行时长,
+                    # 否则之前累计的 run_timeout 会错误地继续计时
+                    self.running_since.pop(job_id, None)
                 if job_id in self.running_since:
                     self.dispatcher._forward_log(job, self.log_positions)
                     if now - self.running_since[job_id] > self.run_timeout:
@@ -679,7 +683,7 @@ class SlurmDispatcher:
                     run_timeout = legacy_timeout
         pending = dict(jobs)
         results: dict[str, bool] = {}
-        unknown_streaks = {job_id: 0 for job_id in jobs}
+        indeterminate_streaks = {job_id: 0 for job_id in jobs}
         running_since: dict[str, float] = {}
         log_positions: dict[str, int] = {}
 
@@ -692,13 +696,13 @@ class SlurmDispatcher:
                 job.status = status
 
                 if status == "COMPLETED":
-                    unknown_streaks[job_id] = 0
+                    indeterminate_streaks[job_id] = 0
                     self._forward_log(job, log_positions)
                     results[job_id] = True
                     finished.append(job_id)
                     console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
                 elif status in FAILURE_STATES:
-                    unknown_streaks[job_id] = 0
+                    indeterminate_streaks[job_id] = 0
                     self._forward_log(job, log_positions)
                     job.failure_reason = f"Slurm 状态: {status}"
                     results[job_id] = False
@@ -708,7 +712,7 @@ class SlurmDispatcher:
                     if status == "GONE":
                         outcome = self._classify_gone(job)
                         if outcome == "COMPLETED":
-                            unknown_streaks[job_id] = 0
+                            indeterminate_streaks[job_id] = 0
                             job.status = "COMPLETED"
                             self._forward_log(job, log_positions)
                             results[job_id] = True
@@ -716,15 +720,15 @@ class SlurmDispatcher:
                             console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
                             continue
                         if outcome == "FAILED":
-                            unknown_streaks[job_id] = 0
+                            indeterminate_streaks[job_id] = 0
                             job.status = "FAILED"
                             self._forward_log(job, log_positions)
                             results[job_id] = False
                             finished.append(job_id)
                             console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败（作业已消失，依据日志判定）")
                             continue
-                    unknown_streaks[job_id] += 1
-                    if unknown_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
+                    indeterminate_streaks[job_id] += 1
+                    if indeterminate_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
                         if status == "GONE":
                             job.status = "FAILED"
                             job.failure_reason = "作业已从集群消失且无输出日志，无法确认渲染结果"
@@ -740,9 +744,12 @@ class SlurmDispatcher:
                             results[job_id] = False
                             finished.append(job_id)
                 else:
-                    unknown_streaks[job_id] = 0
+                    indeterminate_streaks[job_id] = 0
                     if status in RUNNING_STATES:
                         running_since.setdefault(job_id, now)
+                    elif job_id in running_since:
+                        # 被抢占退回排队: 停止累计运行时长
+                        running_since.pop(job_id, None)
                     if job_id in running_since:
                         self._forward_log(job, log_positions)
                         if now - running_since[job_id] > run_timeout:

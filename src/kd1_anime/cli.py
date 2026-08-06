@@ -11,6 +11,7 @@ kd1-anime CLI 入口
   kd1-anime plan "..."        → 只生成场景规划
 """
 
+import json
 import re
 import shutil
 from typing import Optional
@@ -19,10 +20,12 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
 from kd1_anime.config import settings
+from kd1_anime.eval.metrics import ComparisonResult, EvalResult
 from kd1_anime.run_store import RunManifest, RunRepository, lock_run
 
 app = typer.Typer(
@@ -304,7 +307,7 @@ def status(
     if run_id:
         try:
             _print_run_details(repository.load(run_id))
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
             console.print(f"[bold red]读取失败:[/] {exc}", markup=False)
             raise typer.Exit(1) from exc
         return
@@ -351,7 +354,7 @@ def resume(
     except KeyboardInterrupt as exc:
         console.print("\n[yellow]用户中断 (已记录恢复点并清理 Slurm 任务)[/]")
         raise typer.Exit(130) from exc
-    except (OSError, ValueError, RuntimeError) as exc:
+    except Exception as exc:
         console.print(f"[bold red]恢复失败:[/] {exc}\n使用 kd1-anime status 查看可用运行", markup=False)
         raise typer.Exit(1) from exc
     if manifest.dry_run:
@@ -710,7 +713,7 @@ def evaluate(
         raise typer.Exit(1)
 
 
-def _print_eval_result(result: 'EvalResult'):
+def _print_eval_result(result: EvalResult):
     """打印评估结果"""
     from rich.table import Table
     from rich.panel import Panel
@@ -754,10 +757,8 @@ def _print_eval_result(result: 'EvalResult'):
         console.print(f"\n[dim]{result.summary}[/]")
 
 
-def _print_comparison(comparison: 'ComparisonResult'):
+def _print_comparison(comparison: ComparisonResult):
     """打印对比结果"""
-    from rich.table import Table
-    
     diff = comparison.score_diff
     diff_color = "green" if diff > 0 else "red" if diff < 0 else "white"
     diff_str = f"+{diff:.2f}" if diff > 0 else f"{diff:.2f}"
@@ -841,7 +842,7 @@ def test_llm(
                 response_model=TestResponse,
                 temperature=0.0,
             )
-            console.print(f"  [green]✓ JSON 模式正常[/]")
+            console.print("  [green]✓ JSON 模式正常[/]")
             console.print(f"    解析结果: status={result.status}, message={result.message}")
         except Exception as e:
             console.print(f"  [yellow]⚠ JSON 模式异常: {e}[/]")

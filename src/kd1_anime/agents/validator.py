@@ -228,7 +228,6 @@ class _SafetyVisitor(ast.NodeVisitor):
         # 检查动态构造危险调用（如 getattr(os, "system")）
         if isinstance(node.func, ast.Name) and node.func.id == "getattr":
             if len(node.args) >= 2:
-                obj_arg = node.args[0]
                 attr_arg = node.args[1]
                 # 检查是否在访问危险属性
                 if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):

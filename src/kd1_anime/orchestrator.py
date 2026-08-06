@@ -18,22 +18,12 @@ from rich.console import Console
 from rich.prompt import Confirm
 
 from kd1_anime.exceptions import (
-    ConfigError,
     LLMError,
     LLMResponseError,
-    PipelineAbortedError,
-    PipelineExhaustedError,
     PipelineError,
-    RenderError,
     RunError,
-    RunIntegrityError,
-    RunLockError,
     RunNotFoundError,
-    SlurmError,
-    SlurmSubmitError,
-    SlurmTimeoutError,
     ValidationError,
-    VideoNotFoundError,
 )
 from kd1_anime.logging import get_logger
 
@@ -2327,8 +2317,10 @@ class Orchestrator:
                 self._emit("eval_skipped", reason="no_final_video")
                 return False
 
-            code_scores = []
-            scene_eval_results: dict[int, object] = {}
+            from kd1_anime.eval.metrics import EvalResult
+
+            code_scores: list[EvalResult] = []
+            scene_eval_results: dict[int, EvalResult] = {}
             for scene_id, state in ctx.scene_states.items():
                 if state.code:
                     code_result = evaluator.evaluate_code(state.code)
@@ -2362,8 +2354,6 @@ class Orchestrator:
                 threshold=settings.EVAL_THRESHOLD,
             )
 
-            from kd1_anime.eval.metrics import EvalResult
-
             eval_result = EvalResult(
                 run_id=ctx.paths.run_id,
                 summary=f"Auto-evaluation: {overall_score:.2f}/5.00",
@@ -2388,7 +2378,7 @@ class Orchestrator:
             low_score_scenes = [
                 scene_id
                 for scene_id, scene_eval in scene_eval_results.items()
-                if scene_eval.overall_score < settings.EVAL_THRESHOLD  # type: ignore[attr-defined]
+                if scene_eval.overall_score < settings.EVAL_THRESHOLD
             ]
             ctx.scenes_to_improve = low_score_scenes
             for scene_id in low_score_scenes:

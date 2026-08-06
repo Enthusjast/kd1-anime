@@ -15,7 +15,6 @@ from typing import Literal
 from rich.console import Console
 from rich.table import Table
 
-from kd1_anime.config import settings
 from kd1_anime.logging import get_logger
 
 logger = get_logger(__name__)
@@ -106,7 +105,7 @@ class BatchProcessor:
         """从文件加载任务。"""
         prompts = load_prompts_from_file(file_path)
         tasks = []
-        for i, prompt in enumerate(prompts, start=1):
+        for prompt in prompts:
             task = self.add_task(prompt)
             tasks.append(task)
         return tasks
@@ -152,71 +151,72 @@ class BatchProcessor:
         return task
     
     def execute_all(self) -> list[BatchTask]:
-        """并行执行所有任务。"""
+        """并行执行所有任务。
+
+        避免在并发 worker 打印期间全屏 clear/重绘: 逐条追加结果行,
+        全部结束后再一次性输出汇总表 (此时无并发写, 可安全使用 Table)。
+        """
         if not self.tasks:
             console.print("[yellow]没有任务可执行[/]")
             return []
-        
+
         console.print(f"[cyan]开始批量处理[/] 共 {len(self.tasks)} 个任务，最大并行数: {self.config.max_parallel}")
-        
-        # 创建进度表
-        table = Table(title="批量处理进度")
+
+        completed_tasks: list[BatchTask] = []
+        with ThreadPoolExecutor(max_workers=self.config.max_parallel) as executor:
+            future_to_task = {
+                executor.submit(self._execute_single_task, task): task
+                for task in self.tasks
+            }
+            for future in as_completed(future_to_task):
+                task = future.result()
+                completed_tasks.append(task)
+                elapsed = ""
+                if task.start_time and task.end_time:
+                    elapsed = f"{(task.end_time - task.start_time).total_seconds():.1f}s"
+                icon = "✓" if task.status == "completed" else "✗"
+                color = "green" if task.status == "completed" else "red"
+                detail = task.output if task.status == "completed" else task.error or ""
+                console.print(
+                    f"[{color}]{icon} 任务 {task.task_id}[/] "
+                    f"{task.status} ({elapsed}) {str(detail)[-60:]}",
+                    markup=False,
+                )
+
+        # 汇总表 (全部结束后再打印, 避免与并发输出交错)
+        table = Table(title="批量处理结果")
         table.add_column("任务 ID", justify="right")
         table.add_column("Prompt", max_width=50)
         table.add_column("状态")
         table.add_column("耗时")
         table.add_column("输出/错误")
-        
-        completed_tasks = []
-        
-        with ThreadPoolExecutor(max_workers=self.config.max_parallel) as executor:
-            # 提交所有任务
-            future_to_task = {
-                executor.submit(self._execute_single_task, task): task
-                for task in self.tasks
-            }
-            
-            # 处理完成的任务
-            for future in as_completed(future_to_task):
-                task = future.result()
-                completed_tasks.append(task)
-                
-                # 更新进度
-                elapsed = ""
-                if task.start_time and task.end_time:
-                    elapsed = f"{(task.end_time - task.start_time).total_seconds():.1f}s"
-                
-                status_text = {
-                    "completed": "[green]✓ 完成[/]",
-                    "failed": "[red]✗ 失败[/]",
-                    "running": "[yellow]⟳ 运行中[/]",
-                    "pending": "[dim]○ 等待中[/]",
-                }.get(task.status, task.status)
-                
-                output_or_error = ""
-                if task.output:
-                    output_or_error = str(task.output)[-40:]
-                elif task.error:
-                    output_or_error = task.error[-40:]
-                
-                table.add_row(
-                    str(task.task_id),
-                    task.prompt[:50] + ("..." if len(task.prompt) > 50 else ""),
-                    status_text,
-                    elapsed,
-                    output_or_error,
-                )
-                
-                # 清除之前的表格输出，显示更新
-                console.clear()
-                console.print(table)
-        
-        # 打印最终统计
+        for task in sorted(completed_tasks, key=lambda t: t.task_id):
+            elapsed = ""
+            if task.start_time and task.end_time:
+                elapsed = f"{(task.end_time - task.start_time).total_seconds():.1f}s"
+            status_text = {
+                "completed": "[green]✓ 完成[/]",
+                "failed": "[red]✗ 失败[/]",
+                "running": "[yellow]⟳ 运行中[/]",
+                "pending": "[dim]○ 等待中[/]",
+            }.get(task.status, task.status)
+            output_or_error = ""
+            if task.output:
+                output_or_error = str(task.output)[-40:]
+            elif task.error:
+                output_or_error = task.error[-40:]
+            table.add_row(
+                str(task.task_id),
+                task.prompt[:50] + ("..." if len(task.prompt) > 50 else ""),
+                status_text,
+                elapsed,
+                output_or_error,
+            )
+        console.print(table)
+
         completed = sum(1 for t in completed_tasks if t.status == "completed")
         failed = sum(1 for t in completed_tasks if t.status == "failed")
-        
-        console.print(f"\n[bold]批量处理完成[/] 成功: {completed}, 失败: {failed}")
-        
+        console.print(f"[bold]批量处理完成[/] 成功: {completed}, 失败: {failed}")
         return completed_tasks
     
     def generate_summary(self, tasks: list[BatchTask]) -> str:
