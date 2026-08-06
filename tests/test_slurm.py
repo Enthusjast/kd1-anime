@@ -268,3 +268,42 @@ def test_cancel_job_invalid_id_is_benign(monkeypatch):
 
     monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
     assert dispatcher.cancel_job("123") is True
+
+
+def test_gone_with_nested_video_is_completed(monkeypatch, tmp_path):
+    """manim 成品在嵌套路径 <media_dir>/videos/<file>/<quality>/<Scene>.mp4
+    下也要能识别 (HPC 实测场景: 源文件 scene_3.py → videos/scene_3/1080p30/)."""
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    nested = job.media_dir / "videos" / "scene_3" / "1080p30"
+    nested.mkdir(parents=True)
+    (nested / "Demo.mp4").write_bytes(b"fake")
+    monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "GONE"})
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    assert result == {"123": True}
+
+
+def test_gone_with_stale_video_is_not_completed(monkeypatch, tmp_path):
+    """提交前就存在的旧 mp4 (上一次修复尝试残留) 不能当作本次成功产物。"""
+    import os
+
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path, submitted_at=time.time())
+    nested = job.media_dir / "videos" / "scene_3" / "1080p30"
+    nested.mkdir(parents=True)
+    vid = nested / "Demo.mp4"
+    vid.write_bytes(b"fake")
+    old = time.time() - 3600
+    os.utime(vid, (old, old))
+    monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 1)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "GONE"})
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    assert result == {"123": False}
+    assert job.status == "FAILED"

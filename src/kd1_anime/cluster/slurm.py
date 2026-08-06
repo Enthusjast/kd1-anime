@@ -563,26 +563,28 @@ class SlurmDispatcher:
 
     @staticmethod
     def _find_final_video(job: SlurmJob) -> Path | None:
-        """在作业 media_dir 顶层查找最终渲染视频 (不含 partial_movie_files)。
+        """递归查找作业产出的最终渲染视频。
 
-        只接受 mtime 不早于作业提交时间的视频, 避免误复用上一次修复尝试的旧产物。
+        manim 0.20 会把成品写到嵌套路径
+        <media_dir>/videos/<源文件名>/<quality>/<SceneClass>.mp4
+        (不同版本/平台层级略有差异), 因此必须递归查找, 与 VideoMerger 的
+        定位逻辑保持一致; 同时排除 partial_movie_files, 并只接受 mtime
+        不早于作业提交时间的产物, 避免误复用上一次修复尝试的旧视频。
         """
         if not job.media_dir.is_dir():
             return None
-
-        def _fresh(path: Path) -> bool:
-            try:
-                return path.stat().st_mtime >= job.submitted_at - 1.0
-            except OSError:
-                return False
-
-        exact = job.media_dir / f"{job.scene_class_name}.mp4"
-        if exact.is_file() and _fresh(exact):
-            return exact
-        for path in sorted(job.media_dir.glob("*.mp4")):
-            if path.is_file() and _fresh(path):
-                return path
-        return None
+        try:
+            candidates = [
+                path
+                for path in job.media_dir.rglob(f"{job.scene_class_name}.mp4")
+                if "partial_movie_files" not in path.parts
+                and path.stat().st_mtime >= job.submitted_at - 1.0
+            ]
+        except OSError:
+            return None
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
 
     @staticmethod
     def _job_log_tail(job: SlurmJob, limit: int = 4000) -> str:
