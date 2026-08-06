@@ -80,6 +80,19 @@ BANNED_ATTRIBUTE_NAMES = {
 }
 
 SCENE_BASES = {"Scene", "ThreeDScene", "MovingCameraScene"}
+# mobject 继承树的根类: manim 只对"子类的基类"做 OpenGL 转换, Mobject/VMobject
+# 这两个根类本身始终是 Cairo 版。场景文件里自定义这些根类的子类, 在 OpenGL
+# 渲染下会得到缺少 should_render 的 Cairo 对象, 渲染时直接 AttributeError。
+MOBJECT_BASES = {
+    "Mobject",
+    "VMobject",
+    "PMobject",
+    "Mobject1D",
+    "Mobject2D",
+    "OpenGLMobject",
+    "OpenGLVMobject",
+    "OpenGLPMobject",
+}
 TEX_MOBJECTS = {"Tex", "MathTex"}
 
 
@@ -287,6 +300,17 @@ class _SafetyVisitor(ast.NodeVisitor):
                 continue
             self.error(statement, f"类 {node.name!r} 的类体中禁止执行动态语句")
         bases = {base.id for base in node.bases if isinstance(base, ast.Name)}
+        # 禁止自定义 mobject 子类: OpenGL 渲染器只接受 OpenGLMobject 家族,
+        # class X(Mobject)/class X(VMobject) 会产出缺少 should_render 的
+        # Cairo 对象, 在 opengl_renderer.update_frame 渲染崩溃。
+        if bases & MOBJECT_BASES and not (bases & SCENE_BASES):
+            self.error(
+                node,
+                "禁止自定义 mobject 子类 (Mobject/VMobject/PMobject 及其 OpenGL 版)。"
+                "OpenGL 渲染器下这类对象没有 should_render 属性, 渲染会崩溃; "
+                "请直接在 construct() 内用 manim 标准类 (Polygon/VGroup/Line/"
+                "Square/MathTex 等) 组合, 不要自定义继承",
+            )
         if bases & SCENE_BASES:
             self.scene_classes.append(node.name)
             construct = next(

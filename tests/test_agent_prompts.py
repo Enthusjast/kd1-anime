@@ -36,6 +36,16 @@ def test_coder_guards_against_blind_subscript_access():
     assert "len()" in CODER_SYSTEM_PROMPT
 
 
+def test_coder_forbids_custom_mobject_subclass():
+    assert "自定义 mobject 子类" in CODER_SYSTEM_PROMPT
+    assert "should_render" in CODER_SYSTEM_PROMPT
+
+
+def test_auto_fixer_has_should_render_pattern():
+    assert "should_render" in AUTO_FIXER_SYSTEM_PROMPT
+    assert "自定义 mobject 子类" in AUTO_FIXER_SYSTEM_PROMPT
+
+
 def test_auto_fixer_has_index_error_pattern():
     assert "IndexError" in AUTO_FIXER_SYSTEM_PROMPT
     assert "下标越界" in AUTO_FIXER_SYSTEM_PROMPT
