@@ -492,9 +492,10 @@ def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
 
     state = ctx.scene_states[1]
     assert state.give_up is True
-    # 相同错误只修复 1 次就放弃 (第 2 次相同 → 提前放弃)
-    assert autofixer.fix_calls == 1
-    assert "连续 2 次渲染错误完全相同" in state.failure_reason
+    # 相同错误至少要修 2 次 (fix_attempts>=2 门槛), 第 3 次相同才提前放弃,
+    # 避免一次修复失败就被误判为环境问题。
+    assert autofixer.fix_calls == 2
+    assert "连续 3 次渲染错误完全相同" in state.failure_reason
     # 放弃原因里带错误日志尾部, 方便直接定位根因
     assert "ValueError: something deterministic" in state.failure_reason
 

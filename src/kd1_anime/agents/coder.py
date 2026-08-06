@@ -289,6 +289,9 @@ self.set_camera_orientation(phi=75*DEGREES, theta=30*DEGREES)
 - 中文必须用 Tex + ctex (TexTemplate 已加载), 不要用 Text 渲染中文
 - 使用 tex_template 配置 XeLaTeX
 - 数学公式用 MathTex, 纯中文/混合说明文字用 Tex
+- 不要对 split / get_part_by_tex / get_parts_by_tex / VGroup 分组的返回结果盲目取 [0]/[1]:
+  先确认元素数量 (len() 判断或遍历), 分隔结果或子串不存在时元素可能不足, 访问不存在的下标会触发
+  IndexError. 需要固定位置时用 VGroup(...).arrange() 或显式构造, 不要凭空假设一定有第二个元素
 """ + MANIM_API_KNOWLEDGE
 
 

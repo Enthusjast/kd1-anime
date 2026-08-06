@@ -2031,11 +2031,18 @@ class Orchestrator:
         else:
             state.identical_error_count = 1
             state.last_error_fp = fp
-        if state.identical_error_count >= settings.MAX_FIX_IDENTICAL_ERRORS:
+        # 连续相同错误 → 提前放弃, 避免修复器在同一个环境错误上空转。
+        # 但必须叠加 fix_attempts>=2 门槛: 修复器至少要修过 2 次才允许据此放弃,
+        # 否则像 camera.frame / LaTeX 这类"可修代码错误"在第一次修复失败后
+        # 就会被误判为环境问题而直接放弃 (此前只给 1 次机会)。
+        if (
+            state.identical_error_count >= settings.MAX_FIX_IDENTICAL_ERRORS
+            and state.fix_attempts >= 2
+        ):
             state.give_up = True
             state.failure_reason = self._give_up_reason(
-                f"连续 {state.identical_error_count} 次渲染错误完全相同，"
-                "判定为环境/配置问题而非代码问题", error_log
+                f"连续 {state.identical_error_count} 次渲染错误完全相同且修复未能消除，"
+                "疑似环境/配置问题，已放弃", error_log
             )
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
