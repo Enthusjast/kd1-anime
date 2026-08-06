@@ -133,6 +133,23 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
 - 不要凭空假设一定有第二个元素; 用循环、显式长度检查或备选路径
 - 保持分镜的数学内容与视觉设计不变, 只修复取值方式
 
+### 12. OpenGL 渲染下 mobject 缺少 should_render (高频)
+**症状**: `AttributeError: Xxx object has no attribute 'should_render'`
+         (Xxx 是 Polygon/VGroup/Line 等), 位置在 opengl_renderer.py 的
+         update_frame 遍历 scene.mobjects 时
+**原因**: 场景里出现了非 OpenGL 兼容的 mobject。本项目以 OpenGL 渲染,
+         OpenGL 渲染器要求 scene 里的对象都是 OpenGLMobject 系列 (带
+         should_render 属性)。**自定义 mobject 子类** (class X(Mobject) /
+         class X(VMobject) / class X(PMobject)) 是头号原因: manim 只对
+         子类的基类做 OpenGL 转换, 这两个根类本身始终是 Cairo 版。
+**修复**:
+- **删除所有自定义 mobject 子类**, 直接用 manim 标准类 (Polygon / VGroup /
+  Line / Square / MathTex / Tex 等) 在 construct() 内构造并组合
+- 自定义形状请用 VGroup + 标准图形 (Line/Polygon/Arc) 组合, 或用
+  `from manim import *` 的标准类 + 变换 (Transform/TransformMatchingTex)
+- 不要用 type(...) 动态创建类、不要模块级 (class 外) 创建 mobject
+- 保持 Scene 类名与分镜的数学内容不变
+
 ## 修复原则
 
 1. **最小改动**: 只修复导致错误的部分,不要重构代码
@@ -240,6 +257,12 @@ class AutoFixerAgent(BaseAgent):
             return (
                 "相机 frame 属性错误 — self.camera.frame 只在 MovingCameraScene 中可用，"
                 "普通 Scene 的相机没有 frame 属性。将类改为继承 MovingCameraScene 或删除该用法"
+            )
+        elif "should_render" in log_lower:
+            return (
+                "OpenGL mobject 不兼容 — 场景里出现了自定义 mobject 子类或非 "
+                "OpenGLMobject 对象 (缺 should_render 属性)。删除自定义子类, "
+                "只用 manim 标准类 (Polygon/VGroup/Line/MathTex) 在 construct() 内构造"
             )
         elif "latex" in log_lower or "emergency stop" in log_lower or "missing $" in log_lower:
             return "LaTeX 编译错误 — 检查 MathTex 中的 LaTeX 语法、括号匹配、转义字符"

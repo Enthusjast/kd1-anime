@@ -111,6 +111,20 @@ PangoError: couldn't load font "Noto Sans CJK SC"
         error_type = fixer._classify_error(error_log)
         assert "字体" in error_type or "font" in error_type.lower()
 
+    def test_classify_should_render_error(self, fixer):
+        """OpenGL mobject 缺少 should_render 的分类。"""
+        error_log = """
+Traceback (most recent call last):
+  File "scene_4.py", line 63, in construct
+    self.play(Create(outer_square))
+  File ".../opengl_renderer.py", line 941, in update_frame
+    if not mobject.should_render:
+AttributeError: Polygon object has no attribute 'should_render'
+        """
+        error_type = fixer._classify_error(error_log)
+        assert "should_render" in error_type or "OpenGL" in error_type
+
+
     def test_classify_index_error(self, fixer):
         """测试下标越界分类 (split/分组结果直接取下标)。"""
         error_log = """
