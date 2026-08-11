@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
+from typing import Literal
 
 from kd1_anime.config import settings
 
@@ -73,6 +74,7 @@ BANNED_ATTRIBUTE_NAMES = {
     "dump",
     "dumps",
     "load_library",
+    "open_memmap",
     "__subclasses__",
     "__globals__",
     "__code__",
@@ -156,7 +158,7 @@ class CodeValidationResult:
 
 
 class _SafetyVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, renderer: Literal["cairo", "opengl"] | None = None) -> None:
         self.errors: list[str] = []
         self.scene_classes: list[str] = []
         self.has_manim_import = False
@@ -165,10 +167,21 @@ class _SafetyVisitor(ast.NodeVisitor):
         self.configured_templates: set[str] = set()
         self.tex_calls: list[tuple[ast.Call, str | None]] = []
         self.imported_modules: set[str] = set()
+        self.dangerous_aliases: set[str] = set()
+        self.renderer = renderer or settings.MANIM_RENDERER
 
     def error(self, node: ast.AST, message: str) -> None:
         line = getattr(node, "lineno", "?")
         self.errors.append(f"第 {line} 行: {message}")
+
+    def _check_config_assignment(self, target: ast.expr, node: ast.AST) -> None:
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "config"
+            and target.attr != "tex_template"
+        ):
+            self.error(node, f"禁止修改 Manim 全局配置 config.{target.attr}")
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -190,15 +203,23 @@ class _SafetyVisitor(ast.NodeVisitor):
             self.error(node, f"禁止从模块 {module!r} 导入")
         if root == "manim":
             self.has_manim_import = True
+            for alias in node.names:
+                if alias.name in BANNED_CALLS:
+                    local_name = alias.asname or alias.name
+                    self.dangerous_aliases.add(local_name)
+                    self.error(node, f"禁止导入危险 Manim 对象 {alias.name!r}")
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         # 检查直接函数调用
-        if isinstance(node.func, ast.Name) and node.func.id in BANNED_CALLS:
+        if isinstance(node.func, ast.Name) and (
+            node.func.id in BANNED_CALLS or node.func.id in self.dangerous_aliases
+        ):
             self.error(node, f"禁止调用 {node.func.id}()")
         # 检查属性方法调用
         elif isinstance(node.func, ast.Attribute) and (
-            node.func.attr in BANNED_ATTRIBUTE_NAMES or node.func.attr.startswith("__")
+            node.func.attr in BANNED_ATTRIBUTE_NAMES
+            or (node.func.attr.startswith("__") and not self._is_super_init(node.func))
         ):
             self.error(node, f"禁止调用属性方法 {node.func.attr}()")
 
@@ -213,7 +234,14 @@ class _SafetyVisitor(ast.NodeVisitor):
                     break
 
         # 检查 Tex/MathTex 调用
-        if isinstance(node.func, ast.Name) and node.func.id in TEX_MOBJECTS:
+        tex_constructor = (
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else ""
+        )
+        if tex_constructor in TEX_MOBJECTS:
             template_keyword = next(
                 (keyword for keyword in node.keywords if keyword.arg == "tex_template"),
                 None,
@@ -226,51 +254,120 @@ class _SafetyVisitor(ast.NodeVisitor):
             self.tex_calls.append((node, template_name))
 
         # 检查动态构造危险调用（如 getattr(os, "system")）
-        if isinstance(node.func, ast.Name) and node.func.id == "getattr":
-            if len(node.args) >= 2:
-                attr_arg = node.args[1]
-                # 检查是否在访问危险属性
-                if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
-                    if attr_arg.value in BANNED_ATTRIBUTE_NAMES:
-                        self.error(node, f"禁止通过 getattr 访问危险属性 {attr_arg.value!r}")
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
+            attr_arg = node.args[1]
+            if (
+                isinstance(attr_arg, ast.Constant)
+                and isinstance(attr_arg.value, str)
+                and attr_arg.value in BANNED_ATTRIBUTE_NAMES
+            ):
+                self.error(node, f"禁止通过 getattr 访问危险属性 {attr_arg.value!r}")
 
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id.startswith("__"):
+            self.error(node, f"禁止访问双下划线名称 {node.id!r}")
+        if isinstance(node.ctx, ast.Load) and (
+            node.id in BANNED_CALLS or node.id in self.dangerous_aliases
+        ):
+            self.error(node, f"禁止引用危险能力 {node.id!r}")
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.value, ast.Name) and node.value.id in {"__builtins__", "builtins"}:
+            self.error(node, "禁止通过 builtins 下标访问运行时能力")
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr.startswith("__"):
+        if node.attr in BANNED_ATTRIBUTE_NAMES:
+            self.error(node, f"禁止引用危险属性 {node.attr!r}")
+        if node.attr.startswith("__") and not self._is_super_init(node):
             self.error(node, f"禁止访问双下划线属性 {node.attr}")
         self.generic_visit(node)
 
+    @staticmethod
+    def _is_super_init(node: ast.Attribute) -> bool:
+        """只放行类构造器中常见且无额外能力的 ``super().__init__``。"""
+
+        return (
+            node.attr == "__init__"
+            and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "super"
+            and not node.value.args
+            and not node.value.keywords
+        )
+
     def visit_Assign(self, node: ast.Assign) -> None:
+        if isinstance(node.value, ast.Name) and (
+            node.value.id in BANNED_CALLS or node.value.id in self.dangerous_aliases
+        ):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.dangerous_aliases.add(target.id)
+                    self.error(node, f"禁止为危险 callable 创建别名 {target.id!r}")
+        if isinstance(node.value, ast.Attribute) and (
+            node.value.attr in BANNED_ATTRIBUTE_NAMES or node.value.attr.startswith("__")
+        ):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.dangerous_aliases.add(target.id)
+                    self.error(node, f"禁止为危险属性创建别名 {target.id!r}")
         # 检查 TexTemplate 赋值: tex_template = TexTemplate(tex_compiler='xelatex', ...)
-        if (len(node.targets) == 1 and 
-            isinstance(node.targets[0], ast.Name) and 
-            isinstance(node.value, ast.Call)):
+        if (
+            len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+        ):
             func_name = ""
             if isinstance(node.value.func, ast.Name):
                 func_name = node.value.func.id
             elif isinstance(node.value.func, ast.Attribute):
                 func_name = node.value.func.attr
             if func_name == "TexTemplate":
-                # 检查是否使用 xelatex 编译器
-                for kw in node.value.keywords:
-                    if kw.arg == "tex_compiler" and isinstance(kw.value, ast.Constant):
-                        if kw.value.value == "xelatex":
-                            self.xelatex_templates.add(node.targets[0].id)
-                        break
-        
+                keyword_values = {
+                    keyword.arg: keyword.value
+                    for keyword in node.value.keywords
+                    if keyword.arg is not None
+                }
+                compiler = keyword_values.get("tex_compiler")
+                output = keyword_values.get("output_format")
+                if (
+                    isinstance(compiler, ast.Constant)
+                    and compiler.value == "xelatex"
+                    and isinstance(output, ast.Constant)
+                    and output.value == ".xdv"
+                ):
+                    self.xelatex_templates.add(node.targets[0].id)
+
+        # 不允许生成代码改写 Manim 的输出目录/渲染器等全局配置；
+        # 唯一放行的属性赋值是项目要求的 config.tex_template。
+        for target in node.targets:
+            self._check_config_assignment(target, node)
+
         # 检查 config.tex_template = ... 赋值
         if len(node.targets) == 1:
             target = node.targets[0]
-            if (isinstance(target, ast.Attribute) and 
-                target.attr == "tex_template" and
-                isinstance(target.value, ast.Name) and 
-                target.value.id == "config"):
-                # 找到被赋值的模板变量名
-                if isinstance(node.value, ast.Name):
-                    self.configured_templates.add(node.value.id)
-        
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "tex_template"
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "config"
+                and isinstance(node.value, ast.Name)
+            ):
+                self.configured_templates.add(node.value.id)
+
         # 允许类属性赋值（已在 visit_ClassDef 中检查）
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._check_config_assignment(node.target, node)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._check_config_assignment(node.target, node)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -298,11 +395,15 @@ class _SafetyVisitor(ast.NodeVisitor):
             if isinstance(statement, ast.AnnAssign) and _is_static_expression(statement.value):
                 continue
             self.error(statement, f"类 {node.name!r} 的类体中禁止执行动态语句")
-        bases = {base.id for base in node.bases if isinstance(base, ast.Name)}
+        bases = {
+            base.id if isinstance(base, ast.Name) else base.attr
+            for base in node.bases
+            if isinstance(base, (ast.Name, ast.Attribute))
+        }
         # 禁止自定义 mobject 子类: OpenGL 渲染器只接受 OpenGLMobject 家族,
         # class X(Mobject)/class X(VMobject) 会产出缺少 should_render 的
         # Cairo 对象, 在 opengl_renderer.update_frame 渲染崩溃。
-        if bases & MOBJECT_BASES and not (bases & SCENE_BASES):
+        if self.renderer == "opengl" and bases & MOBJECT_BASES and not (bases & SCENE_BASES):
             self.error(
                 node,
                 "禁止自定义 mobject 子类 (Mobject/VMobject/PMobject 及其 OpenGL 版)。"
@@ -328,7 +429,7 @@ class _SafetyVisitor(ast.NodeVisitor):
             #   MovingCameraScene 也无效 → 一律禁止相机运镜, 必须删除。
             # - Cairo 渲染器下 frame 仅在 MovingCameraScene 中可用。
             frame_access = _find_camera_frame_access(node)
-            renderer = getattr(settings, "MANIM_RENDERER", "cairo")
+            renderer = self.renderer
             if renderer == "opengl":
                 if "MovingCameraScene" in bases:
                     self.error(
@@ -372,12 +473,18 @@ class _SafetyVisitor(ast.NodeVisitor):
 
         for call, template_name in self.tex_calls:
             if template_name is None:
-                self.error(call, "每个 Tex/MathTex 调用都必须显式传入 tex_template=tex_template" + HINT)
+                self.error(
+                    call, "每个 Tex/MathTex 调用都必须显式传入 tex_template=tex_template" + HINT
+                )
             elif template_name not in self.xelatex_templates:
                 self.error(call, "Tex/MathTex 的 tex_template 必须引用 XeLaTeX .xdv 模板" + HINT)
 
 
-def validate_manim_code(code: str) -> CodeValidationResult:
+def validate_manim_code(
+    code: str,
+    *,
+    renderer: Literal["cairo", "opengl"] | None = None,
+) -> CodeValidationResult:
     """校验生成的 Manim 代码，返回可展示给 Coder 的确定性反馈。"""
 
     if not code.strip():
@@ -389,7 +496,7 @@ def validate_manim_code(code: str) -> CodeValidationResult:
         location = f"第 {exc.lineno or '?'} 行"
         return CodeValidationResult(False, [f"Python 语法错误（{location}）: {exc.msg}"])
 
-    visitor = _SafetyVisitor()
+    visitor = _SafetyVisitor(renderer)
     visitor.visit(tree)
     visitor.validate_tex_configuration()
 
@@ -405,9 +512,17 @@ def validate_manim_code(code: str) -> CodeValidationResult:
             ),
         ):
             continue
-        if isinstance(statement, ast.Assign) and _is_static_expression(statement.value):
+        if (
+            isinstance(statement, ast.Assign)
+            and all(isinstance(target, ast.Name) for target in statement.targets)
+            and _is_static_expression(statement.value)
+        ):
             continue
-        if isinstance(statement, ast.AnnAssign) and _is_static_expression(statement.value):
+        if (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and _is_static_expression(statement.value)
+        ):
             continue
         if _is_docstring(statement):
             continue
@@ -416,7 +531,7 @@ def validate_manim_code(code: str) -> CodeValidationResult:
     # 检查导入
     if not visitor.has_manim_import:
         visitor.errors.append("缺少 Manim 导入（应使用 from manim import *）")
-    
+
     # 检查 Scene 类数量
     if not visitor.scene_classes:
         visitor.errors.append("未找到继承 Scene、ThreeDScene 或 MovingCameraScene 的场景类")

@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = ""
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
-    LLM_MAX_TOKENS: int | None = Field(default=None)
+    LLM_MAX_TOKENS: int | None = Field(default=32768, ge=1, le=1_000_000)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     # 单次 LLM 请求的连接/读取超时(秒)。读取超时对非流式是"等待完整响应"，
     # 对流式是"等待下一个 chunk"——静默流式下 600s 只是兜底，不会拖慢任何请求。
@@ -60,8 +60,7 @@ class Settings(BaseSettings):
     # 非流式 + 短读超时会导致"超时→重头生成"的级联；静默流式按 chunk 计超时，
     # 内容一开始生成就能收到，终端表现与非流式完全一致。
     LLM_SILENT_STREAM: bool = Field(
-        default=True,
-        description="stream=False 时仍走流式传输但静默收集，避免长生成超时"
+        default=True, description="stream=False 时仍走流式传输但静默收集，避免长生成超时"
     )
     # 空响应重试时补上的 max_tokens 兜底值：推理模型常把输出预算耗尽在思考上，
     # 导致 content 为空；补足预算后重试可避免反复拿到空响应。
@@ -77,12 +76,13 @@ class Settings(BaseSettings):
         if value is None or value == "":
             return None
         return value
+
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)
     LLM_DEBUG: bool = False
     LLM_USE_JSON_MODE: bool = Field(
         default=True,
-        description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级"
+        description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级",
     )
 
     # --- Slurm 集群 ---
@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     SLURM_SUBMIT_RETRY_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     SLURM_CONTAINER_IMAGE: Path | None = None
     SLURM_REQUIRE_CONTAINER: bool = False
+    SLURM_CONTAINER_DISABLE_NETWORK: bool = Field(
+        default=False,
+        description="在 Apptainer 支持时为生成代码禁用容器网络",
+    )
 
     # --- Manim 渲染 ---
     MANIM_RENDERER: Literal["cairo", "opengl"] = "cairo"
@@ -132,31 +136,18 @@ class Settings(BaseSettings):
     # 门槛, 确保修复器至少有 2 次真实尝试, 不会因一次修复失败就误判放弃。
     MAX_FIX_IDENTICAL_ERRORS: int = Field(default=3, ge=1, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
-    
+
     # --- 自动评估配置 ---
-    ENABLE_AUTO_EVAL: bool = Field(
-        default=False,
-        description="是否启用自动评估-改进循环"
-    )
+    ENABLE_AUTO_EVAL: bool = Field(default=False, description="是否启用自动评估-改进循环")
     ENABLE_VISUAL_EVAL: bool = Field(
-        default=False,
-        description="是否启用视觉效果评估（需要 LLM 支持多模态）"
+        default=False, description="是否启用视觉效果评估（需要 LLM 支持多模态）"
     )
     EVAL_THRESHOLD: float = Field(
-        default=3.5,
-        ge=1.0,
-        le=5.0,
-        description="评估通过阈值（1-5分），低于此分数触发改进"
+        default=3.5, ge=1.0, le=5.0, description="评估通过阈值（1-5分），低于此分数触发改进"
     )
-    MAX_EVAL_ROUNDS: int = Field(
-        default=2,
-        ge=0,
-        le=5,
-        description="最大评估-改进轮数"
-    )
+    MAX_EVAL_ROUNDS: int = Field(default=2, ge=0, le=5, description="最大评估-改进轮数")
     EVAL_VISUAL_MODEL: str | None = Field(
-        default=None,
-        description="视觉评估使用的模型（默认使用 LLM_MODEL）"
+        default=None, description="视觉评估使用的模型（默认使用 LLM_MODEL）"
     )
     MAX_SCENES: int = Field(default=12, ge=1, le=100)
     MAX_PROMPT_CHARS: int = Field(default=50_000, ge=100, le=1_000_000)
@@ -206,8 +197,11 @@ class Settings(BaseSettings):
     @field_validator("SLURM_TIME_LIMIT")
     @classmethod
     def validate_slurm_time_limit(cls, value: str) -> str:
-        if not re.fullmatch(r"(?:\d+-)?\d{1,3}:\d{2}:\d{2}", value):
+        match = re.fullmatch(r"(?:\d+-)?(\d{1,3}):(\d{2}):(\d{2})", value)
+        if not match:
             raise ValueError("必须使用 [days-]HH:MM:SS 格式")
+        if int(match.group(2)) >= 60 or int(match.group(3)) >= 60:
+            raise ValueError("MM 和 SS 必须小于 60")
         return value
 
     @field_validator("SLURM_MEM_GB")
@@ -229,19 +223,19 @@ class Settings(BaseSettings):
         """兼容旧方法名：验证调用 OpenAI-compatible API 所需的完整配置。"""
         missing: list[str] = []
         placeholder_values = {"sk-your-key-here", "your-model-name", ""}
-        
+
         if not self.LLM_API_KEY or self.LLM_API_KEY in placeholder_values:
             missing.append("LLM_API_KEY")
-        if not self.LLM_BASE_URL.strip() or self.LLM_BASE_URL == "https://api.openai.com/v1":
+        if not self.LLM_BASE_URL.strip():
             missing.append("LLM_BASE_URL")
         if not self.LLM_MODEL.strip() or self.LLM_MODEL in placeholder_values:
             missing.append("LLM_MODEL")
-        
+
         if missing:
             config_path = self.user_env_file
             example_path = Path.cwd() / ".env.example"
-            
-            error_msg = f"""LLM 配置不完整（缺少或仍为占位值：{', '.join(missing)}）
+
+            error_msg = f"""LLM 配置不完整（缺少或仍为占位值：{", ".join(missing)}）
 
 配置方法（按优先级）：
 1. 设置环境变量：
@@ -253,7 +247,7 @@ class Settings(BaseSettings):
    {config_path}
 
 3. 在项目目录创建 .env：
-   {Path.cwd() / '.env'}
+   {Path.cwd() / ".env"}
 
 配置示例见：{example_path}
             """

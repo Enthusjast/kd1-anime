@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,7 +16,9 @@ from typing import Literal
 from rich.console import Console
 from rich.table import Table
 
+from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.logging import get_logger
+from kd1_anime.resources import ResourceCoordinator
 
 logger = get_logger(__name__)
 console = Console()
@@ -24,6 +27,7 @@ console = Console()
 @dataclass
 class BatchTask:
     """批量任务定义。"""
+
     task_id: int
     prompt: str
     output: Path | None = None
@@ -37,44 +41,70 @@ class BatchTask:
 @dataclass
 class BatchConfig:
     """批量处理配置。"""
+
     max_parallel: int = 3
     dry_run: bool = False
     output_dir: Path | None = None
     incremental: bool = False
     base_run_ids: dict[int, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if isinstance(self.max_parallel, bool) or not 1 <= self.max_parallel <= 32:
+            raise ValueError("max_parallel 必须在 1..32 之间")
+        normalized: dict[int, str] = {}
+        for raw_task_id, raw_run_id in self.base_run_ids.items():
+            task_id = int(raw_task_id)
+            run_id = str(raw_run_id)
+            if task_id < 1:
+                raise ValueError("base_run_ids 的任务 ID 必须大于 0")
+            if not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{8}", run_id):
+                raise ValueError(f"base_run_ids 包含无效 run-id: {run_id!r}")
+            normalized[task_id] = run_id
+        self.base_run_ids = normalized
+
 
 def load_prompts_from_file(file_path: Path) -> list[str]:
     """从文件加载 prompts。
-    
+
     支持的格式：
     - 纯文本：每行一个 prompt
     - JSON：包含 prompts 数组的 JSON 文件
     """
     content = file_path.read_text(encoding="utf-8").strip()
-    
+
     # 尝试解析为 JSON
     if file_path.suffix == ".json":
         try:
             data = json.loads(content)
             if isinstance(data, list):
-                return [str(p) for p in data if p]
-            elif isinstance(data, dict) and "prompts" in data:
-                return [str(p) for p in data["prompts"] if p]
-        except json.JSONDecodeError:
-            pass
-    
+                values = data
+            elif isinstance(data, dict):
+                values = data.get("prompts")
+            else:
+                values = None
+            if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+                raise ValueError("JSON prompt 文件必须是字符串数组或包含 prompts 字符串数组的对象")
+            prompts = [item.strip() for item in values if item.strip()]
+            if not prompts:
+                raise ValueError("prompt 文件未包含有效任务")
+            return prompts
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSON prompt 文件格式无效: {exc}") from exc
+
     # 作为纯文本处理，每行一个 prompt
     lines = [line.strip() for line in content.split("\n") if line.strip()]
     # 过滤掉注释行
-    return [line for line in lines if not line.startswith("#")]
+    prompts = [line for line in lines if not line.startswith("#")]
+    if not prompts:
+        raise ValueError("prompt 文件未包含有效任务")
+    return prompts
 
 
 def load_batch_config(file_path: Path) -> BatchConfig:
     """从 JSON 文件加载批量配置。"""
     content = file_path.read_text(encoding="utf-8")
     data = json.loads(content)
-    
+
     return BatchConfig(
         max_parallel=data.get("max_parallel", 3),
         dry_run=data.get("dry_run", False),
@@ -86,11 +116,15 @@ def load_batch_config(file_path: Path) -> BatchConfig:
 
 class BatchProcessor:
     """批量并行处理器。"""
-    
+
     def __init__(self, config: BatchConfig | None = None) -> None:
         self.config = config or BatchConfig()
         self.tasks: list[BatchTask] = []
-    
+        self.resources = ResourceCoordinator(
+            llm_limit=settings.LLM_PARALLEL_WORKERS,
+            slurm_limit=settings.SLURM_MAX_IN_FLIGHT,
+        )
+
     def add_task(self, prompt: str, output: Path | None = None) -> BatchTask:
         """添加单个任务。"""
         task = BatchTask(
@@ -100,7 +134,7 @@ class BatchProcessor:
         )
         self.tasks.append(task)
         return task
-    
+
     def load_tasks_from_file(self, file_path: Path) -> list[BatchTask]:
         """从文件加载任务。"""
         prompts = load_prompts_from_file(file_path)
@@ -109,17 +143,19 @@ class BatchProcessor:
             task = self.add_task(prompt)
             tasks.append(task)
         return tasks
-    
+
     def _execute_single_task(self, task: BatchTask) -> BatchTask:
         """执行单个任务。"""
         from kd1_anime.orchestrator import Orchestrator
-        
+
         task.status = "running"
         task.start_time = datetime.now()
-        
+        orchestrator: Orchestrator | None = None
+
         try:
-            orchestrator = Orchestrator()
-            
+            orchestrator = Orchestrator(resource_coordinator=self.resources)
+            output_path = self._task_output_path(task)
+
             if self.config.incremental and task.task_id in self.config.base_run_ids:
                 # 增量渲染模式
                 base_run_id = self.config.base_run_ids[task.task_id]
@@ -127,29 +163,52 @@ class BatchProcessor:
                     task.prompt,
                     base_run_id,
                     dry_run=self.config.dry_run,
+                    output_path=output_path,
                 )
             else:
                 # 普通渲染模式
                 final_video = orchestrator.run(
                     task.prompt,
                     dry_run=self.config.dry_run,
+                    output_path=output_path,
                 )
-            
+
             task.status = "completed"
+            task.output = final_video
             if final_video:
-                task.output = final_video
                 logger.info(f"任务 {task.task_id} 完成: {final_video}")
-        
+            task.run_id = orchestrator._ctx.paths.run_id if orchestrator._ctx else None
+
         except Exception as exc:
             task.status = "failed"
             task.error = str(exc)
             logger.error(f"任务 {task.task_id} 失败: {exc}")
-        
+
         finally:
+            if task.run_id is None and orchestrator is not None and orchestrator._ctx is not None:
+                task.run_id = orchestrator._ctx.paths.run_id
             task.end_time = datetime.now()
-        
+
         return task
-    
+
+    def _task_output_path(self, task: BatchTask) -> Path | None:
+        if task.output is not None:
+            return resolve_runtime_path(task.output)
+        if self.config.output_dir is None:
+            return None
+        output_dir = resolve_runtime_path(self.config.output_dir)
+        return output_dir / f"task_{task.task_id:03d}.mp4"
+
+    def _validate_output_targets(self) -> None:
+        targets = [self._task_output_path(task) for task in self.tasks]
+        concrete = [target for target in targets if target is not None]
+        if len({str(target) for target in concrete}) != len(concrete):
+            raise ValueError("批量任务包含重复输出路径")
+        for target in concrete:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() and not settings.OVERWRITE_OUTPUT:
+                raise FileExistsError(f"输出文件已存在且 OVERWRITE_OUTPUT=false: {target}")
+
     def execute_all(self) -> list[BatchTask]:
         """并行执行所有任务。
 
@@ -159,14 +218,16 @@ class BatchProcessor:
         if not self.tasks:
             console.print("[yellow]没有任务可执行[/]")
             return []
+        self._validate_output_targets()
 
-        console.print(f"[cyan]开始批量处理[/] 共 {len(self.tasks)} 个任务，最大并行数: {self.config.max_parallel}")
+        console.print(
+            f"[cyan]开始批量处理[/] 共 {len(self.tasks)} 个任务，最大并行数: {self.config.max_parallel}"
+        )
 
         completed_tasks: list[BatchTask] = []
         with ThreadPoolExecutor(max_workers=self.config.max_parallel) as executor:
             future_to_task = {
-                executor.submit(self._execute_single_task, task): task
-                for task in self.tasks
+                executor.submit(self._execute_single_task, task): task for task in self.tasks
             }
             for future in as_completed(future_to_task):
                 task = future.result()
@@ -218,17 +279,17 @@ class BatchProcessor:
         failed = sum(1 for t in completed_tasks if t.status == "failed")
         console.print(f"[bold]批量处理完成[/] 成功: {completed}, 失败: {failed}")
         return completed_tasks
-    
+
     def generate_summary(self, tasks: list[BatchTask]) -> str:
         """生成批量处理摘要。"""
         completed = sum(1 for t in tasks if t.status == "completed")
         failed = sum(1 for t in tasks if t.status == "failed")
-        
+
         total_time = 0
         for task in tasks:
             if task.start_time and task.end_time:
                 total_time += (task.end_time - task.start_time).total_seconds()
-        
+
         summary = f"""
 批量处理摘要
 ============
@@ -243,5 +304,5 @@ class BatchProcessor:
             status = "✓" if task.status == "completed" else "✗"
             output = str(task.output) if task.output else task.error or "N/A"
             summary += f"  {status} 任务 {task.task_id}: {output}\n"
-        
+
         return summary

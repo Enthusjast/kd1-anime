@@ -63,7 +63,7 @@ packages = ["src/kd1_anime"]
 include = [
     "src/kd1_anime", "main.py",
     "requirements.txt", ".env.example",
-    "README.md", "LICENSE", "ARCHITECTURE.md", "CLAUDE.md", "AGENTS.md",
+    "README.md", "LICENSE", "ARCHITECTURE.md", "AGENTS.md",
 ]
 
 [tool.pytest.ini_options]

@@ -2,6 +2,17 @@ import time
 
 from kd1_anime.cluster.slurm import SlurmDispatcher, SlurmJob
 from kd1_anime.config import settings
+from kd1_anime.rendering import VideoMetadata
+
+
+def valid_metadata():
+    return VideoMetadata(
+        size_bytes=4,
+        duration_seconds=1,
+        width=settings.MANIM_PIXEL_WIDTH,
+        height=settings.MANIM_PIXEL_HEIGHT,
+        frame_rate=settings.MANIM_FRAME_RATE,
+    )
 
 
 def make_job(tmp_path, submitted_at=None):
@@ -60,6 +71,143 @@ def test_cairo_script_does_not_pass_write_to_movie(monkeypatch, tmp_path):
         1, tmp_path / "scene.py", "Demo", tmp_path / "media", tmp_path / "out", tmp_path / "err"
     )
     assert "--write_to_movie" not in script
+
+
+def test_script_pins_resolution_and_frame_rate(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "MANIM_PIXEL_WIDTH", 1280)
+    monkeypatch.setattr(settings, "MANIM_PIXEL_HEIGHT", 720)
+    monkeypatch.setattr(settings, "MANIM_FRAME_RATE", 30)
+
+    script = SlurmDispatcher()._build_script(
+        1, tmp_path / "scene.py", "Demo", tmp_path / "media", tmp_path / "out", tmp_path / "err"
+    )
+
+    assert "--resolution 1280,720" in script
+    assert "--fps 30" in script
+
+
+def test_container_can_disable_network(monkeypatch, tmp_path):
+    image = tmp_path / "manim.sif"
+    image.write_bytes(b"image")
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "SLURM_CONTAINER_IMAGE", image)
+    monkeypatch.setattr(settings, "SLURM_CONTAINER_DISABLE_NETWORK", True)
+
+    script = SlurmDispatcher()._build_script(
+        1, tmp_path / "scene.py", "Demo", tmp_path / "media", tmp_path / "out", tmp_path / "err"
+    )
+
+    assert "apptainer exec" in script
+    assert "--net --network none" in script
+
+
+def test_script_rejects_multiline_directive_paths(tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError, match="单行"):
+        SlurmDispatcher()._build_script(
+            1,
+            tmp_path / "scene.py",
+            "Demo",
+            tmp_path / "media",
+            tmp_path / "out\n#SBATCH --account=attacker",
+            tmp_path / "err",
+        )
+
+
+def test_each_submission_gets_an_isolated_media_directory(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    scene = tmp_path / "scenes" / "scene_1.py"
+    scene.parent.mkdir()
+    scene.write_text("from manim import *\n", encoding="utf-8")
+    job_ids = iter(["101", "102"])
+    monkeypatch.setattr(dispatcher, "submit", lambda script: next(job_ids))
+
+    first = dispatcher.submit_scene(
+        1,
+        scene,
+        "Demo",
+        scenes_dir=tmp_path / "scenes",
+        logs_dir=tmp_path / "logs",
+        videos_dir=tmp_path / "videos",
+    )
+    second = dispatcher.submit_scene(
+        1,
+        scene,
+        "Demo",
+        scenes_dir=tmp_path / "scenes",
+        logs_dir=tmp_path / "logs",
+        videos_dir=tmp_path / "videos",
+    )
+
+    assert first.media_dir != second.media_dir
+    assert first.media_dir.parent == second.media_dir.parent == tmp_path / "videos" / "scene_1"
+
+
+def test_attempt_media_dir_does_not_break_container_run_bind(monkeypatch, tmp_path):
+    """带 attempt 子目录时, 容器仍必须绑定整个 run 根目录。"""
+    image = tmp_path / "manim.sif"
+    image.write_bytes(b"image")
+    run_root = tmp_path / "runs" / "20260811-120000-abcdef12"
+    scene = run_root / "scenes" / "scene_1.py"
+    scene.parent.mkdir(parents=True)
+    scene.write_text("from manim import *\n", encoding="utf-8")
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "SLURM_CONTAINER_IMAGE", image)
+
+    script_path, _, _, media_dir = SlurmDispatcher().generate_script(
+        1,
+        scene,
+        "Demo",
+        scenes_dir=scene.parent,
+        logs_dir=run_root / "logs",
+        videos_dir=run_root / "videos",
+        attempt_token="abcdef123456",
+    )
+
+    script = script_path.read_text(encoding="utf-8")
+    assert media_dir == run_root / "videos" / "scene_1" / "attempt_abcdef123456"
+    assert f"--bind {run_root}:{run_root}" in script
+    assert f"#SBATCH -J kd1-{run_root.name}-s1" in script
+
+
+def test_submission_uses_captured_render_profile_not_mutated_settings(monkeypatch, tmp_path):
+    from kd1_anime.rendering import RenderProfile
+
+    dispatcher = SlurmDispatcher()
+    scene = tmp_path / "scenes" / "scene_1.py"
+    scene.parent.mkdir()
+    scene.write_text("from manim import *\n", encoding="utf-8")
+    profile = RenderProfile(
+        renderer="cairo",
+        quality="m",
+        pixel_width=1280,
+        pixel_height=720,
+        frame_rate=24,
+        opengl_platform="egl",
+    )
+    monkeypatch.setattr(settings, "MANIM_QUALITY", "h")
+    monkeypatch.setattr(settings, "MANIM_PIXEL_WIDTH", 1920)
+    monkeypatch.setattr(settings, "MANIM_PIXEL_HEIGHT", 1080)
+    monkeypatch.setattr(settings, "MANIM_FRAME_RATE", 60)
+    monkeypatch.setattr(dispatcher, "submit", lambda script: "123")
+
+    job = dispatcher.submit_scene(
+        1,
+        scene,
+        "Demo",
+        scenes_dir=tmp_path / "scenes",
+        logs_dir=tmp_path / "logs",
+        videos_dir=tmp_path / "videos",
+        render_profile=profile,
+    )
+    script = job.script_path.read_text(encoding="utf-8")
+
+    assert "-qm" in script
+    assert "--resolution 1280,720" in script
+    assert "--fps 24" in script
+    assert job.render_profile == profile
 
 
 def test_queue_timeout_cancels_job(monkeypatch, tmp_path):
@@ -121,6 +269,7 @@ def test_known_running_state_resets_unknown_streak(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: next(statuses))
     monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: cancelled.append(jid) or True)
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda job: True)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
     result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
@@ -146,6 +295,10 @@ def test_submit_uses_parsable_output(monkeypatch, tmp_path):
 
     assert dispatcher.submit(script) == "456"
     assert commands == [["/usr/bin/sbatch", "--parsable", str(script)]]
+
+
+def test_normalize_state_handles_sacct_suffix():
+    assert SlurmDispatcher._normalize_state("CANCELLED+ by 0") == "CANCELLED"
 
 
 def test_submit_timeout_is_not_retried(monkeypatch, tmp_path):
@@ -213,6 +366,9 @@ def test_gone_with_video_is_completed(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "GONE"})
     monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+    monkeypatch.setattr(
+        "kd1_anime.cluster.slurm.verify_video", lambda path, profile: valid_metadata()
+    )
 
     result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
 
@@ -281,6 +437,9 @@ def test_gone_with_nested_video_is_completed(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "GONE"})
     monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+    monkeypatch.setattr(
+        "kd1_anime.cluster.slurm.verify_video", lambda path, profile: valid_metadata()
+    )
 
     result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
 
@@ -364,6 +523,7 @@ def test_preempted_back_to_pending_resets_run_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "MONITOR_QUEUE_TIMEOUT", 100_000)
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": next(statuses)})
     monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda job: True)
 
     def fake_sleep(_seconds):
         clock[0] += 40  # 每次轮询间隔推进 40s
@@ -375,3 +535,33 @@ def test_preempted_back_to_pending_resets_run_timeout(monkeypatch, tmp_path):
     # 若不重置 running_since, 第二次 RUNNING 时已累计 80s > 50s 会触发 RUN_TIMEOUT
     assert result == {"123": True}
     assert job.status == "COMPLETED"
+
+
+def test_completed_without_final_video_is_failed(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "COMPLETED"})
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    assert result == {"123": False}
+    assert job.status == "FAILED"
+    assert "最终 MP4" in job.failure_reason
+
+
+def test_completed_with_invalid_video_is_failed(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path, submitted_at=time.time() - 1)
+    job.media_dir.mkdir(parents=True)
+    (job.media_dir / "Demo.mp4").write_bytes(b"corrupt")
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "COMPLETED"})
+    monkeypatch.setattr(
+        "kd1_anime.cluster.slurm.verify_video",
+        lambda path, profile: (_ for _ in ()).throw(ValueError("corrupt mp4")),
+    )
+
+    result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
+
+    assert result == {"123": False}
+    assert job.status == "FAILED"
+    assert "视频验证失败" in job.failure_reason

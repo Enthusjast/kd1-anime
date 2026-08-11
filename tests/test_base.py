@@ -5,7 +5,7 @@ from typing import Literal
 import pytest
 from pydantic import BaseModel
 
-from kd1_anime.agents.base import BaseAgent
+from kd1_anime.agents.base import BaseAgent, TruncatedResponseError
 from kd1_anime.config import settings
 
 
@@ -84,6 +84,7 @@ def test_empty_json_mode_response_falls_back_to_prompt_only(monkeypatch):
     monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
     monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    monkeypatch.setattr(settings, "LLM_MAX_TOKENS", None)
     calls = []
 
     class FakeCompletions:
@@ -114,6 +115,7 @@ def test_empty_stream_response_gets_max_tokens_boost(monkeypatch):
     monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
     monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    monkeypatch.setattr(settings, "LLM_MAX_TOKENS", None)
     calls = []
 
     class FakeCompletions:
@@ -218,12 +220,54 @@ def test_length_empty_raises_only_after_retries_exhausted(monkeypatch):
         def client(self):
             return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
-    with pytest.raises(RuntimeError, match="仍然失败"):
+    with pytest.raises(TruncatedResponseError, match="仍被截断"):
         CompatibleAgent().call_llm(json_mode=True, max_tokens=4096)
 
     # 1 次补充 max_tokens (不消耗业务重试) + LLM_MAX_RETRIES 次业务重试
     assert len(calls) == 2
     assert calls[1]["max_tokens"] == max(4096 * 2, settings.LLM_EMPTY_RETRY_MAX_TOKENS)
+
+
+def test_nonempty_truncated_response_is_never_returned(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs.copy())
+            if len(calls) == 1:
+                return iter([_chunk('{"partial":', finish="length")])
+            return iter([_chunk('{"complete": true}', finish="stop")])
+
+    class CompatibleAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    result = CompatibleAgent().call_llm(max_tokens=1024)
+
+    assert result == '{"complete": true}'
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] >= settings.LLM_EMPTY_RETRY_MAX_TOKENS
+
+
+def test_persistent_nonempty_truncation_raises_specific_error(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    monkeypatch.setattr(settings, "LLM_MAX_RETRIES", 1)
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return iter([_chunk("partial", finish="length")])
+
+    class CompatibleAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    with pytest.raises(TruncatedResponseError, match="仍被截断"):
+        CompatibleAgent().call_llm(max_tokens=1024)
 
 
 def test_json_schema_error_retries_then_recovers():

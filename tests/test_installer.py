@@ -14,9 +14,9 @@ def make_fake_tex_bin(path: Path, *, complete: bool) -> Path:
     kpsewhich = path / "kpsewhich"
     kpsewhich.write_text(
         "#!/usr/bin/env bash\n"
-        "if [ \"${1:-}\" = -var-value=TEXMFROOT ]; then\n"
+        'if [ "${1:-}" = -var-value=TEXMFROOT ]; then\n'
         "    printf '%s\\n' \"${FAKE_TEX_ROOT:-/nonexistent}\"\n"
-        "elif [ \"${FAKE_TEX_COMPLETE:-0}\" = 1 ]; then\n"
+        'elif [ "${FAKE_TEX_COMPLETE:-0}" = 1 ]; then\n'
         "    printf '/fake/texmf/%s\\n' \"${1:-unknown}\"\n"
         "fi\n",
         encoding="utf-8",
@@ -290,8 +290,8 @@ def test_installer_creates_runnable_wrappers_and_idempotent_shell_config(tmp_pat
     conda_sh.parent.mkdir(parents=True)
     conda_sh.write_text(
         "conda() {\n"
-        "    [ \"${1:-}\" = activate ] || return 1\n"
-        "    export CONDA_DEFAULT_ENV=\"$2\"\n"
+        '    [ "${1:-}" = activate ] || return 1\n'
+        '    export CONDA_DEFAULT_ENV="$2"\n'
         "}\n",
         encoding="utf-8",
     )

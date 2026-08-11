@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -18,10 +19,29 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from kd1_anime.agents.planner import SceneOutline, ScenePlan
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
+from kd1_anime.rendering import (
+    RenderProfile,
+    SceneArtifact,
+    VideoMetadata,
+    sha256_file,
+    verify_video,
+)
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
+RESUME_LLM_STATES = frozenset(
+    {
+        "INIT",
+        "PLANNING",
+        "DETAILING",
+        "CODING",
+        "REVIEWING",
+        "FIXING",
+        "EVALUATING",
+        "ERROR",
+    }
+)
 RunStatus = Literal["running", "interrupted", "failed", "completed", "dry_run_complete"]
 
 
@@ -38,7 +58,7 @@ class StoredSlurmJob(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str = Field(pattern=r"^(?:\d+|reused-\d+)$")
+    job_id: str = Field(pattern=r"^\d+$")
     scene_id: int = Field(ge=1)
     script_path: str
     log_out: str
@@ -46,6 +66,11 @@ class StoredSlurmJob(BaseModel):
     media_dir: str
     scene_class_name: str = Field(min_length=1, max_length=200)
     submitted_at: float = Field(gt=0)
+    code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
+    output_path: str | None = None
+    output_metadata: VideoMetadata | None = None
+    elapsed_seconds: float | None = Field(default=None, ge=0)
     status: str = Field(min_length=1, max_length=100)
     failure_reason: str = Field(default="", max_length=50_000)
     cancelled: bool = False
@@ -66,6 +91,8 @@ class StoredSceneState(BaseModel):
     last_error_fp: str = Field(default="", max_length=64)
     identical_error_count: int = Field(default=0, ge=0)
     slurm_job: StoredSlurmJob | None = None
+    artifact: SceneArtifact | None = None
+    phase: str = Field(default="pending", min_length=1, max_length=40)
     rendered: bool = False
     give_up: bool = False
     failed: bool = False
@@ -77,7 +104,8 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[1] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[2] = MANIFEST_SCHEMA_VERSION
+    revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -88,14 +116,17 @@ class RunManifest(BaseModel):
     interactive: bool = False
     auto_fix: bool = True
     output_path: str
+    render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     outlines: list[SceneOutline] = Field(default_factory=list)
     scenes: dict[int, StoredSceneState] = Field(default_factory=dict)
     final_video: str | None = None
+    final_video_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     error: str = Field(default="", max_length=50_000)
-    
+
     # 增量渲染支持
     incremental: bool = False
     base_run_id: str | None = Field(default=None, pattern=r"^(?:\d{8}-\d{6}-[0-9a-f]{8})?$")
+    eval_round: int = Field(default=0, ge=0)
 
     @field_validator("run_id")
     @classmethod
@@ -146,6 +177,11 @@ def store_slurm_job(job: SlurmJob, root: Path) -> StoredSlurmJob:
         media_dir=_run_relative(root, job.media_dir),
         scene_class_name=job.scene_class_name,
         submitted_at=job.submitted_at,
+        code_sha256=job.code_sha256,
+        render_profile=job.render_profile,
+        output_path=_run_relative(root, job.output_path) if job.output_path else None,
+        output_metadata=job.output_metadata,
+        elapsed_seconds=job.elapsed_seconds,
         status=job.status,
         failure_reason=job.failure_reason,
         cancelled=job.cancelled,
@@ -162,6 +198,11 @@ def restore_slurm_job(stored: StoredSlurmJob, root: Path) -> SlurmJob:
         media_dir=restore_run_path(root, stored.media_dir),
         scene_class_name=stored.scene_class_name,
         submitted_at=stored.submitted_at,
+        code_sha256=stored.code_sha256,
+        render_profile=stored.render_profile,
+        output_path=(restore_run_path(root, stored.output_path) if stored.output_path else None),
+        output_metadata=stored.output_metadata,
+        elapsed_seconds=stored.elapsed_seconds,
         status=stored.status,
         failure_reason=stored.failure_reason,
         cancelled=stored.cancelled,
@@ -184,6 +225,11 @@ def write_manifest(path: Path, manifest: RunManifest) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         path.chmod(0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
@@ -212,7 +258,11 @@ class RunRepository:
         path = self.manifest_path(run_id)
         if not path.is_file() or path.is_symlink():
             raise FileNotFoundError(f"找不到运行清单: {run_id}")
-        manifest = RunManifest.model_validate_json(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("运行清单顶层必须是 JSON 对象")
+        migrated = migrate_manifest_data(raw, self.run_root(run_id))
+        manifest = RunManifest.model_validate(migrated)
         if manifest.run_id != run_id:
             raise ValueError("运行目录与 manifest.run_id 不一致")
         return manifest
@@ -235,9 +285,22 @@ class RunRepository:
 def lock_run(root: Path) -> Iterator[None]:
     """持有进程级排他锁，防止两个 resume 实例操作同一批 Slurm 作业。"""
 
+    if root.is_symlink():
+        raise RuntimeError(f"运行目录不能是符号链接: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    # 旧版本创建的 run 目录可能仍然是组/其他用户可读的；恢复时重新收紧
+    # 权限，避免 manifest、提示词和生成代码继续暴露给同机用户。
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(f"运行目录不是可信的真实目录: {root}")
+    root.chmod(0o700)
     lock_path = root / ".run.lock"
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    if lock_path.is_symlink():
+        raise RuntimeError(f"运行锁不能是符号链接: {lock_path}")
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, open_flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"无法安全打开运行锁: {lock_path}") from exc
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -252,61 +315,6 @@ def lock_run(root: Path) -> Iterator[None]:
             os.close(descriptor)
 
 
-def get_latest_completed_run(repository: RunRepository) -> RunManifest | None:
-    """获取最近一次完成的运行，用于增量渲染。"""
-    manifests = repository.list()
-    for manifest in manifests:
-        if manifest.status in ("completed", "dry_run_complete"):
-            return manifest
-    return None
-
-
-def find_base_run_for_incremental(
-    repository: RunRepository,
-    user_prompt: str,
-) -> RunManifest | None:
-    """查找适合增量渲染的基础运行。
-    
-    优先查找：
-    1. 最近一次完成的运行
-    2. prompt 相似的运行（未来可以添加相似度匹配）
-    """
-    return get_latest_completed_run(repository)
-
-
-def compute_scene_changes(
-    old_manifest: RunManifest,
-    new_scenes: dict[int, ScenePlan],
-) -> dict[str, list[int]]:
-    """计算场景变化，返回需要渲染和可以复用的场景列表。
-    
-    Returns:
-        dict with keys:
-        - "to_render": list of scene_ids that need re-rendering
-        - "to_reuse": list of scene_ids that can reuse old videos
-    """
-    to_render = []
-    to_reuse = []
-    
-    for scene_id in sorted(new_scenes.keys()):
-        new_plan = new_scenes[scene_id]
-        old_scene = old_manifest.scenes.get(scene_id)
-        if old_scene is None:
-            # 新场景，需要渲染
-            to_render.append(scene_id)
-        elif not old_scene.rendered or not old_scene.code_sha256:
-            # 旧场景未渲染或无 hash，需要渲染
-            to_render.append(scene_id)
-        elif old_scene.plan == new_plan:
-            # 计划完全相同，代码不变，可以复用
-            to_reuse.append(scene_id)
-        else:
-            # 计划变化，需要重新生成和渲染
-            to_render.append(scene_id)
-    
-    return {"to_render": to_render, "to_reuse": to_reuse}
-
-
 def get_reusable_video_path(
     old_manifest: RunManifest,
     scene_id: int,
@@ -316,23 +324,185 @@ def get_reusable_video_path(
     old_scene = old_manifest.scenes.get(scene_id)
     if old_scene is None or not old_scene.rendered:
         return None
-    
+
+    if old_scene.artifact and old_scene.artifact.verified:
+        artifact = old_scene.artifact
+        source_root = old_root
+        if artifact.source_run_id != old_manifest.run_id:
+            source_root = old_root.parent / artifact.source_run_id
+            # 跨 run 复用只能访问 workspace/runs 下的真实兄弟目录，不能让
+            # 清单中的合法 run-id 通过符号链接逃逸到 workspace 之外。
+            if (
+                source_root.is_symlink()
+                or not source_root.is_dir()
+                or source_root.resolve().parent != old_root.resolve().parent
+            ):
+                return None
+        try:
+            video = restore_run_path(source_root, artifact.video_path)
+        except (OSError, ValueError):
+            return None
+        try:
+            return video if video.is_file() and video.stat().st_size > 0 else None
+        except OSError:
+            return None
+
     old_job = old_scene.slurm_job
     if old_job is None:
         return None
-    
-    # 构建旧视频路径
-    old_media_dir = restore_run_path(old_root, old_job.media_dir)
-    video_candidates = list(old_media_dir.rglob(f"{old_scene.class_name}.mp4"))
-    
-    # 排除 partial 文件
-    valid_videos = [
-        v for v in video_candidates
-        if "partial_movie_files" not in v.parts and v.stat().st_size > 0
-    ]
-    
+
+    try:
+        # 构建旧视频路径
+        old_media_dir = restore_run_path(old_root, old_job.media_dir)
+        video_candidates = list(old_media_dir.rglob(f"{old_scene.class_name}.mp4"))
+
+        # 排除 partial 文件
+        valid_videos = [
+            v
+            for v in video_candidates
+            if "partial_movie_files" not in v.parts and v.stat().st_size > 0
+        ]
+    except (OSError, ValueError):
+        return None
+
     if valid_videos:
         # 返回最新的视频
-        return max(valid_videos, key=lambda v: v.stat().st_mtime)
-    
+        try:
+            return max(valid_videos, key=lambda v: v.stat().st_mtime)
+        except OSError:
+            return None
+
     return None
+
+
+def _legacy_phase(scene: dict) -> str:
+    if scene.get("rendered"):
+        return "rendered"
+    if scene.get("give_up") or scene.get("failed"):
+        return "failed"
+    if scene.get("slurm_job"):
+        return "monitoring"
+    if scene.get("reviewed"):
+        return "reviewed"
+    if scene.get("code_file"):
+        return "coded"
+    if scene.get("plan_ready"):
+        return "detailed"
+    return "pending"
+
+
+def _migrate_legacy_artifact(
+    *,
+    root: Path,
+    run_id: str,
+    scene_id: int,
+    scene: dict,
+    profile: RenderProfile,
+) -> SceneArtifact | None:
+    job = scene.get("slurm_job")
+    code_hash = scene.get("code_sha256", "")
+    class_name = scene.get("class_name", "")
+    if not scene.get("rendered") or not job or not code_hash or not class_name:
+        return None
+    if not str(job.get("job_id", "")).isdigit():
+        return None
+    try:
+        media_dir = restore_run_path(root, job["media_dir"])
+        candidates = [
+            item
+            for item in media_dir.rglob(f"{class_name}.mp4")
+            if "partial_movie_files" not in item.parts and item.stat().st_size > 0
+        ]
+        if not candidates:
+            return None
+        video = max(candidates, key=lambda item: item.stat().st_mtime)
+        metadata = verify_video(video, profile)
+        return SceneArtifact(
+            origin="rendered",
+            source_run_id=run_id,
+            job_id=str(job["job_id"]),
+            scene_id=scene_id,
+            scene_class_name=class_name,
+            code_sha256=code_hash,
+            render_profile_sha256=profile.digest(),
+            video_path=_run_relative(root, video),
+            video_sha256=sha256_file(video),
+            metadata=metadata,
+            verified=True,
+        )
+    except (KeyError, OSError, RuntimeError, ValueError):
+        return None
+
+
+def migrate_manifest_data(raw: dict, root: Path) -> dict:
+    """把旧清单升级为当前 schema；未来版本明确拒绝降级读取。"""
+
+    version = raw.get("schema_version", 1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
+    if version == MANIFEST_SCHEMA_VERSION:
+        return raw
+    if version != 1:
+        raise ValueError(f"不支持的 manifest schema_version: {version}")
+
+    data = dict(raw)
+    if not isinstance(data.get("run_id"), str):
+        raise ValueError("旧版运行清单缺少有效 run_id")
+    raw_scenes = data.get("scenes", {})
+    if not isinstance(raw_scenes, dict):
+        raise ValueError("旧版运行清单的 scenes 必须是对象")
+    profile = RenderProfile.current()
+    data["schema_version"] = MANIFEST_SCHEMA_VERSION
+    data["revision"] = 0
+    data["render_profile"] = profile.model_dump(mode="json")
+    migrated_scenes: dict[str, dict] = {}
+    for raw_scene_id, raw_scene in raw_scenes.items():
+        try:
+            scene_id = int(raw_scene_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"旧版运行清单包含无效场景 ID: {raw_scene_id!r}") from exc
+        if not isinstance(raw_scene, dict):
+            raise ValueError(f"旧版运行清单 Scene {scene_id} 必须是对象")
+        scene = dict(raw_scene)
+        scene["phase"] = _legacy_phase(scene)
+        scene["artifact"] = None
+        job = scene.get("slurm_job")
+        if job is not None and not isinstance(job, dict):
+            raise ValueError(f"旧版运行清单 Scene {scene_id} 的 slurm_job 必须是对象")
+        if job and str(job.get("job_id", "")).startswith("reused-"):
+            scene["slurm_job"] = None
+            scene["rendered"] = False
+            scene["phase"] = "reviewed" if scene.get("reviewed") else "coded"
+            scene["failure_reason"] = "旧版复用记录无法安全验证，将重新渲染"
+        elif job:
+            migrated_job = dict(job)
+            migrated_job["code_sha256"] = scene.get("code_sha256", "")
+            migrated_job["render_profile"] = profile.model_dump(mode="json")
+            migrated_job["output_path"] = None
+            migrated_job["output_metadata"] = None
+            migrated_job["elapsed_seconds"] = None
+            scene["slurm_job"] = migrated_job
+            artifact = _migrate_legacy_artifact(
+                root=root,
+                run_id=data["run_id"],
+                scene_id=scene_id,
+                scene=scene,
+                profile=profile,
+            )
+            if artifact:
+                scene["artifact"] = artifact.model_dump(mode="json")
+                migrated_job["output_path"] = artifact.video_path
+                migrated_job["output_metadata"] = artifact.metadata.model_dump(mode="json")
+            elif scene.get("rendered"):
+                scene["rendered"] = False
+                scene["phase"] = "reviewed"
+                scene["failure_reason"] = "旧版渲染产物无法按当前配置验证，将重新渲染"
+        elif scene.get("rendered"):
+            # v1 中 rendered=True 并不保证存在真实 Slurm 作业或最终视频。
+            # 没有可核验作业记录时不能制造 artifact，保守地重新渲染。
+            scene["rendered"] = False
+            scene["phase"] = "reviewed" if scene.get("reviewed") else "coded"
+            scene["failure_reason"] = "旧版场景缺少可验证的渲染作业，将重新渲染"
+        migrated_scenes[str(scene_id)] = scene
+    data["scenes"] = migrated_scenes
+    return data

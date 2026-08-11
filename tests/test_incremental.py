@@ -1,180 +1,204 @@
-"""增量渲染功能测试。"""
+"""增量复用必须同时匹配代码、渲染配置和视频内容。"""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
-import pytest
-
-from kd1_anime.run_store import (
-    RunManifest,
-    StoredSceneState,
-    StoredSlurmJob,
-    compute_scene_changes,
-    find_base_run_for_incremental,
-    get_latest_completed_run,
-    get_reusable_video_path,
-)
 from kd1_anime.agents.planner import ScenePlan
+from kd1_anime.agents.reviewer import ReviewResult
+from kd1_anime.config import settings
+from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState
+from kd1_anime.rendering import RenderProfile, SceneArtifact, VideoMetadata, sha256_file
+from kd1_anime.run_store import RunManifest, StoredSceneState, get_reusable_video_path, sha256_text
+
+RUN_ID = "20260728-120000-1234abcd"
+NEW_RUN_ID = "20260729-120000-deadbeef"
+CODE = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
 
 
-@pytest.fixture
-def sample_manifest():
-    """创建示例 manifest。"""
-    scenes = {
-        1: StoredSceneState(
-            plan=ScenePlan(
-                scene_id=1,
-                title="Scene 1",
-                duration_seconds=30,
-                purpose="Test",
-                math_concept="Test",
-                visual_design="Test",
-                camera_movement="Test",
-                visual_flow=["Step 1"],
-                key_moments=["Moment 1"],
-                computation="Test",
-            ),
-            code_file="scenes/scene_1.py",
-            code_sha256="a" * 64,
-            class_name="Scene1",
-            rendered=True,
-            slurm_job=StoredSlurmJob(
-                job_id="12345",
-                scene_id=1,
-                script_path="scripts/scene_1.sh",
-                log_out="logs/scene_1.out",
-                log_err="logs/scene_1.err",
-                media_dir="videos/scene_1",
-                scene_class_name="Scene1",
-                submitted_at=1000.0,
-                status="COMPLETED",
-            ),
-        ),
-        2: StoredSceneState(
-            plan=ScenePlan(
-                scene_id=2,
-                title="Scene 2",
-                duration_seconds=30,
-                purpose="Test",
-                math_concept="Test",
-                visual_design="Test",
-                camera_movement="Test",
-                visual_flow=["Step 1"],
-                key_moments=["Moment 1"],
-                computation="Test",
-            ),
-            code_file="scenes/scene_2.py",
-            code_sha256="b" * 64,
-            class_name="Scene2",
-            rendered=True,
-        ),
-    }
-    return RunManifest(
-        run_id="20260728-120000-1234abcd",
-        user_prompt="Test prompt",
-        output_path="/tmp/output.mp4",
-        scenes=scenes,
-        status="completed",
+def make_plan(scene_id: int = 1) -> ScenePlan:
+    return ScenePlan(
+        scene_id=scene_id,
+        title=f"Scene {scene_id}",
+        duration_seconds=30,
+        purpose="Test",
+        math_concept="Test",
+        visual_design="Test",
+        camera_movement="Test",
+        visual_flow=["Step 1"],
+        key_moments=["Moment 1"],
+        computation="Test",
     )
 
 
-class TestComputeSceneChanges:
-    """测试场景变化计算。"""
-
-    def test_all_new_scenes(self, sample_manifest):
-        """测试所有场景都是新的。"""
-        new_scenes = {
-            1: ScenePlan(
-                scene_id=1,
-                title="New Scene 1",
-                duration_seconds=30,
-                purpose="Test",
-                math_concept="Test",
-                visual_design="Test",
-                camera_movement="Test",
-                visual_flow=["Step 1"],
-                key_moments=["Moment 1"],
-                computation="Test",
-            ),
-            2: ScenePlan(
-                scene_id=2,
-                title="New Scene 2",
-                duration_seconds=30,
-                purpose="Test",
-                math_concept="Test",
-                visual_design="Test",
-                camera_movement="Test",
-                visual_flow=["Step 1"],
-                key_moments=["Moment 1"],
-                computation="Test",
-            ),
-        }
-        
-        result = compute_scene_changes(sample_manifest, new_scenes)
-        assert result["to_render"] == [1, 2]
-        assert result["to_reuse"] == []
-
-    def test_some_reusable_scenes(self, sample_manifest):
-        """测试部分场景可复用。"""
-        new_scenes = {
-            1: sample_manifest.scenes[1].plan,  # 可复用
-            3: ScenePlan(
-                scene_id=3,
-                title="New Scene 3",
-                duration_seconds=30,
-                purpose="Test",
-                math_concept="Test",
-                visual_design="Test",
-                camera_movement="Test",
-                visual_flow=["Step 1"],
-                key_moments=["Moment 1"],
-                computation="Test",
-            ),  # 新场景
-        }
-        
-        result = compute_scene_changes(sample_manifest, new_scenes)
-        assert 3 in result["to_render"]
-        assert 1 in result["to_reuse"]
+def make_paths(workspace: Path) -> RunPaths:
+    root = workspace / "runs" / NEW_RUN_ID
+    for directory in (root, root / "scenes", root / "logs", root / "videos"):
+        directory.mkdir(parents=True, exist_ok=True)
+    return RunPaths(
+        NEW_RUN_ID,
+        root,
+        root / "scenes",
+        root / "logs",
+        root / "videos",
+        root / "output.mp4",
+    )
 
 
-class TestGetLatestCompletedRun:
-    """测试获取最近完成的运行。"""
+def make_base(workspace: Path, profile: RenderProfile) -> tuple[RunManifest, Path]:
+    root = workspace / "runs" / RUN_ID
+    video = root / "videos" / "scene_1" / "Demo.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"verified old video")
+    artifact = SceneArtifact(
+        origin="rendered",
+        source_run_id=RUN_ID,
+        job_id="12345",
+        scene_id=1,
+        scene_class_name="Demo",
+        code_sha256=sha256_text(CODE),
+        render_profile_sha256=profile.digest(),
+        video_path=video.relative_to(root).as_posix(),
+        video_sha256=sha256_file(video),
+        metadata=VideoMetadata(
+            size_bytes=video.stat().st_size,
+            duration_seconds=1,
+            width=profile.pixel_width,
+            height=profile.pixel_height,
+            frame_rate=profile.frame_rate,
+        ),
+    )
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        status="completed",
+        state="DONE",
+        user_prompt="base",
+        output_path=str(root / "output.mp4"),
+        render_profile=profile,
+        scenes={
+            1: StoredSceneState(
+                plan=make_plan(),
+                code_file="scenes/scene_1.py",
+                code_sha256=sha256_text(CODE),
+                class_name="Demo",
+                reviewed=True,
+                rendered=True,
+                artifact=artifact,
+            )
+        },
+    )
+    return manifest, video
 
-    def test_find_completed_run(self, tmp_path):
-        """测试查找已完成的运行。"""
-        # 这个测试需要完整的 repository mock，暂时跳过
-        pass
+
+def test_incremental_reuses_verified_matching_artifact(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    profile = RenderProfile.current()
+    base, video = make_base(workspace, profile)
+    paths = make_paths(workspace)
+    state = SceneState(plan=make_plan(), code=CODE, class_name="Demo", reviewed=True)
+    ctx = PipelineContext(
+        "updated",
+        paths=paths,
+        scene_states={1: state},
+        incremental=True,
+        base_run_id=RUN_ID,
+        base_manifest=base,
+        render_profile=profile,
+    )
+
+    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+
+    assert state.rendered is True
+    assert state.slurm_job is None
+    assert state.artifact is not None
+    assert state.artifact.origin == "reused"
+    assert get_reusable_video_path(base, 1, workspace / "runs" / RUN_ID) == video
 
 
-class TestGetReusableVideoPath:
-    """测试获取可复用的视频路径。"""
+def test_incremental_rejects_render_profile_change(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    old_profile = RenderProfile.current()
+    base, _ = make_base(workspace, old_profile)
+    changed_profile = old_profile.model_copy(update={"frame_rate": old_profile.frame_rate + 1})
+    paths = make_paths(workspace)
+    state = SceneState(plan=make_plan(), code=CODE, class_name="Demo", reviewed=True)
+    ctx = PipelineContext(
+        "updated",
+        paths=paths,
+        scene_states={1: state},
+        incremental=True,
+        base_run_id=RUN_ID,
+        base_manifest=base,
+        render_profile=changed_profile,
+    )
 
-    def test_get_video_path(self, sample_manifest, tmp_path):
-        """测试获取视频路径。"""
-        # 创建模拟的视频目录
-        old_root = tmp_path / "old_run"
-        media_dir = old_root / "videos" / "scene_1"
-        media_dir.mkdir(parents=True)
-        
-        # 创建模拟的视频文件
-        video_file = media_dir / "Scene1.mp4"
-        video_file.write_bytes(b"fake video content")
-        
-        video_path = get_reusable_video_path(
-            sample_manifest,
-            scene_id=1,
-            old_root=old_root,
-        )
-        
-        # 注意：由于 StoredSlurmJob 是 MagicMock，这个测试可能会失败
-        # 在实际实现中需要正确设置 mock
+    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
 
-    def test_no_video_for_missing_scene(self, sample_manifest, tmp_path):
-        """测试不存在的场景返回 None。"""
-        old_root = tmp_path / "old_run"
-        video_path = get_reusable_video_path(
-            sample_manifest,
-            scene_id=999,
-            old_root=old_root,
-        )
-        assert video_path is None
+    assert state.rendered is False
+    assert state.artifact is None
+    assert ctx.scenes_to_render == [1]
+
+
+def test_incremental_rejects_code_change(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    profile = RenderProfile.current()
+    base, _ = make_base(workspace, profile)
+    paths = make_paths(workspace)
+    changed = CODE.replace("self.wait()", "self.wait(2)")
+    state = SceneState(plan=make_plan(), code=changed, class_name="Demo", reviewed=True)
+    ctx = PipelineContext(
+        "updated",
+        paths=paths,
+        scene_states={1: state},
+        incremental=True,
+        base_run_id=RUN_ID,
+        base_manifest=base,
+        render_profile=profile,
+    )
+
+    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+
+    assert state.rendered is False
+    assert ctx.scenes_to_render == [1]
+
+
+def test_reviewer_code_change_invalidates_existing_artifact(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    profile = RenderProfile.current()
+    base, _ = make_base(workspace, profile)
+    paths = make_paths(workspace)
+    paths.scenes.joinpath("scene_1.py").write_text(CODE, encoding="utf-8")
+    artifact = base.scenes[1].artifact
+    state = SceneState(
+        plan=make_plan(),
+        code=CODE,
+        class_name="Demo",
+        artifact=artifact,
+        rendered=True,
+    )
+    ctx = PipelineContext("x", paths=paths, scene_states={1: state}, render_profile=profile)
+    orchestrator = Orchestrator()
+
+    orchestrator._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(
+            is_valid=False,
+            severity="minor",
+            feedback="增加停顿",
+            fixes=[
+                {
+                    "find": "self.wait()",
+                    "replace": "self.wait(2)",
+                    "reason": "节奏",
+                }
+            ],
+        ),
+    )
+
+    assert state.code != CODE
+    assert state.rendered is False
+    assert state.artifact is None

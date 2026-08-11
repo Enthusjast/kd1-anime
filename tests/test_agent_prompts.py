@@ -1,5 +1,6 @@
 from kd1_anime.agents.auto_fixer import AUTO_FIXER_SYSTEM_PROMPT, AutoFixerAgent
-from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT
+from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, build_coder_system_prompt
+from kd1_anime.config import settings
 
 
 def test_coder_requires_xelatex_xdv_and_ctex_template():
@@ -36,9 +37,27 @@ def test_coder_guards_against_blind_subscript_access():
     assert "len()" in CODER_SYSTEM_PROMPT
 
 
-def test_coder_forbids_custom_mobject_subclass():
-    assert "自定义 mobject 子类" in CODER_SYSTEM_PROMPT
-    assert "should_render" in CODER_SYSTEM_PROMPT
+def test_coder_forbids_custom_mobject_subclass_for_opengl(monkeypatch):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    prompt = build_coder_system_prompt()
+    assert "自定义 Mobject/VMobject 子类" in prompt
+    assert "should_render" in prompt
+
+
+def test_coder_allows_moving_camera_for_cairo(monkeypatch):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    prompt = build_coder_system_prompt()
+    assert "MovingCameraScene" in prompt
+    assert "self.camera.frame.animate" in prompt
+
+
+def test_explicit_renderer_context_overrides_mutated_process_settings(monkeypatch):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+
+    prompt = build_coder_system_prompt("cairo")
+
+    assert "Renderer: Cairo" in prompt
+    assert "self.camera.frame.animate" in prompt
 
 
 def test_auto_fixer_has_should_render_pattern():

@@ -36,6 +36,29 @@ def test_existing_output_requires_force(monkeypatch, tmp_path):
     assert output.read_bytes() == b"old"
 
 
+def test_explicit_same_run_replacement_does_not_require_global_force(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    video = tmp_path / "input.mp4"
+    output = tmp_path / "output.mp4"
+    video.write_bytes(b"video")
+    output.write_bytes(b"old")
+    monkeypatch.setattr(settings, "OVERWRITE_OUTPUT", False)
+    merger = VideoMerger()
+
+    def fake_ffmpeg(cmd, temporary_output, label):
+        temporary_output.write_bytes(b"new")
+        return True
+
+    monkeypatch.setattr(merger, "_run_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(merger, "_verify_output", lambda *args: True)
+
+    result = merger.merge([video], output, replace_existing=True)
+
+    assert result == output
+    assert output.read_bytes() == b"new"
+
+
 def test_merge_uses_atomic_temporary_output(monkeypatch, tmp_path):
     from kd1_anime.config import settings
 
@@ -51,9 +74,36 @@ def test_merge_uses_atomic_temporary_output(monkeypatch, tmp_path):
         return True
 
     monkeypatch.setattr(merger, "_run_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(merger, "_verify_output", lambda *args: True)
 
     result = merger.merge([video], output)
 
     assert result == output
     assert output.read_bytes() == b"new"
     assert not list(tmp_path.glob(".*.tmp.mp4"))
+
+
+def test_invalid_temporary_video_never_replaces_existing_output(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    video = tmp_path / "input.mp4"
+    output = tmp_path / "output.mp4"
+    video.write_bytes(b"video")
+    output.write_bytes(b"old")
+    monkeypatch.setattr(settings, "OVERWRITE_OUTPUT", True)
+    merger = VideoMerger()
+
+    def fake_ffmpeg(cmd, temporary_output, label):
+        temporary_output.write_bytes(b"corrupt")
+        return True
+
+    monkeypatch.setattr(merger, "_run_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(merger, "_verify_output", lambda *args: False)
+
+    try:
+        merger.merge([video], output)
+    except RuntimeError as exc:
+        assert "FFmpeg 拼接失败" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+    assert output.read_bytes() == b"old"

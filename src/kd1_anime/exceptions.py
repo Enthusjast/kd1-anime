@@ -136,6 +136,6 @@ class DependencyError(InstallError):
 
 class EnvironmentConfigError(InstallError):
     """环境配置错误（conda 环境损坏、路径问题等）。
-    
+
     注意：原名 EnvironmentError 会遮蔽内置异常，已重命名为 EnvironmentConfigError。
     """

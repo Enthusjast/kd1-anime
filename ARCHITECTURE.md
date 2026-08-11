@@ -5,10 +5,11 @@
 ## 1. 设计目标
 
 - 使用原生 Python、Pydantic 和显式有限状态机，不引入重型 Agent 框架。
-- 将独立场景拆成可并行的规划、代码生成、审查和 Slurm 渲染单元。
+- 让每个场景独立完成分镜、编码、审查、Slurm 渲染与修复。
 - 对模型输出同时执行 LLM 语义审查与确定性 AST 校验。
 - 让每次运行拥有隔离的代码、日志、媒体和输出目录。
-- 在集群故障、LLM 格式错误、渲染失败和视频编码差异下提供清晰的失败边界。
+- 用可验证的产物身份避免旧视频、错误配置和错误 Job 被误复用。
+- 在集群故障、LLM 格式错误、渲染失败和视频编码差异下提供清晰失败边界。
 
 ## 2. 组件
 
@@ -23,121 +24,143 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/reviewer.py      结构化语义审查
        ├── agents/validator.py     AST 确定性校验
        ├── agents/auto_fixer.py    根据渲染日志修复代码
-       ├── cluster/slurm.py        sbatch、批量状态查询、超时取消
-       ├── media/merger.py         精确收集视频、FFmpeg 拼接
-       └── run_store.py            原子清单、代码哈希、运行锁和恢复路径校验
+       ├── agents/render_context.py renderer 能力与对象生命周期约束
+       ├── cluster/slurm.py        sbatch、状态查询、产物验证、超时取消
+       ├── rendering.py            RenderProfile、ffprobe、SceneArtifact
+       ├── resources.py            跨批量项目的进程级 LLM/Slurm 配额
+       ├── media/merger.py         精确输入列表、FFmpeg 原子拼接
+       ├── eval/                   代码/效率评估与可选多帧视觉评估
+       └── run_store.py            Manifest v2、原子检查点、运行锁
 ```
 
-`src/kd1_anime/agents/base.py` 是全部 LLM Agent 的公共层，封装 OpenAI-compatible client、重试、流式输出、JSON/代码提取和 Pydantic 校验。
+`agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。非空但 `finish_reason=length` 的响应不会被消费；系统会提高输出预算并完整重试，持续截断时抛出明确错误。
 
-## 3. 状态机
+## 3. 执行模型
 
 ```text
-INIT
-  → PLANNING
-  → DETAILING
-  → CODING
-  → REVIEWING ───────────────┐
-  → DISPATCHING              │ 代码改变后重新审查
-  → MONITORING               │
-      ├─ 全部成功 → MERGING  │
-      └─ 有失败 → FIXING ────┘
-  → DONE
+全局：INIT → PLANNING
+
+每个 Scene 独立线程：
+DETAILING → CODING → REVIEWING → DISPATCHING → MONITORING
+                         ▲                         │
+                         └──────── FIXING ◀────────┘
+
+全部线程结束：MERGING → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-`ERROR` 是终止状态。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Slurm job。
+FSM 枚举同时用于清单检查点和 TUI 阶段提示。实际执行不是“所有场景完成一个阶段后再进入下一阶段”：一个 Scene 可以在另一个 Scene 仍编写分镜时已经提交或修复。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
+
+LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
+
+`ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。
 
 ### 3.1 PLANNING / DETAILING
 
 Planner 使用两阶段结构化输出：
 
-1. `plan_outline()` 生成短小的 `SceneOutline` 列表，并把 scene ID 按返回顺序规范化为 `1..N`。
-2. `plan_detail()` 同时接收原始需求、全部概要和当前概要，生成包含视觉设计、镜头、动画流、关键时刻和计算说明的 `ScenePlan`。
+1. `plan_outline()` 生成短小 `SceneOutline` 列表，并按返回顺序规范化 scene ID 为 `1..N`。
+2. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要和当前概要，生成视觉设计、镜头、动画流、关键时刻和计算说明。
 
-详细分镜彼此独立，使用 `ThreadPoolExecutor` 并发调用。worker 禁用流式 stdout；失败后的交互式 retry 只在主线程执行，避免多个线程争用终端输入。
+Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。用户需求被明确标记为不可信数据，不能改变系统规则。
 
 ### 3.2 CODING / REVIEWING
 
-Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文件读写、shell、subprocess 和动态执行。
+Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文件读写、shell、subprocess 和动态执行。Coder、Reviewer 和 AutoFixer 都收到当前 renderer 能力说明：
 
-生成结果先通过 `agents.validator.validate_manim_code()`：
+- OpenGL 禁止 `self.camera.frame`、`MovingCameraScene` 运镜和自定义 Mobject 根类子类；
+- Cairo 只有 `MovingCameraScene` 可使用 frame API；
+- 3D Scene 使用专用相机 API；
+- introducer、Transform、FadeOut 等必须遵守对象生命周期。
+
+生成结果先通过 `validate_manim_code()`：
 
 - Python 必须可解析；
 - 只允许 Manim、NumPy、math 和少量纯计算标准库；
-- 禁止危险函数、危险属性和模块顶层执行；
-- 每个文件必须且只能定义一个直接继承支持的 Scene 类；
+- 禁止危险函数、危险属性、别名逃逸和模块顶层执行；
+- 每个文件必须且只能定义一个直接继承支持基类的 Scene 类；
 - Scene 类必须实现 `construct()`；
-- `Tex`/`MathTex` 必须显式使用已注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板，并加载 `ctex`。
+- 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若校验失败，Coder 会得到确定性反馈并重写，最多 `CODE_VALIDATION_ATTEMPTS` 次。
+若校验失败，确定性反馈会交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全和分镜符合度。结构化输出只允许：
 
-Reviewer 再执行数学、LaTeX、Manim API、动画生命周期、布局和安全方面的语义审查。返回结构由 Pydantic 强约束：
+- valid / `info`：通过；
+- `minor`：至少一条可精确唯一匹配的查找替换；
+- `major`：带具体反馈并回到 Coder 重写。
 
-- `severity` 只能为 `minor` 或 `major`；
-- minor 必须给出可唯一匹配的查找替换；
-- major 必须给出重写反馈；
-- valid 结果会被规范化，清空无意义的反馈。
-
-Reviewer 同时接收完整 `ScenePlan`，用于核对叙事作用、数学规格、视觉流程、镜头和关键时刻，而不只检查代码能否运行。
-
-所有未通过审查的轮次共同受 `MAX_REVIEW_ROUNDS` 限制，避免 minor 修复形成无限循环。代码一旦改变，必须重新进入 REVIEWING；通过后才可提交。
+审查受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Reviewer；major 反馈仍回到 CODING，绝不直接提交。
 
 ### 3.3 DISPATCHING / MONITORING
 
-`src/kd1_anime/cluster/slurm.py` 直接生成 sbatch 字符串，不使用 Jinja 模板。每个场景对应一个 Slurm job，因此场景可以由调度器并行执行。
+`cluster/slurm.py` 直接构建 sbatch 脚本，并对所有 directive 值使用配置层单行校验和 shell quoting。
 
 资源策略：
 
-- Cairo 仅申请 CPU；即使设置 GPU 类型也不会添加 `--gres`。
-- OpenGL 必须配置 `SLURM_GPU_TYPE`，并添加 GPU 资源请求。
-- conda base 优先使用 `SLURM_CONDA_BASE`，否则加载 module 并执行 `conda info --base` 动态探测。
-- 可选 Apptainer 执行使用 `--containall --cleanenv --no-home`，只绑定当前 run 根目录；GPU 作业增加 `--nv`。`render` 子命令会先把外部源码复制进当前 run，避免容器不可见和提交后源码变化。
+- Cairo 只申请 CPU；OpenGL 必须配置 GPU 类型并申请 GPU；
+- Manim 命令显式传入 renderer、分辨率和帧率；OpenGL 显式启用 `--write_to_movie`；
+- conda base 优先使用配置，否则加载 module 并动态探测；
+- 可选 Apptainer 使用 `--containall --cleanenv --no-home`，只绑定当前 run；OpenGL 增加 `--nv`。
 
-监控器批量调用 `squeue`，并使用 `sacct` 查询已离开队列的最终状态。它分别追踪：
+每次成功提交都会保存数字 Job ID、提交时间、代码哈希和 RenderProfile。监控区分：
 
-- `MONITOR_QUEUE_TIMEOUT`：尚未开始运行的排队时间；
-- `MONITOR_RUN_TIMEOUT`：第一次进入运行态后的运行时间；
-- `MONITOR_MAX_UNKNOWN`：连续无法确认状态的次数。
+- 正常调度器状态；
+- `GONE`：squeue 可达，但作业不在队列且 sacct 无记录；
+- `UNKNOWN`：调度器查询失败，不能确认作业是否存在。
 
-超时或连续 UNKNOWN 时调用 `scancel`，而不是只在客户端停止等待。取消失败会保留为 `CANCEL_FAILED`，禁止自动重提，以避免原作业仍运行时产生重复作业。`sbatch` 使用 `--parsable`；命令超时属于提交状态不确定，不自动重试。
+`UNKNOWN` 达阈值时先取消；`scancel` 失败会进入 `CANCEL_FAILED` 并禁止自动重提。`GONE` 会依据当前 Job 的最终视频和日志分类，不会把查询故障等同于作业消失。被抢占退回排队后会重置运行计时，避免误触发 run timeout。
+
+Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算成功。每次提交都使用独立的 `attempt_<token>` 媒体目录；定位会递归适配 Manim 嵌套层级、排除 `partial_movie_files` 和早于本次提交的文件，不会把上一次修复的 MP4 当成当前产物。
 
 ### 3.4 FIXING
 
-失败场景从精确的 stderr 路径读取最后 `LOG_TAIL_LINES` 行，并再受 `MAX_LOG_CHARS` 限制。环境、conda、Apptainer、Slurm 配置和显示服务错误不会交给 LLM 重写业务代码。其余错误交给 AutoFixer，修复结果再次经过 AST 校验；不通过时由 Coder 根据校验反馈和原始错误重写。修复后的代码会重新进入 REVIEWING，而不是直接提交。
+失败场景只读取精确 Job 的 stderr 尾部，并受 `LOG_TAIL_LINES` 和 `MAX_LOG_CHARS` 限制。环境、conda、容器、Slurm、显示服务和字体错误不会交给 LLM 重写业务代码。
 
-每个场景最多自动修复 `MAX_FIX_ATTEMPTS` 次。
+其余错误交给 AutoFixer，结果再次通过 AST 校验；不通过时由 Coder 根据校验反馈和原始错误重写。修复后的代码强制复审。修复次数和连续相同错误次数都有上限。
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在每次 FSM 转换以及每个 Slurm 提交后，使用同目录临时文件和 `os.replace()` 原子更新 `manifest.json`。清单包含原始需求、场景规划、代码 SHA-256、审查/修复次数、精确 Slurm Job ID 与媒体路径、最终输出和最后错误。
+Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v2 包含单调 revision、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、场景产物凭据和最终视频哈希。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile，不受当前进程配置变化影响。
 
-`kd1-anime resume <run-id>` 在持有 `.run.lock` 排他锁后重新读取清单：
+每个成功场景保存 `SceneArtifact`：
 
-- 代码文件必须仍位于当前 run 且 SHA-256 匹配；
-- 已提交且未取消的 Job ID 会继续监控，不会重新提交；
-- 中断时成功取消的作业会清除旧 Job ID，再进入 DISPATCHING；
-- `ERROR` 终态和已被修改的代码拒绝自动恢复；
+- 来源 run/job、scene ID 和类名；
+- 代码 SHA-256、RenderProfile SHA-256；
+- run 内相对视频路径、视频 SHA-256；
+- ffprobe 验证的大小、时长、分辨率和帧率。
+
+v1 清单读取时会迁移。旧复用占位 Job、缺失 Job 或无法验证的视频会保守地重新渲染。
+
+`resume` 在持有 `.run.lock` 后读取清单：
+
+- 代码必须位于规范 run 路径且 SHA-256 匹配；
+- 未确认终态或成功取消前不会复用/重提 Job ID；
+- COMPLETED/GONE 只有产物验证成功才恢复为 rendered；
+- 已完成、失败、在途场景的事件快照会补发给 TUI；
 - 两个进程不能同时恢复同一 run。
 
-`status` 只读取清单，不调用 LLM/Slurm。`clean` 默认只删除超过保留期的非 running 运行，并用同一把锁跳过仍活跃的进程。
+`status` 只读清单；`clean` 使用同一把锁跳过活跃运行。
 
-### 3.6 MERGING
+### 3.6 MERGING 与增量复用
 
-VideoMerger 不扫描共享目录猜测产物，而是使用 `SlurmJob.media_dir` 和 `scene_class_name` 精确定位当前 run 的最终 MP4，并排除 `partial_movie_files`。
+VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifact` 解析精确路径，再核对 scene ID、类名、代码哈希、配置哈希和视频哈希。
 
-合并顺序按 `scene_id`：
+按 scene ID 合并：
 
-1. 首先尝试 FFmpeg concat stream copy；
-2. 编码参数不兼容时回退到 H.264/AAC；
-3. 回退编码使用等比例缩放 + padding，避免横竖屏被拉伸；
-4. FFmpeg 写入同目录临时文件，成功后原子替换目标；失败不会留下半成品；
-5. 自定义输出默认拒绝覆盖，必须显式使用 `--force`/`OVERWRITE_OUTPUT=true`。
+1. 尝试 FFmpeg concat stream copy；
+2. 参数不兼容时回退 H.264/AAC；
+3. 回退使用等比例缩放和 padding；
+4. 写临时文件，先用 ffprobe 验证临时视频，再原子替换最终输出；
+5. 自定义输出默认拒绝覆盖。
 
-默认 `ALLOW_PARTIAL_OUTPUT=false`。任一场景未完成时不会静默生成残缺视频。
+默认 `ALLOW_PARTIAL_OUTPUT=false`。增量运行仍完成新代码的生成、校验和审查；只有代码哈希、RenderProfile 哈希和旧视频哈希全部一致时才复用旧 `SceneArtifact`，不会创建伪 Job ID。
+
+### 3.7 EVALUATING
+
+- 代码和效率指标由确定性逻辑计算；运行对比会聚合同一指标的所有场景分数。
+- 视觉评估从最终视频均匀抽取多帧，在一次多模态请求中联合评分。
+- 抽帧、端点或结构化响应失败时记录为 unknown 并从总分排除，不填充假分数；若自动评估明确要求视觉指标，指标缺失时不作通过/改进决策。
+- 自动改进只有在低分可定位到具体场景代码时才重生成；无法归因时停止循环并保留报告。
 
 ## 4. 运行目录
-
-`RunPaths.create()` 为每次运行生成唯一目录：
 
 ```text
 workspace/runs/<YYYYMMDD-HHMMSS>-<uuid8>/
@@ -147,55 +170,40 @@ workspace/runs/<YYYYMMDD-HHMMSS>-<uuid8>/
 ├── scenes/
 ├── logs/
 ├── videos/
+├── eval_frames/          # 启用视觉评估时
 └── output_final.mp4
 ```
 
-这解决了重复运行、并发运行和旧 Manim 产物被误选的问题。run 根目录权限为 `0700`，prompt、manifest、锁文件和生成代码为 `0600`。若 `OUTPUT_FILE` 被显式配置，只有最终视频写到指定位置。
+run 根目录权限为 `0700`，prompt、manifest、锁文件和生成代码为 `0600`。外部源码在 `render` 提交前复制到私有 run。若显式配置外部输出，只有最终视频写到该位置。
 
 ## 5. 配置
 
-`config.Settings` 使用 pydantic-settings，加载顺序为：
+加载顺序：
 
 ```text
-环境变量 > 当前目录 .env > ~/.config/kd1-anime/.env
+进程环境变量 > 当前目录 .env > ~/.config/kd1-anime/.env
 ```
 
-重要配置分组：
-
-- LLM：`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`、重试、token 和并发数；
-- Slurm：分区、QoS、account、CPU/内存/GPU、最大在途作业数、conda、容器；
-- Manim：renderer、quality、分辨率、帧率和 OpenGL platform；
-- 流水线：审查/修复次数、排队/运行超时、日志截断和部分输出策略；
-- 路径：`WORKSPACE_DIR`、`OUTPUT_FILE`。
-
-`MONITOR_TIMEOUT` 仅用于兼容旧配置；新配置应使用拆分后的 queue/run timeout。
+主要分组：LLM、Slurm、Manim、流水线/监控、评估和路径。`MONITOR_TIMEOUT` 只用于旧配置兼容；新配置使用 queue/run 两个 timeout。
 
 ## 6. 安全边界
 
-AST 校验用于拒绝明显危险或不符合项目结构的代码，但 Python 静态分析不是完整沙箱。高信任要求场景应开启 Apptainer，并使用只包含渲染依赖的只读镜像。`SLURM_REQUIRE_CONTAINER=true` 可防止配置遗漏时回退到宿主 conda 环境。
+AST 校验是纵深防御，不是 Python 沙箱。共享或高信任要求集群应使用只读 Apptainer 镜像，并设置 `SLURM_REQUIRE_CONTAINER=true` 防止回退宿主环境。`SLURM_CONTAINER_DISABLE_NETWORK=true` 可在集群支持时增加隔离网络，但默认关闭以兼容不同 HPC 配置。未配置容器时 CLI 会明确告警。
 
-## 7. 打包与安装
+## 7. 打包、测试与 CI
 
-- wheel 只包含 Python 运行时模块，不包含集群专用 `install.sh` 和运行产物。
-- `install.sh` 可独立下载；远程模式通过临时 GitHub ZIP 安装，不 clone 源码。
-- 本地源码模式执行 editable install。
-- 安装器无 sudo，优先复用 PATH 或 `/usr/local/texlive` 中完整的 XeLaTeX，不修改完整的系统安装。
-- 仅在现有环境不可用时，将最小 TeX Live 安装到用户主目录；CJK 支持只补 `ctex`、`xeCJK` 和 `fontspec` 等必需包。
-- 安装器创建用户级 `.env`，但不覆盖已有配置。
+- wheel 只包含 Python 运行时模块；主机依赖由 `install.sh` 和文档管理。
+- 安装器无 sudo，优先复用完整 XeLaTeX；需要时安装最小用户级 TeX Live。
+- 单元测试不得调用真实 LLM、提交 Slurm 或执行生成代码。
 
-## 8. 测试与 CI
+质量门：
 
-测试覆盖：
+```bash
+ruff check .
+python -m compileall -q .
+bash -n install.sh
+pytest -q
+python -m build --wheel
+```
 
-- JSON/LaTeX 转义；
-- Reviewer schema；
-- AST 安全校验；
-- Reviewer 状态机退出与轮次上限；
-- Cairo/OpenGL 资源策略和 Slurm 超时取消；
-- 精确视频选择和 partial 文件排除；
-- run 路径唯一性；
-- manifest 原子持久化、代码哈希恢复、路径逃逸拒绝和过期清理；
-- Slurm 最大在途作业限制；
-- 通用 LLM 配置校验。
-
-CI 执行 Ruff、compileall、`bash -n install.sh`、pytest 和 wheel 构建。
+测试覆盖结构化输出、截断重试、renderer 提示词、AST 安全、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest 迁移/恢复、增量复用、视觉 unknown、批量资源配额和 FFmpeg 原子输出。

@@ -3,12 +3,11 @@
 测试错误分类、修复逻辑和边界情况。
 """
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from kd1_anime.agents.auto_fixer import AutoFixerAgent, AUTO_FIXER_SYSTEM_PROMPT
+from kd1_anime.agents.auto_fixer import AUTO_FIXER_SYSTEM_PROMPT, AutoFixerAgent
 
 
 @pytest.fixture
@@ -124,7 +123,6 @@ AttributeError: Polygon object has no attribute 'should_render'
         error_type = fixer._classify_error(error_log)
         assert "should_render" in error_type or "OpenGL" in error_type
 
-
     def test_classify_index_error(self, fixer):
         """测试下标越界分类 (split/分组结果直接取下标)。"""
         error_log = """
@@ -220,7 +218,7 @@ class TestAutoFixerFix:
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_fix_basic(self, mock_call_llm, fixer):
         """测试基本修复。"""
-        mock_call_llm.return_value = '''```python
+        mock_call_llm.return_value = """```python
 from manim import *
 
 class TestScene(Scene):
@@ -232,19 +230,19 @@ class TestScene(Scene):
         circle = Circle()
         self.play(Create(circle))
         self.wait(1)
-```'''
-        
-        original_code = '''from manim import *
+```"""
+
+        original_code = """from manim import *
 
 class TestScene(Scene):
     def construct(self):
         circle = Circle()
-        self.play(ShowCreation(circle))'''
-        
+        self.play(ShowCreation(circle))"""
+
         error_log = "NameError: name 'ShowCreation' is not defined"
-        
+
         fixed_code = fixer.fix(original_code, error_log)
-        
+
         assert "from manim import *" in fixed_code
         assert "class TestScene(Scene):" in fixed_code
         assert "ShowCreation" not in fixed_code
@@ -252,7 +250,7 @@ class TestScene(Scene):
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_fix_preserves_structure(self, mock_call_llm, fixer):
         """测试修复保持代码结构。"""
-        mock_call_llm.return_value = '''```python
+        mock_call_llm.return_value = """```python
 from manim import *
 
 class TestScene(Scene):
@@ -268,9 +266,9 @@ class TestScene(Scene):
         square = Square(color=RED)
         self.play(Create(square))
         self.wait(2)
-```'''
-        
-        original_code = '''from manim import *
+```"""
+
+        original_code = """from manim import *
 
 class TestScene(Scene):
     def construct(self):
@@ -280,12 +278,12 @@ class TestScene(Scene):
         
         square = Square()
         self.play(Create(square))
-        self.wait(1)'''
-        
+        self.wait(1)"""
+
         error_log = "Some error"
-        
+
         fixed_code = fixer.fix(original_code, error_log)
-        
+
         # 验证结构保持
         assert "circle = Circle" in fixed_code
         assert "square = Square" in fixed_code
@@ -295,7 +293,7 @@ class TestScene(Scene):
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_fix_adds_tex_template(self, mock_call_llm, fixer):
         """测试修复添加 TexTemplate。"""
-        mock_call_llm.return_value = '''```python
+        mock_call_llm.return_value = """```python
 from manim import *
 
 class TestScene(Scene):
@@ -306,19 +304,19 @@ class TestScene(Scene):
         
         eq = MathTex(r"\\frac{a}{b}", tex_template=tex_template)
         self.play(Write(eq))
-```'''
-        
-        original_code = '''from manim import *
+```"""
+
+        original_code = """from manim import *
 
 class TestScene(Scene):
     def construct(self):
         eq = MathTex(r"\\frac{a}{b}")
-        self.play(Write(eq))'''
-        
+        self.play(Write(eq))"""
+
         error_log = "Tex/MathTex 必须使用 TexTemplate"
-        
+
         fixed_code = fixer.fix(original_code, error_log)
-        
+
         assert "TexTemplate" in fixed_code
         assert "tex_template" in fixed_code
 
@@ -384,9 +382,9 @@ class TestAutoFixerErrorHandling:
     def test_fix_handles_llm_error(self, mock_call_llm, fixer):
         """测试处理 LLM 调用错误。"""
         from kd1_anime.exceptions import LLMError
-        
+
         mock_call_llm.side_effect = LLMError("API 调用失败")
-        
+
         with pytest.raises(LLMError):
             fixer.fix("code", "error")
 
@@ -394,7 +392,7 @@ class TestAutoFixerErrorHandling:
     def test_fix_handles_empty_response(self, mock_call_llm, fixer):
         """测试处理空响应。"""
         mock_call_llm.return_value = ""
-        
+
         code = fixer.fix("original code", "error log")
         # 应该返回空字符串或原始代码
         assert isinstance(code, str)

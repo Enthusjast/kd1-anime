@@ -13,6 +13,7 @@ from rich.console import Console
 
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
+from kd1_anime.rendering import RenderProfile, verify_video
 
 console = Console()
 
@@ -23,17 +24,23 @@ class VideoMerger:
 
         if not job.media_dir.exists():
             raise RuntimeError(f"Scene {job.scene_id} 的媒体目录不存在: {job.media_dir}")
-        candidates = [
-            path
-            for path in job.media_dir.rglob(f"{job.scene_class_name}.mp4")
-            if "partial_movie_files" not in path.parts and path.stat().st_size > 0
-        ]
+        try:
+            candidates = [
+                path
+                for path in job.media_dir.rglob(f"{job.scene_class_name}.mp4")
+                if "partial_movie_files" not in path.parts and path.stat().st_size > 0
+            ]
+        except OSError as exc:
+            raise RuntimeError(f"Scene {job.scene_id} 的媒体目录无法读取: {job.media_dir}") from exc
         if not candidates:
             raise RuntimeError(
                 f"Scene {job.scene_id} 未找到当前类 {job.scene_class_name!r} 的最终 MP4"
             )
         # 当前 run 的目录是隔离的；若 Manim 产生多个质量目录，取最新完成的文件。
-        return max(candidates, key=lambda path: path.stat().st_mtime)
+        try:
+            return max(candidates, key=lambda path: path.stat().st_mtime)
+        except OSError as exc:
+            raise RuntimeError(f"Scene {job.scene_id} 的最终 MP4 在读取时消失") from exc
 
     def collect_job_videos(self, jobs: list[SlurmJob]) -> list[Path]:
         videos: list[Path] = []
@@ -47,6 +54,9 @@ class VideoMerger:
         self,
         video_paths: list[Path],
         output_path: Path,
+        *,
+        replace_existing: bool = False,
+        render_profile: RenderProfile | None = None,
     ) -> Path:
         if not video_paths:
             raise RuntimeError("没有视频文件可供拼接")
@@ -59,8 +69,9 @@ class VideoMerger:
         resolved_inputs = [path.expanduser().resolve() for path in video_paths]
         if output in resolved_inputs:
             raise RuntimeError("输出文件不能与任一输入视频相同")
-        if output.exists() and not settings.OVERWRITE_OUTPUT:
+        if output.exists() and not (settings.OVERWRITE_OUTPUT or replace_existing):
             raise RuntimeError(f"输出文件已存在，拒绝覆盖: {output}（使用 --force 允许覆盖）")
+        profile = render_profile or RenderProfile.current()
         temporary_output = output.with_name(
             f".{output.stem}.{uuid4().hex[:8]}.tmp{output.suffix or '.mp4'}"
         )
@@ -92,16 +103,18 @@ class VideoMerger:
                 "copy",
                 str(temporary_output),
             ]
-            if self._run_ffmpeg(copy_cmd, temporary_output, "stream copy"):
+            if self._run_ffmpeg(copy_cmd, temporary_output, "stream copy") and self._verify_output(
+                temporary_output, profile, "stream copy"
+            ):
                 temporary_output.replace(output)
                 output.chmod(0o600)
                 return output
             with suppress(OSError):
                 temporary_output.unlink(missing_ok=True)
 
-            width = settings.MANIM_PIXEL_WIDTH
-            height = settings.MANIM_PIXEL_HEIGHT
-            fps = settings.MANIM_FRAME_RATE
+            width = profile.pixel_width
+            height = profile.pixel_height
+            fps = profile.frame_rate
             video_filter = (
                 f"fps={fps},"
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
@@ -131,7 +144,9 @@ class VideoMerger:
                 "+faststart",
                 str(temporary_output),
             ]
-            if self._run_ffmpeg(reencode_cmd, temporary_output, "re-encode"):
+            if self._run_ffmpeg(
+                reencode_cmd, temporary_output, "re-encode"
+            ) and self._verify_output(temporary_output, profile, "re-encode"):
                 temporary_output.replace(output)
                 output.chmod(0o600)
                 return output
@@ -161,66 +176,27 @@ class VideoMerger:
         )
         return True
 
-    def collect_incremental_videos(
-        self,
-        scene_states: dict,
-        current_root: Path,
-        base_manifest=None,
-        base_root: Path | None = None,
-    ) -> list[Path]:
-        """收集增量渲染的视频，包括新渲染的和复用的旧视频。"""
-        videos: list[Path] = []
-        
-        for scene_id in sorted(scene_states.keys()):
-            state = scene_states[scene_id]
-            
-            if state.slurm_job is None:
-                raise RuntimeError(f"Scene {scene_id} 没有 Slurm Job")
-            
-            # 检查是否是复用的作业
-            if state.slurm_job.job_id.startswith("reused-"):
-                # 复用的作业，视频在旧 run 目录中
-                if base_root and base_manifest:
-                    base_scene = base_manifest.scenes.get(scene_id)
-                    if base_scene and base_scene.slurm_job:
-                        from kd1_anime.run_store import restore_run_path
-                        old_media_dir = restore_run_path(base_root, base_scene.slurm_job.media_dir)
-                        old_video = self._find_video_in_dir(old_media_dir, state.class_name)
-                        if old_video:
-                            videos.append(old_video)
-                            console.print(f"[dim][Merger][/] Scene {scene_id}: 复用旧视频 {old_video}")
-                            continue
-                
-                # 如果无法复用，尝试从当前 job 查找
-                video = self.find_job_video(state.slurm_job)
-            else:
-                # 新渲染的作业
-                video = self.find_job_video(state.slurm_job)
-            
-            videos.append(video)
-            console.print(f"[dim][Merger][/] Scene {scene_id}: {video}")
-        
-        return videos
-    
-    def _find_video_in_dir(self, media_dir: Path, class_name: str) -> Path | None:
-        """在指定目录中查找视频文件。"""
-        if not media_dir.exists():
-            return None
-        
-        candidates = [
-            path
-            for path in media_dir.rglob(f"{class_name}.mp4")
-            if "partial_movie_files" not in path.parts and path.stat().st_size > 0
-        ]
-        
-        if candidates:
-            return max(candidates, key=lambda path: path.stat().st_mtime)
-        return None
+    @staticmethod
+    def _verify_output(output: Path, profile: RenderProfile, label: str) -> bool:
+        try:
+            verify_video(output, profile)
+        except (OSError, RuntimeError, ValueError) as exc:
+            console.print(
+                f"[red][Merger][/] ffmpeg {label} 产物验证失败: {exc}",
+                markup=False,
+            )
+            return False
+        return True
 
     def merge_jobs(
         self,
         jobs: list[SlurmJob],
         *,
         output_path: Path,
+        render_profile: RenderProfile | None = None,
     ) -> Path:
-        return self.merge(self.collect_job_videos(jobs), output_path)
+        return self.merge(
+            self.collect_job_videos(jobs),
+            output_path,
+            render_profile=render_profile,
+        )

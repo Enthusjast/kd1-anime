@@ -92,8 +92,8 @@ ruff format .
 所有公共 API 必须有类型注解：
 
 ```python
-def plan_outline(self, user_prompt: str) -> list[SceneOutline]:
-    ...
+def plan_outline(self, user_prompt: str) -> list[SceneOutline]: ...
+
 
 class ScenePlan(BaseModel):
     scene_id: int = Field(ge=1)
@@ -177,10 +177,10 @@ git checkout -b feature/your-feature-name
 
 # 运行检查
 ruff check .
-pytest -q
-
-# 确保编译通过
 python -m compileall -q .
+bash -n install.sh
+pytest -q
+python -m build --wheel
 ```
 
 ### 3. 提交 PR
@@ -216,34 +216,38 @@ pytest --cov=kd1_anime
 ### 编写测试
 
 - 每个新功能都应有对应测试
+- 每个状态机、解析、路径选择或超时 Bug 都应有回归测试
 - 测试文件放在 `tests/` 目录
 - 使用 `pytest` 的 fixtures 和 markers
+- 普通单元测试不得发送真实 LLM 请求、提交 Slurm 作业或执行模型生成代码
 
 ```python
 import pytest
 from kd1_anime.agents.validator import validate_manim_code
 
+
 def test_valid_code():
-    code = '''
+    code = """
 from manim import *
 
 class TestScene(Scene):
     def construct(self):
         circle = Circle()
         self.play(Create(circle))
-'''
+"""
     result = validate_manim_code(code)
     assert result.is_valid
 
+
 def test_invalid_import():
-    code = '''
+    code = """
 import os
 from manim import *
 
 class TestScene(Scene):
     def construct(self):
         pass
-'''
+"""
     result = validate_manim_code(code)
     assert not result.is_valid
     assert "禁止导入模块 'os'" in result.feedback
@@ -255,6 +259,7 @@ class TestScene(Scene):
 
 ```python
 from unittest.mock import patch, MagicMock
+
 
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")
 def test_planner(mock_call_llm):

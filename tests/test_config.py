@@ -36,6 +36,13 @@ def test_slurm_identifier_rejects_newline_injection():
         )
 
 
+def test_slurm_time_limit_rejects_invalid_minute_or_second():
+    with pytest.raises(ValueError, match="MM 和 SS"):
+        Settings(_env_file=None, SLURM_TIME_LIMIT="01:60:00")
+    with pytest.raises(ValueError, match="MM 和 SS"):
+        Settings(_env_file=None, SLURM_TIME_LIMIT="01:00:60")
+
+
 def test_empty_container_image_is_normalized_to_none():
     """.env 中 SLURM_CONTAINER_IMAGE= 不应被解析成 truthy 的 Path(".")。"""
     config = Settings(
@@ -83,6 +90,7 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_TIMEOUT_CONNECT == 30.0
     assert config.LLM_TIMEOUT_READ == 600.0
     assert config.LLM_SILENT_STREAM is True
+    assert config.LLM_MAX_TOKENS == 32768
     assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
 
 

@@ -10,9 +10,9 @@ TUI 交互模块
 """
 
 import locale
-import time
 import signal
 import sys
+import time
 from contextlib import suppress
 
 from prompt_toolkit import PromptSession
@@ -141,7 +141,7 @@ class Clarifier:
                     console.print("[dim cyan]AI:[/]")
                     for char in response:
                         console.print(char, end="", highlight=False)
-                        if char in "，。！？、；：""''（）":
+                        if char in "，。！？、；：''（）":
                             time.sleep(0.05)
                         elif char == "\n":
                             time.sleep(0.08)
@@ -270,12 +270,13 @@ class ChatSession:
 
     def run(self) -> None:
         """启动完整的交互会话"""
+
         # 设置信号处理，避免退出时的 threading 警告
         def _signal_handler(signum, frame):
             raise KeyboardInterrupt()
-        
+
         signal.signal(signal.SIGINT, _signal_handler)
-        
+
         _setup_terminal()
         try:
             # 用户选择了"恢复运行"时 _show_banner 返回 True:
@@ -361,37 +362,39 @@ class ChatSession:
         """检查并提示恢复中断的运行; 返回是否选择了恢复 (调用方据此结束会话)。"""
         try:
             from kd1_anime.run_store import RunRepository
+
             repository = RunRepository(settings.WORKSPACE_DIR)
-            manifests = repository.list()[:10]
-            
+            manifests = repository.list()
+
             resumable = []
             for manifest in manifests:
                 if manifest.status == "interrupted":
                     resumable.append(manifest)
                 elif manifest.status == "failed":
                     rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
-                    if rendered > 0 and rendered < len(manifest.scenes):
+                    if manifest.scenes and rendered < len(manifest.scenes):
                         resumable.append(manifest)
-            
+            resumable = resumable[:10]
+
             if not resumable:
-                return
-            
+                return False
+
             console.print()
             console.print(Rule("发现中断的运行", style="yellow"))
-            
+
             table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
             table.add_column("#", style="cyan", justify="center")
             table.add_column("Run ID", style="dim")
             table.add_column("时间", style="dim")
             table.add_column("状态", style="yellow")
             table.add_column("进度", style="green")
-            
-            for i, manifest in enumerate(resumable[:5], 1):
+
+            for i, manifest in enumerate(resumable, 1):
                 rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
                 total = len(manifest.scenes)
                 updated = manifest.updated_at.astimezone().strftime("%m-%d %H:%M")
                 status_color = "yellow" if manifest.status == "interrupted" else "red"
-                
+
                 table.add_row(
                     str(i),
                     manifest.run_id[:16] + "...",
@@ -399,10 +402,10 @@ class ChatSession:
                     f"[{status_color}]{manifest.status}[/]",
                     f"{rendered}/{total} 场景",
                 )
-            
+
             console.print(table)
             console.print()
-            
+
             choice = input("  输入编号恢复运行 (直接回车跳过): ").strip()
             if choice.isdigit() and 1 <= int(choice) <= len(resumable):
                 selected = resumable[int(choice) - 1]
@@ -418,6 +421,14 @@ class ChatSession:
         """恢复指定的运行 (与 _run_pipeline 一样带 Live 场景仪表盘)"""
         from kd1_anime.dashboard import SceneDashboard
         from kd1_anime.orchestrator import Orchestrator
+        from kd1_anime.run_store import RESUME_LLM_STATES, RunRepository
+
+        # 欢迎页会在检查 LLM 配置之前提供恢复选项；已经进入渲染/合并的
+        # 运行不应因为当前没有 API Key 而无法继续，但仍需 LLM 的阶段要
+        # 在启动 Live 前给出明确的配置错误。
+        manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
+        if manifest.state in RESUME_LLM_STATES:
+            settings.require_llm_key()
 
         dashboard = SceneDashboard()
         dashboard_active = dashboard.start()
@@ -430,9 +441,7 @@ class ChatSession:
 
         try:
             orchestrator = Orchestrator()
-            final_video = orchestrator.resume(
-                run_id, callback=callback, interactive=True
-            )
+            final_video = orchestrator.resume(run_id, callback=callback, interactive=True)
             if dashboard_active:
                 dashboard.stop()
             self._show_completion(final_video)
@@ -484,7 +493,7 @@ class ChatSession:
 
     def _run_clarification(self, initial_prompt: str) -> str | None:
         """运行需求澄清对话"""
-        max_rounds = getattr(settings, "MAX_CLARIFY_ROUNDS", 6)
+        max_rounds = settings.MAX_CLARIFY_ROUNDS
 
         console.print(Rule("需求澄清", style="dim"))
         console.print()
@@ -655,6 +664,8 @@ class ChatSession:
                         console.print(Rule("[bold magenta]自动修复[/]", style="magenta"))
                     case "merging":
                         console.print(Rule("[bold magenta]视频拼接[/]", style="magenta"))
+                    case "evaluating":
+                        console.print(Rule("[bold magenta]质量评估[/]", style="magenta"))
 
             case "security_warning":
                 console.print(f"[bold yellow]安全警告:[/] {esc(data.get('message', ''))}")
@@ -700,9 +711,17 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]审查通过 ✓[/]")
 
+            case "scene_reviewing":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]代码审查中[/]")
+
+            case "scene_review_skipped":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]已跳过审查[/]")
+
             case "scene_rewriting":
                 scene_id = data.get("scene_id", "?")
-                reason = data.get("reason", "")
+                reason = esc(data.get("reason", ""))
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]Coder 正在修正...[/]")
                 if reason:
                     console.print(f"    [dim]原因: {reason}[/]")

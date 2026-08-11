@@ -8,12 +8,14 @@ import shlex
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 from rich.console import Console
 
 from kd1_anime.config import settings
+from kd1_anime.rendering import RenderProfile, VideoMetadata, verify_video
 
 console = Console()
 
@@ -37,6 +39,9 @@ TERMINAL_STATES = {
     "OUT_OF_MEMORY",
     "BOOT_FAIL",
     "PREEMPTED",
+    "DEADLINE",
+    "REVOKED",
+    "SPECIAL_EXIT",
 }
 FAILURE_STATES = TERMINAL_STATES - {"COMPLETED"}
 RUNNING_STATES = {"RUNNING", "COMPLETING", "STAGE_OUT"}
@@ -53,6 +58,11 @@ class SlurmJob:
     media_dir: Path
     scene_class_name: str
     submitted_at: float
+    code_sha256: str = ""
+    render_profile: RenderProfile = field(default_factory=RenderProfile.current)
+    output_path: Path | None = None
+    output_metadata: VideoMetadata | None = None
+    elapsed_seconds: float | None = None
     status: str = "PENDING"
     failure_reason: str = ""
     cancelled: bool = False
@@ -120,11 +130,23 @@ class JobMonitor:
 
             if status == "COMPLETED":
                 self.indeterminate_streaks[job_id] = 0
+                job.elapsed_seconds = max(
+                    0.0, now - self.running_since.get(job_id, job.submitted_at)
+                )
                 self.dispatcher._forward_log(job, self.log_positions)
-                self.results[job_id] = True
+                valid = self.dispatcher.validate_completed_job(job)
+                self.results[job_id] = valid
                 finished.append(job_id)
-                if not quiet:
+                if not valid:
+                    job.status = "FAILED"
+                if not quiet and valid:
                     console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
+                elif not quiet:
+                    console.print(
+                        f"[bold red][Monitor][/] Scene {job.scene_id} 作业结束但产物无效: "
+                        f"{job.failure_reason}",
+                        markup=False,
+                    )
             elif status in FAILURE_STATES:
                 self.indeterminate_streaks[job_id] = 0
                 self.dispatcher._forward_log(job, self.log_positions)
@@ -140,6 +162,7 @@ class JobMonitor:
                     if outcome == "COMPLETED":
                         self.indeterminate_streaks[job_id] = 0
                         job.status = "COMPLETED"
+                        job.elapsed_seconds = max(0.0, now - job.submitted_at)
                         self.dispatcher._forward_log(job, self.log_positions)
                         self.results[job_id] = True
                         finished.append(job_id)
@@ -167,7 +190,9 @@ class JobMonitor:
                         self.results[job_id] = False
                         finished.append(job_id)
                         if not quiet:
-                            console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败：作业消失且无输出")
+                            console.print(
+                                f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败：作业消失且无输出"
+                            )
                     else:
                         self.dispatcher._cancel_for_monitor_failure(
                             job,
@@ -224,6 +249,8 @@ class SlurmDispatcher:
         scenes_dir: Path | None = None,
         logs_dir: Path | None = None,
         videos_dir: Path | None = None,
+        attempt_token: str | None = None,
+        render_profile: RenderProfile | None = None,
     ) -> tuple[Path, Path, Path, Path]:
         scenes_dir = Path(scenes_dir or settings.SCENES_DIR).resolve()
         logs_dir = Path(logs_dir or settings.LOGS_DIR).resolve()
@@ -235,6 +262,10 @@ class SlurmDispatcher:
         log_out = logs_dir / f"scene_{scene_id}_%j.out"
         log_err = logs_dir / f"scene_{scene_id}_%j.err"
         media_dir = videos_dir / f"scene_{scene_id}"
+        if attempt_token:
+            if not re.fullmatch(r"[0-9a-f]{12}", attempt_token):
+                raise ValueError("渲染尝试标识格式无效")
+            media_dir /= f"attempt_{attempt_token}"
         media_dir.mkdir(parents=True, exist_ok=True)
 
         content = self._build_script(
@@ -244,6 +275,8 @@ class SlurmDispatcher:
             media_dir=media_dir,
             log_out=log_out,
             log_err=log_err,
+            run_root=scenes_dir.parent,
+            render_profile=render_profile,
         )
         script_path.write_text(content, encoding="utf-8")
         script_path.chmod(0o700)
@@ -259,8 +292,20 @@ class SlurmDispatcher:
         media_dir: Path,
         log_out: Path,
         log_err: Path,
+        run_root: Path | None = None,
+        render_profile: RenderProfile | None = None,
     ) -> str:
-        renderer = settings.MANIM_RENDERER
+        for label, value in (
+            ("场景代码路径", python_file),
+            ("媒体输出路径", media_dir),
+            ("标准输出日志路径", log_out),
+            ("错误日志路径", log_err),
+            ("Scene 类名", scene_class_name),
+        ):
+            if any(character in str(value) for character in ("\x00", "\r", "\n")):
+                raise ValueError(f"{label}必须是单行值")
+        profile = render_profile or RenderProfile.current()
+        renderer = profile.renderer
         use_gpu = renderer == "opengl"
         if use_gpu and not settings.SLURM_GPU_TYPE:
             raise RuntimeError(
@@ -276,7 +321,10 @@ class SlurmDispatcher:
             lines.append(f"#SBATCH -p {settings.SLURM_PARTITION}")
         if settings.SLURM_ACCOUNT:
             lines.append(f"#SBATCH --account={settings.SLURM_ACCOUNT}")
-        run_id = media_dir.parent.parent.name
+        # media_dir 可能包含本次提交专用的 attempt_<token> 子目录，不能再用
+        # 固定层级推导 run 根目录；代码文件始终位于 <run>/scenes 下。
+        run_root = (run_root or python_file.parent.parent).resolve()
+        run_id = run_root.name
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id)[:48]
         job_name = f"kd1-{safe_run_id}-s{scene_id}"[:80]
         lines.extend(
@@ -342,19 +390,23 @@ class SlurmDispatcher:
             ]
         )
 
-        quality = f"-q{settings.MANIM_QUALITY}"
+        quality = f"-q{profile.quality}"
         manim_args = [
             "manim",
             "render",
             f"--renderer={renderer}",
             quality,
+            "--resolution",
+            f"{profile.pixel_width},{profile.pixel_height}",
+            "--fps",
+            str(profile.frame_rate),
             "--media_dir",
             str(media_dir),
             str(python_file),
             scene_class_name,
         ]
         if use_gpu:
-            lines.append(f"export PYOPENGL_PLATFORM={settings.MANIM_OPENGL_PLATFORM}")
+            lines.append(f"export PYOPENGL_PLATFORM={profile.opengl_platform}")
             # manim 0.20 的 OpenGL 渲染器必须显式传 --write_to_movie 才会写视频文件；
             # 否则动画照常"播放"、退出码为 0，但不会产出任何 mp4。
             manim_args.insert(-2, "--write_to_movie")
@@ -367,7 +419,6 @@ class SlurmDispatcher:
                     f"请检查 .env 中的 SLURM_CONTAINER_IMAGE 配置。\n"
                     f"如果不需要容器，请设置 SLURM_CONTAINER_IMAGE 为空或注释掉该行。"
                 )
-            run_root = media_dir.parent.parent
             container_cmd = [
                 "apptainer",
                 "exec",
@@ -377,6 +428,8 @@ class SlurmDispatcher:
             ]
             if use_gpu:
                 container_cmd.append("--nv")
+            if settings.SLURM_CONTAINER_DISABLE_NETWORK:
+                container_cmd.extend(["--net", "--network", "none"])
             container_cmd.extend(["--bind", f"{run_root}:{run_root}", image, *manim_args])
             lines.append(shlex.join(container_cmd))
         else:
@@ -389,7 +442,7 @@ class SlurmDispatcher:
                 "",
                 'echo "=========================================="',
                 'echo "渲染完成: $(date)"',
-                f'echo "输出目录: {media_dir}"',
+                shlex.join(["echo", f"输出目录: {media_dir}"]),
                 'echo "=========================================="',
                 "",
             ]
@@ -480,7 +533,7 @@ class SlurmDispatcher:
 
     @staticmethod
     def _normalize_state(raw: str) -> str:
-        return raw.strip().split()[0].upper() if raw.strip() else "UNKNOWN"
+        return raw.strip().split()[0].upper().rstrip("+") if raw.strip() else "UNKNOWN"
 
     @staticmethod
     def _check_final_status(job_id: str) -> tuple[bool, str]:
@@ -543,9 +596,7 @@ class SlurmDispatcher:
                 # 部分集群对"已消失的 job id"执行 squeue -j 会非零退出
                 # (例如 Invalid job id specified), 导致活跃作业无法被发现。
                 # 改用 -u 按用户名查询 (不涉及无效 id), 据此判断作业是否仍在队列。
-                uresult = self._run_squeue(
-                    [squeue, "-u", getpass.getuser(), "-h", "-o", "%i|%T"]
-                )
+                uresult = self._run_squeue([squeue, "-u", getpass.getuser(), "-h", "-o", "%i|%T"])
                 if uresult is not None and uresult.returncode == 0:
                     squeue_ok = True
                     self._merge_squeue_output(uresult.stdout, seen)
@@ -603,6 +654,7 @@ class SlurmDispatcher:
                 path
                 for path in job.media_dir.rglob(f"{job.scene_class_name}.mp4")
                 if "partial_movie_files" not in path.parts
+                and path.stat().st_size > 0
                 and path.stat().st_mtime >= job.submitted_at - 1.0
             ]
         except OSError:
@@ -610,6 +662,22 @@ class SlurmDispatcher:
         if not candidates:
             return None
         return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def validate_completed_job(self, job: SlurmJob) -> bool:
+        """确认当前作业确实生成了可解析且匹配配置的最终视频。"""
+
+        video = self._find_final_video(job)
+        if video is None:
+            job.failure_reason = "Slurm 状态为 COMPLETED，但未找到本次作业的最终 MP4"
+            return False
+        try:
+            metadata = verify_video(video, job.render_profile)
+        except (OSError, RuntimeError, ValueError) as exc:
+            job.failure_reason = f"Slurm 状态为 COMPLETED，但视频验证失败: {exc}"
+            return False
+        job.output_path = video
+        job.output_metadata = metadata
+        return True
 
     @staticmethod
     def _job_log_tail(job: SlurmJob, limit: int = 4000) -> str:
@@ -631,7 +699,7 @@ class SlurmDispatcher:
         - 有日志内容 → "FAILED" (作业实际运行过, 失败原因在日志中, 可走自动修复)
         - 无任何产物 → None (可能是刚提交尚未注册, 交给计数延后决断)
         """
-        if self._find_final_video(job) is not None:
+        if self.validate_completed_job(job):
             return "COMPLETED"
         log_tail = self._job_log_tail(job)
         if log_tail:
@@ -697,10 +765,22 @@ class SlurmDispatcher:
 
                 if status == "COMPLETED":
                     indeterminate_streaks[job_id] = 0
+                    job.elapsed_seconds = max(
+                        0.0, now - running_since.get(job_id, job.submitted_at)
+                    )
                     self._forward_log(job, log_positions)
-                    results[job_id] = True
+                    valid = self.validate_completed_job(job)
+                    results[job_id] = valid
                     finished.append(job_id)
-                    console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
+                    if valid:
+                        console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
+                    else:
+                        job.status = "FAILED"
+                        console.print(
+                            f"[bold red][Monitor][/] Scene {job.scene_id} 作业结束但产物无效: "
+                            f"{job.failure_reason}",
+                            markup=False,
+                        )
                 elif status in FAILURE_STATES:
                     indeterminate_streaks[job_id] = 0
                     self._forward_log(job, log_positions)
@@ -714,6 +794,7 @@ class SlurmDispatcher:
                         if outcome == "COMPLETED":
                             indeterminate_streaks[job_id] = 0
                             job.status = "COMPLETED"
+                            job.elapsed_seconds = max(0.0, now - job.submitted_at)
                             self._forward_log(job, log_positions)
                             results[job_id] = True
                             finished.append(job_id)
@@ -725,7 +806,9 @@ class SlurmDispatcher:
                             self._forward_log(job, log_positions)
                             results[job_id] = False
                             finished.append(job_id)
-                            console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败（作业已消失，依据日志判定）")
+                            console.print(
+                                f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败（作业已消失，依据日志判定）"
+                            )
                             continue
                     indeterminate_streaks[job_id] += 1
                     if indeterminate_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
@@ -734,7 +817,9 @@ class SlurmDispatcher:
                             job.failure_reason = "作业已从集群消失且无输出日志，无法确认渲染结果"
                             results[job_id] = False
                             finished.append(job_id)
-                            console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败：作业消失且无输出")
+                            console.print(
+                                f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败：作业消失且无输出"
+                            )
                         else:
                             self._cancel_for_monitor_failure(
                                 job,
@@ -842,7 +927,10 @@ class SlurmDispatcher:
         scenes_dir: Path | None = None,
         logs_dir: Path | None = None,
         videos_dir: Path | None = None,
+        code_sha256: str = "",
+        render_profile: RenderProfile | None = None,
     ) -> SlurmJob:
+        profile = render_profile or RenderProfile.current()
         script_path, log_out_pattern, log_err_pattern, media_dir = self.generate_script(
             scene_id,
             python_file,
@@ -850,9 +938,13 @@ class SlurmDispatcher:
             scenes_dir=scenes_dir,
             logs_dir=logs_dir,
             videos_dir=videos_dir,
+            # 每次提交使用独立媒体目录，从结构上杜绝自动修复后
+            # 把上一次作业的 MP4 误认为当前作业产物。
+            attempt_token=uuid4().hex[:12],
+            render_profile=profile,
         )
-        job_id = self.submit(script_path)
         submitted_at = time.time()
+        job_id = self.submit(script_path)
         return SlurmJob(
             job_id=job_id,
             scene_id=scene_id,
@@ -862,4 +954,6 @@ class SlurmDispatcher:
             media_dir=media_dir,
             scene_class_name=scene_class_name,
             submitted_at=submitted_at,
+            code_sha256=code_sha256,
+            render_profile=profile,
         )
