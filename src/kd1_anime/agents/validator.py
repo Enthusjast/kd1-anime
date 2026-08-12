@@ -22,6 +22,136 @@ ALLOWED_IMPORT_ROOTS = {
     "collections",
 }
 
+# 生成代码只需要这些顶层模块。模块路径必须精确匹配；例如
+# ``import manim.utils.file_ops`` 和 ``import numpy.random`` 都不能因为根模块
+# 在白名单中而被放行。
+ALLOWED_IMPORT_MODULES = ALLOWED_IMPORT_ROOTS
+ALLOWED_MODULE_ALIASES = {
+    "manim": {"manim"},
+    "math": {"math"},
+    "numpy": {"numpy", "np"},
+    "random": {"random"},
+    "itertools": {"itertools"},
+    "functools": {"functools"},
+    "collections": {"collections"},
+}
+
+# 只允许从纯计算模块导入明确的无文件/网络能力。Manim 的公开类很多，
+# 因此保留项目提示词要求的 ``from manim import *``，但禁止它的别名形式
+# 以及危险对象；其它模块不允许通配符导入。
+SAFE_FROM_IMPORTS = {
+    "math": {
+        "acos",
+        "acosh",
+        "asin",
+        "asinh",
+        "atan",
+        "atan2",
+        "atanh",
+        "ceil",
+        "copysign",
+        "cos",
+        "cosh",
+        "degrees",
+        "e",
+        "erf",
+        "exp",
+        "expm1",
+        "fabs",
+        "factorial",
+        "floor",
+        "fmod",
+        "frexp",
+        "gamma",
+        "gcd",
+        "hypot",
+        "inf",
+        "isclose",
+        "isfinite",
+        "isinf",
+        "isnan",
+        "lcm",
+        "ldexp",
+        "lgamma",
+        "log",
+        "log10",
+        "log1p",
+        "log2",
+        "modf",
+        "nan",
+        "perm",
+        "pi",
+        "pow",
+        "radians",
+        "remainder",
+        "sin",
+        "sinh",
+        "sqrt",
+        "tan",
+        "tanh",
+        "tau",
+        "trunc",
+    },
+    "numpy": {
+        "abs",
+        "absolute",
+        "arange",
+        "array",
+        "asarray",
+        "bool_",
+        "ceil",
+        "clip",
+        "cos",
+        "dot",
+        "e",
+        "exp",
+        "eye",
+        "float32",
+        "float64",
+        "floor",
+        "full",
+        "int32",
+        "int64",
+        "linspace",
+        "matmul",
+        "maximum",
+        "minimum",
+        "nan",
+        "newaxis",
+        "ndarray",
+        "ones",
+        "pi",
+        "sign",
+        "sin",
+        "sqrt",
+        "tan",
+        "uint8",
+        "where",
+        "zeros",
+    },
+    "random": {
+        "choice",
+        "randint",
+        "random",
+        "randrange",
+        "sample",
+        "uniform",
+    },
+    "itertools": {
+        "chain",
+        "combinations",
+        "cycle",
+        "islice",
+        "permutations",
+        "product",
+        "repeat",
+        "starmap",
+        "zip_longest",
+    },
+    "functools": {"partial", "reduce"},
+    "collections": {"Counter", "OrderedDict", "defaultdict", "deque", "namedtuple"},
+}
+
 # 明确禁止的模块 - 这些模块可能提供危险能力
 BANNED_CALLS = {
     "eval",
@@ -42,6 +172,23 @@ BANNED_CALLS = {
     "ImageMobject",
     "OpenGLImageMobject",
     "SVGMobject",
+    "SceneFileWriter",
+}
+
+# ``from manim import *`` 也会把若干内部模块带入局部命名空间；它们不是
+# 场景 API，且可能间接提供文件/渲染器访问。显式导入这些名称同样拒绝。
+BANNED_MANIM_INTERNALS = {
+    "animation",
+    "camera",
+    "core",
+    "data_structures",
+    "mobject",
+    "opengl",
+    "plugins",
+    "renderer",
+    "scene",
+    "typing",
+    "utils",
 }
 
 BANNED_ATTRIBUTE_NAMES = {
@@ -75,6 +222,11 @@ BANNED_ATTRIBUTE_NAMES = {
     "dumps",
     "load_library",
     "open_memmap",
+    "file_ops",
+    "write_file",
+    "read_file",
+    "guarantee_existence",
+    "modify_path",
     "__subclasses__",
     "__globals__",
     "__code__",
@@ -168,6 +320,9 @@ class _SafetyVisitor(ast.NodeVisitor):
         self.tex_calls: list[tuple[ast.Call, str | None]] = []
         self.imported_modules: set[str] = set()
         self.dangerous_aliases: set[str] = set()
+        self.module_aliases: dict[str, str] = {}
+        self.imported_names: dict[str, tuple[str, str]] = {}
+        self.config_aliases: set[str] = {"config"}
         self.renderer = renderer or settings.MANIM_RENDERER
 
     def error(self, node: ast.AST, message: str) -> None:
@@ -175,32 +330,76 @@ class _SafetyVisitor(ast.NodeVisitor):
         self.errors.append(f"第 {line} 行: {message}")
 
     def _check_config_assignment(self, target: ast.expr, node: ast.AST) -> None:
-        if (
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "config"
-            and target.attr != "tex_template"
-        ):
-            self.error(node, f"禁止修改 Manim 全局配置 config.{target.attr}")
+        path = self._attribute_path(target)
+        if not path:
+            return
+        if path[0] == "config":
+            if len(path) != 2 or path[1] != "tex_template":
+                self.error(node, f"禁止修改 Manim 全局配置 {'.'.join(path)}")
+        elif path[0] in self.config_aliases:
+            self.error(node, f"禁止通过 config 别名修改 Manim 全局配置 {'.'.join(path)}")
+        elif len(path) >= 2 and self.module_aliases.get(path[0]) == "manim" and path[1] == "config":
+            self.error(node, f"禁止通过模块别名修改 Manim 全局配置 {'.'.join(path)}")
+
+    def _attribute_path(self, node: ast.AST) -> list[str] | None:
+        """返回简单的 ``a.b.c`` 路径，复杂表达式不视为可安全追踪路径。"""
+
+        if isinstance(node, ast.Name):
+            return [node.id]
+        if isinstance(node, ast.Attribute):
+            parent = self._attribute_path(node.value)
+            return [*parent, node.attr] if parent else None
+        return None
+
+    def _check_import_module(self, node: ast.AST, module: str, *, from_import: bool) -> str:
+        root = module.split(".", 1)[0]
+        self.imported_modules.add(root)
+        if root not in ALLOWED_IMPORT_MODULES:
+            self.error(
+                node,
+                f"禁止{'从模块' if from_import else ''}导入模块 {module!r}",
+            )
+        elif module != root:
+            self.error(node, f"只允许导入白名单顶层模块，不允许模块路径 {module!r}")
+        return root
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            root = alias.name.split(".", 1)[0]
-            self.imported_modules.add(root)
-            if root not in ALLOWED_IMPORT_ROOTS:
-                self.error(node, f"禁止导入模块 {alias.name!r}")
+            root = self._check_import_module(node, alias.name, from_import=False)
+            local_name = alias.asname or alias.name.split(".", 1)[0]
+            allowed_aliases = ALLOWED_MODULE_ALIASES.get(root, set())
+            if alias.asname and alias.asname not in allowed_aliases:
+                self.error(node, f"模块 {alias.name!r} 不允许使用别名 {alias.asname!r}")
+            if alias.name == root:
+                self.module_aliases[local_name] = root
             if root == "manim":
                 self.has_manim_import = True
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
-        root = module.split(".", 1)[0]
-        self.imported_modules.add(root)
         if node.level:
             self.error(node, "禁止相对导入")
-        elif root not in ALLOWED_IMPORT_ROOTS:
-            self.error(node, f"禁止从模块 {module!r} 导入")
+        root = self._check_import_module(node, module, from_import=True) if not node.level else ""
+        if not node.level and root in ALLOWED_IMPORT_MODULES:
+            if any(alias.name == "*" for alias in node.names) and root != "manim":
+                self.error(node, f"禁止从模块 {module!r} 使用通配符导入")
+            allowed_names = SAFE_FROM_IMPORTS.get(root, set())
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                if alias.name == "*":
+                    continue
+                if root != "manim" and alias.name not in allowed_names:
+                    self.error(node, f"禁止从模块 {module!r} 导入符号 {alias.name!r}")
+                if root == "manim" and alias.name in BANNED_MANIM_INTERNALS:
+                    self.error(node, f"禁止导入 Manim 内部模块 {alias.name!r}")
+                if alias.asname and alias.asname != alias.name:
+                    self.error(node, f"禁止为导入符号 {alias.name!r} 创建别名 {alias.asname!r}")
+                if root == "manim" and alias.name == "config" and alias.asname:
+                    self.error(
+                        node, "禁止为 Manim config 创建别名；只能直接使用 config.tex_template"
+                    )
+                self.imported_names[local_name] = (root, alias.name)
         if root == "manim":
             self.has_manim_import = True
             for alias in node.names:
@@ -268,6 +467,8 @@ class _SafetyVisitor(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if node.id.startswith("__"):
             self.error(node, f"禁止访问双下划线名称 {node.id!r}")
+        if isinstance(node.ctx, ast.Load) and node.id in BANNED_MANIM_INTERNALS:
+            self.error(node, f"禁止访问 Manim 内部模块 {node.id!r}")
         if isinstance(node.ctx, ast.Load) and (
             node.id in BANNED_CALLS or node.id in self.dangerous_aliases
         ):
@@ -284,6 +485,23 @@ class _SafetyVisitor(ast.NodeVisitor):
             self.error(node, f"禁止引用危险属性 {node.attr!r}")
         if node.attr.startswith("__") and not self._is_super_init(node):
             self.error(node, f"禁止访问双下划线属性 {node.attr}")
+        path = self._attribute_path(node)
+        if path and path[0] == "config" and (len(path) != 2 or path[1] != "tex_template"):
+            self.error(node, f"禁止访问 Manim 全局配置 {'.'.join(path)}")
+        if path and path[0] in self.config_aliases and path[0] != "config":
+            self.error(node, "禁止通过 config 别名访问 Manim 全局配置")
+        if (
+            path
+            and len(path) >= 2
+            and self.module_aliases.get(path[0]) == "manim"
+            and (path[1] == "config" or path[1] in BANNED_MANIM_INTERNALS)
+        ):
+            if path[1] == "config":
+                self.error(
+                    node, "禁止通过模块别名访问 Manim 全局配置；只能直接使用 config.tex_template"
+                )
+            else:
+                self.error(node, f"禁止通过模块别名访问 Manim 内部模块 {path[1]!r}")
         self.generic_visit(node)
 
     @staticmethod
@@ -301,6 +519,26 @@ class _SafetyVisitor(ast.NodeVisitor):
         )
 
     def visit_Assign(self, node: ast.Assign) -> None:
+        value_path = self._attribute_path(node.value)
+        value_is_config = bool(
+            value_path
+            and (
+                value_path[0] in self.config_aliases
+                or (
+                    len(value_path) >= 2
+                    and self.module_aliases.get(value_path[0]) == "manim"
+                    and value_path[1] == "config"
+                )
+            )
+        )
+        value_is_module = isinstance(node.value, ast.Name) and node.value.id in self.module_aliases
+        if value_is_config or value_is_module:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if value_is_config:
+                        self.config_aliases.add(target.id)
+                    if value_is_module:
+                        self.module_aliases[target.id] = self.module_aliases[node.value.id]
         if isinstance(node.value, ast.Name) and (
             node.value.id in BANNED_CALLS or node.value.id in self.dangerous_aliases
         ):

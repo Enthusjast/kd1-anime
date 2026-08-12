@@ -1,10 +1,12 @@
 """批量并行处理模块测试。"""
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
 
+import kd1_anime.batch as batch_module
 import kd1_anime.orchestrator as orchestrator_module
 from kd1_anime.batch import (
     BatchConfig,
@@ -210,6 +212,62 @@ class TestBatchProcessor:
 
         assert task.status == "failed"
         assert task.run_id == "20260728-120000-1234abcd"
+
+    def test_keyboard_interrupt_cancels_active_orchestrators(self, monkeypatch):
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        class FakeOrchestrator:
+            def __init__(self, resource_coordinator=None):
+                self._ctx = SimpleNamespace(
+                    paths=SimpleNamespace(run_id="20260728-120000-1234abcd")
+                )
+
+            def run(self, *args, **kwargs):
+                started.set()
+                cancelled.wait(timeout=2)
+                return None
+
+            def cancel_all(self):
+                cancelled.set()
+
+        monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+        processor = BatchProcessor(BatchConfig(max_parallel=1, dry_run=True))
+        processor.add_task("demo")
+
+        def interrupt_after_worker(futures):
+            assert started.wait(timeout=2)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(batch_module, "as_completed", interrupt_after_worker)
+
+        tasks = processor.execute_all()
+
+        assert tasks[0].status == "interrupted"
+        assert cancelled.is_set()
+
+    def test_error_after_interrupt_is_recorded_as_interrupted(self, monkeypatch):
+        class FakeOrchestrator:
+            def __init__(self, resource_coordinator=None):
+                self._ctx = SimpleNamespace(
+                    paths=SimpleNamespace(run_id="20260728-120000-1234abcd")
+                )
+
+            def run(self, *args, **kwargs):
+                processor._interrupted.set()
+                raise RuntimeError("cancelled while waiting")
+
+            def cancel_all(self):
+                pass
+
+        monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+        processor = BatchProcessor(BatchConfig(max_parallel=1, dry_run=True))
+        processor.add_task("demo")
+
+        task = processor._execute_single_task(processor.tasks[0])
+
+        assert task.status == "interrupted"
+        assert task.error == "用户中断，任务已停止"
 
 
 class TestBatchTask:

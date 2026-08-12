@@ -14,7 +14,10 @@ _CODER_BASE_PROMPT = r"""你是 Manim Community Edition 动画编程专家。根
 ## 硬性结构与安全规则
 1. 使用 `from manim import *`，文件中恰好一个继承 Scene/ThreeDScene/MovingCameraScene 的类并实现 `construct(self)`。
 2. 只输出 ```python 围栏中的完整代码；不要写 `if __name__ == "__main__"`。
-3. 只导入 manim、numpy、math 和允许的纯计算标准库；禁止文件、网络、shell、subprocess、eval/exec、动态导入和用户环境访问。
+3. 只导入 manim、numpy、math 和允许的纯计算标准库顶层模块；优先使用
+   `import numpy as np`、`import math`，禁止导入子模块、通配符导入（Manim 的
+   `from manim import *` 除外）以及 numpy 文件 I/O 符号；禁止文件、网络、shell、
+   subprocess、eval/exec、动态导入和用户环境访问。
 4. 不使用 ShowCreation、TextMobject、TexMobject、setColor、moveToEdge、beside 等旧 API。
 5. 保持 Scene 类名稳定；修订时只修反馈指出的问题并保留正确动画。
 

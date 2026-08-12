@@ -15,6 +15,9 @@ from kd1_anime.config import settings
 from kd1_anime.eval.metrics import EvalMetric, QualityScore
 from kd1_anime.eval.prompts import VISUAL_EVAL_PROMPT
 
+MAX_FRAME_COUNT = 8
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
 
 class _Dimension(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -66,7 +69,19 @@ class VisualEvaluator:
         path = Path(image_path)
         if not path.is_file():
             raise FileNotFoundError(f"Image not found: {path}")
-        return base64.b64encode(path.read_bytes()).decode("ascii")
+        try:
+            size = path.stat().st_size
+            if size > MAX_IMAGE_BYTES:
+                raise ValueError(f"Image too large: {path} ({size} bytes > {MAX_IMAGE_BYTES})")
+            with path.open("rb") as handle:
+                payload = handle.read(MAX_IMAGE_BYTES + 1)
+        except OSError as exc:
+            raise OSError(f"读取图片失败: {path}") from exc
+        if not payload:
+            raise ValueError(f"Image is empty: {path}")
+        if len(payload) > MAX_IMAGE_BYTES:
+            raise ValueError(f"Image too large: {path} ({len(payload)} bytes > {MAX_IMAGE_BYTES})")
+        return base64.b64encode(payload).decode("ascii")
 
     @staticmethod
     def _image_content(path: Path) -> dict[str, Any]:
@@ -93,6 +108,8 @@ class VisualEvaluator:
     ) -> VisualAnalysisResult:
         if not frame_paths:
             raise ValueError("No frame paths provided")
+        if len(frame_paths) > MAX_FRAME_COUNT:
+            raise ValueError(f"关键帧数量不能超过 {MAX_FRAME_COUNT}")
         content: list[dict[str, Any]] = [
             {
                 "type": "text",

@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -43,6 +43,21 @@ RESUME_LLM_STATES = frozenset(
     }
 )
 RunStatus = Literal["running", "interrupted", "failed", "completed", "dry_run_complete"]
+FSMState = Literal[
+    "INIT",
+    "PLANNING",
+    "DETAILING",
+    "CODING",
+    "REVIEWING",
+    "DISPATCHING",
+    "MONITORING",
+    "FIXING",
+    "MERGING",
+    "EVALUATING",
+    "DONE",
+    "ERROR",
+]
+ScenePhase = Literal["pending", "detailed", "coded", "reviewed", "monitoring", "rendered", "failed"]
 
 
 def utc_now() -> datetime:
@@ -77,7 +92,7 @@ class StoredSlurmJob(BaseModel):
 
 
 class StoredSceneState(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     plan: ScenePlan
     code_file: str = ""
@@ -92,7 +107,7 @@ class StoredSceneState(BaseModel):
     identical_error_count: int = Field(default=0, ge=0)
     slurm_job: StoredSlurmJob | None = None
     artifact: SceneArtifact | None = None
-    phase: str = Field(default="pending", min_length=1, max_length=40)
+    phase: ScenePhase = "pending"
     rendered: bool = False
     give_up: bool = False
     failed: bool = False
@@ -110,7 +125,7 @@ class RunManifest(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     status: RunStatus = "running"
-    state: str = "INIT"
+    state: FSMState = "INIT"
     user_prompt: str = Field(max_length=1_000_000)
     dry_run: bool = False
     interactive: bool = False
@@ -209,22 +224,20 @@ def restore_slurm_job(stored: StoredSlurmJob, root: Path) -> SlurmJob:
     )
 
 
-def write_manifest(path: Path, manifest: RunManifest) -> None:
-    """以同目录临时文件 + os.replace 原子更新清单。"""
+def atomic_write_text(path: Path, payload: str, *, mode: int = 0o600) -> None:
+    """以同目录临时文件 + fsync + os.replace 原子写入私有文本文件。"""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    manifest.updated_at = utc_now()
-    payload = manifest.model_dump_json(indent=2) + "\n"
-    fd, temporary_name = tempfile.mkstemp(prefix=".manifest-", suffix=".tmp", dir=path.parent)
+    fd, temporary_name = tempfile.mkstemp(prefix=".atomic-", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        os.fchmod(fd, 0o600)
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        path.chmod(0o600)
+        path.chmod(mode)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -233,6 +246,23 @@ def write_manifest(path: Path, manifest: RunManifest) -> None:
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def atomic_write_json(path: Path, payload: Any, *, mode: int = 0o600) -> None:
+    """原子写入 JSON，供评估报告等非 manifest 持久化使用。"""
+
+    atomic_write_text(
+        path,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        mode=mode,
+    )
+
+
+def write_manifest(path: Path, manifest: RunManifest) -> None:
+    """以同目录临时文件 + os.replace 原子更新清单。"""
+
+    manifest.updated_at = utc_now()
+    atomic_write_text(path, manifest.model_dump_json(indent=2) + "\n")
 
 
 class RunRepository:
@@ -352,27 +382,31 @@ def get_reusable_video_path(
         return None
 
     try:
-        # 构建旧视频路径
         old_media_dir = restore_run_path(old_root, old_job.media_dir)
-        video_candidates = list(old_media_dir.rglob(f"{old_scene.class_name}.mp4"))
-
-        # 排除 partial 文件
-        valid_videos = [
-            v
-            for v in video_candidates
-            if "partial_movie_files" not in v.parts and v.stat().st_size > 0
-        ]
+        video = _latest_video_candidate(old_media_dir, old_scene.class_name)
     except (OSError, ValueError):
         return None
+    return video
 
-    if valid_videos:
-        # 返回最新的视频
-        try:
-            return max(valid_videos, key=lambda v: v.stat().st_mtime)
-        except OSError:
-            return None
 
-    return None
+def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
+    """在媒体目录中竞态安全地选择最新的完整 MP4。"""
+
+    candidates: list[tuple[Path, float]] = []
+    try:
+        for path in media_dir.rglob(f"{class_name}.mp4"):
+            if "partial_movie_files" in path.parts:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                # 渲染器可能正在替换/删除文件；跳过瞬时消失的候选。
+                continue
+            if stat.st_size > 0:
+                candidates.append((path, stat.st_mtime))
+    except OSError:
+        return None
+    return max(candidates, key=lambda item: item[1])[0] if candidates else None
 
 
 def _legacy_phase(scene: dict) -> str:
@@ -408,14 +442,9 @@ def _migrate_legacy_artifact(
         return None
     try:
         media_dir = restore_run_path(root, job["media_dir"])
-        candidates = [
-            item
-            for item in media_dir.rglob(f"{class_name}.mp4")
-            if "partial_movie_files" not in item.parts and item.stat().st_size > 0
-        ]
-        if not candidates:
+        video = _latest_video_candidate(media_dir, class_name)
+        if video is None:
             return None
-        video = max(candidates, key=lambda item: item.stat().st_mtime)
         metadata = verify_video(video, profile)
         return SceneArtifact(
             origin="rendered",

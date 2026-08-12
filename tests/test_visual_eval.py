@@ -3,8 +3,10 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from kd1_anime.config import settings
 from kd1_anime.eval.evaluator import Evaluator
 from kd1_anime.eval.visual_eval import VisualEvaluator
+from kd1_anime.run_store import RunManifest, write_manifest
 
 
 def visual_payload() -> str:
@@ -65,6 +67,25 @@ def test_visual_response_rejects_non_integer_scores(invalid_score):
         VisualEvaluator._parse_response(json.dumps(payload))
 
 
+def test_visual_evaluator_rejects_excessive_frame_count(tmp_path):
+    frames = []
+    for index in range(9):
+        path = tmp_path / f"frame_{index}.jpg"
+        path.write_bytes(b"jpeg")
+        frames.append(path)
+
+    with pytest.raises(ValueError, match="关键帧数量"):
+        VisualEvaluator("vision-model").evaluate_video_frames(frames)
+
+
+def test_visual_evaluator_rejects_oversized_image(tmp_path):
+    image = tmp_path / "large.jpg"
+    image.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+    with pytest.raises(ValueError, match="too large"):
+        VisualEvaluator.encode_image(image)
+
+
 def test_visual_failure_is_recorded_as_unknown_not_fake_score(monkeypatch, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -91,3 +112,26 @@ def test_visual_failure_is_recorded_as_unknown_not_fake_score(monkeypatch, tmp_p
     assert result.overall_score is None
     assert result.scores == []
     assert "vision endpoint unavailable" in result.errors["visual"]
+
+
+def test_evaluate_run_rejects_untrusted_manifest_video(monkeypatch, tmp_path):
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    run_dir = workspace / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    manifest = RunManifest(
+        run_id=run_id,
+        user_prompt="demo",
+        output_path=str(tmp_path / "configured.mp4"),
+        final_video=str(tmp_path / "untrusted.mp4"),
+    )
+    write_manifest(run_dir / "manifest.json", manifest)
+
+    result = Evaluator(enable_visual_eval=True, output_dir=tmp_path / "reports").evaluate_run(
+        run_id,
+        run_dir,
+        enable_visual=True,
+    )
+
+    assert "路径不在允许范围内" in result.errors["visual"]

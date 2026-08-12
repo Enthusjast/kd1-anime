@@ -24,12 +24,19 @@ class VideoMerger:
 
         if not job.media_dir.exists():
             raise RuntimeError(f"Scene {job.scene_id} 的媒体目录不存在: {job.media_dir}")
+        candidates: list[tuple[Path, float]] = []
         try:
-            candidates = [
-                path
-                for path in job.media_dir.rglob(f"{job.scene_class_name}.mp4")
-                if "partial_movie_files" not in path.parts and path.stat().st_size > 0
-            ]
+            for path in job.media_dir.rglob(f"{job.scene_class_name}.mp4"):
+                if "partial_movie_files" in path.parts:
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    # 成品可能正在由 Manim/ffmpeg 替换；忽略本轮消失的候选，
+                    # 避免一次目录竞态导致整个合并失败。
+                    continue
+                if stat.st_size > 0:
+                    candidates.append((path, stat.st_mtime))
         except OSError as exc:
             raise RuntimeError(f"Scene {job.scene_id} 的媒体目录无法读取: {job.media_dir}") from exc
         if not candidates:
@@ -37,10 +44,7 @@ class VideoMerger:
                 f"Scene {job.scene_id} 未找到当前类 {job.scene_class_name!r} 的最终 MP4"
             )
         # 当前 run 的目录是隔离的；若 Manim 产生多个质量目录，取最新完成的文件。
-        try:
-            return max(candidates, key=lambda path: path.stat().st_mtime)
-        except OSError as exc:
-            raise RuntimeError(f"Scene {job.scene_id} 的最终 MP4 在读取时消失") from exc
+        return max(candidates, key=lambda item: item[1])[0]
 
     def collect_job_videos(self, jobs: list[SlurmJob]) -> list[Path]:
         videos: list[Path] = []

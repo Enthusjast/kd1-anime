@@ -134,6 +134,9 @@ kd1-anime status 20260728-120000-1234abcd
 # 从清单恢复中断运行；不会重复提交仍有 Job ID 的场景
 kd1-anime resume 20260728-120000-1234abcd
 
+# 检查依赖；--probe 会额外运行本地最小 FFmpeg/XeLaTeX/Manim 探测，不提交 Slurm
+kd1-anime doctor --probe
+
 # 清理 30 天前的已结束运行目录
 kd1-anime clean --older-than 30d --yes
 ```

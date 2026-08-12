@@ -1,3 +1,5 @@
+import pytest
+
 from kd1_anime.agents.validator import validate_manim_code
 from kd1_anime.config import settings
 
@@ -47,6 +49,82 @@ def test_rejects_numpy_file_io():
     )
     assert not result.is_valid
     assert "save" in result.feedback
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        (
+            "from manim import *\n"
+            "from numpy import load\n"
+            "class Demo(Scene):\n"
+            "    def construct(self):\n"
+            "        load('secret.npy')\n",
+            "导入符号 'load'",
+        ),
+        (
+            "from manim import *\n"
+            "from numpy import *\n"
+            "class Demo(Scene):\n"
+            "    def construct(self): pass\n",
+            "通配符导入",
+        ),
+        (
+            "from manim import *\n"
+            "from manim import config as cfg\n"
+            "class Demo(Scene):\n"
+            "    def construct(self):\n"
+            "        cfg.media_dir = '/tmp/escape'\n",
+            "config 创建别名",
+        ),
+        (
+            "from manim import *\n"
+            "import manim.utils.file_ops\n"
+            "class Demo(Scene):\n"
+            "    def construct(self): pass\n",
+            "模块路径",
+        ),
+    ],
+)
+def test_rejects_import_allowlist_bypasses(source, expected):
+    result = validate_manim_code(source)
+    assert not result.is_valid
+    assert expected in result.feedback
+
+
+def test_rejects_manim_module_alias_config_access():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "import manim as m\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        m.config.media_dir = '/tmp/escape'\n"
+    )
+    assert not result.is_valid
+    assert "模块别名" in result.feedback
+
+
+def test_rejects_config_alias_created_by_assignment():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        cfg = config\n"
+        "        cfg.media_dir = '/tmp/escape'\n"
+    )
+    assert not result.is_valid
+    assert "config 别名" in result.feedback
+
+
+def test_rejects_manim_internal_module_exposed_by_wildcard_import():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        utils.file_ops.write_file('/tmp/escape', 'x')\n"
+    )
+    assert not result.is_valid
+    assert "内部模块" in result.feedback or "file_ops" in result.feedback
 
 
 def test_rejects_dynamic_module_assignment():

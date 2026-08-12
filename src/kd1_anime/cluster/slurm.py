@@ -86,14 +86,19 @@ class JobMonitor:
         queue_timeout: int | None = None,
         run_timeout: int | None = None,
         poll_interval: int | None = None,
+        use_legacy_timeout: bool = True,
     ) -> None:
         self.dispatcher = dispatcher
-        self.queue_timeout = queue_timeout or settings.MONITOR_QUEUE_TIMEOUT
-        self.run_timeout = run_timeout or settings.MONITOR_RUN_TIMEOUT
-        self.poll_interval = poll_interval or settings.MONITOR_POLL_INTERVAL
+        self.queue_timeout = (
+            settings.MONITOR_QUEUE_TIMEOUT if queue_timeout is None else queue_timeout
+        )
+        self.run_timeout = settings.MONITOR_RUN_TIMEOUT if run_timeout is None else run_timeout
+        self.poll_interval = (
+            settings.MONITOR_POLL_INTERVAL if poll_interval is None else poll_interval
+        )
         # 兼容只设置旧 MONITOR_TIMEOUT 的配置；显式修改新的拆分项时以新项为准。
         legacy_timeout = settings.MONITOR_TIMEOUT
-        if legacy_timeout is not None:
+        if use_legacy_timeout and legacy_timeout is not None:
             if self.queue_timeout == 3600:
                 self.queue_timeout = legacy_timeout
             if self.run_timeout == 3600:
@@ -649,19 +654,25 @@ class SlurmDispatcher:
         """
         if not job.media_dir.is_dir():
             return None
+        candidates: list[tuple[Path, float]] = []
         try:
-            candidates = [
-                path
-                for path in job.media_dir.rglob(f"{job.scene_class_name}.mp4")
-                if "partial_movie_files" not in path.parts
-                and path.stat().st_size > 0
-                and path.stat().st_mtime >= job.submitted_at - 1.0
-            ]
+            paths = job.media_dir.rglob(f"{job.scene_class_name}.mp4")
+            for path in paths:
+                if "partial_movie_files" in path.parts:
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    # ffmpeg/manim 可能在扫描期间替换或删除文件；跳过该候选，
+                    # 不应让一次竞态把成功作业判成监控器异常。
+                    continue
+                if stat.st_size > 0 and stat.st_mtime >= job.submitted_at - 1.0:
+                    candidates.append((path, stat.st_mtime))
         except OSError:
             return None
         if not candidates:
             return None
-        return max(candidates, key=lambda path: path.stat().st_mtime)
+        return max(candidates, key=lambda item: item[1])[0]
 
     def validate_completed_job(self, job: SlurmJob) -> bool:
         """确认当前作业确实生成了可解析且匹配配置的最终视频。"""
@@ -736,7 +747,6 @@ class SlurmDispatcher:
         poll_interval: int | None = None,
         timeout: int | None = None,
     ) -> dict[str, bool]:
-        interval = poll_interval or settings.MONITOR_POLL_INTERVAL
         legacy_timeout = settings.MONITOR_TIMEOUT
         if timeout is not None:
             queue_timeout = run_timeout = timeout
@@ -749,119 +759,23 @@ class SlurmDispatcher:
                     queue_timeout = legacy_timeout
                 if run_timeout == 3600:
                     run_timeout = legacy_timeout
-        pending = dict(jobs)
-        results: dict[str, bool] = {}
-        indeterminate_streaks = {job_id: 0 for job_id in jobs}
-        running_since: dict[str, float] = {}
-        log_positions: dict[str, int] = {}
 
-        while pending:
-            now = time.time()
-            statuses = self.poll_all_statuses(list(pending))
-            finished: list[str] = []
-            for job_id, job in pending.items():
-                status = statuses.get(job_id, "UNKNOWN")
-                job.status = status
-
-                if status == "COMPLETED":
-                    indeterminate_streaks[job_id] = 0
-                    job.elapsed_seconds = max(
-                        0.0, now - running_since.get(job_id, job.submitted_at)
-                    )
-                    self._forward_log(job, log_positions)
-                    valid = self.validate_completed_job(job)
-                    results[job_id] = valid
-                    finished.append(job_id)
-                    if valid:
-                        console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
-                    else:
-                        job.status = "FAILED"
-                        console.print(
-                            f"[bold red][Monitor][/] Scene {job.scene_id} 作业结束但产物无效: "
-                            f"{job.failure_reason}",
-                            markup=False,
-                        )
-                elif status in FAILURE_STATES:
-                    indeterminate_streaks[job_id] = 0
-                    self._forward_log(job, log_positions)
-                    job.failure_reason = f"Slurm 状态: {status}"
-                    results[job_id] = False
-                    finished.append(job_id)
-                    console.print(f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败: {status}")
-                elif status in ("UNKNOWN", "GONE"):
-                    if status == "GONE":
-                        outcome = self._classify_gone(job)
-                        if outcome == "COMPLETED":
-                            indeterminate_streaks[job_id] = 0
-                            job.status = "COMPLETED"
-                            job.elapsed_seconds = max(0.0, now - job.submitted_at)
-                            self._forward_log(job, log_positions)
-                            results[job_id] = True
-                            finished.append(job_id)
-                            console.print(f"[bold green][Monitor][/] Scene {job.scene_id} 渲染成功")
-                            continue
-                        if outcome == "FAILED":
-                            indeterminate_streaks[job_id] = 0
-                            job.status = "FAILED"
-                            self._forward_log(job, log_positions)
-                            results[job_id] = False
-                            finished.append(job_id)
-                            console.print(
-                                f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败（作业已消失，依据日志判定）"
-                            )
-                            continue
-                    indeterminate_streaks[job_id] += 1
-                    if indeterminate_streaks[job_id] >= settings.MONITOR_MAX_UNKNOWN:
-                        if status == "GONE":
-                            job.status = "FAILED"
-                            job.failure_reason = "作业已从集群消失且无输出日志，无法确认渲染结果"
-                            results[job_id] = False
-                            finished.append(job_id)
-                            console.print(
-                                f"[bold red][Monitor][/] Scene {job.scene_id} 渲染失败：作业消失且无输出"
-                            )
-                        else:
-                            self._cancel_for_monitor_failure(
-                                job,
-                                status="UNKNOWN_TIMEOUT",
-                                reason="状态连续未知，已停止监控并尝试取消远端任务",
-                            )
-                            results[job_id] = False
-                            finished.append(job_id)
-                else:
-                    indeterminate_streaks[job_id] = 0
-                    if status in RUNNING_STATES:
-                        running_since.setdefault(job_id, now)
-                    elif job_id in running_since:
-                        # 被抢占退回排队: 停止累计运行时长
-                        running_since.pop(job_id, None)
-                    if job_id in running_since:
-                        self._forward_log(job, log_positions)
-                        if now - running_since[job_id] > run_timeout:
-                            self._cancel_for_monitor_failure(
-                                job,
-                                status="RUN_TIMEOUT",
-                                reason=f"运行超过 {run_timeout} 秒",
-                            )
-                            results[job_id] = False
-                            finished.append(job_id)
-                            continue
-                    elif now - job.submitted_at > queue_timeout:
-                        self._cancel_for_monitor_failure(
-                            job,
-                            status="QUEUE_TIMEOUT",
-                            reason=f"排队超过 {queue_timeout} 秒",
-                        )
-                        results[job_id] = False
-                        finished.append(job_id)
-                        continue
-                    console.print(f"[dim][Monitor][/] Scene {job.scene_id}: {status}")
-
-            for job_id in finished:
-                pending.pop(job_id, None)
-            if pending:
-                time.sleep(interval)
-        return results
+        monitor = JobMonitor(
+            self,
+            queue_timeout=queue_timeout,
+            run_timeout=run_timeout,
+            poll_interval=poll_interval,
+            # 上面已把 timeout 参数解析成最终值；不能再次被旧的
+            # MONITOR_TIMEOUT 覆盖，尤其是显式传入 3600 时。
+            use_legacy_timeout=False,
+        )
+        for job in jobs.values():
+            monitor.add_job(job)
+        while monitor.pending:
+            monitor.poll_once()
+            if monitor.pending:
+                time.sleep(monitor.poll_interval)
+        return monitor.results
 
     def _cancel_for_monitor_failure(self, job: SlurmJob, *, status: str, reason: str) -> None:
         console.print(

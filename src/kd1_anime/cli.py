@@ -12,9 +12,12 @@ kd1-anime CLI 入口
 """
 
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -49,6 +52,8 @@ def main_callback(
     ),
 ):
     """kd1-anime — AI 驱动的数学动画生成器"""
+    ctx.ensure_object(dict)
+    ctx.obj["dry_run"] = dry_run
     if api_key:
         settings.LLM_API_KEY = api_key
     if model:
@@ -61,14 +66,16 @@ def main_callback(
 
 @app.command()
 def chat(
+    ctx: typer.Context,
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成代码不提交 Slurm"),
 ):
     """启动交互式会话 (默认命令)"""
-    _start_chat(dry_run=dry_run)
+    _start_chat(dry_run=dry_run or bool((ctx.obj or {}).get("dry_run")))
 
 
 @app.command()
 def generate(
+    ctx: typer.Context,
     prompt: str = typer.Argument(None, help="动画需求的自然语言描述"),
     output: Path = typer.Option(
         None, "--output", "-o", help="输出视频文件路径 (默认: output_final.mp4)"
@@ -103,6 +110,7 @@ def generate(
     ),
 ):
     """直接生成模式 (无需求澄清)"""
+    dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
     if not prompt and not resume:
@@ -117,7 +125,10 @@ def generate(
             settings.MAX_FIX_ATTEMPTS = max_fix
         if output:
             settings.OUTPUT_FILE = output
-        settings.OVERWRITE_OUTPUT = force
+        # 不要让 Typer 的默认 False 覆盖 .env 中显式配置的 true；只有用户
+        # 明确传入 --force 时才开启覆盖。
+        if force:
+            settings.OVERWRITE_OUTPUT = True
     except ValueError as e:
         console.print(f"[bold red]配置错误:[/] {e}", markup=False)
         raise typer.Exit(1) from e
@@ -211,6 +222,7 @@ def plan(
 
 @app.command()
 def render(
+    ctx: typer.Context,
     file: Path = typer.Argument(
         ...,
         help="Manim Python 文件路径",
@@ -243,6 +255,11 @@ def render(
         )
         raise typer.Exit(1)
     selected_class = class_name or validation.scene_classes[0]
+    if bool((ctx.obj or {}).get("dry_run")):
+        console.print(
+            f"[bold green]Dry-run:[/] 代码校验通过，不提交 Scene {selected_class} 的 Slurm 任务"
+        )
+        return
     try:
         job, final_video, run_id = Orchestrator().submit_existing_scene(
             source_code,
@@ -358,7 +375,8 @@ def resume(
         manifest = repository.load(run_id)
         if manifest.state in RESUME_LLM_STATES:
             settings.require_llm_key()
-        settings.OVERWRITE_OUTPUT = force
+        if force:
+            settings.OVERWRITE_OUTPUT = True
         from kd1_anime.orchestrator import Orchestrator
 
         final_video = Orchestrator().resume(run_id, interactive=interactive)
@@ -438,6 +456,7 @@ def clean(
 
 @app.command()
 def batch(
+    ctx: typer.Context,
     prompts_file: Path = typer.Argument(
         ...,
         help="包含 prompts 的文件路径（每行一个 prompt 或 JSON 格式）",
@@ -467,6 +486,7 @@ def batch(
     ),
 ):
     """批量并行处理多个动画项目。"""
+    dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
     try:
         settings.require_llm_key()
     except ValueError as e:
@@ -496,10 +516,15 @@ def batch(
 
         # 检查是否有失败的任务
         failed_count = sum(1 for t in tasks if t.status == "failed")
+        interrupted_count = sum(1 for t in tasks if t.status == "interrupted")
         if failed_count > 0:
             console.print(f"[bold red]{failed_count} 个任务失败[/]")
             raise typer.Exit(1)
+        if interrupted_count > 0:
+            raise typer.Exit(130)
 
+    except typer.Exit:
+        raise
     except Exception as e:
         console.print(f"[bold red]批量处理失败:[/] {e}", markup=False)
         raise typer.Exit(1) from e
@@ -521,10 +546,13 @@ def version_cmd():
 @app.command()
 def doctor(
     deep: bool = typer.Option(False, "--deep", help="额外执行 Slurm 客户端版本探测"),
+    probe: bool = typer.Option(
+        False,
+        "--probe",
+        help="运行一次最小 FFmpeg、XeLaTeX 和当前 Manim renderer 探测（不会提交 Slurm）",
+    ),
 ):
     """检查环境依赖和配置是否完整。"""
-    import subprocess
-
     console.print("[bold]kd1-anime 环境检查[/]\n")
 
     checks = []
@@ -608,6 +636,9 @@ def doctor(
         except (OSError, subprocess.TimeoutExpired) as exc:
             checks.append(("Slurm 客户端", False, str(exc)))
 
+    if probe:
+        _run_doctor_probes(checks)
+
     # 检查 LLM 配置
     llm_ok = bool(settings.LLM_API_KEY and settings.LLM_MODEL)
     llm_info = "已配置" if llm_ok else "未配置 (需要 LLM_API_KEY 和 LLM_MODEL)"
@@ -642,6 +673,143 @@ def doctor(
     else:
         console.print("[bold yellow]部分依赖缺失，请参考文档安装：[/]")
         console.print("  https://github.com/Enthusjast/kd1-anime#readme")
+
+
+def _run_doctor_probes(checks: list[tuple[str, bool, str]]) -> None:
+    """执行不提交 Slurm 的本地最小能力探测。"""
+
+    def run_probe(name: str, command: list[str], *, env: dict[str, str] | None = None) -> None:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+                env=env,
+            )
+            detail = (result.stdout or result.stderr).strip().splitlines()
+            checks.append((name, result.returncode == 0, detail[-1][:120] if detail else "完成"))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            checks.append((name, False, str(exc)))
+
+    with tempfile.TemporaryDirectory(prefix="kd1-doctor-") as directory:
+        root = Path(directory)
+
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if ffmpeg and ffprobe:
+            video = root / "probe.mp4"
+            run_probe(
+                "FFmpeg 最小编码探测",
+                [
+                    ffmpeg,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=16x16:d=0.2",
+                    "-c:v",
+                    "mpeg4",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(video),
+                ],
+            )
+            run_probe(
+                "ffprobe 最小视频探测",
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    str(video),
+                ],
+            )
+        else:
+            checks.append(("FFmpeg/ffprobe 最小探测", False, "缺少 ffmpeg 或 ffprobe"))
+
+        xelatex = shutil.which("xelatex")
+        if xelatex:
+            tex = root / "probe.tex"
+            tex.write_text(
+                "\\documentclass{article}\n\\begin{document}\nprobe\\end{document}\n",
+                encoding="utf-8",
+            )
+            run_probe(
+                "XeLaTeX .xdv 探测",
+                [
+                    xelatex,
+                    "-no-pdf",
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    "-output-directory",
+                    str(root),
+                    str(tex),
+                ],
+            )
+            checks.append(
+                ("XeLaTeX .xdv 产物", (root / "probe.xdv").is_file(), str(root / "probe.xdv"))
+            )
+        else:
+            checks.append(("XeLaTeX .xdv 探测", False, "未找到 xelatex"))
+
+        scene = root / "doctor_scene.py"
+        scene.write_text(
+            "from manim import *\n"
+            "class DoctorProbe(Scene):\n"
+            "    def construct(self):\n"
+            "        self.add(Square())\n"
+            "        self.wait(0.1)\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["MANIM_RENDERER"] = settings.MANIM_RENDERER
+        env["MANIM_OPENGL_PLATFORM"] = settings.MANIM_OPENGL_PLATFORM
+        manim_command = [
+            sys.executable,
+            "-m",
+            "manim",
+            "render",
+            "--renderer",
+            settings.MANIM_RENDERER,
+            "-ql",
+            "--disable_caching",
+            "--media_dir",
+            str(root / "manim_media"),
+            str(scene),
+            "DoctorProbe",
+        ]
+        if settings.MANIM_RENDERER == "opengl":
+            # OpenGL 默认可能只播放而不写成品；探针必须覆盖真正的文件输出路径。
+            manim_command.insert(-2, "--write_to_movie")
+        run_probe(
+            f"Manim {settings.MANIM_RENDERER} 最小渲染",
+            manim_command,
+            env=env,
+        )
+        try:
+            rendered_videos = list((root / "manim_media").rglob("DoctorProbe.mp4"))
+        except OSError:
+            rendered_videos = []
+        rendered_video = None
+        for path in rendered_videos:
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    rendered_video = path
+                    break
+            except OSError:
+                continue
+        checks.append(
+            (
+                "Manim 最小渲染产物",
+                rendered_video is not None,
+                str(rendered_video) if rendered_video else "未找到 DoctorProbe.mp4",
+            )
+        )
 
 
 def _start_chat(dry_run: bool = False) -> None:

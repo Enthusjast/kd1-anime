@@ -60,6 +60,14 @@ def test_empty_container_image_is_normalized_to_none():
     assert config2.SLURM_CONTAINER_IMAGE is None
 
 
+def test_empty_conda_base_is_normalized_to_none():
+    config = Settings(_env_file=None, SLURM_CONDA_BASE="")
+    assert config.SLURM_CONDA_BASE is None
+
+    config2 = Settings(_env_file=None, SLURM_CONDA_BASE="   ")
+    assert config2.SLURM_CONDA_BASE is None
+
+
 def test_settings_assignment_is_validated():
     config = Settings(_env_file=None)
     with pytest.raises(ValueError):

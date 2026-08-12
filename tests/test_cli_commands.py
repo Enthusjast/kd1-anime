@@ -1,6 +1,7 @@
 from typer.testing import CliRunner
 
 from kd1_anime.cli import _print_comparison, app
+from kd1_anime.config import settings
 from kd1_anime.eval.metrics import ComparisonResult, EvalResult
 
 
@@ -54,3 +55,84 @@ def test_generate_resume_does_not_require_a_dummy_prompt(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert "成功" in result.output
     assert "output_final.mp4" in result.output
+
+
+def test_global_dry_run_is_forwarded_to_generate(monkeypatch, tmp_path):
+    import kd1_anime.orchestrator as orchestrator_module
+
+    calls = []
+
+    class FakeOrchestrator:
+        def __init__(self):
+            pass
+
+        def run(self, prompt, *, dry_run=False):
+            calls.append((prompt, dry_run))
+            return None
+
+    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(settings, "LLM_API_KEY", "key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "model")
+
+    result = CliRunner().invoke(app, ["--dry-run", "generate", "demo"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("demo", True)]
+
+
+def test_generate_does_not_clear_configured_overwrite_setting(monkeypatch):
+    import kd1_anime.orchestrator as orchestrator_module
+
+    class FakeOrchestrator:
+        def __init__(self):
+            pass
+
+        def run(self, prompt, *, dry_run=False):
+            return None
+
+    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(settings, "LLM_API_KEY", "key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "model")
+    monkeypatch.setattr(settings, "OVERWRITE_OUTPUT", True)
+
+    result = CliRunner().invoke(app, ["generate", "demo", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert settings.OVERWRITE_OUTPUT is True
+
+
+def test_global_dry_run_is_forwarded_to_batch(monkeypatch, tmp_path):
+    from kd1_anime.batch import BatchProcessor
+
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("demo\n", encoding="utf-8")
+    monkeypatch.setattr(settings, "LLM_API_KEY", "key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "model")
+    calls = []
+
+    def fake_execute(self):
+        calls.append(self.config.dry_run)
+        return []
+
+    monkeypatch.setattr(BatchProcessor, "execute_all", fake_execute)
+
+    result = CliRunner().invoke(app, ["--dry-run", "batch", str(prompts)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [True]
+
+
+def test_global_dry_run_skips_direct_render_submission(tmp_path):
+    scene = tmp_path / "scene.py"
+    scene.write_text(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(Square())\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--dry-run", "render", str(scene)])
+
+    assert result.exit_code == 0, result.output
+    assert "不提交" in result.output

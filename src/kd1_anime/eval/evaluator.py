@@ -15,12 +15,16 @@ from kd1_anime.eval.code_eval import CodeEvaluator
 from kd1_anime.eval.metrics import ComparisonResult, EvalMetric, EvalResult, QualityScore
 from kd1_anime.eval.visual_eval import VisualEvaluator
 from kd1_anime.exceptions import KD1Error
-from kd1_anime.rendering import probe_video
-from kd1_anime.run_store import RunRepository
+from kd1_anime.rendering import probe_video, sha256_file
+from kd1_anime.run_store import RunRepository, atomic_write_json
 
 
 class EvaluationError(KD1Error):
     pass
+
+
+MAX_VISUAL_FRAMES = 8
+MAX_VISUAL_FRAME_BYTES = 2 * 1024 * 1024
 
 
 class Evaluator:
@@ -40,6 +44,7 @@ class Evaluator:
             resolve_runtime_path(settings.WORKSPACE_DIR) / "eval_results"
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.chmod(0o700)
 
     def evaluate_code(self, code: str) -> EvalResult:
         result = EvalResult(run_id=f"code_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -64,17 +69,18 @@ class Evaluator:
         *,
         frame_count: int = 6,
     ) -> list[Path]:
-        if frame_count < 1:
-            raise ValueError("frame_count 必须大于 0")
+        if not 1 <= frame_count <= MAX_VISUAL_FRAMES:
+            raise ValueError(f"frame_count 必须在 1..{MAX_VISUAL_FRAMES} 之间")
         metadata = probe_video(video_path)
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise EvaluationError("未找到 ffmpeg，无法抽取视觉评估关键帧")
         output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.chmod(0o700)
         frames: list[Path] = []
         for index in range(frame_count):
             timestamp = metadata.duration_seconds * (index + 1) / (frame_count + 1)
-            output = output_dir / f"frame_{index + 1:02d}.png"
+            output = output_dir / f"frame_{index + 1:02d}.jpg"
             try:
                 result = subprocess.run(
                     [
@@ -84,8 +90,14 @@ class Evaluator:
                         f"{timestamp:.3f}",
                         "-i",
                         str(video_path),
+                        "-vf",
+                        "scale=1024:1024:force_original_aspect_ratio=decrease",
                         "-frames:v",
                         "1",
+                        "-c:v",
+                        "mjpeg",
+                        "-q:v",
+                        "5",
                         str(output),
                     ],
                     capture_output=True,
@@ -98,6 +110,11 @@ class Evaluator:
             if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
                 raise EvaluationError(
                     f"关键帧抽取失败 ({index + 1}/{frame_count}): {result.stderr[-500:]}"
+                )
+            if output.stat().st_size > MAX_VISUAL_FRAME_BYTES:
+                raise EvaluationError(
+                    f"关键帧过大 ({index + 1}/{frame_count}): "
+                    f"{output.stat().st_size} bytes > {MAX_VISUAL_FRAME_BYTES}"
                 )
             output.chmod(0o600)
             frames.append(output)
@@ -145,11 +162,37 @@ class Evaluator:
 
         if enable_visual and self.visual_evaluator is not None:
             final_video = None
+            manifest_video_rejected = False
             if manifest and manifest.final_video:
                 candidate = Path(manifest.final_video).expanduser().resolve()
-                if candidate.is_file():
-                    final_video = candidate
-            if final_video is None:
+                run_root = run_dir.resolve()
+                allowed_external = Path(manifest.output_path).expanduser().resolve()
+                try:
+                    candidate.relative_to(run_root)
+                    is_allowed = True
+                except ValueError:
+                    is_allowed = candidate == allowed_external
+                if not is_allowed:
+                    manifest_video_rejected = True
+                    result.add_error("visual", "清单中的最终视频路径不在允许范围内")
+                elif not candidate.is_file():
+                    manifest_video_rejected = True
+                    result.add_error("visual", f"清单中的最终视频不存在: {candidate}")
+                else:
+                    try:
+                        hash_matches = not manifest.final_video_sha256 or (
+                            sha256_file(candidate) == manifest.final_video_sha256
+                        )
+                    except OSError as exc:
+                        hash_matches = False
+                        manifest_video_rejected = True
+                        result.add_error("visual", f"读取最终视频失败，拒绝视觉评估: {exc}")
+                    if not hash_matches and "visual" not in result.errors:
+                        manifest_video_rejected = True
+                        result.add_error("visual", "清单中的最终视频哈希不匹配，拒绝视觉评估")
+                    if hash_matches:
+                        final_video = candidate
+            if final_video is None and not manifest_video_rejected:
                 candidate = run_dir / "output_final.mp4"
                 if candidate.is_file():
                     final_video = candidate
@@ -160,7 +203,7 @@ class Evaluator:
                         result.add_score(score)
                 except Exception as exc:
                     result.add_error("visual", str(exc))
-            else:
+            elif final_video is None and not result.errors.get("visual"):
                 result.add_error("visual", "未找到最终视频，无法进行视觉评估")
 
         for score in self._evaluate_efficiency(run_dir, manifest):
@@ -377,11 +420,7 @@ class Evaluator:
             "results": [result.to_dict() for result in results],
             "summary": self._generate_batch_summary(results),
         }
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
-        output_path.chmod(0o600)
+        atomic_write_json(output_path, report)
         return output_path
 
     @staticmethod

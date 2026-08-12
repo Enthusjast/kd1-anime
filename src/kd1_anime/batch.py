@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,7 +32,7 @@ class BatchTask:
     task_id: int
     prompt: str
     output: Path | None = None
-    status: Literal["pending", "running", "completed", "failed"] = "pending"
+    status: Literal["pending", "running", "completed", "failed", "interrupted"] = "pending"
     run_id: str | None = None
     error: str | None = None
     start_time: datetime | None = None
@@ -124,6 +125,9 @@ class BatchProcessor:
             llm_limit=settings.LLM_PARALLEL_WORKERS,
             slurm_limit=settings.SLURM_MAX_IN_FLIGHT,
         )
+        self._active_lock = threading.RLock()
+        self._active_orchestrators: dict[int, object] = {}
+        self._interrupted = threading.Event()
 
     def add_task(self, prompt: str, output: Path | None = None) -> BatchTask:
         """添加单个任务。"""
@@ -153,7 +157,18 @@ class BatchProcessor:
         orchestrator: Orchestrator | None = None
 
         try:
+            if self._interrupted.is_set():
+                task.status = "interrupted"
+                task.error = "用户中断，任务已停止"
+                return task
             orchestrator = Orchestrator(resource_coordinator=self.resources)
+            with self._active_lock:
+                self._active_orchestrators[task.task_id] = orchestrator
+            if self._interrupted.is_set():
+                orchestrator.cancel_all()
+                task.status = "interrupted"
+                task.error = "用户中断，任务已停止"
+                return task
             output_path = self._task_output_path(task)
 
             if self.config.incremental and task.task_id in self.config.base_run_ids:
@@ -173,18 +188,29 @@ class BatchProcessor:
                     output_path=output_path,
                 )
 
-            task.status = "completed"
-            task.output = final_video
-            if final_video:
-                logger.info(f"任务 {task.task_id} 完成: {final_video}")
+            if self._interrupted.is_set():
+                task.status = "interrupted"
+                task.error = "用户中断，任务已停止"
+            else:
+                task.status = "completed"
+                task.output = final_video
+                if final_video:
+                    logger.info(f"任务 {task.task_id} 完成: {final_video}")
             task.run_id = orchestrator._ctx.paths.run_id if orchestrator._ctx else None
 
         except Exception as exc:
-            task.status = "failed"
-            task.error = str(exc)
-            logger.error(f"任务 {task.task_id} 失败: {exc}")
+            if self._interrupted.is_set():
+                task.status = "interrupted"
+                task.error = "用户中断，任务已停止"
+            else:
+                task.status = "failed"
+                task.error = str(exc)
+                logger.error(f"任务 {task.task_id} 失败: {exc}")
 
         finally:
+            if orchestrator is not None:
+                with self._active_lock:
+                    self._active_orchestrators.pop(task.task_id, None)
             if task.run_id is None and orchestrator is not None and orchestrator._ctx is not None:
                 task.run_id = orchestrator._ctx.paths.run_id
             task.end_time = datetime.now()
@@ -225,24 +251,44 @@ class BatchProcessor:
         )
 
         completed_tasks: list[BatchTask] = []
-        with ThreadPoolExecutor(max_workers=self.config.max_parallel) as executor:
-            future_to_task = {
-                executor.submit(self._execute_single_task, task): task for task in self.tasks
-            }
+        executor = ThreadPoolExecutor(max_workers=self.config.max_parallel)
+        future_to_task = {
+            executor.submit(self._execute_single_task, task): task for task in self.tasks
+        }
+        try:
             for future in as_completed(future_to_task):
                 task = future.result()
                 completed_tasks.append(task)
                 elapsed = ""
                 if task.start_time and task.end_time:
                     elapsed = f"{(task.end_time - task.start_time).total_seconds():.1f}s"
-                icon = "✓" if task.status == "completed" else "✗"
-                color = "green" if task.status == "completed" else "red"
+                if task.status == "completed":
+                    icon, color = "✓", "green"
+                elif task.status == "interrupted":
+                    icon, color = "⏹", "yellow"
+                else:
+                    icon, color = "✗", "red"
                 detail = task.output if task.status == "completed" else task.error or ""
                 console.print(
                     f"[{color}]{icon} 任务 {task.task_id}[/] "
                     f"{task.status} ({elapsed}) {str(detail)[-60:]}",
                     markup=False,
                 )
+        except KeyboardInterrupt:
+            self.cancel_all()
+            for future in future_to_task:
+                future.cancel()
+            for task in self.tasks:
+                if task.status in {"pending", "running"}:
+                    task.status = "interrupted"
+                    task.error = "用户中断，任务已停止"
+                    task.end_time = datetime.now()
+            # 等待 worker 完成自己的清理，避免退出时遗留远端作业。
+            executor.shutdown(wait=True, cancel_futures=True)
+            completed_tasks = list(self.tasks)
+            console.print("[yellow]批量处理已中断，活动任务已取消[/]")
+        else:
+            executor.shutdown(wait=True)
 
         # 汇总表 (全部结束后再打印, 避免与并发输出交错)
         table = Table(title="批量处理结果")
@@ -258,6 +304,7 @@ class BatchProcessor:
             status_text = {
                 "completed": "[green]✓ 完成[/]",
                 "failed": "[red]✗ 失败[/]",
+                "interrupted": "[yellow]⏹ 中断[/]",
                 "running": "[yellow]⟳ 运行中[/]",
                 "pending": "[dim]○ 等待中[/]",
             }.get(task.status, task.status)
@@ -277,13 +324,29 @@ class BatchProcessor:
 
         completed = sum(1 for t in completed_tasks if t.status == "completed")
         failed = sum(1 for t in completed_tasks if t.status == "failed")
-        console.print(f"[bold]批量处理完成[/] 成功: {completed}, 失败: {failed}")
+        interrupted = sum(1 for t in completed_tasks if t.status == "interrupted")
+        console.print(
+            f"[bold]批量处理完成[/] 成功: {completed}, 失败: {failed}, 中断: {interrupted}"
+        )
         return completed_tasks
+
+    def cancel_all(self) -> None:
+        """取消所有正在执行的 Orchestrator 及其远端 Slurm 作业。"""
+
+        self._interrupted.set()
+        with self._active_lock:
+            active = list(self._active_orchestrators.values())
+        for orchestrator in active:
+            try:
+                orchestrator.cancel_all()
+            except Exception as exc:
+                logger.warning("取消批量任务失败: %s", exc)
 
     def generate_summary(self, tasks: list[BatchTask]) -> str:
         """生成批量处理摘要。"""
         completed = sum(1 for t in tasks if t.status == "completed")
         failed = sum(1 for t in tasks if t.status == "failed")
+        interrupted = sum(1 for t in tasks if t.status == "interrupted")
 
         total_time = 0
         for task in tasks:
@@ -296,12 +359,15 @@ class BatchProcessor:
 总任务数: {len(tasks)}
 成功: {completed}
 失败: {failed}
+中断: {interrupted}
 总耗时: {total_time:.1f}秒
 
 详细结果:
 """
         for task in tasks:
-            status = "✓" if task.status == "completed" else "✗"
+            status = (
+                "✓" if task.status == "completed" else "⏹" if task.status == "interrupted" else "✗"
+            )
             output = str(task.output) if task.output else task.error or "N/A"
             summary += f"  {status} 任务 {task.task_id}: {output}\n"
 

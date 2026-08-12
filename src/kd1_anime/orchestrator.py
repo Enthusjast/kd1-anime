@@ -168,6 +168,8 @@ class Orchestrator:
         # 场景级并行调度时多个工作线程会并发写 manifest, 需要串行化
         self._state_lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._cancel_requested = threading.Event()
+        self._checkpoint_error: Exception | None = None
         self._phase_lock = threading.Lock()
         self._emitted_phases: set[str] = set()
         self._resource_coordinator = resource_coordinator
@@ -177,10 +179,13 @@ class Orchestrator:
             self._callback(event, data)
 
     def cancel_all(self) -> None:
+        self._cancel_requested.set()
         self._stop_event.set()
         if not self._ctx:
             return
-        for state in self._ctx.scene_states.values():
+        with self._state_lock:
+            states = list(self._ctx.scene_states.values())
+        for state in states:
             job = state.slurm_job
             if (
                 job
@@ -189,9 +194,10 @@ class Orchestrator:
                 and job.status not in {"COMPLETED", "CANCELLED", *FAILURE_STATES}
                 and self.slurm.cancel_job(job.job_id)
             ):
-                job.cancelled = True
-                job.status = "CANCELLED"
-                job.failure_reason = "本地流水线停止时已取消远端任务"
+                with self._state_lock:
+                    job.cancelled = True
+                    job.status = "CANCELLED"
+                    job.failure_reason = "本地流水线停止时已取消远端任务"
 
     def _ask_retry_or_skip(self, scene_id: int, error: str) -> bool:
         if not self._ctx or not self._ctx.interactive:
@@ -297,6 +303,15 @@ class Orchestrator:
             )
             write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
             self._manifest = manifest
+
+    def _record_checkpoint_failure(self, error: Exception) -> None:
+        """记录持久化故障并停止其它 worker，避免继续推进未保存的状态。"""
+
+        with self._state_lock:
+            if self._checkpoint_error is None:
+                self._checkpoint_error = error
+        self._stop_event.set()
+        self._emit("checkpoint_failed", error=str(error))
 
     @staticmethod
     def _scene_phase(scene: SceneState) -> str:
@@ -487,6 +502,8 @@ class Orchestrator:
 
         self._callback = callback
         self._manifest = None
+        self._cancel_requested.clear()
+        self._stop_event.clear()
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
@@ -518,6 +535,8 @@ class Orchestrator:
             )
         self._callback = callback
         self._manifest = None
+        self._cancel_requested.clear()
+        self._stop_event.clear()
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
@@ -541,6 +560,8 @@ class Orchestrator:
     ) -> tuple[SlurmJob, Path | None, str]:
         """提交用户已有的单 Scene 文件，并让它拥有完整的运行清单。"""
 
+        self._cancel_requested.clear()
+        self._stop_event.clear()
         validation = self._validate(source_code, renderer=RenderProfile.current().renderer)
         if not validation.is_valid or class_name not in validation.scene_classes:
             raise ValueError("直接渲染代码未通过确定性校验")
@@ -643,6 +664,8 @@ class Orchestrator:
         with lock_run(root):
             manifest = repository.load(run_id)
             self._callback = callback
+            self._cancel_requested.clear()
+            self._stop_event.clear()
             self._manifest = manifest
             ctx = self._context_from_manifest(manifest, root)
             ctx.interactive = interactive
@@ -756,6 +779,11 @@ class Orchestrator:
             improve = True
             while improve:
                 self._run_scheduler(ctx)
+                if self._cancel_requested.is_set():
+                    # 批量处理收到 Ctrl-C 时，worker 线程无法直接收到
+                    # KeyboardInterrupt；在调度器收尾后转成同一条中断收尾路径，
+                    # 确保 manifest 记录 interrupted 而不是误记为 failed。
+                    raise KeyboardInterrupt
                 if ctx.dry_run:
                     break
                 self._merge(ctx)
@@ -1012,7 +1040,9 @@ class Orchestrator:
         self._slot_lock = threading.Lock()
         self._in_flight = 0
         self._reserved_existing_scenes: set[int] = set()
-        self._stop_event.clear()
+        if not self._cancel_requested.is_set():
+            self._stop_event.clear()
+        self._checkpoint_error = None
         with self._phase_lock:
             self._emitted_phases.clear()
 
@@ -1032,6 +1062,10 @@ class Orchestrator:
             thread.start()
         for thread in threads:
             thread.join()
+        if self._checkpoint_error is not None:
+            raise RuntimeError(
+                f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
+            ) from self._checkpoint_error
 
     def _scene_worker(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         """单个 Scene 的完整流水线: 分镜→编码→审查→提交→渲染→(修复→重新提交)。"""
@@ -1075,8 +1109,13 @@ class Orchestrator:
                         self._release_slot()
                         acquired = False
                         return
+                    if self._cancel_requested.is_set() or self._stop_event.is_set():
+                        self.cancel_all()
+                        return
                 ok = self._scene_wait_render(ctx, state)
                 if ok:
+                    return
+                if self._cancel_requested.is_set() or self._stop_event.is_set():
                     return
                 if state.failed or state.give_up:
                     return
@@ -1095,16 +1134,20 @@ class Orchestrator:
         except Exception as exc:
             with self._state_lock:
                 self._mark_failed(state, f"Scene {scene_id} 流水线异常: {exc}")
+            try:
                 self._checkpoint(ctx, State.MONITORING)
+            except Exception as checkpoint_error:
+                self._record_checkpoint_failure(checkpoint_error)
             self._emit("scene_failed", scene_id=scene_id, reason=str(exc))
         finally:
             # 无论成功/失败/异常, 都要释放 in-flight 名额, 避免其他场景死等
             if acquired:
                 self._release_slot()
             if not self._stop_event.is_set():
-                # 检查点失败不应让工作线程崩溃 (可能导致 join 永久等待)
-                with suppress(Exception):
+                try:
                     self._checkpoint(ctx, State.MONITORING)
+                except Exception as checkpoint_error:
+                    self._record_checkpoint_failure(checkpoint_error)
 
     def _try_acquire_slot(self) -> bool:
         if self._resource_coordinator:
@@ -1255,6 +1298,10 @@ class Orchestrator:
                 scene_id=scene_id,
                 job_id=job.job_id,
             )
+            if self._cancel_requested.is_set():
+                # Ctrl-C 可能恰好发生在 submit_scene 返回之后、批量取消器
+                # 扫描之前；此处再扫一次，避免新 Job 漏掉。
+                self.cancel_all()
         except Exception as exc:
             # 一旦拿到 Job ID 就绝不能把持久化异常伪装成提交失败并自动重提。
             if "job" in locals():
@@ -1281,6 +1328,8 @@ class Orchestrator:
         monitor = JobMonitor(self.slurm)
         monitor.add_job(job)
         while monitor.pending:
+            if self._cancel_requested.is_set() or self._stop_event.is_set():
+                return False
             if monitor.poll_once():
                 break
             time.sleep(settings.MONITOR_POLL_INTERVAL)

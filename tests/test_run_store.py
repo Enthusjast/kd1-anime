@@ -401,3 +401,19 @@ def test_checkpoint_revision_is_monotonic_under_threads(tmp_path):
     manifest = RunRepository(workspace).load(RUN_ID)
     assert manifest.revision == 20
     assert json.loads((paths.root / "manifest.json").read_text())["revision"] == 20
+
+
+def test_manifest_rejects_unknown_fsm_state_and_scene_phase():
+    with pytest.raises(ValueError):
+        RunManifest(
+            run_id=RUN_ID,
+            user_prompt="prompt",
+            output_path="/tmp/output.mp4",
+            state="NOT_A_STATE",
+        )
+    with pytest.raises(ValueError):
+        StoredSceneState(plan=make_plan(), phase="not-a-phase")
+
+    scene = StoredSceneState(plan=make_plan())
+    with pytest.raises(ValueError):
+        scene.phase = "not-a-phase"

@@ -52,6 +52,55 @@ def test_valid_review_after_rewrite_exits_review_loop(tmp_path):
     assert ctx.scene_states[1].review_round == 0
 
 
+def test_scheduler_stops_when_checkpoint_persistence_fails(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        dry_run=True,
+        scene_states={
+            1: SceneState(
+                plan=plan(),
+                code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+                class_name="Demo",
+                plan_ready=True,
+                reviewed=True,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "write_manifest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(RuntimeError, match="持久化失败"):
+        Orchestrator()._run_scheduler(ctx)
+
+
+def test_external_cancel_is_checkpointed_as_interrupted(monkeypatch, tmp_path):
+    orch = Orchestrator()
+    orch._cancel_requested.set()
+    ctx = PipelineContext(
+        "x",
+        paths=paths(tmp_path),
+        dry_run=True,
+        scene_states={1: SceneState(plan=plan(), plan_ready=True)},
+    )
+    captured = {}
+    monkeypatch.setattr(orch, "_run_scheduler", lambda current: None)
+    monkeypatch.setattr(
+        module,
+        "write_manifest",
+        lambda path, manifest: captured.setdefault("manifest", manifest),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        orch._execute(ctx, State.INIT)
+
+    assert captured["manifest"].status == "interrupted"
+
+
 def test_resume_snapshot_emits_state_for_existing_scenes(monkeypatch, tmp_path):
     """resume 后快照应为已渲染/进行中的场景补发事件, 避免仪表盘显示"未开始"。"""
     events = []

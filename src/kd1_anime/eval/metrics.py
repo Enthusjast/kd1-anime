@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from kd1_anime.run_store import atomic_write_json
+
 
 class EvalMetric(str, Enum):
     CODE_SYNTAX = "code_syntax"
@@ -118,12 +120,7 @@ class EvalResult:
         }
 
     def save(self, output_path: Path) -> None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(self.to_dict(), indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        output_path.chmod(0o600)
+        atomic_write_json(output_path, self.to_dict())
 
     @classmethod
     def load(cls, input_path: Path) -> EvalResult:

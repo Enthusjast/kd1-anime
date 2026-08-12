@@ -194,6 +194,21 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("SLURM_CONDA_BASE", mode="before")
+    @classmethod
+    def normalize_conda_base(cls, value):
+        """把空的 Conda 根目录配置视为未配置。
+
+        ``Path("")`` 会变成当前目录 ``Path('.')``，这会让渲染脚本把空的
+        ``SLURM_CONDA_BASE=`` 误当成有效路径，并在远端生成错误的激活命令。
+        """
+
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("SLURM_TIME_LIMIT")
     @classmethod
     def validate_slurm_time_limit(cls, value: str) -> str:

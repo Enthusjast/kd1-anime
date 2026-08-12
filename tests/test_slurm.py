@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from kd1_anime.cluster.slurm import SlurmDispatcher, SlurmJob
 from kd1_anime.config import settings
 from kd1_anime.rendering import VideoMetadata
@@ -220,6 +222,24 @@ def test_queue_timeout_cancels_job(monkeypatch, tmp_path):
     result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
     assert result == {"123": False}
     assert cancelled == ["123"]
+
+
+def test_explicit_timeout_is_not_overridden_by_legacy_timeout(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path, submitted_at=time.time() - 5)
+    monkeypatch.setattr(settings, "MONITOR_TIMEOUT", 1)
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: pytest.fail("should not cancel"))
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    calls = {"count": 0}
+
+    def fake_poll(ids):
+        calls["count"] += 1
+        return {"123": "PENDING" if calls["count"] == 1 else "COMPLETED"}
+
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", fake_poll)
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda current: True)
+    assert dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1, timeout=10) == {"123": True}
 
 
 def test_empty_partition_and_qos_use_scheduler_defaults(monkeypatch, tmp_path):
