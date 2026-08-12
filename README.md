@@ -33,10 +33,14 @@ curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.s
 ```bash
 export KD1_ANIME_REF=v0.3.0
 export KD1_ANIME_ARCHIVE_SHA256=<release-zip-sha256>
+# 可选：同时固定 TeX Live 安装器摘要；设置为 1 后两项摘要都必须提供
+export KD1_ANIME_TEXLIVE_INSTALLER_SHA256=<install-tl-unx-tar-gz-sha256>
+# export KD1_ANIME_REQUIRE_CHECKSUM=1
 bash /tmp/kd1-anime-install.sh
 ```
 
-摘要不匹配或 ref 含路径遍历字符时，安装器会在调用 pip 前终止。
+摘要不匹配或 ref 含路径遍历字符时，安装器会在调用 pip 前终止。设置
+`KD1_ANIME_REQUIRE_CHECKSUM=1` 可让远程源码归档和 TeX Live 安装器都强制要求 SHA-256。
 
 安装器会全自动完成：
 
@@ -182,6 +186,9 @@ workspace/runs/<timestamp>-<uuid>/
 | `SLURM_SUBMIT_RETRIES` | `3` | 明确失败时的 sbatch 重试次数；命令超时不会自动重提 |
 | `MONITOR_QUEUE_TIMEOUT` | `3600` | 排队超时秒数，超时自动 `scancel` |
 | `MONITOR_RUN_TIMEOUT` | `3600` | 运行超时秒数，超时自动 `scancel` |
+| `MONITOR_UNKNOWN_TIMEOUT` | `300` | 集群状态连续不可查询的最短持续时间，避免短暂控制面故障误取消作业 |
+| `MONITOR_ARTIFACT_GRACE` | `60` | Slurm 完成后等待共享文件系统同步最终 MP4 的秒数 |
+| `MAX_INFRA_RETRIES` | `2` | 节点故障、抢占等基础设施终态的自动重新排队次数 |
 | `ALLOW_PARTIAL_OUTPUT` | `false` | 是否允许缺失场景时合并部分视频 |
 | `OVERWRITE_OUTPUT` | `false` | 是否允许覆盖已存在的自定义输出文件 |
 | `SLURM_CONTAINER_IMAGE` | 空 | 可选 Apptainer 镜像路径 |
@@ -206,7 +213,7 @@ LLM 生成代码在提交前会经过 AST 校验，包括顶层动态执行、�
 3. 设置 `SLURM_REQUIRE_CONTAINER=true`；
 4. 若集群允许无特权网络命名空间，测试通过后设置 `SLURM_CONTAINER_DISABLE_NETWORK=true`。
 
-容器作业使用 `--containall --cleanenv --no-home`，仅绑定当前 run 目录；OpenGL 模式额外使用 `--nv`。未配置容器时程序保持兼容运行，但 `doctor` 和生成流程会给出醒目的安全提示。
+容器作业使用 `--containall --cleanenv --no-home`，仅绑定当前 run 目录；OpenGL 模式额外使用 `--nv` 并显式传递 `PYOPENGL_PLATFORM`（例如 `egl`）。未配置容器时程序保持兼容运行，但 `doctor` 和生成流程会给出醒目的安全提示。
 
 ## 开发与验证
 

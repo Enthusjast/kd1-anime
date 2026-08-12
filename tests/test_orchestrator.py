@@ -185,6 +185,53 @@ def test_resume_error_retries_all_give_up_scenes(monkeypatch, tmp_path):
     assert captured["state"] is State.CODING
 
 
+def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_path):
+    """最后检查点停在 MONITORING 时，resume 也不能跳过 failed 场景。"""
+    from kd1_anime.config import settings
+
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / run_id
+    (root / "scenes").mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n"
+    code_path = root / "scenes" / "scene_1.py"
+    code_path.write_text(code, encoding="utf-8")
+    manifest = RunManifest(
+        run_id=run_id,
+        status="failed",
+        state="MONITORING",
+        user_prompt="prompt",
+        output_path=str((root / "output.mp4").resolve()),
+        scenes={
+            1: StoredSceneState(
+                plan=plan(),
+                code_file="scenes/scene_1.py",
+                code_sha256=sha256_text(code),
+                class_name="Demo",
+                plan_ready=True,
+                reviewed=True,
+                failed=True,
+                failure_reason="previous monitor failure",
+            )
+        },
+    )
+    write_manifest(root / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    captured = {}
+
+    def fake_execute(self, context, state):
+        captured["context"] = context
+        captured["state"] = state
+        return None
+
+    monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
+
+    assert Orchestrator().resume(run_id) is None
+    assert captured["state"] is State.MONITORING
+    assert captured["context"].scene_states[1].failed is False
+    assert captured["context"].scene_states[1].failure_reason == ""
+
+
 def test_run_paths_are_unique(monkeypatch, tmp_path):
     from kd1_anime.config import settings
 

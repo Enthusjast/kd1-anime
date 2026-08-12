@@ -13,9 +13,59 @@ def test_selects_expected_class_and_ignores_partial(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"video")
     job = SlurmJob(
-        "1", 1, tmp_path / "x.sh", tmp_path / "o", tmp_path / "e", media, "Demo", time.time()
+        "1",
+        1,
+        tmp_path / "x.sh",
+        tmp_path / "o",
+        tmp_path / "e",
+        media,
+        "Demo",
+        time.time(),
+        output_path=final,
     )
     assert VideoMerger().find_job_video(job) == final
+
+
+def test_merge_jobs_uses_checkpointed_output_not_newest_directory_candidate(tmp_path):
+    media = tmp_path / "media"
+    exact = media / "videos" / "scene" / "1080p60" / "Demo.mp4"
+    stale = media / "videos" / "scene" / "1080p60" / "newer" / "Demo.mp4"
+    exact.parent.mkdir(parents=True)
+    stale.parent.mkdir(parents=True)
+    exact.write_bytes(b"exact")
+    stale.write_bytes(b"stale")
+    job = SlurmJob(
+        "1",
+        1,
+        tmp_path / "x.sh",
+        tmp_path / "o",
+        tmp_path / "e",
+        media,
+        "Demo",
+        time.time(),
+        output_path=exact,
+    )
+
+    assert VideoMerger().collect_job_videos([job]) == [exact]
+
+
+def test_merge_jobs_rejects_unverified_job_without_output_path(tmp_path):
+    job = SlurmJob(
+        "1",
+        1,
+        tmp_path / "x.sh",
+        tmp_path / "o",
+        tmp_path / "e",
+        tmp_path / "media",
+        "Demo",
+        time.time(),
+    )
+    try:
+        VideoMerger().collect_job_videos([job])
+    except RuntimeError as exc:
+        assert "output_path" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
 
 
 def test_existing_output_requires_force(monkeypatch, tmp_path):

@@ -168,7 +168,9 @@ def test_pipeline_error_is_concise_and_does_not_render_markup(monkeypatch):
     monkeypatch.setattr(tui_module, "console", Console(file=output, force_terminal=False))
     monkeypatch.setattr(settings, "LLM_DEBUG", False)
 
-    ChatSession()._run_pipeline("test prompt")
+    session = ChatSession()
+    assert session._run_pipeline("test prompt") is False
+    assert session.exit_code == 1
 
     rendered = output.getvalue()
     assert "生成失败: [Errno 2] No such file or directory" in rendered

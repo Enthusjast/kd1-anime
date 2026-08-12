@@ -267,8 +267,11 @@ class ChatSession:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
         self.clarifier: Clarifier | None = None
+        # 交互模式也必须向 shell 传递流水线失败/中断语义，不能只在终端
+        # 打印红字后以退出码 0 结束。
+        self.exit_code = 0
 
-    def run(self) -> None:
+    def run(self) -> int:
         """启动完整的交互会话"""
 
         # 设置信号处理，避免退出时的 threading 警告
@@ -282,7 +285,7 @@ class ChatSession:
             # 用户选择了"恢复运行"时 _show_banner 返回 True:
             # 恢复结束 (成功或失败) 后直接退出会话, 不要落入"描述你的需求"新提示。
             if self._show_banner():
-                return
+                return self.exit_code
 
             # 在构造 Agent 前检查完整的 OpenAI-compatible 配置。
             try:
@@ -295,12 +298,13 @@ class ChatSession:
                         border_style="red",
                     )
                 )
-                return
+                self.exit_code = 1
+                return self.exit_code
 
             # 获取初始需求
             user_prompt = self._get_initial_prompt()
             if not user_prompt:
-                return
+                return self.exit_code
 
             # 此刻才构造 Clarifier (Key 已确认存在)
             self.clarifier = Clarifier()
@@ -309,7 +313,7 @@ class ChatSession:
             while True:
                 refined_prompt = self._run_clarification(user_prompt)
                 if not refined_prompt:
-                    return
+                    return self.exit_code
 
                 if self._confirm_prompt(refined_prompt):
                     break
@@ -319,7 +323,7 @@ class ChatSession:
                 feedback = _read_multiline(">>> ")
                 if not feedback or feedback.lower() in ("quit", "exit", "q"):
                     console.print("[dim]已退出[/]")
-                    return
+                    return self.exit_code
                 user_prompt = (
                     f"用户对当前需求描述不满意: {feedback}\n\n"
                     f"当前的需求描述是: {refined_prompt}\n\n"
@@ -328,9 +332,12 @@ class ChatSession:
 
             # 执行生成流水线
             self._run_pipeline(refined_prompt)
+            return self.exit_code
 
         except KeyboardInterrupt:
             console.print("\n[dim]已取消[/]")
+            self.exit_code = 130
+            return self.exit_code
 
     def _show_banner(self) -> bool:
         """显示欢迎横幅; 返回 True 表示用户选择了恢复运行 (会话应结束)。"""
@@ -365,6 +372,11 @@ class ChatSession:
 
             repository = RunRepository(settings.WORKSPACE_DIR)
             manifests = repository.list()
+            if repository.list_errors:
+                console.print(
+                    f"[yellow]警告: 有 {len(repository.list_errors)} 个运行清单无法读取，"
+                    "请使用 kd1-anime status <run-id> 检查。[/]"
+                )
 
             resumable = []
             for manifest in manifests:
@@ -414,48 +426,56 @@ class ChatSession:
                 return True
             return False
         except Exception as e:
-            console.print(f"[dim]检查历史运行时出错: {e}[/]")
-            return False
+            # 历史清单读取失败不应被当成“没有可恢复运行”，否则用户会
+            # 被静默带入新 Prompt，原运行状态也无法修复。
+            self.exit_code = 1
+            console.print(f"[bold red]检查历史运行失败:[/] {e}", markup=False)
+            return True
 
-    def _resume_run(self, run_id: str) -> None:
+    def _resume_run(self, run_id: str) -> bool:
         """恢复指定的运行 (与 _run_pipeline 一样带 Live 场景仪表盘)"""
         from kd1_anime.dashboard import SceneDashboard
         from kd1_anime.orchestrator import Orchestrator
         from kd1_anime.run_store import RESUME_LLM_STATES, RunRepository
 
-        # 欢迎页会在检查 LLM 配置之前提供恢复选项；已经进入渲染/合并的
-        # 运行不应因为当前没有 API Key 而无法继续，但仍需 LLM 的阶段要
-        # 在启动 Live 前给出明确的配置错误。
-        manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
-        if manifest.state in RESUME_LLM_STATES:
-            settings.require_llm_key()
-
-        dashboard = SceneDashboard()
-        dashboard_active = dashboard.start()
-
-        def callback(event: str, data: dict) -> None:
-            if dashboard_active:
-                dashboard.on_event(event, data)
-            else:
-                self._pipeline_callback(event, data)
-
+        dashboard = None
+        dashboard_active = False
         try:
+            # 欢迎页会在检查 LLM 配置之前提供恢复选项；已经进入渲染/合并的
+            # 运行不应因为当前没有 API Key 而无法继续，但仍需 LLM 的阶段要
+            # 在启动 Live 前给出明确的配置错误。
+            manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
+            if manifest.state in RESUME_LLM_STATES:
+                settings.require_llm_key()
+
+            dashboard = SceneDashboard()
+            dashboard_active = dashboard.start()
+
+            def callback(event: str, data: dict) -> None:
+                if dashboard_active:
+                    dashboard.on_event(event, data)
+                else:
+                    self._pipeline_callback(event, data)
+
             orchestrator = Orchestrator()
             final_video = orchestrator.resume(run_id, callback=callback, interactive=True)
-            if dashboard_active:
-                dashboard.stop()
             self._show_completion(final_video)
+            self.exit_code = 0
+            return True
 
         except KeyboardInterrupt:
-            if dashboard_active:
-                dashboard.stop()
             console.print("\n[yellow]用户中断[/]")
+            self.exit_code = 130
+            return False
         except Exception as e:
-            if dashboard_active:
-                dashboard.stop()
             console.print(f"\n[bold red]恢复失败:[/] {e}", markup=False)
             if settings.LLM_DEBUG:
                 console.print_exception()
+            self.exit_code = 1
+            return False
+        finally:
+            if dashboard is not None and dashboard_active:
+                dashboard.stop()
 
     def _get_initial_prompt(self) -> str | None:
         """获取用户的初始需求描述
@@ -587,7 +607,7 @@ class ChatSession:
             console.print("[dim]已取消. 重新描述需求或输入 quit 退出.[/]")
         return answer
 
-    def _run_pipeline(self, prompt: str) -> None:
+    def _run_pipeline(self, prompt: str) -> bool:
         """执行生成流水线,带进度指示"""
         console.print()
         console.print(Rule("开始生成", style="bold magenta"))
@@ -617,10 +637,13 @@ class ChatSession:
             if dashboard_active:
                 dashboard.stop()
             self._show_completion(final_video)
+            self.exit_code = 0
+            return True
         except KeyboardInterrupt:
             if dashboard_active:
                 dashboard.stop()
             console.print("\n[bold yellow]用户中断,正在清理...[/]")
+            self.exit_code = 130
             raise
         except Exception as e:
             if dashboard_active:
@@ -629,6 +652,8 @@ class ChatSession:
             console.print(f"生成失败: {e}", style="bold red", markup=False)
             if settings.LLM_DEBUG:
                 console.print_exception()
+            self.exit_code = 1
+            return False
 
     @staticmethod
     def _escape_markup(text: str) -> str:

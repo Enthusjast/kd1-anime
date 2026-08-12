@@ -257,6 +257,7 @@ class SceneDashboard:
             "scene_rewriting",
             "scene_reviewing",
             "scene_fixing",
+            "scene_retrying",
         ):
             if status:
                 if event == "scene_detailing":
@@ -275,6 +276,9 @@ class SceneDashboard:
                 elif event == "scene_fixing":
                     status.invalidate_from("审查")
                     self._mark_running(status, "修复", f"自动修复 #{data.get('attempt', 0)}")
+                elif event == "scene_retrying":
+                    status.invalidate_from("渲染")
+                    self._mark_running(status, "渲染", "基础设施故障，重新排队")
 
         elif event in ("scene_detailed", "scene_coded"):
             if status:

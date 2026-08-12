@@ -81,6 +81,7 @@ class StoredSlurmJob(BaseModel):
     media_dir: str
     scene_class_name: str = Field(min_length=1, max_length=200)
     submitted_at: float = Field(gt=0)
+    started_at: float | None = Field(default=None, gt=0)
     code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     output_path: str | None = None
@@ -100,6 +101,7 @@ class StoredSceneState(BaseModel):
     class_name: str = Field(default="", max_length=200)
     review_round: int = Field(default=0, ge=0)
     fix_attempts: int = Field(default=0, ge=0)
+    infra_retries: int = Field(default=0, ge=0)
     reviewed: bool = False
     plan_ready: bool = False
     rewrite_feedback: str = Field(default="", max_length=50_000)
@@ -192,6 +194,7 @@ def store_slurm_job(job: SlurmJob, root: Path) -> StoredSlurmJob:
         media_dir=_run_relative(root, job.media_dir),
         scene_class_name=job.scene_class_name,
         submitted_at=job.submitted_at,
+        started_at=job.started_at,
         code_sha256=job.code_sha256,
         render_profile=job.render_profile,
         output_path=_run_relative(root, job.output_path) if job.output_path else None,
@@ -213,6 +216,7 @@ def restore_slurm_job(stored: StoredSlurmJob, root: Path) -> SlurmJob:
         media_dir=restore_run_path(root, stored.media_dir),
         scene_class_name=stored.scene_class_name,
         submitted_at=stored.submitted_at,
+        started_at=stored.started_at,
         code_sha256=stored.code_sha256,
         render_profile=stored.render_profile,
         output_path=(restore_run_path(root, stored.output_path) if stored.output_path else None),
@@ -270,6 +274,7 @@ class RunRepository:
 
     def __init__(self, workspace_dir: Path) -> None:
         self.runs_root = resolve_runtime_path(workspace_dir) / "runs"
+        self.list_errors: list[tuple[str, str]] = []
 
     def run_root(self, run_id: str) -> Path:
         if not RUN_ID_PATTERN.fullmatch(run_id):
@@ -298,6 +303,7 @@ class RunRepository:
         return manifest
 
     def list(self) -> list[RunManifest]:
+        self.list_errors = []
         if not self.runs_root.is_dir():
             return []
         manifests: list[RunManifest] = []
@@ -306,7 +312,8 @@ class RunRepository:
                 continue
             try:
                 manifests.append(self.load(child.name))
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                self.list_errors.append((child.name, str(exc)))
                 continue
         return sorted(manifests, key=lambda item: item.updated_at, reverse=True)
 

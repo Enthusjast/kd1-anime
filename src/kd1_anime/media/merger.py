@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import shutil
 import subprocess
 import tempfile
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,8 +21,58 @@ console = Console()
 
 
 class VideoMerger:
+    @staticmethod
+    @contextmanager
+    def _output_lock(output: Path):
+        """锁定最终输出目标，避免两个独立进程同时 concat/替换同一文件。"""
+
+        lock_path = output.with_name(f".{output.name}.lock")
+        if lock_path.is_symlink():
+            raise RuntimeError(f"输出锁不能是符号链接: {lock_path}")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise RuntimeError(f"无法打开输出锁: {lock_path}") from exc
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f"输出文件正被另一个拼接进程使用: {output}") from exc
+            os.fchmod(descriptor, 0o600)
+            yield
+        finally:
+            with suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    @staticmethod
+    def _exact_job_video(job: SlurmJob) -> Path:
+        """只接受 SlurmJob 已验证并记录的当前产物，不扫描目录猜测。"""
+
+        if job.output_path is None:
+            raise RuntimeError(
+                f"Scene {job.scene_id} 缺少当前 Slurm Job 的 output_path，拒绝扫描目录选择视频"
+            )
+        video = job.output_path.expanduser().resolve()
+        media_dir = job.media_dir.expanduser().resolve()
+        try:
+            video.relative_to(media_dir)
+        except ValueError as exc:
+            raise RuntimeError(f"Scene {job.scene_id} 的 output_path 不在当前媒体目录内") from exc
+        if "partial_movie_files" in video.parts or video.name != f"{job.scene_class_name}.mp4":
+            raise RuntimeError(f"Scene {job.scene_id} 的 output_path 不是当前类的最终 MP4")
+        if not video.is_file() or video.stat().st_size <= 0:
+            raise RuntimeError(f"Scene {job.scene_id} 的当前产物不存在或为空: {video}")
+        return video
+
     def find_job_video(self, job: SlurmJob) -> Path:
-        """按当前 job 的 media_dir 和 Scene 类名精确定位最终视频。"""
+        """返回当前 SlurmJob 已验证并记录的最终视频。"""
+
+        return self._exact_job_video(job)
+
+    def discover_job_video(self, job: SlurmJob) -> Path:
+        """显式的旧版目录发现 helper，仅用于诊断，不可用于 merge_jobs。"""
 
         if not job.media_dir.exists():
             raise RuntimeError(f"Scene {job.scene_id} 的媒体目录不存在: {job.media_dir}")
@@ -49,7 +101,7 @@ class VideoMerger:
     def collect_job_videos(self, jobs: list[SlurmJob]) -> list[Path]:
         videos: list[Path] = []
         for job in sorted(jobs, key=lambda item: item.scene_id):
-            video = self.find_job_video(job)
+            video = self._exact_job_video(job)
             videos.append(video)
             console.print(f"[dim][Merger][/] Scene {job.scene_id}: {video}")
         return videos
@@ -64,12 +116,28 @@ class VideoMerger:
     ) -> Path:
         if not video_paths:
             raise RuntimeError("没有视频文件可供拼接")
+        output = Path(output_path).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with self._output_lock(output):
+            return self._merge_unlocked(
+                video_paths,
+                output,
+                replace_existing=replace_existing,
+                render_profile=render_profile,
+            )
+
+    def _merge_unlocked(
+        self,
+        video_paths: list[Path],
+        output: Path,
+        *,
+        replace_existing: bool = False,
+        render_profile: RenderProfile | None = None,
+    ) -> Path:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("未找到 ffmpeg，请先激活包含 FFmpeg 的环境")
 
-        output = Path(output_path).expanduser().resolve()
-        output.parent.mkdir(parents=True, exist_ok=True)
         resolved_inputs = [path.expanduser().resolve() for path in video_paths]
         if output in resolved_inputs:
             raise RuntimeError("输出文件不能与任一输入视频相同")

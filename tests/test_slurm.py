@@ -65,6 +65,25 @@ def test_opengl_script_forces_write_to_movie(monkeypatch, tmp_path):
     assert "--gres=gpu" in script
 
 
+def test_opengl_container_receives_pyopengl_platform(monkeypatch, tmp_path):
+    """Apptainer cleanenv 下仍要显式传递 EGL/GLX 平台。"""
+    image = tmp_path / "manim.sif"
+    image.write_bytes(b"image")
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    monkeypatch.setattr(settings, "MANIM_OPENGL_PLATFORM", "egl")
+    monkeypatch.setattr(settings, "SLURM_GPU_TYPE", "A100")
+    monkeypatch.setattr(settings, "SLURM_CONTAINER_IMAGE", image)
+
+    script = SlurmDispatcher()._build_script(
+        1, tmp_path / "scene.py", "Demo", tmp_path / "media", tmp_path / "out", tmp_path / "err"
+    )
+
+    assert "--cleanenv" in script
+    assert "export MANIM_RENDERER=opengl" in script
+    assert "--env MANIM_RENDERER=opengl" in script
+    assert "--env PYOPENGL_PLATFORM=egl" in script
+
+
 def test_cairo_script_does_not_pass_write_to_movie(monkeypatch, tmp_path):
     """cairo 渲染器默认写视频，无需 --write_to_movie。"""
     monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
@@ -530,6 +549,22 @@ def test_poll_all_statuses_both_squeue_fail_is_unknown(monkeypatch):
     assert dispatcher.poll_all_statuses(["555"]) == {"555": "UNKNOWN"}
 
 
+def test_squeue_output_captures_actual_start_time():
+    dispatcher = SlurmDispatcher()
+    seen = {}
+    starts = {}
+
+    dispatcher._merge_squeue_output(
+        "123|RUNNING|2026-08-06T17:43:30\n124|PENDING|N/A\n",
+        seen,
+        starts,
+    )
+
+    assert seen == {"123": "RUNNING", "124": "PENDING"}
+    assert starts["123"] > 0
+    assert "124" not in starts
+
+
 def test_preempted_back_to_pending_resets_run_timeout(monkeypatch, tmp_path):
     """作业被抢占退回 PENDING 后, 之前累计的运行时长应重置, 不误触发 RUN_TIMEOUT。"""
     import kd1_anime.cluster.slurm as slurm_mod
@@ -560,6 +595,7 @@ def test_preempted_back_to_pending_resets_run_timeout(monkeypatch, tmp_path):
 def test_completed_without_final_video_is_failed(monkeypatch, tmp_path):
     dispatcher = SlurmDispatcher()
     job = make_job(tmp_path)
+    monkeypatch.setattr(settings, "MONITOR_ARTIFACT_GRACE", 0)
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "COMPLETED"})
 
     result = dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1)
@@ -572,6 +608,7 @@ def test_completed_without_final_video_is_failed(monkeypatch, tmp_path):
 def test_completed_with_invalid_video_is_failed(monkeypatch, tmp_path):
     dispatcher = SlurmDispatcher()
     job = make_job(tmp_path, submitted_at=time.time() - 1)
+    monkeypatch.setattr(settings, "MONITOR_ARTIFACT_GRACE", 0)
     job.media_dir.mkdir(parents=True)
     (job.media_dir / "Demo.mp4").write_bytes(b"corrupt")
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "COMPLETED"})
@@ -585,3 +622,72 @@ def test_completed_with_invalid_video_is_failed(monkeypatch, tmp_path):
     assert result == {"123": False}
     assert job.status == "FAILED"
     assert "视频验证失败" in job.failure_reason
+
+
+def test_completed_waits_for_delayed_artifact(monkeypatch, tmp_path):
+    """Slurm 已完成但 NFS 上的 MP4 延迟出现时，下一轮应识别为成功。"""
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    statuses = iter([{"123": "COMPLETED"}, {"123": "COMPLETED"}])
+    calls = {"count": 0}
+    monkeypatch.setattr(settings, "MONITOR_ARTIFACT_GRACE", 60)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: next(statuses))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    def validate(current):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            current.failure_reason = "Slurm 状态为 COMPLETED，但未找到本次作业的最终 MP4"
+            return False
+        current.output_path = current.media_dir / "Demo.mp4"
+        current.output_path.parent.mkdir(parents=True, exist_ok=True)
+        current.output_path.write_bytes(b"video")
+        current.output_metadata = valid_metadata()
+        return True
+
+    monkeypatch.setattr(dispatcher, "validate_completed_job", validate)
+
+    assert dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1) == {"123": True}
+    assert calls["count"] == 2
+
+
+def test_unknown_status_requires_time_grace_before_cancel(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr("kd1_anime.cluster.slurm.time.time", lambda: clock[0])
+    monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
+    monkeypatch.setattr(settings, "MONITOR_UNKNOWN_TIMEOUT", 100)
+    statuses = iter([{"123": "UNKNOWN"}, {"123": "UNKNOWN"}, {"123": "UNKNOWN"}])
+    cancelled = []
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: next(statuses))
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: cancelled.append(jid) or True)
+    monkeypatch.setattr(
+        "kd1_anime.cluster.slurm.time.sleep", lambda _: clock.__setitem__(0, clock[0] + 60)
+    )
+
+    assert dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1) == {"123": False}
+    assert cancelled == ["123"]
+
+
+def test_scene_id_and_scene_class_are_validated(tmp_path):
+    dispatcher = SlurmDispatcher()
+    with pytest.raises(ValueError):
+        dispatcher.generate_script(0, tmp_path / "scene.py", "Demo", scenes_dir=tmp_path / "scenes")
+    with pytest.raises(ValueError):
+        dispatcher.generate_script(
+            1, tmp_path / "scene.py", "Demo;touch", scenes_dir=tmp_path / "scenes"
+        )
+
+
+def test_error_log_falls_back_to_stdout_when_stderr_is_empty(tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    job.log_out.write_text(
+        "Traceback (most recent call last):\nValueError: boom\n", encoding="utf-8"
+    )
+
+    error_log = dispatcher.get_error_log(job=job)
+
+    assert error_log is not None
+    assert "ValueError: boom" in error_log

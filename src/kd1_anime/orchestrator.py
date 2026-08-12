@@ -58,6 +58,16 @@ from kd1_anime.run_store import (
 logger = get_logger(__name__)
 console = Console()
 Callback = Callable[[str, dict], None]
+# 这些状态通常是代码之外的暂时性基础设施问题；优先重新排队，不要把
+# 节点故障/抢占交给 LLM 当成业务代码错误修改。
+RETRYABLE_INFRA_STATES = {
+    "PREEMPTED",
+    "NODE_FAIL",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "REVOKED",
+    "SPECIAL_EXIT",
+}
 FIXABLE_RENDER_STATES = {"FAILED", "TIMEOUT", "OUT_OF_MEMORY", "RUN_TIMEOUT"}
 
 
@@ -112,6 +122,7 @@ class SceneState:
     class_name: str = ""
     review_round: int = 0
     fix_attempts: int = 0
+    infra_retries: int = 0
     slurm_job: SlurmJob | None = None
     artifact: SceneArtifact | None = None
     rendered: bool = False
@@ -254,6 +265,7 @@ class Orchestrator:
                     class_name=scene.class_name,
                     review_round=scene.review_round,
                     fix_attempts=scene.fix_attempts,
+                    infra_retries=scene.infra_retries,
                     slurm_job=(
                         store_slurm_job(scene.slurm_job, ctx.paths.root)
                         if scene.slurm_job
@@ -387,6 +399,7 @@ class Orchestrator:
                 class_name=stored.class_name,
                 review_round=stored.review_round,
                 fix_attempts=stored.fix_attempts,
+                infra_retries=getattr(stored, "infra_retries", 0),
                 slurm_job=job,
                 artifact=artifact,
                 reviewed=stored.reviewed,
@@ -691,6 +704,7 @@ class Orchestrator:
             # 旧逻辑先判断 ERROR，导致“所有场景都已放弃”时无法进入这里的
             # 重试分支，仪表盘提示可恢复但实际直接报“无可用场景”。
             reset_give_up = False
+            reset_failed = False
             for scene in ctx.scene_states.values():
                 if scene.give_up:
                     scene.give_up = False
@@ -698,6 +712,13 @@ class Orchestrator:
                     scene.fix_attempts = 0
                     scene.failure_reason = ""
                     reset_give_up = True
+                # 失败清单也允许显式 resume。旧实现只在 ERROR 快照中清除
+                # failed，若最后一次检查点是 MONITORING，调度器会永久跳过
+                # 这些场景，表现为“恢复成功但没有重新开始”。
+                if scene.failed and not scene.rendered:
+                    scene.failed = False
+                    scene.failure_reason = ""
+                    reset_failed = True
 
             if state is State.ERROR:
                 # 允许从 ERROR 状态恢复：无场景时重跑概要规划；已有场景
@@ -723,6 +744,13 @@ class Orchestrator:
                 if state not in {State.CODING, State.REVIEWING, State.DISPATCHING}:
                     # 回到审查阶段重新评估已生成的代码
                     state = State.REVIEWING
+
+            if reset_failed:
+                with suppress(Exception):
+                    from kd1_anime.dashboard import quiet
+
+                    if not quiet():
+                        console.print("[yellow]发现失败的场景，将重置并重试[/]")
 
             cancelled_jobs = False
             for scene in ctx.scene_states.values():
@@ -981,13 +1009,19 @@ class Orchestrator:
                 status = self.slurm.poll_all_statuses([job.job_id]).get(job.job_id, "UNKNOWN")
             except Exception:
                 continue  # 集群查询异常 → 保守保留, 交给监控处理
+            start_time = getattr(self.slurm, "last_start_times", {}).get(job.job_id)
+            if start_time is not None:
+                job.started_at = start_time
+            job.status = status
             if status == "COMPLETED":
                 if self.slurm.validate_completed_job(job):
                     state.artifact = self._artifact_from_job(ctx, state, job)
                     state.rendered = True
                     self._emit("scene_rendered", scene_id=scene_id)
                 else:
-                    job.status = "FAILED"
+                    # 不要在产物尚未传播时把已完成作业改写成 FAILED；
+                    # JobMonitor 会在共享文件系统宽限期内继续重验。
+                    job.status = "COMPLETED"
             elif status == "GONE":
                 outcome = self.slurm._classify_gone(job)
                 if outcome == "COMPLETED":
@@ -1001,6 +1035,8 @@ class Orchestrator:
                     job.status = "FAILED"
             elif status == "UNKNOWN":
                 job.status = "UNKNOWN"
+            else:
+                job.status = status
 
     def _emit_scene_snapshot(self, ctx: PipelineContext) -> None:
         """resume 后把已有场景的当前进度以事件形式补发给 TUI/仪表盘。
@@ -1120,6 +1156,10 @@ class Orchestrator:
                 if state.failed or state.give_up:
                     return
                 # 渲染失败 → 修复后重新提交 (名额保留)
+                if state.slurm_job is None:
+                    # 基础设施故障重排队路径已经清除了旧 Job；不要把
+                    # 没有错误日志的节点故障交给 AutoFix，也不要释放名额。
+                    continue
                 self._scene_fix(ctx, scene_id, state)
                 # AutoFix 改变了代码，必须再次经过 Reviewer；major 反馈仍按
                 # 正常编码循环重写，绝不能把未经复审的修复代码直接提交。
@@ -1228,6 +1268,7 @@ class Orchestrator:
             state.class_name = class_name
             state.rewrite_feedback = ""
             state.reviewed = False
+            state.infra_retries = 0
             state.artifact = None
             state.rendered = False
             self._checkpoint(ctx, State.CODING)
@@ -1330,8 +1371,14 @@ class Orchestrator:
         while monitor.pending:
             if self._cancel_requested.is_set() or self._stop_event.is_set():
                 return False
+            previous_started_at = job.started_at
             if monitor.poll_once():
                 break
+            if job.started_at is not None and job.started_at != previous_started_at:
+                # 首次从 squeue 得到实际启动时间后立即持久化，进程中断再
+                # resume 时不会丢失运行计时基准。
+                with self._state_lock:
+                    self._checkpoint(ctx, State.MONITORING)
             time.sleep(settings.MONITOR_POLL_INTERVAL)
         ok = monitor.results.get(job.job_id)
         if ok is None:
@@ -1347,6 +1394,36 @@ class Orchestrator:
                 self._checkpoint(ctx, State.MONITORING)
             self._emit("scene_rendered", scene_id=job.scene_id)
             return True
+        # 基础设施终态与业务代码无关，即使关闭 AutoFix 也应直接重新排队；
+        # 不能因为 direct render 使用 auto_fix=False 就把节点故障交给用户手工重提。
+        if job.status in RETRYABLE_INFRA_STATES:
+            with self._state_lock:
+                if state.infra_retries < settings.MAX_INFRA_RETRIES:
+                    state.infra_retries += 1
+                    state.slurm_job = None
+                    state.artifact = None
+                    state.rendered = False
+                    state.failure_reason = (
+                        f"Slurm 基础设施状态 {job.status}，将重新排队 "
+                        f"({state.infra_retries}/{settings.MAX_INFRA_RETRIES})"
+                    )
+                    self._checkpoint(ctx, State.MONITORING)
+                    retry = True
+                else:
+                    state.give_up = True
+                    state.failure_reason = (
+                        f"基础设施故障重试次数已用尽 ({settings.MAX_INFRA_RETRIES}): {job.status}"
+                    )
+                    self._checkpoint(ctx, State.MONITORING)
+                    retry = False
+            if retry:
+                self._emit(
+                    "scene_retrying",
+                    scene_id=job.scene_id,
+                    reason=state.failure_reason,
+                    attempt=state.infra_retries,
+                )
+                return False
         if not ctx.auto_fix or job.status not in FIXABLE_RENDER_STATES:
             with self._state_lock:
                 if not ctx.auto_fix:
@@ -1488,6 +1565,7 @@ class Orchestrator:
             state.class_name = class_name
             state.review_round = 0
             state.reviewed = False
+            state.infra_retries = 0
             state.slurm_job = None
             state.artifact = None
             state.rendered = False

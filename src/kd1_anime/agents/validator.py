@@ -296,6 +296,33 @@ def _is_docstring(statement: ast.stmt) -> bool:
     )
 
 
+def _collect_bound_names(tree: ast.AST) -> set[str]:
+    """收集源码中明确绑定的局部名称。
+
+    ``from manim import *`` 会把若干内部模块名放入命名空间；但 ``scene``
+    或 ``animation`` 也是生成代码中很常见的普通变量名。只对未被源码
+    绑定、确实可能来自 wildcard import 的名称做内部模块拦截，避免安全
+    检查误伤合法的 VGroup/Animation 变量。
+    """
+
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    bound.add(alias.asname or alias.name)
+    return bound
+
+
 @dataclass(slots=True)
 class CodeValidationResult:
     """确定性代码校验结果。"""
@@ -322,6 +349,7 @@ class _SafetyVisitor(ast.NodeVisitor):
         self.dangerous_aliases: set[str] = set()
         self.module_aliases: dict[str, str] = {}
         self.imported_names: dict[str, tuple[str, str]] = {}
+        self.bound_names: set[str] = set()
         self.config_aliases: set[str] = {"config"}
         self.renderer = renderer or settings.MANIM_RENDERER
 
@@ -467,7 +495,11 @@ class _SafetyVisitor(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if node.id.startswith("__"):
             self.error(node, f"禁止访问双下划线名称 {node.id!r}")
-        if isinstance(node.ctx, ast.Load) and node.id in BANNED_MANIM_INTERNALS:
+        if (
+            isinstance(node.ctx, ast.Load)
+            and node.id in BANNED_MANIM_INTERNALS
+            and node.id not in self.bound_names
+        ):
             self.error(node, f"禁止访问 Manim 内部模块 {node.id!r}")
         if isinstance(node.ctx, ast.Load) and (
             node.id in BANNED_CALLS or node.id in self.dangerous_aliases
@@ -735,6 +767,7 @@ def validate_manim_code(
         return CodeValidationResult(False, [f"Python 语法错误（{location}）: {exc.msg}"])
 
     visitor = _SafetyVisitor(renderer)
+    visitor.bound_names = _collect_bound_names(tree)
     visitor.visit(tree)
     visitor.validate_tex_configuration()
 

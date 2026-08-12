@@ -390,6 +390,44 @@ def test_render_failure_triggers_fix_and_resubmit(monkeypatch, tmp_path):
     assert reviewer.calls == 1  # 初始代码已审查；AutoFix 代码必须重新审查
 
 
+def test_infrastructure_failure_requeues_without_autofix(monkeypatch, tmp_path):
+    """节点终态应重排队，不应依赖 AutoFix 开关或调用 LLM。"""
+    run_paths = make_paths(tmp_path)
+
+    class InfraSlurm(FakeSlurm):
+        def poll_all_statuses(self, job_ids):
+            status = "NODE_FAIL" if len(self.submitted) == 1 else "COMPLETED"
+            return {job_id: status for job_id in job_ids}
+
+    slurm = InfraSlurm(run_paths)
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, slurm=slurm)
+    monkeypatch.setattr(settings, "MAX_INFRA_RETRIES", 1)
+
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        auto_fix=False,
+        outlines=[make_outline(1)],
+    )
+    ctx.scene_states[1] = SceneState(
+        plan=make_plan(make_outline(1)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    (run_paths.scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
+
+    orchestrator._run_scheduler(ctx)
+
+    state = ctx.scene_states[1]
+    assert state.rendered is True
+    assert state.failed is False
+    assert state.give_up is False
+    assert state.infra_retries == 1
+    assert slurm.submitted == [1, 1]
+
+
 # ---------------------------------------------------------------------------
 # 5) 不可修复的失败状态 → 直接放弃, 不调用 autofixer
 # ---------------------------------------------------------------------------

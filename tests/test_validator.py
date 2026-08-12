@@ -15,6 +15,18 @@ def test_valid_manim_scene():
     assert result.scene_classes == ["Demo"]
 
 
+def test_allows_common_local_names_that_shadow_manim_internals():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        scene = VGroup(Circle())\n"
+        "        animation = Create(scene)\n"
+        "        self.play(animation)\n"
+    )
+    assert result.is_valid, result.feedback
+
+
 def test_rejects_dangerous_import_and_call():
     result = validate_manim_code(
         "from manim import *\nimport os\n"

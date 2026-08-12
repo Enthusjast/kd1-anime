@@ -98,7 +98,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Cairo 只申请 CPU；OpenGL 必须配置 GPU 类型并申请 GPU；
 - Manim 命令显式传入 renderer、分辨率和帧率；OpenGL 显式启用 `--write_to_movie`；
 - conda base 优先使用配置，否则加载 module 并动态探测；
-- 可选 Apptainer 使用 `--containall --cleanenv --no-home`，只绑定当前 run；OpenGL 增加 `--nv`。
+- 可选 Apptainer 使用 `--containall --cleanenv --no-home`，只绑定当前 run；OpenGL 增加 `--nv` 并显式传递 `PYOPENGL_PLATFORM`。
 
 每次成功提交都会保存数字 Job ID、提交时间、代码哈希和 RenderProfile。监控区分：
 
@@ -184,7 +184,7 @@ run 根目录权限为 `0700`，prompt、manifest、锁文件和生成代码为 
 进程环境变量 > 当前目录 .env > ~/.config/kd1-anime/.env
 ```
 
-主要分组：LLM、Slurm、Manim、流水线/监控、评估和路径。`MONITOR_TIMEOUT` 只用于旧配置兼容；新配置使用 queue/run 两个 timeout。
+主要分组：LLM、Slurm、Manim、流水线/监控、评估和路径。`MONITOR_TIMEOUT` 只用于旧配置兼容；新配置使用 queue/run/unknown 三类 timeout，并为共享文件系统产物提供完成宽限期。
 
 ## 6. 安全边界
 

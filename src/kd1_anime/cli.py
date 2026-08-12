@@ -341,6 +341,11 @@ def status(
         return
 
     manifests = repository.list()[:limit]
+    if repository.list_errors:
+        console.print(
+            f"[yellow]警告: {len(repository.list_errors)} 个运行清单无法读取，"
+            "可用 status <run-id> 查看具体错误。[/]"
+        )
     if not manifests:
         console.print("没有可用的运行记录")
         return
@@ -433,6 +438,10 @@ def clean(
         for manifest in repository.list()
         if manifest.updated_at <= cutoff and (include_running or manifest.status != "running")
     ]
+    if repository.list_errors:
+        console.print(
+            f"[yellow]警告: {len(repository.list_errors)} 个运行清单损坏，已跳过清理。[/]"
+        )
     if not candidates:
         console.print("没有符合条件的运行目录")
         return
@@ -550,6 +559,11 @@ def doctor(
         False,
         "--probe",
         help="运行一次最小 FFmpeg、XeLaTeX 和当前 Manim renderer 探测（不会提交 Slurm）",
+    ),
+    strict: bool = typer.Option(
+        True,
+        "--strict/--no-strict",
+        help="依赖检查失败时返回非零退出码（默认启用）",
     ),
 ):
     """检查环境依赖和配置是否完整。"""
@@ -673,6 +687,8 @@ def doctor(
     else:
         console.print("[bold yellow]部分依赖缺失，请参考文档安装：[/]")
         console.print("  https://github.com/Enthusjast/kd1-anime#readme")
+        if strict:
+            raise typer.Exit(1)
 
 
 def _run_doctor_probes(checks: list[tuple[str, bool, str]]) -> None:
@@ -769,6 +785,10 @@ def _run_doctor_probes(checks: list[tuple[str, bool, str]]) -> None:
         env = os.environ.copy()
         env["MANIM_RENDERER"] = settings.MANIM_RENDERER
         env["MANIM_OPENGL_PLATFORM"] = settings.MANIM_OPENGL_PLATFORM
+        # PyOpenGL 实际读取的是 PYOPENGL_PLATFORM；只设置 Manim 自定义
+        # 变量会让 doctor 在 GLX 环境中误报通过，而 Slurm 的 EGL 作业仍失败。
+        if settings.MANIM_RENDERER == "opengl":
+            env["PYOPENGL_PLATFORM"] = settings.MANIM_OPENGL_PLATFORM
         manim_command = [
             sys.executable,
             "-m",
@@ -776,7 +796,11 @@ def _run_doctor_probes(checks: list[tuple[str, bool, str]]) -> None:
             "render",
             "--renderer",
             settings.MANIM_RENDERER,
-            "-ql",
+            f"-q{settings.MANIM_QUALITY}",
+            "--resolution",
+            f"{settings.MANIM_PIXEL_WIDTH},{settings.MANIM_PIXEL_HEIGHT}",
+            "--fps",
+            str(settings.MANIM_FRAME_RATE),
             "--disable_caching",
             "--media_dir",
             str(root / "manim_media"),
@@ -817,7 +841,9 @@ def _start_chat(dry_run: bool = False) -> None:
     from kd1_anime.tui import ChatSession
 
     session = ChatSession(dry_run=dry_run)
-    session.run()
+    exit_code = session.run()
+    if exit_code:
+        raise typer.Exit(exit_code)
 
 
 @app.command()
@@ -827,7 +853,11 @@ def evaluate(
     code_file: Path | None = typer.Option(None, "--code-file", "-f", help="评估代码文件"),
     image: Path | None = typer.Option(None, "--image", "-i", help="评估渲染截图"),
     description: str = typer.Option("", "--desc", "-d", help="动画描述"),
-    visual: bool = typer.Option(True, "--visual/--no-visual", help="是否进行视觉评估"),
+    visual: bool | None = typer.Option(
+        None,
+        "--visual/--no-visual",
+        help="是否进行视觉评估（默认使用 ENABLE_VISUAL_EVAL 配置）",
+    ),
     visual_model: str | None = typer.Option(None, "--visual-model", help="视觉评估模型"),
     output: Path | None = typer.Option(None, "--output", "-o", help="输出报告路径"),
     compare: str | None = typer.Option(None, "--compare", help="对比的基准运行 ID"),
@@ -843,8 +873,9 @@ def evaluate(
     """
     from kd1_anime.eval import Evaluator
 
+    visual_enabled = settings.ENABLE_VISUAL_EVAL if visual is None else visual
     evaluator = Evaluator(
-        enable_visual_eval=visual,
+        enable_visual_eval=visual_enabled,
         visual_eval_model=visual_model,
     )
 
@@ -887,7 +918,9 @@ def evaluate(
         # 评估运行
         elif run_id:
             console.print(f"[bold]评估运行: {run_id}[/]")
-            result = evaluator.evaluate_run(run_id, description=description, enable_visual=visual)
+            result = evaluator.evaluate_run(
+                run_id, description=description, enable_visual=visual_enabled
+            )
 
         # 评估最近的运行
         else:
@@ -899,7 +932,7 @@ def evaluate(
             recent_run = manifests[0].run_id
             console.print(f"[bold]评估最近的运行: {recent_run}[/]")
             result = evaluator.evaluate_run(
-                recent_run, description=description, enable_visual=visual
+                recent_run, description=description, enable_visual=visual_enabled
             )
 
         # 输出结果
@@ -1033,6 +1066,7 @@ def test_llm(
         name = "TestAgent"
 
     agent = TestAgent()
+    failed = False
 
     # 测试 1: 基本连接
     console.print("[bold]测试 1: 基本连接[/]")
@@ -1047,10 +1081,12 @@ def test_llm(
             console.print(f"  [green]✓ 连接成功[/] 响应: {response.strip()[:50]}")
         else:
             console.print("  [red]✗ 响应为空[/]")
-            return
+            raise typer.Exit(1)
+    except typer.Exit:
+        raise
     except Exception as e:
         console.print(f"  [red]✗ 连接失败: {e}[/]")
-        return
+        raise typer.Exit(1) from e
 
     console.print()
 
@@ -1076,8 +1112,12 @@ def test_llm(
         except Exception as e:
             console.print(f"  [yellow]⚠ JSON 模式异常: {e}[/]")
             console.print("    建议: 在 .env 中设置 LLM_USE_JSON_MODE=false")
+            failed = True
 
     console.print()
+    if failed:
+        console.print("[bold yellow]测试完成，但有检查失败[/]")
+        raise typer.Exit(1)
     console.print("[bold green]测试完成[/]")
 
 
