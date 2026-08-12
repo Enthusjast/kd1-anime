@@ -454,10 +454,21 @@ def clean(
     for manifest in candidates:
         root = repository.run_root(manifest.run_id)
         try:
+            if not root.is_dir() or root.is_symlink():
+                skipped += 1
+                continue
             with lock_run(root):
+                # 候选列表生成与真正删除之间可能有很长的用户确认窗口；
+                # 加锁后重新读取，避免误删刚恢复/刚更新的运行。
+                current = repository.load(manifest.run_id)
+                if current.updated_at > cutoff or (
+                    not include_running and current.status == "running"
+                ):
+                    skipped += 1
+                    continue
                 shutil.rmtree(root)
             removed += 1
-        except (OSError, RuntimeError) as exc:
+        except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
             skipped += 1
             console.print(f"跳过 {manifest.run_id}: {exc}", markup=False, style="yellow")
     console.print(f"清理完成: 删除 {removed}, 跳过 {skipped}")
@@ -773,12 +784,21 @@ def _run_doctor_probes(checks: list[tuple[str, bool, str]]) -> None:
         else:
             checks.append(("XeLaTeX .xdv 探测", False, "未找到 xelatex"))
 
+        dvisvgm = shutil.which("dvisvgm")
+        checks.append(("dvisvgm", dvisvgm is not None, dvisvgm or "未找到"))
+
         scene = root / "doctor_scene.py"
         scene.write_text(
             "from manim import *\n"
-            "class DoctorProbe(Scene):\n"
+            'tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")\n'
+            'tex_template.add_to_preamble(r"\\usepackage{ctex}")\n'
+            "config.tex_template = tex_template\n"
+            "class DoctorTexProbe(Scene):\n"
             "    def construct(self):\n"
-            "        self.add(Square())\n"
+            '        chinese = Tex("中文测试", tex_template=tex_template)\n'
+            '        formula = MathTex(r"a^2+b^2=c^2", tex_template=tex_template)\n'
+            "        formula.next_to(chinese, DOWN)\n"
+            "        self.add(chinese, formula)\n"
             "        self.wait(0.1)\n",
             encoding="utf-8",
         )
@@ -805,18 +825,18 @@ def _run_doctor_probes(checks: list[tuple[str, bool, str]]) -> None:
             "--media_dir",
             str(root / "manim_media"),
             str(scene),
-            "DoctorProbe",
+            "DoctorTexProbe",
         ]
         if settings.MANIM_RENDERER == "opengl":
             # OpenGL 默认可能只播放而不写成品；探针必须覆盖真正的文件输出路径。
             manim_command.insert(-2, "--write_to_movie")
         run_probe(
-            f"Manim {settings.MANIM_RENDERER} 最小渲染",
+            f"Manim {settings.MANIM_RENDERER} + XeLaTeX/CJK 最小渲染",
             manim_command,
             env=env,
         )
         try:
-            rendered_videos = list((root / "manim_media").rglob("DoctorProbe.mp4"))
+            rendered_videos = list((root / "manim_media").rglob("DoctorTexProbe.mp4"))
         except OSError:
             rendered_videos = []
         rendered_video = None
@@ -829,9 +849,9 @@ def _run_doctor_probes(checks: list[tuple[str, bool, str]]) -> None:
                 continue
         checks.append(
             (
-                "Manim 最小渲染产物",
+                "Manim TeX/CJK 最小渲染产物",
                 rendered_video is not None,
-                str(rendered_video) if rendered_video else "未找到 DoctorProbe.mp4",
+                str(rendered_video) if rendered_video else "未找到 DoctorTexProbe.mp4",
             )
         )
 

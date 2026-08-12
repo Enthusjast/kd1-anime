@@ -86,6 +86,7 @@ class StoredSlurmJob(BaseModel):
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     output_path: str | None = None
     output_metadata: VideoMetadata | None = None
+    output_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     elapsed_seconds: float | None = Field(default=None, ge=0)
     status: str = Field(min_length=1, max_length=100)
     failure_reason: str = Field(default="", max_length=50_000)
@@ -199,6 +200,7 @@ def store_slurm_job(job: SlurmJob, root: Path) -> StoredSlurmJob:
         render_profile=job.render_profile,
         output_path=_run_relative(root, job.output_path) if job.output_path else None,
         output_metadata=job.output_metadata,
+        output_sha256=job.output_sha256,
         elapsed_seconds=job.elapsed_seconds,
         status=job.status,
         failure_reason=job.failure_reason,
@@ -221,6 +223,7 @@ def restore_slurm_job(stored: StoredSlurmJob, root: Path) -> SlurmJob:
         render_profile=stored.render_profile,
         output_path=(restore_run_path(root, stored.output_path) if stored.output_path else None),
         output_metadata=stored.output_metadata,
+        output_sha256=stored.output_sha256,
         elapsed_seconds=stored.elapsed_seconds,
         status=stored.status,
         failure_reason=stored.failure_reason,
@@ -432,6 +435,30 @@ def _legacy_phase(scene: dict) -> str:
     return "pending"
 
 
+def _legacy_plan_ready(scene: dict) -> bool:
+    """从 v1 清单推导分镜是否已完成，避免恢复时重复调用 Planner。"""
+
+    if scene.get("plan_ready") is True:
+        return True
+    if any(
+        scene.get(key) for key in ("rendered", "reviewed", "code_file", "code_sha256", "class_name")
+    ):
+        return True
+    plan = scene.get("plan")
+    if not isinstance(plan, dict):
+        return False
+    # 早期清单可能只保存概要占位计划；只有关键详细字段都存在且不是
+    # 占位省略号时才认为 plan_detail 已完成。
+    detail_values = [
+        plan.get("visual_design"),
+        plan.get("camera_movement"),
+        plan.get("visual_flow"),
+        plan.get("key_moments"),
+        plan.get("computation"),
+    ]
+    return all(value and value != "…" and value != ["…"] for value in detail_values)
+
+
 def _migrate_legacy_artifact(
     *,
     root: Path,
@@ -500,7 +527,10 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
         if not isinstance(raw_scene, dict):
             raise ValueError(f"旧版运行清单 Scene {scene_id} 必须是对象")
         scene = dict(raw_scene)
+        scene["plan_ready"] = _legacy_plan_ready(scene)
         scene["phase"] = _legacy_phase(scene)
+        if scene["plan_ready"] and scene["phase"] == "pending":
+            scene["phase"] = "detailed"
         scene["artifact"] = None
         job = scene.get("slurm_job")
         if job is not None and not isinstance(job, dict):
@@ -529,6 +559,7 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
                 scene["artifact"] = artifact.model_dump(mode="json")
                 migrated_job["output_path"] = artifact.video_path
                 migrated_job["output_metadata"] = artifact.metadata.model_dump(mode="json")
+                migrated_job["output_sha256"] = artifact.video_sha256
             elif scene.get("rendered"):
                 scene["rendered"] = False
                 scene["phase"] = "reviewed"

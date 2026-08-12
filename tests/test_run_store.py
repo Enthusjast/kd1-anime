@@ -100,6 +100,25 @@ def test_resume_completed_run_rejects_tampered_final_video(monkeypatch, tmp_path
         Orchestrator().resume(RUN_ID)
 
 
+def test_context_rejects_manifest_final_video_different_from_output(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = make_paths(workspace)
+    paths.root.mkdir(parents=True)
+    output = paths.root / "output.mp4"
+    other = paths.root / "other.mp4"
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        status="failed",
+        state="MERGING",
+        user_prompt="prompt",
+        output_path=str(output.resolve()),
+        final_video=str(other.resolve()),
+    )
+
+    with pytest.raises(ValueError, match="final_video"):
+        Orchestrator._context_from_manifest(manifest, paths.root)
+
+
 def test_restore_rejects_slurm_job_with_different_code_identity(tmp_path):
     workspace = tmp_path / "workspace"
     paths = make_paths(workspace)
@@ -323,6 +342,7 @@ def test_v1_reused_job_is_migrated_to_safe_rerender(tmp_path):
     scene = manifest.scenes[1]
 
     assert manifest.schema_version == 2
+    assert scene.plan_ready is True
     assert scene.rendered is False
     assert scene.slurm_job is None
     assert scene.artifact is None
@@ -360,6 +380,7 @@ def test_v1_unverifiable_video_is_forced_to_rerender(tmp_path):
 
     scene = RunRepository(workspace).load(RUN_ID).scenes[1]
 
+    assert scene.plan_ready is True
     assert scene.rendered is False
     assert scene.artifact is None
     assert scene.phase == "reviewed"

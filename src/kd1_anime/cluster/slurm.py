@@ -17,7 +17,7 @@ from uuid import uuid4
 from rich.console import Console
 
 from kd1_anime.config import settings
-from kd1_anime.rendering import RenderProfile, VideoMetadata, verify_video
+from kd1_anime.rendering import RenderProfile, VideoMetadata, sha256_file, verify_video
 
 console = Console()
 
@@ -47,7 +47,13 @@ TERMINAL_STATES = {
 }
 FAILURE_STATES = TERMINAL_STATES - {"COMPLETED"}
 RUNNING_STATES = {"RUNNING", "COMPLETING", "STAGE_OUT"}
-MONITOR_ABORT_STATES = {"QUEUE_TIMEOUT", "RUN_TIMEOUT", "UNKNOWN_TIMEOUT", "CANCEL_FAILED"}
+MONITOR_ABORT_STATES = {
+    "QUEUE_TIMEOUT",
+    "RUN_TIMEOUT",
+    "UNKNOWN_TIMEOUT",
+    "MONITOR_QUERY_FAILED",
+    "CANCEL_FAILED",
+}
 
 
 @dataclass
@@ -66,6 +72,7 @@ class SlurmJob:
     render_profile: RenderProfile = field(default_factory=RenderProfile.current)
     output_path: Path | None = None
     output_metadata: VideoMetadata | None = None
+    output_sha256: str = ""
     elapsed_seconds: float | None = None
     status: str = "PENDING"
     failure_reason: str = ""
@@ -150,7 +157,22 @@ class JobMonitor:
         if not self.pending:
             return False
         now = time.time()
-        statuses = self.dispatcher.poll_all_statuses(list(self.pending))
+        try:
+            statuses = self.dispatcher.poll_all_statuses(list(self.pending))
+        except Exception as exc:
+            # 监控命令本身异常时不能让 worker 直接退出并把远端作业遗留在集群
+            # 上，尤其是 ALLOW_PARTIAL_OUTPUT=true 时后续可能仍会成功合并。
+            # 这是监控故障，不是生成代码故障：立即尝试取消并保留明确状态。
+            reason = f"Slurm 状态查询异常: {exc}；已停止监控并尝试取消远端任务"
+            for job_id, job in list(self.pending.items()):
+                self.dispatcher._cancel_for_monitor_failure(
+                    job,
+                    status="MONITOR_QUERY_FAILED",
+                    reason=reason,
+                )
+                self.results[job_id] = False
+            self.pending.clear()
+            return True
         start_times = getattr(self.dispatcher, "last_start_times", {})
         finished: list[str] = []
         quiet = self._quiet()
@@ -615,9 +637,9 @@ class SlurmDispatcher:
                 timeout=15,
                 check=False,
             )
-        except subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired) as exc:
             if not _dashboard_quiet():
-                console.print(f"[yellow][Slurm][/] 取消 Job {job_id} 超时")
+                console.print(f"[yellow][Slurm][/] 取消 Job {job_id} 失败: {exc}", markup=False)
             return False
         if result.returncode != 0:
             err = (result.stderr or "").strip()
@@ -657,7 +679,7 @@ class SlurmDispatcher:
                 timeout=10,
                 check=False,
             )
-        except subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired):
             return False, "UNKNOWN"
         if result.returncode != 0:
             return False, "UNKNOWN"
@@ -726,10 +748,12 @@ class SlurmDispatcher:
             sacct_ok, sacct_state = self._check_final_status(job_id)
             if sacct_ok and sacct_state != "UNKNOWN":
                 out[job_id] = sacct_state
-            elif squeue_ok:
+            elif sacct_ok and squeue_ok:
                 # 调度器可查但该作业不在队列、且无账务记录 → 作业已消失
                 out[job_id] = "GONE"
             else:
+                if not sacct_ok:
+                    diagnostics.append(f"sacct 查询 Job {job_id} 失败或超时")
                 out[job_id] = "UNKNOWN"
         self.last_status_diagnostic = "；".join(dict.fromkeys(item for item in diagnostics if item))
         return out
@@ -745,7 +769,7 @@ class SlurmDispatcher:
                 timeout=10,
                 check=False,
             )
-        except subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired):
             return None
 
     @staticmethod
@@ -792,7 +816,16 @@ class SlurmDispatcher:
                     # ffmpeg/manim 可能在扫描期间替换或删除文件；跳过该候选，
                     # 不应让一次竞态把成功作业判成监控器异常。
                     continue
-                if stat.st_size > 0 and stat.st_mtime >= job.submitted_at - 1.0:
+                # submit_scene 为每次尝试创建独立的 attempt_<token> 目录，目录
+                # 隔离已经排除了旧尝试污染，因此不再依赖登录节点与计算节点的
+                # wall-clock 一致性。旧版/手工构造的共享目录仍保留宽松的 mtime
+                # 保护，兼容历史清单并避免误拾取明显陈旧产物。
+                isolated_attempt = bool(re.fullmatch(r"attempt_[0-9a-f]{12}", job.media_dir.name))
+                if isolated_attempt:
+                    fresh_enough = True
+                else:
+                    fresh_enough = stat.st_mtime >= job.submitted_at - 300.0
+                if stat.st_size > 0 and fresh_enough:
                     candidates.append((path, stat.st_mtime))
         except OSError:
             return None
@@ -809,11 +842,15 @@ class SlurmDispatcher:
             return False
         try:
             metadata = verify_video(video, job.render_profile)
+            digest = sha256_file(video)
         except (OSError, RuntimeError, ValueError) as exc:
             job.failure_reason = f"Slurm 状态为 COMPLETED，但视频验证失败: {exc}"
             return False
         job.output_path = video
         job.output_metadata = metadata
+        # 记录经过 ffprobe 验证的精确文件身份，供恢复和公共 merge_jobs
+        # 继续拒绝目录中被替换的同名文件。
+        job.output_sha256 = digest
         return True
 
     @staticmethod
@@ -924,7 +961,12 @@ class SlurmDispatcher:
             console.print(
                 f"[bold red][Monitor][/] Scene {job.scene_id} {reason}，取消 Job {job.job_id}"
             )
-        if self.cancel_job(job.job_id):
+        try:
+            cancelled = self.cancel_job(job.job_id)
+        except Exception as exc:
+            cancelled = False
+            reason = f"{reason}；调用 scancel 时发生异常: {exc}"
+        if cancelled:
             job.cancelled = True
             job.status = status
             job.failure_reason = reason

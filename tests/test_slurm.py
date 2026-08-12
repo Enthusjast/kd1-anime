@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from kd1_anime.cluster.slurm import SlurmDispatcher, SlurmJob
+from kd1_anime.cluster.slurm import JobMonitor, SlurmDispatcher, SlurmJob
 from kd1_anime.config import settings
 from kd1_anime.rendering import VideoMetadata
 
@@ -547,6 +547,63 @@ def test_poll_all_statuses_both_squeue_fail_is_unknown(monkeypatch):
 
     monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
     assert dispatcher.poll_all_statuses(["555"]) == {"555": "UNKNOWN"}
+
+
+def test_poll_all_statuses_sacct_failure_is_unknown_not_gone(monkeypatch):
+    """squeue 可访问但 sacct 失败时，不能把仍可能运行的作业判为 GONE。"""
+    from types import SimpleNamespace
+
+    dispatcher = SlurmDispatcher()
+    monkeypatch.setattr("kd1_anime.cluster.slurm.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(command, **kwargs):
+        if command[0].endswith("sacct"):
+            return SimpleNamespace(returncode=1, stdout="", stderr="accounting unavailable")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("kd1_anime.cluster.slurm.subprocess.run", fake_run)
+
+    assert dispatcher.poll_all_statuses(["777"]) == {"777": "UNKNOWN"}
+    assert "sacct" in dispatcher.last_status_diagnostic
+
+
+def test_monitor_query_exception_cancels_remote_job(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    cancelled = []
+
+    def fail_poll(_ids):
+        raise OSError("slurmctld unavailable")
+
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", fail_poll)
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda job_id: cancelled.append(job_id) or True)
+
+    monitor = JobMonitor(dispatcher, poll_interval=1)
+    monitor.add_job(job)
+
+    assert monitor.poll_once() is True
+    assert monitor.pending == {}
+    assert monitor.results == {"123": False}
+    assert cancelled == ["123"]
+    assert job.status == "MONITOR_QUERY_FAILED"
+    assert job.cancelled is True
+
+
+def test_isolated_attempt_video_ignores_wall_clock_skew(monkeypatch, tmp_path):
+    """当前提交专用目录中的视频不应因节点时钟偏差被拒绝。"""
+    import os
+
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path, submitted_at=time.time())
+    job.media_dir = tmp_path / "media" / "attempt_abcdef123456"
+    job.media_dir.mkdir(parents=True)
+    video = job.media_dir / "Demo.mp4"
+    video.write_bytes(b"fake")
+    old = time.time() - 3600
+    os.utime(video, (old, old))
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda current: True)
+
+    assert dispatcher._find_final_video(job) == video
 
 
 def test_squeue_output_captures_actual_start_time():

@@ -111,7 +111,40 @@ def test_incremental_reuses_verified_matching_artifact(monkeypatch, tmp_path):
     assert state.slurm_job is None
     assert state.artifact is not None
     assert state.artifact.origin == "reused"
+    assert state.artifact.source_run_id == NEW_RUN_ID
+    copied = paths.root / state.artifact.video_path
+    assert copied.is_file()
+    assert copied.read_bytes() == video.read_bytes()
     assert get_reusable_video_path(base, 1, workspace / "runs" / RUN_ID) == video
+
+
+def test_incremental_reuse_is_self_contained_after_base_cleanup(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    profile = RenderProfile.current()
+    base, _video = make_base(workspace, profile)
+    paths = make_paths(workspace)
+    state = SceneState(plan=make_plan(), code=CODE, class_name="Demo", reviewed=True)
+    ctx = PipelineContext(
+        "updated",
+        paths=paths,
+        scene_states={1: state},
+        incremental=True,
+        base_run_id=RUN_ID,
+        base_manifest=base,
+        render_profile=profile,
+    )
+
+    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+    assert state.artifact is not None
+    reused_path = paths.root / state.artifact.video_path
+
+    # 新 run 的 artifact 不应继续解析 base run；删除旧 run 后仍能验证本地文件。
+    import shutil
+
+    shutil.rmtree(workspace / "runs" / RUN_ID)
+    assert reused_path.is_file()
+    assert sha256_file(reused_path) == state.artifact.video_sha256
 
 
 def test_incremental_rejects_render_profile_change(monkeypatch, tmp_path):

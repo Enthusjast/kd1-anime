@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import threading
@@ -350,6 +351,8 @@ class Orchestrator:
         final_video = Path(manifest.final_video).expanduser() if manifest.final_video else None
         if final_video is not None and not final_video.is_absolute():
             raise ValueError("manifest.final_video 必须是绝对路径")
+        if final_video is not None and final_video.resolve() != output.resolve():
+            raise ValueError("manifest.final_video 必须与 manifest.output_path 一致")
         paths = RunPaths(
             run_id=manifest.run_id,
             root=root,
@@ -575,9 +578,11 @@ class Orchestrator:
 
         self._cancel_requested.clear()
         self._stop_event.clear()
-        validation = self._validate(source_code, renderer=RenderProfile.current().renderer)
+        profile = RenderProfile.current()
+        validation = self._validate(source_code, renderer=profile.renderer)
         if not validation.is_valid or class_name not in validation.scene_classes:
             raise ValueError("直接渲染代码未通过确定性校验")
+        self._preflight_environment(profile)
         paths = RunPaths.create()
         for directory in (
             paths.root,
@@ -863,6 +868,28 @@ class Orchestrator:
         except KeyError:
             return fallback
 
+    @staticmethod
+    def _preflight_environment(profile: RenderProfile | None = None) -> None:
+        """在创建/提交渲染任务前验证本地控制端和渲染配置。"""
+
+        profile = profile or RenderProfile.current()
+        missing = [name for name in ("sbatch", "ffmpeg", "ffprobe") if not shutil.which(name)]
+        container = settings.SLURM_CONTAINER_IMAGE
+        if settings.SLURM_REQUIRE_CONTAINER and not container:
+            raise RuntimeError("SLURM_REQUIRE_CONTAINER=true，但未配置 SLURM_CONTAINER_IMAGE")
+        if container:
+            image = Path(container).expanduser()
+            if not image.is_file():
+                raise RuntimeError(f"Apptainer 镜像不存在: {image}")
+            if not shutil.which("apptainer"):
+                missing.append("apptainer")
+        if profile.renderer == "opengl" and not settings.SLURM_GPU_TYPE:
+            raise RuntimeError(
+                "MANIM_RENDERER=opengl 时必须配置 SLURM_GPU_TYPE；否则无法保证 Slurm 分配 GPU 节点"
+            )
+        if missing:
+            raise RuntimeError("运行环境缺少命令: " + ", ".join(dict.fromkeys(missing)))
+
     def _handle_init(self, ctx: PipelineContext) -> State:
         for directory in (
             ctx.paths.root,
@@ -888,11 +915,7 @@ class Orchestrator:
                     self._emit("security_warning", message=warning)
                 else:
                     console.print(f"[bold yellow]安全警告:[/] {warning}")
-            missing = [name for name in ("sbatch", "ffmpeg", "ffprobe") if not shutil.which(name)]
-            if settings.SLURM_REQUIRE_CONTAINER and not shutil.which("apptainer"):
-                missing.append("apptainer")
-            if missing:
-                raise RuntimeError("运行环境缺少命令: " + ", ".join(missing))
+            self._preflight_environment(ctx.render_profile)
 
         # 增量渲染分析
         if ctx.incremental:
@@ -1318,6 +1341,7 @@ class Orchestrator:
             self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
             return
         state.class_name = validation.scene_classes[0]
+        job: SlurmJob | None = None
         try:
             job = self.slurm.submit_scene(
                 scene_id,
@@ -1333,26 +1357,38 @@ class Orchestrator:
                 state.slurm_job = job
                 state.artifact = None
                 state.rendered = False
-                self._checkpoint(ctx, State.DISPATCHING)
-            self._emit(
-                "scene_submitted",
-                scene_id=scene_id,
-                job_id=job.job_id,
-            )
+                try:
+                    self._checkpoint(ctx, State.DISPATCHING)
+                except Exception as checkpoint_error:
+                    # sbatch 已经返回 Job ID；此时不能伪装成普通提交失败并
+                    # 自动重提。停止所有 worker，保留内存中的 Job ID，交由
+                    # 外层 cancel_all 做一次安全取消和失败收尾。
+                    state.failed = True
+                    state.give_up = True
+                    state.failure_reason = (
+                        f"Slurm Job {job.job_id} 已提交，但本地检查点持久化失败: "
+                        f"{checkpoint_error}；保留 Job ID 并禁止自动重提"
+                    )
+                    self._record_checkpoint_failure(checkpoint_error)
+                    self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+                    return
+            self._emit("scene_submitted", scene_id=scene_id, job_id=job.job_id)
             if self._cancel_requested.is_set():
                 # Ctrl-C 可能恰好发生在 submit_scene 返回之后、批量取消器
                 # 扫描之前；此处再扫一次，避免新 Job 漏掉。
                 self.cancel_all()
         except Exception as exc:
-            # 一旦拿到 Job ID 就绝不能把持久化异常伪装成提交失败并自动重提。
-            if "job" in locals():
+            # 一旦拿到 Job ID 就绝不能把提交后的异常伪装成提交失败并自动重提。
+            if job is not None:
                 with self._state_lock:
                     state.slurm_job = job
                     state.give_up = True
+                    state.failed = True
                     state.failure_reason = (
                         f"Slurm Job {job.job_id} 已提交，但本地检查点持久化失败: {exc}；"
                         "保留 Job ID 并禁止自动重提"
                     )
+                self._record_checkpoint_failure(exc)
                 self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
                 return
             with self._state_lock:
@@ -1456,6 +1492,12 @@ class Orchestrator:
             # 跳过 Manim 进度条行 (含 % 和 |) 与纯时间行
             if "%" in low and "|" in low:
                 continue
+            # 每次重试都会产生新的 attempt 目录和部分临时哈希文件名；这些
+            # 随机 token 不能影响“同一根因”的判定。
+            low = re.sub(r"\b\d{8}-\d{6}-[0-9a-f]{8}\b", "<run>", low)
+            low = re.sub(r"\battempt_[0-9a-f]{12}\b", "attempt_<token>", low)
+            low = re.sub(r"\b[0-9a-f]{12,}\b", "<hex>", low)
+            low = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", low)
             low = re.sub(r"\d+", "#", low).strip()
             if low:
                 normalized.append(low)
@@ -1683,27 +1725,74 @@ class Orchestrator:
         ):
             base_root = RunRepository(settings.WORKSPACE_DIR).run_root(ctx.base_run_id)
             old_video = get_reusable_video_path(ctx.base_manifest, scene_id, base_root)
-            if old_video and sha256_file(old_video) == artifact.video_sha256:
-                state.rendered = True
-                state.slurm_job = None
-                state.artifact = SceneArtifact(
-                    origin="reused",
-                    source_run_id=artifact.source_run_id,
-                    job_id=artifact.job_id,
-                    scene_id=scene_id,
-                    scene_class_name=artifact.scene_class_name,
-                    code_sha256=artifact.code_sha256,
-                    render_profile_sha256=artifact.render_profile_sha256,
-                    video_path=artifact.video_path,
-                    video_sha256=artifact.video_sha256,
-                    metadata=artifact.metadata,
-                    verified=True,
-                )
-                if scene_id not in ctx.scenes_to_reuse:
-                    ctx.scenes_to_reuse.append(scene_id)
-                return
+            if old_video:
+                try:
+                    if (
+                        old_video.stat().st_size == artifact.metadata.size_bytes
+                        and sha256_file(old_video) == artifact.video_sha256
+                    ):
+                        copied_video = self._copy_reused_video(
+                            ctx,
+                            scene_id,
+                            artifact,
+                            old_video,
+                        )
+                    else:
+                        copied_video = None
+                except (OSError, RuntimeError, ValueError) as exc:
+                    logger.warning("Scene %s 增量视频复制失败，将重新渲染: %s", scene_id, exc)
+                    copied_video = None
+                if copied_video is not None:
+                    relative_video = copied_video.relative_to(ctx.paths.root).as_posix()
+                    state.rendered = True
+                    state.slurm_job = None
+                    state.artifact = SceneArtifact(
+                        origin="reused",
+                        # 复用视频已复制到当前 run；清理 base run 后当前 run
+                        # 仍必须能够恢复和重新合并，因此凭据路径也归属于当前 run。
+                        source_run_id=ctx.paths.run_id,
+                        job_id=artifact.job_id,
+                        scene_id=scene_id,
+                        scene_class_name=artifact.scene_class_name,
+                        code_sha256=artifact.code_sha256,
+                        render_profile_sha256=artifact.render_profile_sha256,
+                        video_path=relative_video,
+                        video_sha256=artifact.video_sha256,
+                        metadata=artifact.metadata,
+                        verified=True,
+                    )
+                    if scene_id not in ctx.scenes_to_reuse:
+                        ctx.scenes_to_reuse.append(scene_id)
+                    return
         if scene_id not in ctx.scenes_to_render:
             ctx.scenes_to_render.append(scene_id)
+
+    @staticmethod
+    def _copy_reused_video(
+        ctx: PipelineContext,
+        scene_id: int,
+        artifact: SceneArtifact,
+        source: Path,
+    ) -> Path:
+        """把增量复用的视频复制到当前 run，并以原子替换完成落盘。"""
+
+        destination_dir = ctx.paths.videos / f"scene_{scene_id}" / "reused"
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_dir.chmod(0o700)
+        destination = destination_dir / f"{artifact.scene_class_name}.mp4"
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex[:8]}.tmp")
+        try:
+            shutil.copyfile(source, temporary)
+            temporary.chmod(0o600)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            if destination.stat().st_size <= 0 or sha256_file(destination) != artifact.video_sha256:
+                raise RuntimeError("复制后的视频哈希或大小校验失败")
+            return destination
+        finally:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
 
     def _artifact_from_job(
         self,
@@ -1945,12 +2034,18 @@ class Orchestrator:
                 state = ctx.scene_states[scene_id]
                 state.rendered = False
                 state.reviewed = False
+                state.failed = False
+                state.give_up = False
                 state.code = ""
                 state.class_name = ""
                 state.slurm_job = None
                 state.artifact = None
                 state.fix_attempts = 0
+                state.infra_retries = 0
                 state.rewrite_feedback = ""
+                state.failure_reason = ""
+                state.last_error_fp = ""
+                state.identical_error_count = 0
             # 轮次和场景重置必须先持久化；检查点失败应终止流水线，不能被
             # 当作可忽略的视觉评估错误，否则 resume 会复用上一轮旧视频。
             self._checkpoint(ctx, State.EVALUATING)

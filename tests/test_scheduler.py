@@ -795,3 +795,16 @@ def test_error_fingerprint_normalizes_digits(monkeypatch, tmp_path):
 
     fp3 = Orchestrator._error_fingerprint("Traceback line 42: KeyError at frame 1234")
     assert fp1 != fp3  # 错误类型不同 → 指纹不同
+
+
+def test_error_fingerprint_normalizes_attempt_paths_and_hex_names():
+    first = Orchestrator._error_fingerprint(
+        "ValueError: failed in workspace/runs/20260811-120000-abcdef12/"
+        "videos/scene_1/attempt_0123456789ab/Tex/aa11bb22cc33dd44.svg"
+    )
+    second = Orchestrator._error_fingerprint(
+        "ValueError: failed in workspace/runs/20260812-130000-1234abcd/"
+        "videos/scene_1/attempt_fedcba987654/Tex/ffeeddccbbaa9988.svg"
+    )
+
+    assert first == second

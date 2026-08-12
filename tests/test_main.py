@@ -10,6 +10,8 @@ from kd1_anime.run_store import RunRepository
 
 
 def test_render_copies_source_into_private_run_directory(monkeypatch, tmp_path):
+    import kd1_anime.orchestrator as orchestrator_module
+
     source = tmp_path / "external" / "scene.py"
     source.parent.mkdir()
     source.write_text(
@@ -17,6 +19,11 @@ def test_render_copies_source_into_private_run_directory(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path / "workspace")
+    monkeypatch.setattr(
+        orchestrator_module.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}",
+    )
     captured: dict[str, Path] = {}
 
     def fake_submit(self, scene_id, python_file, scene_class_name, **kwargs):

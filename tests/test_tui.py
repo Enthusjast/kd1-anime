@@ -31,6 +31,43 @@ def test_clarifier_fallback_keeps_all_user_answers():
     assert "目标受众是谁" not in fallback
 
 
+def test_clarifier_context_is_bounded_and_keeps_recent_answer(monkeypatch):
+    monkeypatch.setattr(settings, "MAX_CLARIFY_CONTEXT_CHARS", 2_000)
+    clarifier = Clarifier()
+    clarifier.history.extend(
+        [
+            {"role": "user", "content": "初始需求"},
+            {"role": "assistant", "content": "旧回答 " + "x" * 800},
+            {"role": "user", "content": "旧补充 " + "y" * 800},
+            {"role": "assistant", "content": "最近问题"},
+            {"role": "user", "content": "最近回答"},
+        ]
+    )
+
+    bounded = clarifier._bounded_history()
+    total_chars = sum(len(str(message.get("content", ""))) for message in bounded)
+
+    assert total_chars <= settings.MAX_CLARIFY_CONTEXT_CHARS
+    assert bounded[1]["content"] == "初始需求"
+    assert bounded[-1]["content"] == "最近回答"
+
+
+def test_clarifier_fallback_respects_prompt_limit(monkeypatch):
+    monkeypatch.setattr(settings, "MAX_PROMPT_CHARS", 100)
+    clarifier = Clarifier()
+    clarifier.history.extend(
+        [
+            {"role": "user", "content": "initial"},
+            {"role": "assistant", "content": "question"},
+            {"role": "user", "content": "补充信息 " + "x" * 200},
+        ]
+    )
+
+    fallback = clarifier.build_fallback_prompt("initial")
+
+    assert len(fallback) <= 100
+
+
 def test_enter_submits_input():
     buffer = Mock()
 

@@ -15,7 +15,7 @@ from rich.console import Console
 
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
-from kd1_anime.rendering import RenderProfile, verify_video
+from kd1_anime.rendering import RenderProfile, sha256_file, verify_video
 
 console = Console()
 
@@ -64,6 +64,8 @@ class VideoMerger:
             raise RuntimeError(f"Scene {job.scene_id} 的 output_path 不是当前类的最终 MP4")
         if not video.is_file() or video.stat().st_size <= 0:
             raise RuntimeError(f"Scene {job.scene_id} 的当前产物不存在或为空: {video}")
+        if job.output_sha256 and sha256_file(video) != job.output_sha256:
+            raise RuntimeError(f"Scene {job.scene_id} 的当前产物哈希与 Slurm 检查点不一致")
         return video
 
     def find_job_video(self, job: SlurmJob) -> Path:
@@ -98,10 +100,21 @@ class VideoMerger:
         # 当前 run 的目录是隔离的；若 Manim 产生多个质量目录，取最新完成的文件。
         return max(candidates, key=lambda item: item[1])[0]
 
-    def collect_job_videos(self, jobs: list[SlurmJob]) -> list[Path]:
+    def collect_job_videos(
+        self,
+        jobs: list[SlurmJob],
+        *,
+        render_profile: RenderProfile | None = None,
+    ) -> list[Path]:
         videos: list[Path] = []
         for job in sorted(jobs, key=lambda item: item.scene_id):
             video = self._exact_job_video(job)
+            # 旧调用方可能只有 output_path；对新检查点记录的元数据再做一次
+            # ffprobe 校验，避免 merge_jobs 盲信同名 MP4。
+            if job.output_metadata is not None:
+                metadata = verify_video(video, render_profile or job.render_profile)
+                if metadata != job.output_metadata:
+                    raise RuntimeError(f"Scene {job.scene_id} 的视频元数据与 Slurm 检查点不一致")
             videos.append(video)
             console.print(f"[dim][Merger][/] Scene {job.scene_id}: {video}")
         return videos
@@ -268,7 +281,7 @@ class VideoMerger:
         render_profile: RenderProfile | None = None,
     ) -> Path:
         return self.merge(
-            self.collect_job_videos(jobs),
+            self.collect_job_videos(jobs, render_profile=render_profile),
             output_path,
             render_profile=render_profile,
         )

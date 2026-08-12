@@ -164,6 +164,7 @@ workspace/runs/<timestamp>-<uuid>/
 
 如设置 `OUTPUT_FILE=/path/to/final.mp4`，最终视频写到该路径；其余中间产物仍保留在独立 run 目录中。
 `manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。旧版清单会在内存中保守迁移；无法验证的旧产物会重新渲染。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
+增量运行复用的场景视频会复制到新 run 的私有目录，因此清理基准 run 不会破坏新 run 的恢复或重新拼接。
 
 ## 关键配置
 
@@ -175,6 +176,7 @@ workspace/runs/<timestamp>-<uuid>/
 | `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
 | `MAX_PROMPT_CHARS` | `50000` | 用户需求最大字符数 |
+| `MAX_CLARIFY_CONTEXT_CHARS` | `40000` | 澄清多轮对话发送给模型的最大字符数，超出时保留初始需求和最近回答 |
 | `MAX_LOG_CHARS` | `30000` | 发送给 AutoFixer 的错误日志字符上限 |
 | `MANIM_RENDERER` | `cairo` | `cairo` 使用 CPU；`opengl` 可使用 GPU |
 | `MANIM_QUALITY` | `h` | Manim 质量级别 `l/m/h/p/k` |

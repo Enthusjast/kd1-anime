@@ -134,7 +134,7 @@ class Clarifier:
         while True:
             try:
                 # 非流式接收，以便区分用户问题和内部 READY JSON
-                response = self.agent.call_llm(messages=self.history, stream=False)
+                response = self.agent.call_llm(messages=self._bounded_history(), stream=False)
                 self.history.append({"role": "assistant", "content": response})
                 if self.extract_ready(response) is None:
                     # 非 READY 响应：逐字打印模拟流式效果
@@ -164,6 +164,53 @@ class Clarifier:
                     # 移除刚才加入但未得到回复的 user message
                     self.history.pop()
                     raise RuntimeError("Clarifier 失败, 用户选择退出") from e
+
+    @staticmethod
+    def _clip_text(content: str, limit: int) -> str:
+        """按字符裁剪长消息，同时保留开头和结尾的关键信息。"""
+
+        if len(content) <= limit:
+            return content
+        if limit <= 80:
+            return content[:limit]
+        marker = "\n...[内容因上下文预算被裁剪]...\n"
+        available = max(1, limit - len(marker))
+        head = (available + 1) // 2
+        tail = available - head
+        return content[:head] + marker + (content[-tail:] if tail else "")
+
+    def _bounded_history(self) -> list[dict]:
+        """构造有界的澄清上下文，保留系统提示、初始需求和最近回答。"""
+
+        if not self.history:
+            return []
+        budget = settings.MAX_CLARIFY_CONTEXT_CHARS
+        system = dict(self.history[0])
+        system_content = str(system.get("content", ""))
+        system_limit = min(len(system_content), max(1000, budget // 4))
+        system["content"] = self._clip_text(system_content, system_limit)
+        if len(self.history) == 1:
+            return [system]
+
+        # 初始需求是后续澄清的锚点，始终保留；单条超长消息也不能独占整个预算。
+        first = dict(self.history[1])
+        first_limit = max(500, min(budget // 3, budget - len(system["content"]) - 500))
+        first["content"] = self._clip_text(str(first.get("content", "")), first_limit)
+        used = len(str(system.get("content", ""))) + len(str(first.get("content", "")))
+        recent: list[dict] = []
+        for original in reversed(self.history[2:]):
+            message = dict(original)
+            content = str(message.get("content", ""))
+            available = budget - used - 2
+            if available <= 0:
+                break
+            clipped = self._clip_text(content, available)
+            message["content"] = clipped
+            recent.append(message)
+            used += len(clipped) + 2
+            if len(clipped) < len(content):
+                break
+        return [system, first, *reversed(recent)]
 
     def extract_ready(self, response: str) -> str | None:
         """
@@ -218,9 +265,18 @@ class Clarifier:
             if content and content != initial_normalized and content not in additions:
                 additions.append(content)
         if not additions:
-            return initial_normalized
-        details = "\n\n".join(f"- {content}" for content in additions)
-        return f"{initial_normalized}\n\n用户在澄清过程中补充的信息：\n{details}"
+            return self._clip_text(initial_normalized, settings.MAX_PROMPT_CHARS)
+        prefix = f"{initial_normalized}\n\n用户在澄清过程中补充的信息：\n"
+        result = prefix
+        for content in additions:
+            item = f"- {content}\n"
+            available = settings.MAX_PROMPT_CHARS - len(result)
+            if available <= 0:
+                break
+            result += self._clip_text(item, available)
+            if len(item) > available:
+                break
+        return result[: settings.MAX_PROMPT_CHARS]
 
 
 def _setup_terminal() -> None:

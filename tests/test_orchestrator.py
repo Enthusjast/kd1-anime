@@ -654,6 +654,9 @@ def test_eval_improvement_state_and_round_are_checkpointed(monkeypatch, tmp_path
         plan_ready=True,
         reviewed=True,
         rendered=True,
+        failed=True,
+        give_up=True,
+        failure_reason="previous failure",
     )
     ctx = PipelineContext(
         "prompt",
@@ -686,6 +689,9 @@ def test_eval_improvement_state_and_round_are_checkpointed(monkeypatch, tmp_path
     assert ctx.eval_round == 1
     assert state.code == ""
     assert state.rendered is False
+    assert state.failed is False
+    assert state.give_up is False
+    assert state.failure_reason == ""
     manifest = RunManifest.model_validate_json(
         (run_paths.root / "manifest.json").read_text(encoding="utf-8")
     )

@@ -153,6 +153,8 @@ class Settings(BaseSettings):
     )
     MAX_SCENES: int = Field(default=12, ge=1, le=100)
     MAX_PROMPT_CHARS: int = Field(default=50_000, ge=100, le=1_000_000)
+    # 澄清对话会携带多轮 user/assistant 消息；独立预算避免累计内容超过模型上下文。
+    MAX_CLARIFY_CONTEXT_CHARS: int = Field(default=40_000, ge=2_000, le=1_000_000)
     MAX_LOG_CHARS: int = Field(default=30_000, ge=1_000, le=1_000_000)
     CODE_VALIDATION_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     MONITOR_POLL_INTERVAL: int = Field(default=10, ge=1)
