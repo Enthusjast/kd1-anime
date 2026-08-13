@@ -1,7 +1,17 @@
 import time
 
+import pytest
+
+import kd1_anime.media.merger as merger_module
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.media.merger import VideoMerger
+
+
+@pytest.fixture(autouse=True)
+def fake_ffmpeg_binary(monkeypatch):
+    """拼接行为测试使用 fake _run_ffmpeg，不依赖 CI 主机安装 FFmpeg。"""
+
+    monkeypatch.setattr(merger_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
 
 
 def test_selects_expected_class_and_ignores_partial(tmp_path):

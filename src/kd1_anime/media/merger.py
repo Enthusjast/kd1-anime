@@ -147,15 +147,14 @@ class VideoMerger:
         replace_existing: bool = False,
         render_profile: RenderProfile | None = None,
     ) -> Path:
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError("未找到 ffmpeg，请先激活包含 FFmpeg 的环境")
-
         resolved_inputs = [path.expanduser().resolve() for path in video_paths]
         if output in resolved_inputs:
             raise RuntimeError("输出文件不能与任一输入视频相同")
         if output.exists() and not (settings.OVERWRITE_OUTPUT or replace_existing):
             raise RuntimeError(f"输出文件已存在，拒绝覆盖: {output}（使用 --force 允许覆盖）")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("未找到 ffmpeg，请先激活包含 FFmpeg 的环境")
         profile = render_profile or RenderProfile.current()
         temporary_output = output.with_name(
             f".{output.stem}.{uuid4().hex[:8]}.tmp{output.suffix or '.mp4'}"
