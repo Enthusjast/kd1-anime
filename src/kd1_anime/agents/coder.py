@@ -3,7 +3,7 @@
 from typing import Literal
 
 from kd1_anime.agents.base import BaseAgent
-from kd1_anime.agents.planner import ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, ScenePlan
 from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
     renderer_guidance,
@@ -47,6 +47,15 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - 内容逐步出现，不要一次铺满；优先连续 Transform 而不是无意义地反复淡入淡出。
 - 简单动画 0.5–1 秒，文字/公式与变换 1–2 秒，复杂动画 2–4 秒，并留 0.5–1 秒吸收停顿。
 - run_time 总量应大致匹配分镜时长，数学内容必须严格符合 computation。
+
+## 跨场景连续性
+- ScenePlan 中的 continuity_references 是不可擅自修改的全局合同；严格继承其中的背景、
+  调色板、字体、字号层级、线宽、变量颜色、布局锚点和镜头语言。
+- opening_state 中列出的对象、公式和数学状态视为上一场景已经交接到本场景的内容；
+  优先对它们做变换或接续，不要无理由清空画面后重新绘制。
+- closing_state 中列出的内容必须在场景结尾真实存在或明确完成退出，并通过 transition_out
+  交给下一场景。persistent_elements 不能凭空改名、改色或消失。
+- transition_in/out 必须落实为具体对象和动作，禁止只写“自然过渡”“保持一致”等空泛实现。
 
 ## 代码骨架模板
 ```python
@@ -100,6 +109,7 @@ class CoderAgent(BaseAgent):
         *,
         stream: bool = True,
         renderer: Literal["cairo", "opengl"] | None = None,
+        continuity_bible: ContinuityBible | None = None,
     ) -> str:
         self._log(f"正在为 Scene {scene_plan.scene_id} [{scene_plan.title}] 生成代码...")
         user_msg = f"""## 场景导演分镜
@@ -124,6 +134,19 @@ class CoderAgent(BaseAgent):
 
 ### 数学/物理规格
 {scene_plan.computation}
+
+### 跨场景连续性合同
+- 持续对象: {", ".join(scene_plan.persistent_elements) or "无"}
+- 开场状态: {"；".join(scene_plan.opening_state) or "请建立本场景初始状态"}
+- 结束状态: {"；".join(scene_plan.closing_state) or "请声明本场景结束状态"}
+- 进入转场: {scene_plan.transition_in or "请实现具体进入转场"}
+- 离开转场: {scene_plan.transition_out or "请实现具体退出转场"}
+- 必须继承: {"；".join(scene_plan.continuity_references) or "沿用全局连续性规范"}
+"""
+        if continuity_bible is not None:
+            user_msg += f"""
+### 全片连续性圣经（只读约束）
+{continuity_bible.model_dump_json(indent=2)}
 """
         if previous_code:
             user_msg += f"""

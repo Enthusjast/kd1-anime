@@ -20,6 +20,7 @@ kd1_anime.cli / kd1_anime.tui
 kd1_anime.orchestrator ───── callback events ───────────▶ TUI/Rich
        │
        ├── agents/planner.py       概要规划 + 详细分镜
+       ├── agents/continuity.py    全片连续性审查与局部重规划
        ├── agents/coder.py         ManimCE 代码生成/重写
        ├── agents/reviewer.py      结构化语义审查
        ├── agents/validator.py     AST 确定性校验
@@ -48,7 +49,7 @@ DETAILING → CODING → REVIEWING → DISPATCHING → MONITORING
 全部线程结束：MERGING → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-FSM 枚举同时用于清单检查点和 TUI 阶段提示。实际执行不是“所有场景完成一个阶段后再进入下一阶段”：一个 Scene 可以在另一个 Scene 仍编写分镜时已经提交或修复。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
+FSM 枚举同时用于清单检查点和 TUI 阶段提示。实际执行不是“所有场景完成一个阶段后再进入下一阶段”：概要完成后，所有场景的导演分镜会并行生成；通过全片连续性屏障后，一个 Scene 可以在另一个 Scene 仍编码、渲染或修复时继续推进。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 
@@ -56,10 +57,12 @@ LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MA
 
 ### 3.1 PLANNING / DETAILING
 
-Planner 使用两阶段结构化输出：
+Planner 使用分层结构化输出：
 
 1. `plan_outline()` 生成短小 `SceneOutline` 列表，并按返回顺序规范化 scene ID 为 `1..N`。
-2. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要和当前概要，生成视觉设计、镜头、动画流、关键时刻和计算说明。
+2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
+3. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state 和转场合同。
+4. 所有 Detail 完成后执行确定性检查和一次全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。
 
 Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。用户需求被明确标记为不可信数据，不能改变系统规则。
 
@@ -88,6 +91,8 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - `major`：带具体反馈并回到 Coder 重写。
 
 审查受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Reviewer；major 反馈仍回到 CODING，绝不直接提交。
+
+连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。
 
 ### 3.3 DISPATCHING / MONITORING
 

@@ -20,7 +20,17 @@ from rich.prompt import Confirm
 
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.coder import CoderAgent
-from kd1_anime.agents.planner import PlannerAgent, SceneOutline, ScenePlan
+from kd1_anime.agents.continuity import (
+    ContinuityIssue,
+    ContinuityReviewerAgent,
+    deterministic_continuity_issues,
+)
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    PlannerAgent,
+    SceneOutline,
+    ScenePlan,
+)
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewResult
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
 from kd1_anime.cluster.slurm import (
@@ -152,6 +162,10 @@ class PipelineContext:
     outlines: list[SceneOutline] = field(default_factory=list)
     scenes: list[ScenePlan] = field(default_factory=list)
     scene_states: dict[int, SceneState] = field(default_factory=dict)
+    continuity_bible: ContinuityBible | None = None
+    continuity_review_status: str = "passed"
+    continuity_review_round: int = 0
+    continuity_warnings: list[str] = field(default_factory=list)
     final_video: Path | None = None
     final_video_sha256: str = ""
     render_profile: RenderProfile = field(default_factory=RenderProfile.current)
@@ -307,6 +321,10 @@ class Orchestrator:
                 render_profile=ctx.render_profile,
                 outlines=ctx.outlines,
                 scenes=scenes,
+                continuity_bible=ctx.continuity_bible,
+                continuity_review_status=ctx.continuity_review_status,
+                continuity_review_round=ctx.continuity_review_round,
+                continuity_warnings=ctx.continuity_warnings[-100:],
                 final_video=str(ctx.final_video) if ctx.final_video else None,
                 final_video_sha256=ctx.final_video_sha256,
                 error=error[-50_000:],
@@ -425,6 +443,10 @@ class Orchestrator:
             outlines=manifest.outlines,
             scenes=[scene_states[key].plan for key in sorted(scene_states)],
             scene_states=scene_states,
+            continuity_bible=manifest.continuity_bible,
+            continuity_review_status=manifest.continuity_review_status,
+            continuity_review_round=manifest.continuity_review_round,
+            continuity_warnings=list(manifest.continuity_warnings),
             final_video=final_video,
             final_video_sha256=manifest.final_video_sha256,
             incremental=manifest.incremental,
@@ -445,18 +467,24 @@ class Orchestrator:
         previous_code: str = "",
         stream: bool = False,
         renderer: str | None = None,
+        continuity_bible: ContinuityBible | None = None,
     ) -> tuple[str, str]:
         agent = CoderAgent()
         current_feedback = feedback
         current_previous = previous_code
         last_validation: CodeValidationResult | None = None
         for _ in range(settings.CODE_VALIDATION_ATTEMPTS):
+            code_kwargs = {
+                "feedback": current_feedback,
+                "previous_code": current_previous,
+                "stream": stream,
+                "renderer": renderer,
+            }
+            if continuity_bible is not None:
+                code_kwargs["continuity_bible"] = continuity_bible
             code = agent.generate_code(
                 plan,
-                feedback=current_feedback,
-                previous_code=current_previous,
-                stream=stream,
-                renderer=renderer,
+                **code_kwargs,
             )
 
             validation = self._validate(code, renderer=renderer)
@@ -777,6 +805,17 @@ class Orchestrator:
             # 直接监控会得到连续 UNKNOWN → CANCEL_FAILED → 场景永久判死。
             self._reconcile_restored_jobs(ctx)
 
+            # schema 2 的早期清单没有 continuity bible。恢复未完成运行时补建并
+            # 持久化一份；已经渲染完成的旧场景不再触发连续性重规划。
+            if ctx.continuity_bible is None and ctx.outlines and ctx.scene_states:
+                self._plan_continuity_bible(ctx)
+                if any(not scene.rendered for scene in ctx.scene_states.values()):
+                    if ctx.continuity_review_status == "passed":
+                        ctx.continuity_review_status = "pending"
+                else:
+                    ctx.continuity_review_status = "passed"
+                self._checkpoint(ctx, state)
+
             self._emit("run_resumed", run_id=run_id, state=state.name)
             return self._execute(ctx, state)
 
@@ -787,10 +826,14 @@ class Orchestrator:
                 self._handle_init(ctx)
                 self._checkpoint(ctx, State.PLANNING)
                 self._plan_outline(ctx)
+                self._plan_continuity_bible(ctx)
                 ctx.scene_states = {
                     outline.scene_id: SceneState(plan=self._placeholder_plan(outline))
                     for outline in ctx.outlines
                 }
+                # 在任何并行 Detail worker 启动前保存概要和 continuity bible；
+                # 进程此时中断时 resume 不会丢失全片规范或重新生成一份不同的规范。
+                self._checkpoint(ctx, State.DETAILING)
                 self._emit("plan_complete", scenes=ctx.scenes)
             elif ctx.scenes:
                 # resume 等已有 scene_states 的入口: 补发 plan_complete 供 TUI 表格展示
@@ -1004,6 +1047,48 @@ class Orchestrator:
                 f"Planner 生成了 {len(outlines)} 个场景，超过 MAX_SCENES={settings.MAX_SCENES}"
             )
 
+    def _plan_continuity_bible(self, ctx: PipelineContext) -> None:
+        """概要完成后固定全片连续性规范，再允许场景分镜并行生成。"""
+
+        if not ctx.outlines:
+            raise RuntimeError("无法建立连续性圣经：没有场景概要")
+        self._emit("continuity_bible_start", scene_count=len(ctx.outlines))
+        planner_method = getattr(self.planner, "plan_continuity_bible", None)
+        if not callable(planner_method):
+            # 兼容外部集成/测试替换的旧 Planner；正式 Planner 始终提供该方法。
+            ctx.continuity_bible = ContinuityBible()
+            ctx.continuity_review_status = "passed"
+            ctx.continuity_warnings.append("当前 Planner 不支持连续性圣经，已沿用默认规范")
+            self._emit("continuity_warning", reason=ctx.continuity_warnings[-1])
+            return
+        try:
+            with self._llm_slot():
+                ctx.continuity_bible = planner_method(
+                    ctx.user_prompt,
+                    ctx.outlines,
+                    stream=False,
+                    renderer=ctx.render_profile.renderer,
+                )
+        except Exception as exc:
+            # 连续性增强不能让基础流水线因一次额外 LLM 调用完全不可用；
+            # 使用确定的默认圣经并保留 pending，后续仍会进行全片连续性审查。
+            ctx.continuity_bible = ContinuityBible()
+            ctx.continuity_review_status = "pending"
+            warning = f"连续性圣经生成失败，已使用默认规范: {exc}"
+            ctx.continuity_warnings.append(warning)
+            self._emit("continuity_warning", reason=warning)
+            return
+        ctx.continuity_review_status = "pending"
+        ctx.continuity_review_round = 0
+        self._emit("continuity_bible_ready")
+
+    def _llm_slot(self):
+        """在调度器已初始化信号量时复用它，否则提供无锁上下文。"""
+
+        from contextlib import nullcontext
+
+        return self._llm_sem if hasattr(self, "_llm_sem") else nullcontext()
+
     # ------------------------------------------------------------------
     # 场景级并行调度 (per-scene pipeline)
     # 每个 Scene 一个工作线程, 独立推进 分镜→编码→审查→提交→渲染→修复。
@@ -1105,6 +1190,25 @@ class Orchestrator:
         with self._phase_lock:
             self._emitted_phases.clear()
 
+        # 正式运行先完成所有场景的 Detail，再做一次全片连续性审查；通过后才
+        # 进入编码/审查/渲染。这样并行仍然保留，但不会让某个场景在相邻场景
+        # 还没完成分镜时就把不兼容的视觉状态固化成代码。
+        if ctx.continuity_bible is not None and ctx.continuity_review_status in {
+            "pending",
+            "reviewing",
+        }:
+            self._run_detail_barrier(ctx)
+            if self._checkpoint_error is not None:
+                raise RuntimeError(
+                    f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
+                ) from self._checkpoint_error
+            if not self._cancel_requested.is_set():
+                self._run_continuity_review(ctx)
+            if self._checkpoint_error is not None:
+                raise RuntimeError(
+                    f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
+                ) from self._checkpoint_error
+
         threads: list[threading.Thread] = []
         for scene_id, state in sorted(ctx.scene_states.items()):
             if state.rendered or state.failed or state.give_up:
@@ -1125,6 +1229,188 @@ class Orchestrator:
             raise RuntimeError(
                 f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
             ) from self._checkpoint_error
+
+    def _run_detail_barrier(self, ctx: PipelineContext) -> None:
+        """并行完成尚未生成的场景分镜，作为连续性审查的屏障。"""
+
+        import threading
+
+        threads: list[threading.Thread] = []
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            if state.plan_ready or state.rendered or state.failed or state.give_up:
+                continue
+            thread = threading.Thread(
+                target=self._detail_worker,
+                args=(ctx, scene_id, state),
+                name=f"scene-detail-{scene_id}",
+                daemon=True,
+            )
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def _detail_worker(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+        """连续性屏障中的单场景 Detail worker。"""
+
+        try:
+            if self._stop_event.is_set():
+                return
+            self._phase_emit("detailing")
+            self._scene_detail(ctx, scene_id, state)
+        except Exception as exc:
+            with self._state_lock:
+                self._mark_failed(state, f"Scene {scene_id} 分镜生成失败: {exc}")
+            try:
+                self._checkpoint(ctx, State.DETAILING)
+            except Exception as checkpoint_error:
+                self._record_checkpoint_failure(checkpoint_error)
+            self._emit("scene_failed", scene_id=scene_id, reason=str(exc))
+
+    @staticmethod
+    def _dedupe_continuity_issues(
+        issues: list[ContinuityIssue],
+    ) -> list[ContinuityIssue]:
+        """按场景、类别和消息去重，避免同一冲突重复喂给 Planner。"""
+
+        unique: list[ContinuityIssue] = []
+        seen: set[tuple[tuple[int, ...], str, str]] = set()
+        for issue in issues:
+            key = (tuple(sorted(set(issue.scene_ids))), issue.category, issue.message)
+            if key not in seen:
+                seen.add(key)
+                unique.append(issue)
+        return unique
+
+    def _run_continuity_review(self, ctx: PipelineContext) -> None:
+        """审查全片分镜，并只重规划仍未编码的冲突场景。"""
+
+        if ctx.continuity_bible is None:
+            return
+        active_states = [
+            state for state in ctx.scene_states.values() if not state.failed and not state.give_up
+        ]
+        if any(not state.plan_ready for state in active_states):
+            return
+
+        self._emit("continuity_reviewing", scene_count=len(active_states))
+        max_rounds = max(0, settings.MAX_CONTINUITY_FIX_ROUNDS)
+        while True:
+            with self._state_lock:
+                ctx.continuity_review_round += 1
+                current_round = ctx.continuity_review_round
+                ctx.continuity_review_status = "reviewing"
+                self._checkpoint(ctx, State.REVIEWING)
+
+            plans = [
+                state.plan
+                for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+                if not state.failed and not state.give_up
+            ]
+            deterministic = deterministic_continuity_issues(plans, ctx.continuity_bible)
+            try:
+                with self._llm_sem:
+                    result = ContinuityReviewerAgent().review(
+                        ctx.continuity_bible,
+                        ctx.outlines,
+                        plans,
+                        deterministic_issues=deterministic,
+                        renderer=ctx.render_profile.renderer,
+                        stream=False,
+                    )
+                llm_issues = result.issues if not result.is_valid else []
+            except Exception as exc:
+                warning = f"连续性审查调用失败（第 {current_round} 轮）: {exc}"
+                ctx.continuity_warnings.append(warning)
+                # 若确定性检查已经找到可定位问题，仍尝试一次局部修正；否则
+                # 标记 warning 放行，避免连续性增强把整条流水线判死。
+                llm_issues = []
+                if not deterministic:
+                    with self._state_lock:
+                        ctx.continuity_review_status = "warning"
+                        self._checkpoint(ctx, State.REVIEWING)
+                    self._emit("continuity_warning", reason=warning)
+                    return
+                self._emit("continuity_warning", reason=warning)
+
+            issues = self._dedupe_continuity_issues([*deterministic, *llm_issues])
+            if not issues:
+                with self._state_lock:
+                    ctx.continuity_review_status = "passed"
+                    self._checkpoint(ctx, State.REVIEWING)
+                self._emit("continuity_pass", round=current_round)
+                return
+
+            affected_ids = sorted({scene_id for issue in issues for scene_id in issue.scene_ids})
+            uneditable = [
+                scene_id
+                for scene_id in affected_ids
+                if scene_id in ctx.scene_states
+                and (
+                    ctx.scene_states[scene_id].code
+                    or ctx.scene_states[scene_id].slurm_job is not None
+                    or ctx.scene_states[scene_id].rendered
+                )
+            ]
+            if current_round > max_rounds or uneditable:
+                reasons = [
+                    f"Scene {scene_id}: "
+                    + "; ".join(issue.message for issue in issues if scene_id in issue.scene_ids)
+                    for scene_id in affected_ids
+                ]
+                warning = (
+                    "连续性冲突未自动重规划："
+                    + ("已进入编码/渲染阶段" if uneditable else "达到最大连续性修正轮数")
+                    + "。"
+                    + " ".join(reasons)
+                )
+                with self._state_lock:
+                    ctx.continuity_review_status = "warning"
+                    ctx.continuity_warnings.append(warning)
+                    self._checkpoint(ctx, State.REVIEWING)
+                self._emit("continuity_warning", reason=warning)
+                return
+
+            feedback_by_scene: dict[int, list[str]] = {scene_id: [] for scene_id in affected_ids}
+            for issue in issues:
+                feedback = issue.fix_instruction or issue.message
+                for scene_id in issue.scene_ids:
+                    feedback_by_scene.setdefault(scene_id, []).append(
+                        f"[{issue.category}] {issue.message}\n修正要求: {feedback}"
+                    )
+
+            self._emit(
+                "continuity_fixing",
+                scene_ids=affected_ids,
+                round=current_round,
+                max_rounds=max_rounds,
+            )
+            for scene_id in affected_ids:
+                state = ctx.scene_states.get(scene_id)
+                if state is None or state.failed or state.give_up:
+                    continue
+                outline = next(outline for outline in ctx.outlines if outline.scene_id == scene_id)
+                with self._llm_sem:
+                    revised_plan = PlannerAgent().plan_detail(
+                        outline,
+                        ctx.outlines,
+                        ctx.user_prompt,
+                        stream=False,
+                        renderer=ctx.render_profile.renderer,
+                        continuity_bible=ctx.continuity_bible,
+                        continuity_feedback="\n\n".join(feedback_by_scene[scene_id]),
+                    )
+                with self._state_lock:
+                    state.plan = revised_plan
+                    state.plan_ready = True
+                    ctx.scenes = [
+                        item.plan
+                        for item in sorted(
+                            ctx.scene_states.values(), key=lambda item: item.plan.scene_id
+                        )
+                    ]
+                    self._checkpoint(ctx, State.DETAILING)
+                self._emit("scene_detailed", scene_id=scene_id, title=revised_plan.title)
 
     def _scene_worker(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         """单个 Scene 的完整流水线: 分镜→编码→审查→提交→渲染→(修复→重新提交)。"""
@@ -1255,13 +1541,16 @@ class Orchestrator:
         )
         with self._llm_sem:
             outline = next(o for o in ctx.outlines if o.scene_id == scene_id)
-            plan = PlannerAgent().plan_detail(
-                outline,
-                ctx.outlines,
-                ctx.user_prompt,
-                stream=False,
-                renderer=ctx.render_profile.renderer,
-            )
+            planner = PlannerAgent()
+            detail_kwargs = {
+                "stream": False,
+                "renderer": ctx.render_profile.renderer,
+            }
+            if ctx.continuity_bible is not None and callable(
+                getattr(planner, "plan_continuity_bible", None)
+            ):
+                detail_kwargs["continuity_bible"] = ctx.continuity_bible
+            plan = planner.plan_detail(outline, ctx.outlines, ctx.user_prompt, **detail_kwargs)
         with self._state_lock:
             state.plan = plan
             state.plan_ready = True
@@ -1283,6 +1572,7 @@ class Orchestrator:
                 previous_code=state.code if state.rewrite_feedback else "",
                 stream=False,
                 renderer=ctx.render_profile.renderer,
+                continuity_bible=ctx.continuity_bible,
             )
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
@@ -1309,11 +1599,11 @@ class Orchestrator:
             return
         self._emit("scene_reviewing", scene_id=scene_id)
         with self._llm_sem:
-            result = ReviewerAgent().review(
-                state.code,
-                state.plan,
-                renderer=ctx.render_profile.renderer,
-            )
+            reviewer = ReviewerAgent()
+            review_kwargs = {"renderer": ctx.render_profile.renderer}
+            if ctx.continuity_bible is not None:
+                review_kwargs["continuity_bible"] = ctx.continuity_bible
+            result = reviewer.review(state.code, state.plan, **review_kwargs)
         self._apply_review_result(ctx, scene_id, state, result)
 
     def _scene_submit(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
@@ -1598,6 +1888,7 @@ class Orchestrator:
                     previous_code=candidate,
                     stream=False,
                     renderer=ctx.render_profile.renderer,
+                    continuity_bible=ctx.continuity_bible,
                 )
             else:
                 class_name = validation.scene_classes[0]

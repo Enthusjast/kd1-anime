@@ -9,8 +9,10 @@ import pytest
 from pydantic import ValidationError
 
 from kd1_anime.agents.planner import (
+    CONTINUITY_BIBLE_PROMPT,
     DETAIL_PROMPT,
     OUTLINE_PROMPT,
+    ContinuityBible,
     PlannerAgent,
     SceneDetail,
     SceneOutline,
@@ -269,6 +271,28 @@ class TestPlannerAgent:
         assert plan.visual_design == "深灰背景，蓝色圆形"
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_continuity_bible_basic(self, mock_call_llm, planner, sample_outlines):
+        mock_call_llm.return_value = """{
+            "background": "#111111",
+            "palette": ["蓝色表示输入"],
+            "typography": "统一字体",
+            "layout": "标题在顶部",
+            "math_notation": "x 全片不改名",
+            "persistent_elements": ["核心公式"],
+            "camera_language": "固定中景",
+            "narrative_arc": "问题到结论",
+            "transition_rules": ["保留公式"]
+        }"""
+
+        bible = planner.plan_continuity_bible("Test prompt", sample_outlines)
+
+        assert isinstance(bible, ContinuityBible)
+        assert bible.palette == ["蓝色表示输入"]
+        user_message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "引言" in user_message
+        assert "scene_outlines" in user_message
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_detail_includes_outline_info(self, mock_call_llm, planner, sample_outlines):
         """测试场景细节包含概要信息。"""
         mock_call_llm.return_value = """{
@@ -318,6 +342,14 @@ class TestPlannerAgent:
         assert "输出字段契约" in DETAIL_PROMPT
         assert "绝不能是 {time, event, pause}" in DETAIL_PROMPT
         assert "不要使用 Markdown 代码块" in DETAIL_PROMPT
+        assert "opening_state" in DETAIL_PROMPT
+        assert "closing_state" in DETAIL_PROMPT
+        assert "persistent_elements" in DETAIL_PROMPT
+
+    def test_continuity_bible_prompt_structure(self):
+        assert "palette" in CONTINUITY_BIBLE_PROMPT
+        assert "math_notation" in CONTINUITY_BIBLE_PROMPT
+        assert "transition_rules" in CONTINUITY_BIBLE_PROMPT
 
 
 class TestPlannerAgentErrorHandling:

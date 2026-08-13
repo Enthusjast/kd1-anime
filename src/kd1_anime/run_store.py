@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from kd1_anime.agents.planner import SceneOutline, ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
 from kd1_anime.rendering import (
@@ -137,6 +137,12 @@ class RunManifest(BaseModel):
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     outlines: list[SceneOutline] = Field(default_factory=list)
     scenes: dict[int, StoredSceneState] = Field(default_factory=dict)
+    # 新运行在分镜生成前固定全片规范；旧 manifest 缺少这些字段时按已完成兼容，
+    # 不会在恢复已有代码/作业时擅自重规划场景。
+    continuity_bible: ContinuityBible | None = None
+    continuity_review_status: Literal["pending", "reviewing", "passed", "warning"] = "passed"
+    continuity_review_round: int = Field(default=0, ge=0)
+    continuity_warnings: list[str] = Field(default_factory=list, max_length=100)
     final_video: str | None = None
     final_video_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     error: str = Field(default="", max_length=50_000)

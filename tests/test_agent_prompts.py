@@ -37,6 +37,13 @@ def test_coder_guards_against_blind_subscript_access():
     assert "len()" in CODER_SYSTEM_PROMPT
 
 
+def test_coder_prompt_has_continuity_contract():
+    assert "opening_state" in CODER_SYSTEM_PROMPT
+    assert "closing_state" in CODER_SYSTEM_PROMPT
+    assert "persistent_elements" in CODER_SYSTEM_PROMPT
+    assert "transition_out" in CODER_SYSTEM_PROMPT
+
+
 def test_coder_forbids_custom_mobject_subclass_for_opengl(monkeypatch):
     monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
     prompt = build_coder_system_prompt()

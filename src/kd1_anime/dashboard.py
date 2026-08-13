@@ -226,6 +226,7 @@ class SceneDashboard:
             self.stage = data.get("stage", "")
             self.stage_label = {
                 "planning": "场景概要",
+                "continuity": "全片连续性",
                 "detailing": "导演分镜",
                 "coding": "代码生成",
                 "reviewing": "代码审查",
@@ -240,6 +241,38 @@ class SceneDashboard:
             self.run_id = data.get("run_id", "") or self.run_id
             if not self.started_at:
                 self.started_at = time.time()
+
+        elif event in ("continuity_bible_start", "continuity_reviewing"):
+            self.stage = "continuity"
+            self.stage_label = "全片连续性"
+            if event == "continuity_reviewing":
+                for scene in self.scenes.values():
+                    if scene.state == "running":
+                        scene.message = "连续性审查中"
+
+        elif event == "continuity_fixing":
+            self.stage = "continuity"
+            self.stage_label = "连续性修正"
+            affected = {int(scene_id) for scene_id in data.get("scene_ids", [])}
+            for scene_id in affected:
+                status = self.scenes.get(scene_id)
+                if status:
+                    self._mark_running(status, "", "连续性修正中")
+
+        elif event == "continuity_pass":
+            self.stage = "continuity"
+            self.stage_label = "连续性通过"
+            for scene in self.scenes.values():
+                if scene.state == "running" and not scene.stage:
+                    scene.message = "连续性通过"
+
+        elif event == "continuity_warning":
+            self.stage = "continuity"
+            self.stage_label = "连续性提示"
+            reason = (data.get("reason", "") or "").strip()
+            for scene in self.scenes.values():
+                if scene.state == "running" and not scene.stage:
+                    scene.message = reason[:40] or "连续性存在提示"
 
         elif event == "plan_complete":
             scenes = data.get("scenes", [])

@@ -175,6 +175,7 @@ workspace/runs/<timestamp>-<uuid>/
 | `LLM_PARALLEL_WORKERS` | `4` | 逐场景 LLM 并发数 |
 | `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
+| `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 全片连续性审查发现冲突后的局部分镜重规划轮数 |
 | `MAX_PROMPT_CHARS` | `50000` | 用户需求最大字符数 |
 | `MAX_CLARIFY_CONTEXT_CHARS` | `40000` | 澄清多轮对话发送给模型的最大字符数，超出时保留初始需求和最近回答 |
 | `MAX_LOG_CHARS` | `30000` | 发送给 AutoFixer 的错误日志字符上限 |
