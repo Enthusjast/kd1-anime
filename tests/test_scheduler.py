@@ -1,6 +1,6 @@
-"""场景级并行调度 (per-scene pipeline) 测试。
+"""分阶段场景调度测试。
 
-每个 Scene 独立推进 分镜→编码→审查→提交→渲染→修复, 互不等待。
+分镜并行，代码按场景顺序交接，渲染任务并行执行。
 """
 
 import threading
@@ -295,9 +295,9 @@ def make_orchestrator(
 
 
 # ---------------------------------------------------------------------------
-# 1) 已就绪场景立即提交渲染, 不等待其他场景的 LLM 阶段
+# 1) 为了代码级连续性，编码/提交等待所有场景分镜完成
 # ---------------------------------------------------------------------------
-def test_ready_scene_submits_while_other_scene_still_detailing(monkeypatch, tmp_path):
+def test_code_barrier_waits_for_other_scene_detailing(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
     events: list[tuple] = []
     detail_done = threading.Event()
@@ -331,10 +331,11 @@ def test_ready_scene_submits_while_other_scene_still_detailing(monkeypatch, tmp_
 
     orchestrator._run_scheduler(ctx)
 
-    # Scene 1 在 Scene 2 的 detail 完成之前就已提交
+    # Scene 1 的提交必须发生在 Scene 2 detail 完成之后，确保顺序编码前
+    # 每个场景都拥有真实的 ScenePlan。
     detail_end_time = next(t for e, t in events if e == "detail_end")
     scene1_submit_time = next(t for e, sid, t in slurm.events if e == "submit" and sid == 1)
-    assert scene1_submit_time < detail_end_time
+    assert scene1_submit_time >= detail_end_time
     assert ctx.scene_states[1].rendered is True
     assert ctx.scene_states[2].rendered is True
     assert sorted(slurm.submitted) == [1, 2]
@@ -367,6 +368,68 @@ def test_multiple_scenes_complete_independently(monkeypatch, tmp_path):
         assert "scene_coding" in scene_events
         assert "scene_reviewing" in scene_events
         assert "scene_rendered" in scene_events
+
+
+def test_coder_receives_previous_scene_export_in_scene_order(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+
+    class ContextCoder(FakeCoder):
+        def __init__(self):
+            super().__init__()
+            self.inherited: list[str] = []
+
+        def generate_code(
+            self,
+            scene_plan,
+            feedback="",
+            previous_code="",
+            *,
+            stream=True,
+            renderer=None,
+            continuity_bible=None,
+            inherited_elements_code="",
+            inherited_elements=None,
+            elements_to_remove=None,
+        ):
+            self.inherited.append(inherited_elements_code)
+            self.calls.append((feedback, previous_code))
+            return (
+                "from manim import *\n"
+                "class Demo(Scene):\n"
+                "    def construct(self):\n"
+                "        # KD1_CONTINUITY_EXPORT_BEGIN\n"
+                "        formula = MathTex(r'x^2')\n"
+                "        # KD1_CONTINUITY_EXPORT_END\n"
+                "        self.add(formula)\n"
+            )
+
+    class ContextReviewer(FakeReviewer):
+        def review(self, code, scene_plan, *, renderer=None, continuity_bible=None, **kwargs):
+            return ReviewResult(is_valid=True)
+
+    coder = ContextCoder()
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        coder=coder,
+        reviewer=ContextReviewer(),
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        dry_run=True,
+        outlines=[make_outline(1), make_outline(2)],
+        scene_states={
+            1: SceneState(plan=make_plan(make_outline(1))),
+            2: SceneState(plan=make_plan(make_outline(2))),
+        },
+    )
+
+    orchestrator._run_scheduler(ctx)
+
+    assert coder.inherited[0] == ""
+    assert "formula = MathTex" in coder.inherited[1]
 
 
 # ---------------------------------------------------------------------------

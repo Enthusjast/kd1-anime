@@ -2,14 +2,200 @@
 
 from __future__ import annotations
 
+import ast
 import re
+import textwrap
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kd1_anime.agents.base import BaseAgent
-from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    ExtractedElement,
+    SceneOutline,
+    ScenePlan,
+)
 from kd1_anime.agents.render_context import renderer_guidance
+
+CONTINUITY_EXPORT_BEGIN = "KD1_CONTINUITY_EXPORT_BEGIN"
+CONTINUITY_EXPORT_END = "KD1_CONTINUITY_EXPORT_END"
+_BANNED_EXPORT_NAMES = {
+    "open",
+    "eval",
+    "exec",
+    "compile",
+    "__import__",
+    "system",
+    "popen",
+    "subprocess",
+    "os",
+    "pathlib",
+    "print",
+    "input",
+    "breakpoint",
+    "getattr",
+    "setattr",
+    "delattr",
+    "globals",
+    "locals",
+    "vars",
+}
+
+
+def _call_name(node: ast.Call) -> str:
+    function = node.func
+    if isinstance(function, ast.Name):
+        return function.id
+    if isinstance(function, ast.Attribute):
+        return function.attr
+    return ""
+
+
+def _validate_export_statement(statement: ast.stmt) -> tuple[str, str]:
+    """校验一条导出语句，只允许无副作用的 Mobject 赋值。"""
+
+    if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        raise ValueError("连续性导出区只能包含变量赋值")
+    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+        raise ValueError("连续性导出区的赋值目标必须是单个变量")
+    variable_name = targets[0].id
+    value = statement.value
+    if not isinstance(value, (ast.Call, ast.Name, ast.Attribute)):
+        raise ValueError(f"元素 {variable_name} 的定义不是 Mobject 表达式")
+    for node in ast.walk(statement):
+        if isinstance(node, ast.Call) and _call_name(node) in _BANNED_EXPORT_NAMES:
+            raise ValueError(f"连续性导出区包含禁止调用: {_call_name(node)}")
+        if isinstance(node, ast.Attribute) and node.attr in _BANNED_EXPORT_NAMES:
+            raise ValueError(f"连续性导出区包含禁止属性: {node.attr}")
+        if isinstance(node, ast.Name) and node.id in {"self", "__builtins__"}:
+            raise ValueError("连续性导出区不能引用 self 或运行时内建对象")
+    return variable_name, variable_name
+
+
+def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
+    lines = code.splitlines()
+    begin = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line]
+    end = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line]
+    if not begin and not end:
+        return "", []
+    if len(begin) != 1 or len(end) != 1 or begin[0] >= end[0]:
+        raise ValueError("连续性导出区标记不成对或顺序错误")
+    block_lines = lines[begin[0] + 1 : end[0]]
+    block = textwrap.dedent("\n".join(block_lines)).strip()
+    if not block:
+        return "", []
+    try:
+        tree = ast.parse(block)
+    except SyntaxError as exc:
+        raise ValueError(f"连续性导出区不是合法 Python: {exc}") from exc
+    elements: list[ExtractedElement] = []
+    pending_id = ""
+    block_source_lines = block.splitlines()
+    for statement in tree.body:
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            continue
+        source = ast.get_source_segment(block, statement)
+        if not source:
+            raise ValueError("无法读取连续性导出语句")
+        variable_name, _ = _validate_export_statement(statement)
+        element_id = variable_name
+        # 支持紧邻赋值前的 ``# element_id: ...`` 注释；没有注释时使用变量名。
+        comment_lines = []
+        line_index = max(0, statement.lineno - 2)
+        while line_index >= 0 and block_source_lines[line_index].lstrip().startswith("#"):
+            comment_lines.append(block_source_lines[line_index])
+            line_index -= 1
+        for line in [*comment_lines, *source.splitlines()]:
+            match = re.search(r"element_id\s*:\s*([A-Za-z_][A-Za-z0-9_.-]{0,99})", line)
+            if match:
+                pending_id = match.group(1)
+        if pending_id:
+            element_id = pending_id
+            pending_id = ""
+        elements.append(
+            ExtractedElement(
+                element_id=element_id,
+                variable_name=variable_name,
+                code=source.strip(),
+            )
+        )
+    if len({item.element_id for item in elements}) != len(elements):
+        raise ValueError("连续性导出区包含重复 element_id")
+    return block, elements
+
+
+def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]:
+    """提取 Coder 声明的最终元素定义；无标记时使用安全 AST 降级。"""
+
+    if not code.strip():
+        return "", []
+    try:
+        parsed_tree = ast.parse(code)
+    except SyntaxError as exc:
+        raise ValueError(f"无法提取连续性元素，代码语法错误: {exc}") from exc
+    marker_lines = [
+        index + 1
+        for index, line in enumerate(code.splitlines())
+        if CONTINUITY_EXPORT_BEGIN in line or CONTINUITY_EXPORT_END in line
+    ]
+    if marker_lines:
+        construct_nodes = [
+            node
+            for node in ast.walk(parsed_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "construct"
+        ]
+        if not construct_nodes or not any(
+            all(node.lineno < line <= (node.end_lineno or node.lineno) for line in marker_lines)
+            for node in construct_nodes
+        ):
+            raise ValueError("连续性导出区必须位于 Scene.construct() 内")
+    marked_code, marked_elements = _parse_export_block(code)
+    if marker_lines:
+        return marked_code, marked_elements
+
+    tree = parsed_tree
+    candidates: list[ExtractedElement] = []
+    for node in ast.walk(tree):
+        if (
+            not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            or node.name != "construct"
+        ):
+            continue
+        for statement in node.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = statement.value
+            if not isinstance(value, ast.Call):
+                continue
+            constructor = _call_name(value)
+            if not constructor or constructor.startswith("_"):
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+            variable_name = targets[0].id
+            # 只把首字母大写的 Manim 构造器视为候选，避免把普通数值中间变量
+            # 注入下一场景；完整安全性仍由 validate_manim_code 负责。
+            if not constructor[0].isupper():
+                continue
+            _validate_export_statement(statement)
+            source = ast.get_source_segment(code, statement)
+            if source:
+                candidates.append(
+                    ExtractedElement(
+                        element_id=variable_name,
+                        variable_name=variable_name,
+                        code=source.strip(),
+                    )
+                )
+        break
+    unique: dict[str, ExtractedElement] = {}
+    for item in candidates:
+        unique[item.element_id] = item
+    return "\n".join(item.code for item in unique.values()), list(unique.values())
 
 
 class ContinuityIssue(BaseModel):
@@ -53,6 +239,9 @@ CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查�
 4. persistent_elements 是否在需要时保持、变换或明确退出，没有凭空消失。
 5. transition_in 与上一场景的 transition_out 是否描述同一个视觉交接动作。
 6. 第一场景是否建立初始状态，最后场景是否保留结论并完成收束。
+7. inherited_elements、elements_to_remove、new_elements 的 element_id 是否稳定、唯一且可执行。
+8. 后一场景继承的元素是否确实由前一场景导出，是否存在未经计划的清空、重画或突兀消失。
+9. 所有场景的 global_visual_state 是否完全服从同一份全局颜色、字体、字号、线宽和布局配置。
 
 ## 判定原则
 - 只报告会破坏观众理解或造成明显视觉跳变的问题。
@@ -67,7 +256,7 @@ CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查�
   "issues": [
     {
       "scene_ids": [1, 2],
-      "category": "state|style|math|transition|persistent_element|narrative",
+      "category": "state|style|math|transition|persistent_element|narrative|element_handoff",
       "severity": "minor|major",
       "message": "具体冲突",
       "fix_instruction": "只修改相关场景的哪些字段以及改成什么状态"
@@ -119,6 +308,71 @@ def deterministic_continuity_issues(
         )
 
     for index, plan in enumerate(ordered):
+        if plan.global_visual_state != bible.global_visual_state:
+            issues.append(
+                ContinuityIssue(
+                    scene_ids=[plan.scene_id],
+                    category="style",
+                    message="场景的 global_visual_state 与全片连续性圣经不一致。",
+                    fix_instruction="删除场景自定义视觉配置，逐项使用全片 global_visual_state。",
+                )
+            )
+        declared_groups = {
+            "inherited_elements": [item.element_id for item in plan.inherited_elements],
+            "elements_to_remove": [item.element_id for item in plan.elements_to_remove],
+            "new_elements": [item.element_id for item in plan.new_elements],
+        }
+        inherited_ids = set(declared_groups["inherited_elements"])
+        removal_ids = set(declared_groups["elements_to_remove"])
+        new_ids = set(declared_groups["new_elements"])
+        # 一个元素同时出现在 inherited_elements 和 elements_to_remove 是合法的：
+        # 它表示“接管后在本场景明确退出”。真正需要拦截的是同一组内部重复，
+        # 或者 inherited/new 之间的冲突声明。
+        same_group_duplicates = {
+            element_id
+            for ids in declared_groups.values()
+            for element_id in set(ids)
+            if ids.count(element_id) > 1
+        }
+        conflicting_ids = (inherited_ids & new_ids) | (removal_ids & new_ids)
+        if same_group_duplicates or conflicting_ids:
+            issues.append(
+                ContinuityIssue(
+                    scene_ids=[plan.scene_id],
+                    category="persistent_element",
+                    message=(
+                        "同一场景的元素声明存在重复或冲突 element_id: "
+                        + ", ".join(sorted(same_group_duplicates | conflicting_ids))
+                    ),
+                    fix_instruction=(
+                        "每个元素在同一列表中只能出现一次；inherited 与 elements_to_remove "
+                        "可以共享 ID 表示接管后退出，但不能同时出现在 new_elements 中。"
+                    ),
+                )
+            )
+        if plan.scene_id == 1 and plan.inherited_elements:
+            issues.append(
+                ContinuityIssue(
+                    scene_ids=[plan.scene_id],
+                    category="state",
+                    message="第一场景声明了 inherited_elements，但没有上一场景可以接管。",
+                    fix_instruction="清空第一场景 inherited_elements，并将这些对象移到 new_elements。",
+                )
+            )
+        current_inherited_ids = inherited_ids
+        unknown_removals = removal_ids - current_inherited_ids
+        if unknown_removals:
+            issues.append(
+                ContinuityIssue(
+                    scene_ids=[plan.scene_id],
+                    category="persistent_element",
+                    message=(
+                        "elements_to_remove 包含本场景没有接管的元素: "
+                        + ", ".join(sorted(unknown_removals))
+                    ),
+                    fix_instruction="只移除 inherited_elements 中真实存在的 element_id。",
+                )
+            )
         if not plan.opening_state:
             issues.append(
                 ContinuityIssue(
@@ -170,6 +424,25 @@ def deterministic_continuity_issues(
         if index + 1 >= len(ordered):
             continue
         next_plan = ordered[index + 1]
+        closing_ids = {
+            item.element_id
+            for item in (*plan.inherited_elements, *plan.new_elements)
+            if item.required and item.element_id not in removal_ids
+        }
+        next_inherited_ids = {item.element_id for item in next_plan.inherited_elements}
+        missing_ids = next_inherited_ids - closing_ids
+        if missing_ids:
+            issues.append(
+                ContinuityIssue(
+                    scene_ids=[plan.scene_id, next_plan.scene_id],
+                    category="persistent_element",
+                    message=(
+                        f"Scene {next_plan.scene_id} 继承了上一场景未声明保留的元素: "
+                        f"{', '.join(sorted(missing_ids))}。"
+                    ),
+                    fix_instruction="在前一场景的 new_elements/结束状态中保留这些 element_id。",
+                )
+            )
         if (
             plan.closing_state
             and next_plan.opening_state

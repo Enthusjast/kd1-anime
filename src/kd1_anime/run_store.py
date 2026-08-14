@@ -16,7 +16,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    ExtractedElement,
+    SceneOutline,
+    ScenePlan,
+)
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
 from kd1_anime.rendering import (
@@ -115,6 +120,9 @@ class StoredSceneState(BaseModel):
     give_up: bool = False
     failed: bool = False
     failure_reason: str = Field(default="", max_length=50_000)
+    inherited_elements_code: str = Field(default="", max_length=30_000)
+    exported_elements_code: str = Field(default="", max_length=30_000)
+    exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
 
 
 class RunManifest(BaseModel):
@@ -151,6 +159,7 @@ class RunManifest(BaseModel):
     incremental: bool = False
     base_run_id: str | None = Field(default=None, pattern=r"^(?:\d{8}-\d{6}-[0-9a-f]{8})?$")
     eval_round: int = Field(default=0, ge=0)
+    continuity_rebuild_required: bool = False
 
     @field_validator("run_id")
     @classmethod

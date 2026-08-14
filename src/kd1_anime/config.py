@@ -116,6 +116,8 @@ class Settings(BaseSettings):
     MANIM_OPENGL_PLATFORM: Literal["egl", "glx"] = "egl"
     ALLOW_PARTIAL_OUTPUT: bool = False
     OVERWRITE_OUTPUT: bool = False
+    TRANSITION_TYPE: Literal["fade"] = "fade"
+    TRANSITION_DURATION: float = Field(default=0.5, gt=0.0, le=5.0)
 
     # --- 路径 ---
     WORKSPACE_DIR: Path = Path("workspace")

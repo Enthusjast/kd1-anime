@@ -5,6 +5,7 @@ import pytest
 import kd1_anime.media.merger as merger_module
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.media.merger import VideoMerger
+from kd1_anime.rendering import RenderProfile, VideoMetadata
 
 
 @pytest.fixture(autouse=True)
@@ -167,3 +168,49 @@ def test_invalid_temporary_video_never_replaces_existing_output(monkeypatch, tmp
     else:
         raise AssertionError("expected RuntimeError")
     assert output.read_bytes() == b"old"
+
+
+def test_multi_video_merge_uses_xfade_and_expected_offsets(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    output = tmp_path / "output.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    profile = RenderProfile(
+        renderer="cairo", quality="l", pixel_width=320, pixel_height=180, frame_rate=30
+    )
+    monkeypatch.setattr(settings, "TRANSITION_DURATION", 0.5)
+    monkeypatch.setattr(
+        merger_module,
+        "verify_video",
+        lambda path, render_profile: VideoMetadata(
+            size_bytes=path.stat().st_size,
+            duration_seconds=2.0 if path == first else 3.0,
+            width=render_profile.pixel_width,
+            height=render_profile.pixel_height,
+            frame_rate=render_profile.frame_rate,
+        ),
+    )
+    merger = VideoMerger()
+    captured = {}
+
+    def fake_ffmpeg(cmd, temporary_output, label):
+        captured["cmd"] = cmd
+        captured["label"] = label
+        temporary_output.write_bytes(b"merged")
+        return True
+
+    monkeypatch.setattr(merger, "_run_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(merger, "_verify_output", lambda *args, **kwargs: True)
+
+    result = merger.merge([first, second], output, replace_existing=True, render_profile=profile)
+
+    command = " ".join(captured["cmd"])
+    assert result == output
+    assert captured["label"] == "xfade"
+    assert "xfade=transition=fade" in command
+    assert "duration=0.500000" in command
+    assert "offset=1.500000" in command
+    assert "concat" not in command

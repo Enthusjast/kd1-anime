@@ -13,6 +13,9 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "E 类问题一律不阻塞" in REVIEWER_SYSTEM_PROMPT
     assert "fixes 必须可匹配" in REVIEWER_SYSTEM_PROMPT
     assert "相对定位" in REVIEWER_SYSTEM_PROMPT
+    assert "KD1_CONTINUITY_EXPORT_BEGIN" in REVIEWER_SYSTEM_PROMPT
+    assert "elements_to_remove" in REVIEWER_SYSTEM_PROMPT
+    assert "GlobalVisualState" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_severity_is_closed_enum():

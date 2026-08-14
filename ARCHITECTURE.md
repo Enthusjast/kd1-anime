@@ -5,7 +5,7 @@
 ## 1. 设计目标
 
 - 使用原生 Python、Pydantic 和显式有限状态机，不引入重型 Agent 框架。
-- 让每个场景独立完成分镜、编码、审查、Slurm 渲染与修复。
+- 让场景分镜可并行生成、代码按顺序交接，随后独立完成 Slurm 渲染与修复。
 - 对模型输出同时执行 LLM 语义审查与确定性 AST 校验。
 - 让每次运行拥有隔离的代码、日志、媒体和输出目录。
 - 用可验证的产物身份避免旧视频、错误配置和错误 Job 被误复用。
@@ -29,7 +29,7 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── cluster/slurm.py        sbatch、状态查询、产物验证、超时取消
        ├── rendering.py            RenderProfile、ffprobe、SceneArtifact
        ├── resources.py            跨批量项目的进程级 LLM/Slurm 配额
-       ├── media/merger.py         精确输入列表、FFmpeg 原子拼接
+       ├── media/merger.py         精确输入列表、FFmpeg xfade/acrossfade 原子合并
        ├── eval/                   代码/效率评估与可选多帧视觉评估
        └── run_store.py            Manifest v2、原子检查点、运行锁
 ```
@@ -41,15 +41,19 @@ kd1_anime.orchestrator ───── callback events ────────�
 ```text
 全局：INIT → PLANNING
 
-每个 Scene 独立线程：
-DETAILING → CODING → REVIEWING → DISPATCHING → MONITORING
-                         ▲                         │
-                         └──────── FIXING ◀────────┘
+分镜屏障：所有 Scene 并行 DETAILING → 全片连续性审查
+
+顺序代码屏障：
+Scene 1 CODING → REVIEWING → Scene 2 CODING → REVIEWING → …
+
+渲染阶段：各 Scene 并行 DISPATCHING → MONITORING
+                                      ▲              │
+                                      └── FIXING ◀────┘
 
 全部线程结束：MERGING → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-FSM 枚举同时用于清单检查点和 TUI 阶段提示。实际执行不是“所有场景完成一个阶段后再进入下一阶段”：概要完成后，所有场景的导演分镜会并行生成；通过全片连续性屏障后，一个 Scene 可以在另一个 Scene 仍编码、渲染或修复时继续推进。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
+FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行，但编码/审查按场景顺序执行：Scene N 审查通过后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，而不是仅凭 Planner 描述猜测的状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 
@@ -61,10 +65,11 @@ Planner 使用分层结构化输出：
 
 1. `plan_outline()` 生成短小 `SceneOutline` 列表，并按返回顺序规范化 scene ID 为 `1..N`。
 2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
-3. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state 和转场合同。
+3. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state、结构化 `inherited_elements` / `elements_to_remove` / `new_elements` 和转场合同。
 4. 所有 Detail 完成后执行确定性检查和一次全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。
 
 Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。用户需求被明确标记为不可信数据，不能改变系统规则。
+`GlobalVisualState` 固定全片颜色、字体、字号、线宽、布局锚点和镜头语言；每个 `ScenePlan` 都携带同一份只读配置。`VisualElementState` 为跨场景对象分配稳定的 `element_id`。
 
 ### 3.2 CODING / REVIEWING
 
@@ -84,7 +89,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Scene 类必须实现 `construct()`；
 - 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若校验失败，确定性反馈会交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全和分镜符合度。结构化输出只允许：
+若校验失败，确定性反馈会交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内只允许纯 Mobject 定义；Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接。结构化输出只允许：
 
 - valid / `info`：通过；
 - `minor`：至少一条可精确唯一匹配的查找替换；
@@ -92,7 +97,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 
 审查受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Reviewer；major 反馈仍回到 CODING，绝不直接提交。
 
-连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。
+连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除旧交接代码并按顺序重新编码；恢复旧清单时会优先重新提取导出区，提取失败不会静默复用下游状态。
 
 ### 3.3 DISPATCHING / MONITORING
 
@@ -150,10 +155,10 @@ VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifa
 
 按 scene ID 合并：
 
-1. 尝试 FFmpeg concat stream copy；
-2. 参数不兼容时回退 H.264/AAC；
-3. 回退使用等比例缩放和 padding；
-4. 写临时文件，先用 ffprobe 验证临时视频，再原子替换最终输出；
+1. 单场景直接 remux；多场景使用 FFmpeg `xfade=transition=fade` 链式交叉淡化，默认 0.5 秒；
+2. 输入先统一帧率、分辨率、像素格式和 SAR；存在音频时同步使用 `acrossfade`，混合输入为无音频场景补静音；
+3. 用 ffprobe 验证输入和临时输出的分辨率、帧率、音频状态与转场后时长；
+4. 写临时文件，验证成功后原子替换最终输出；
 5. 自定义输出默认拒绝覆盖。
 
 默认 `ALLOW_PARTIAL_OUTPUT=false`。增量运行仍完成新代码的生成、校验和审查；只有代码哈希、RenderProfile 哈希和旧视频哈希全部一致时才复用旧 `SceneArtifact`，不会创建伪 Job ID。

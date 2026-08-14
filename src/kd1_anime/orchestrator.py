@@ -24,12 +24,15 @@ from kd1_anime.agents.continuity import (
     ContinuityIssue,
     ContinuityReviewerAgent,
     deterministic_continuity_issues,
+    extract_continuity_elements,
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    ExtractedElement,
     PlannerAgent,
     SceneOutline,
     ScenePlan,
+    VisualElementState,
 )
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewResult
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
@@ -149,6 +152,10 @@ class SceneState:
     identical_error_count: int = 0
 
     reviewed: bool = False
+    # Scene N 的最终导出状态，作为 Scene N+1 的唯一代码级交接来源。
+    inherited_elements_code: str = ""
+    exported_elements_code: str = ""
+    exported_elements: list[ExtractedElement] = field(default_factory=list)
 
 
 @dataclass
@@ -181,6 +188,8 @@ class PipelineContext:
     # 评估-改进循环支持
     eval_round: int = 0
     scenes_to_improve: list[int] = field(default_factory=list)
+    # 渲染阶段上游 AutoFix 改变代码后，需要停止当前渲染批次并重建下游交接。
+    continuity_rebuild_required: bool = False
 
 
 class Orchestrator:
@@ -297,6 +306,9 @@ class Orchestrator:
                     rewrite_feedback=scene.rewrite_feedback,
                     last_error_fp=scene.last_error_fp,
                     identical_error_count=scene.identical_error_count,
+                    inherited_elements_code=scene.inherited_elements_code,
+                    exported_elements_code=scene.exported_elements_code,
+                    exported_elements=scene.exported_elements,
                 )
             ctx.manifest_revision = (
                 max(
@@ -331,6 +343,7 @@ class Orchestrator:
                 incremental=ctx.incremental,
                 base_run_id=ctx.base_run_id,
                 eval_round=ctx.eval_round,
+                continuity_rebuild_required=ctx.continuity_rebuild_required,
             )
             write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
             self._manifest = manifest
@@ -432,6 +445,9 @@ class Orchestrator:
                 rewrite_feedback=getattr(stored, "rewrite_feedback", ""),
                 last_error_fp=getattr(stored, "last_error_fp", ""),
                 identical_error_count=getattr(stored, "identical_error_count", 0),
+                inherited_elements_code=getattr(stored, "inherited_elements_code", ""),
+                exported_elements_code=getattr(stored, "exported_elements_code", ""),
+                exported_elements=list(getattr(stored, "exported_elements", [])),
             )
         context = PipelineContext(
             user_prompt=manifest.user_prompt,
@@ -454,6 +470,7 @@ class Orchestrator:
             render_profile=manifest.render_profile,
             manifest_revision=manifest.revision,
             eval_round=manifest.eval_round,
+            continuity_rebuild_required=getattr(manifest, "continuity_rebuild_required", False),
         )
         if manifest.incremental and manifest.base_run_id:
             context.base_manifest = RunRepository(settings.WORKSPACE_DIR).load(manifest.base_run_id)
@@ -468,6 +485,9 @@ class Orchestrator:
         stream: bool = False,
         renderer: str | None = None,
         continuity_bible: ContinuityBible | None = None,
+        inherited_elements_code: str = "",
+        inherited_elements: list[VisualElementState] | None = None,
+        elements_to_remove: list[VisualElementState] | None = None,
     ) -> tuple[str, str]:
         agent = CoderAgent()
         current_feedback = feedback
@@ -482,6 +502,12 @@ class Orchestrator:
             }
             if continuity_bible is not None:
                 code_kwargs["continuity_bible"] = continuity_bible
+            if inherited_elements_code:
+                code_kwargs["inherited_elements_code"] = inherited_elements_code
+            if inherited_elements:
+                code_kwargs["inherited_elements"] = inherited_elements
+            if elements_to_remove:
+                code_kwargs["elements_to_remove"] = elements_to_remove
             code = agent.generate_code(
                 plan,
                 **code_kwargs,
@@ -862,6 +888,13 @@ class Orchestrator:
                     raise KeyboardInterrupt
                 if ctx.dry_run:
                     break
+                if ctx.continuity_rebuild_required:
+                    # 上游 AutoFix 已经停止本轮渲染并清空下游；下一轮从
+                    # 顺序编码屏障重新建立继承代码，再恢复并行渲染。
+                    ctx.continuity_rebuild_required = False
+                    self._stop_event.clear()
+                    self._checkpoint(ctx, State.CODING)
+                    continue
                 self._merge(ctx)
                 improve = self._eval(ctx)
 
@@ -1191,23 +1224,29 @@ class Orchestrator:
             self._emitted_phases.clear()
 
         # 正式运行先完成所有场景的 Detail，再做一次全片连续性审查；通过后才
-        # 进入编码/审查/渲染。这样并行仍然保留，但不会让某个场景在相邻场景
-        # 还没完成分镜时就把不兼容的视觉状态固化成代码。
+        # 进入编码/审查/渲染。编码/审查必须顺序执行，因为 Scene N 的真实
+        # 最终 Mobject 定义要作为 Scene N+1 的输入；渲染和监控仍然并行。
+        self._run_detail_barrier(ctx)
+        if self._checkpoint_error is not None:
+            raise RuntimeError(
+                f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
+            ) from self._checkpoint_error
         if ctx.continuity_bible is not None and ctx.continuity_review_status in {
             "pending",
             "reviewing",
         }:
-            self._run_detail_barrier(ctx)
-            if self._checkpoint_error is not None:
-                raise RuntimeError(
-                    f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
-                ) from self._checkpoint_error
             if not self._cancel_requested.is_set():
                 self._run_continuity_review(ctx)
             if self._checkpoint_error is not None:
                 raise RuntimeError(
                     f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
                 ) from self._checkpoint_error
+
+        self._run_code_review_barrier(ctx)
+        if self._checkpoint_error is not None:
+            raise RuntimeError(
+                f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
+            ) from self._checkpoint_error
 
         threads: list[threading.Thread] = []
         for scene_id, state in sorted(ctx.scene_states.items()):
@@ -1229,6 +1268,61 @@ class Orchestrator:
             raise RuntimeError(
                 f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
             ) from self._checkpoint_error
+
+    def _run_code_review_barrier(self, ctx: PipelineContext) -> None:
+        """按 Scene ID 顺序完成编码、审查，并固定代码级连续性上下文。"""
+
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            if self._stop_event.is_set() or state.failed or state.give_up:
+                continue
+            try:
+                previous_context = state.inherited_elements_code
+                self._prepare_inherited_context(ctx, scene_id, state)
+                if previous_context != state.inherited_elements_code and state.code:
+                    # 恢复旧运行或上游重写后，不能继续使用基于旧交接状态生成的代码。
+                    if state.slurm_job is not None and not state.rendered:
+                        if not self.slurm.cancel_job(state.slurm_job.job_id):
+                            raise RuntimeError(
+                                f"Scene {scene_id} 的旧 Slurm Job {state.slurm_job.job_id} "
+                                "仍在使用旧连续性上下文，取消失败，禁止重复提交"
+                            )
+                        state.slurm_job.cancelled = True
+                        state.slurm_job.status = "CANCELLED"
+                        state.slurm_job.failure_reason = "上游场景连续性状态变化，已取消旧作业"
+                    state.code = ""
+                    state.class_name = ""
+                    state.reviewed = False
+                    state.rewrite_feedback = ""
+                    state.artifact = None
+                    state.slurm_job = None
+                    state.exported_elements_code = ""
+                    state.exported_elements = []
+                    self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", "")
+                # 已有成功产物仍需补齐导出状态，但不能因恢复而重新调用 LLM。
+                if state.rendered and state.code:
+                    if not state.exported_elements_code:
+                        self._refresh_scene_export(state)
+                    self._checkpoint(ctx, State.REVIEWING)
+                    continue
+                while not state.reviewed:
+                    if self._stop_event.is_set() or state.failed or state.give_up:
+                        break
+                    if not state.code or state.rewrite_feedback:
+                        self._phase_emit("coding")
+                        self._scene_code(ctx, scene_id, state)
+                    self._phase_emit("reviewing")
+                    self._scene_review(ctx, scene_id, state)
+                if state.reviewed and state.code and not state.exported_elements_code:
+                    self._refresh_scene_export(state)
+                self._checkpoint(ctx, State.REVIEWING)
+            except Exception as exc:
+                with self._state_lock:
+                    self._mark_failed(state, f"Scene {scene_id} 编码/审查失败: {exc}")
+                    try:
+                        self._checkpoint(ctx, State.REVIEWING)
+                    except Exception as checkpoint_error:
+                        self._record_checkpoint_failure(checkpoint_error)
+                self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
 
     def _run_detail_barrier(self, ctx: PipelineContext) -> None:
         """并行完成尚未生成的场景分镜，作为连续性审查的屏障。"""
@@ -1413,7 +1507,7 @@ class Orchestrator:
                 self._emit("scene_detailed", scene_id=scene_id, title=revised_plan.title)
 
     def _scene_worker(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
-        """单个 Scene 的完整流水线: 分镜→编码→审查→提交→渲染→(修复→重新提交)。"""
+        """执行已通过顺序代码屏障的 Scene 渲染→修复→重新提交流程。"""
         acquired = scene_id in self._reserved_existing_scenes
         try:
             if self._stop_event.is_set():
@@ -1557,6 +1651,57 @@ class Orchestrator:
             self._checkpoint(ctx, State.DETAILING)
         self._emit("scene_detailed", scene_id=scene_id, title=plan.title)
 
+    def _prepare_inherited_context(
+        self, ctx: PipelineContext, scene_id: int, state: SceneState
+    ) -> None:
+        """为当前场景固定上一场景的代码级交接，恢复旧运行时按需提取。"""
+
+        if scene_id <= 1:
+            state.inherited_elements_code = ""
+            return
+        previous = ctx.scene_states.get(scene_id - 1)
+        if previous is None:
+            state.inherited_elements_code = ""
+            ctx.continuity_warnings.append(
+                f"Scene {scene_id} 缺少上一场景状态，编码将不带代码级继承上下文。"
+            )
+            return
+        current_code_hash = sha256_text(previous.code) if previous.code else ""
+        export_hashes_match = bool(previous.exported_elements) and all(
+            item.source_code_sha256 in {"", current_code_hash}
+            for item in previous.exported_elements
+        )
+        if previous.code and (not previous.exported_elements_code or not export_hashes_match):
+            exported_code, exported_elements = extract_continuity_elements(previous.code)
+            previous.exported_elements_code = exported_code
+            previous.exported_elements = [
+                item.model_copy(
+                    update={
+                        "source_scene_id": previous.plan.scene_id,
+                        "source_code_sha256": current_code_hash,
+                    }
+                )
+                for item in exported_elements
+            ]
+        state.inherited_elements_code = previous.exported_elements_code
+
+    @staticmethod
+    def _refresh_scene_export(state: SceneState) -> None:
+        """从审查通过的最终代码提取下一场景可复用的纯定义。"""
+
+        exported_code, exported_elements = extract_continuity_elements(state.code)
+        state.exported_elements_code = exported_code
+        code_hash = sha256_text(state.code)
+        state.exported_elements = [
+            item.model_copy(
+                update={
+                    "source_scene_id": state.plan.scene_id,
+                    "source_code_sha256": code_hash,
+                }
+            )
+            for item in exported_elements
+        ]
+
     def _scene_code(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         rewriting = bool(state.rewrite_feedback)
         self._emit(
@@ -1573,6 +1718,9 @@ class Orchestrator:
                 stream=False,
                 renderer=ctx.render_profile.renderer,
                 continuity_bible=ctx.continuity_bible,
+                inherited_elements_code=state.inherited_elements_code,
+                inherited_elements=state.plan.inherited_elements,
+                elements_to_remove=state.plan.elements_to_remove,
             )
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
@@ -1584,11 +1732,22 @@ class Orchestrator:
             state.infra_retries = 0
             state.artifact = None
             state.rendered = False
+            state.exported_elements_code = ""
+            state.exported_elements = []
             self._checkpoint(ctx, State.CODING)
         self._emit("scene_coded", scene_id=scene_id, file_path=str(path))
 
     def _scene_review(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         if settings.SKIP_REVIEW:
+            try:
+                self._refresh_scene_export(state)
+            except ValueError as exc:
+                with self._state_lock:
+                    state.rewrite_feedback = f"连续性导出区无效: {exc}"
+                    state.reviewed = False
+                    self._checkpoint(ctx, State.REVIEWING)
+                self._emit("scene_review_fail", scene_id=scene_id, severity="major")
+                return
             with self._state_lock:
                 state.reviewed = True
                 self._apply_incremental_for_scene(ctx, scene_id, state)
@@ -1603,7 +1762,18 @@ class Orchestrator:
             review_kwargs = {"renderer": ctx.render_profile.renderer}
             if ctx.continuity_bible is not None:
                 review_kwargs["continuity_bible"] = ctx.continuity_bible
+            if state.inherited_elements_code:
+                review_kwargs["inherited_elements_code"] = state.inherited_elements_code
             result = reviewer.review(state.code, state.plan, **review_kwargs)
+        if result.is_valid:
+            try:
+                self._refresh_scene_export(state)
+            except ValueError as exc:
+                result = ReviewResult(
+                    is_valid=False,
+                    severity="major",
+                    feedback=f"连续性导出区无效，无法交接给下一场景: {exc}",
+                )
         self._apply_review_result(ctx, scene_id, state, result)
 
     def _scene_submit(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
@@ -1695,7 +1865,11 @@ class Orchestrator:
         monitor = JobMonitor(self.slurm)
         monitor.add_job(job)
         while monitor.pending:
-            if self._cancel_requested.is_set() or self._stop_event.is_set():
+            if (
+                self._cancel_requested.is_set()
+                or self._stop_event.is_set()
+                or ctx.continuity_rebuild_required
+            ):
                 return False
             previous_started_at = job.started_at
             if monitor.poll_once():
@@ -1706,6 +1880,8 @@ class Orchestrator:
                 with self._state_lock:
                     self._checkpoint(ctx, State.MONITORING)
             time.sleep(settings.MONITOR_POLL_INTERVAL)
+        if ctx.continuity_rebuild_required:
+            return False
         ok = monitor.results.get(job.job_id)
         if ok is None:
             with self._state_lock:
@@ -1804,6 +1980,62 @@ class Orchestrator:
             excerpt = excerpt[-600:]
         return f"{base}\n最近错误日志(尾部):\n{excerpt}"
 
+    def _request_continuity_rebuild(self, ctx: PipelineContext, scene_id: int) -> None:
+        """上游 AutoFix 改码后，安全取消并清空所有下游代码/产物。"""
+
+        downstream = [
+            (sid, state)
+            for sid, state in sorted(ctx.scene_states.items())
+            if sid > scene_id and not state.failed and not state.give_up
+        ]
+        if not downstream:
+            return
+        for sid, state in downstream:
+            job = state.slurm_job
+            if job is not None and not state.rendered:
+                # 监控线程可能刚把作业标成终态，但还没来得及把
+                # ``state.rendered`` 写回。对已经结束的作业不再调用 scancel，
+                # 否则集群会返回 Invalid job id，进而把一个本可安全重建的
+                # 下游场景误判为“取消失败”。
+                terminal = job.cancelled or job.status in {
+                    "COMPLETED",
+                    "CANCELLED",
+                    *FAILURE_STATES,
+                }
+                if not terminal and not self.slurm.cancel_job(job.job_id):
+                    with self._state_lock:
+                        state.give_up = True
+                        state.failed = True
+                        state.failure_reason = (
+                            f"Scene {sid} 的旧 Job {job.job_id} 使用旧连续性上下文，"
+                            "取消失败，禁止自动重提"
+                        )
+                    continue
+                if not terminal:
+                    job.cancelled = True
+                    job.status = "CANCELLED"
+                    job.failure_reason = "上游场景代码变化，连续性重建时取消"
+            with self._state_lock:
+                state.code = ""
+                state.class_name = ""
+                state.reviewed = False
+                state.rewrite_feedback = ""
+                state.slurm_job = None
+                state.artifact = None
+                state.rendered = False
+                state.give_up = False
+                state.failed = False
+                state.failure_reason = ""
+                state.inherited_elements_code = ""
+                state.exported_elements_code = ""
+                state.exported_elements = []
+                self._write_private(ctx.paths.scenes / f"scene_{sid}.py", "")
+        ctx.continuity_rebuild_required = True
+        ctx.continuity_warnings.append(
+            f"Scene {scene_id} AutoFix 修改了代码，已请求重建后续场景的连续性上下文。"
+        )
+        self._stop_event.set()
+
     def _scene_fix(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         self._phase_emit("fixing")
         job = state.slurm_job
@@ -1889,9 +2121,13 @@ class Orchestrator:
                     stream=False,
                     renderer=ctx.render_profile.renderer,
                     continuity_bible=ctx.continuity_bible,
+                    inherited_elements_code=state.inherited_elements_code,
+                    inherited_elements=state.plan.inherited_elements,
+                    elements_to_remove=state.plan.elements_to_remove,
                 )
             else:
                 class_name = validation.scene_classes[0]
+        code_changed = candidate != state.code
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
         with self._state_lock:
             state.code = candidate
@@ -1902,7 +2138,11 @@ class Orchestrator:
             state.slurm_job = None
             state.artifact = None
             state.rendered = False
+            state.exported_elements_code = ""
+            state.exported_elements = []
             self._checkpoint(ctx, State.FIXING)
+        if code_changed:
+            self._request_continuity_rebuild(ctx, scene_id)
         self._emit(
             "scene_coded",
             scene_id=scene_id,

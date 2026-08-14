@@ -3,7 +3,12 @@
 from typing import Literal
 
 from kd1_anime.agents.base import BaseAgent
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    GlobalVisualState,
+    ScenePlan,
+    VisualElementState,
+)
 from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
     renderer_guidance,
@@ -57,6 +62,21 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   交给下一场景。persistent_elements 不能凭空改名、改色或消失。
 - transition_in/out 必须落实为具体对象和动作，禁止只写“自然过渡”“保持一致”等空泛实现。
 
+## 强制上下文继承规则（不可省略）
+- 如果收到 `[Inherited Elements Code]`，必须在 `construct()` 开头（完成必要的全局颜色映射和 TexTemplate 初始化后）重新定义其中的每一个元素；
+  不得把上一场景完整文件复制过来，也不得只用同名文字代替 Mobject。
+- 必须保留每个元素的 `element_id` 和语义状态。需要改变位置、内容、大小、颜色或形状时，
+  优先对已定义对象使用 `Transform`/`ReplacementTransform`，不得无理由删除后重画。
+- 只有 `[Elements To Remove]` 明确列出的对象才能 `FadeOut`；持续元素在场景结尾必须真实存在，
+  并重新写入连续性导出区，交给下一个场景。
+- `[Global Visual State]` 是只读配置。所有颜色、字体、字号、线宽和布局锚点必须由其中的
+  语义变量决定；建议在 construct() 初始化 `COLORS`/`FONTS` 映射后统一引用，不要在场景中另造一套颜色或字体常量。
+- 必须输出以下连续性导出区。区内只能包含无副作用的 Mobject 定义，不能出现 `self.play`、
+  `self.add`、文件/网络调用或动态执行：
+  `# KD1_CONTINUITY_EXPORT_BEGIN` 到 `# KD1_CONTINUITY_EXPORT_END`。
+- 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；
+  不需要交给下一场景的临时对象不得导出。
+
 ## 代码骨架模板
 ```python
 from manim import *
@@ -67,8 +87,12 @@ class Scene1(Scene):
         tex_template.add_to_preamble(r"\usepackage{ctex}")
         config.tex_template = tex_template
 
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: title
         title = Tex(r"标题", tex_template=tex_template).to_edge(UP)
+        # element_id: formula
         formula = MathTex(r"a^2+b^2=c^2", tex_template=tex_template)
+        # KD1_CONTINUITY_EXPORT_END
         formula.next_to(title, DOWN, buff=0.8)
         self.play(Write(title), run_time=1)
         self.play(Write(formula), run_time=1.5)
@@ -110,6 +134,10 @@ class CoderAgent(BaseAgent):
         stream: bool = True,
         renderer: Literal["cairo", "opengl"] | None = None,
         continuity_bible: ContinuityBible | None = None,
+        inherited_elements_code: str = "",
+        inherited_elements: list[VisualElementState] | None = None,
+        elements_to_remove: list[VisualElementState] | None = None,
+        global_visual_state: GlobalVisualState | None = None,
     ) -> str:
         self._log(f"正在为 Scene {scene_plan.scene_id} [{scene_plan.title}] 生成代码...")
         user_msg = f"""## 场景导演分镜
@@ -147,6 +175,42 @@ class CoderAgent(BaseAgent):
             user_msg += f"""
 ### 全片连续性圣经（只读约束）
 {continuity_bible.model_dump_json(indent=2)}
+"""
+        visual_state = global_visual_state or scene_plan.global_visual_state
+        user_msg += f"""
+### Global Visual State（只读配置）
+```json
+{visual_state.model_dump_json(indent=2)}
+```
+所有颜色、字体、字号、线宽和布局锚点必须从这份配置派生。
+"""
+        if inherited_elements_code:
+            user_msg += f"""
+### [Inherited Elements Code]
+以下是上一场景最终保留的纯 Mobject 定义。请在 construct() 开头重新定义并接管它们：
+```python
+{inherited_elements_code}
+```
+### [/Inherited Elements Code]
+"""
+        inherited = (
+            inherited_elements if inherited_elements is not None else scene_plan.inherited_elements
+        )
+        removals = (
+            elements_to_remove if elements_to_remove is not None else scene_plan.elements_to_remove
+        )
+        user_msg += f"""
+### [Inherited Elements State]
+{[item.model_dump(mode="json") for item in inherited]}
+### [/Inherited Elements State]
+
+### [Elements To Remove]
+{[item.model_dump(mode="json") for item in removals]}
+### [/Elements To Remove]
+
+### [New Elements]
+{[item.model_dump(mode="json") for item in scene_plan.new_elements]}
+### [/New Elements]
 """
         if previous_code:
             user_msg += f"""

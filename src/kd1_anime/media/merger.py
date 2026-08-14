@@ -6,7 +6,6 @@ import fcntl
 import os
 import shutil
 import subprocess
-import tempfile
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +14,7 @@ from rich.console import Console
 
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
-from kd1_anime.rendering import RenderProfile, sha256_file, verify_video
+from kd1_anime.rendering import RenderProfile, VideoMetadata, sha256_file, verify_video
 
 console = Console()
 
@@ -24,7 +23,7 @@ class VideoMerger:
     @staticmethod
     @contextmanager
     def _output_lock(output: Path):
-        """锁定最终输出目标，避免两个独立进程同时 concat/替换同一文件。"""
+        """锁定最终输出目标，避免两个独立进程同时转场合并/替换同一文件。"""
 
         lock_path = output.with_name(f".{output.name}.lock")
         if lock_path.is_symlink():
@@ -160,86 +159,156 @@ class VideoMerger:
             f".{output.stem}.{uuid4().hex[:8]}.tmp{output.suffix or '.mp4'}"
         )
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            prefix="kd1-anime-concat-",
-            suffix=".txt",
-            dir=output.parent,
-            delete=False,
-        ) as filelist_handle:
-            filelist = Path(filelist_handle.name)
-            for video in video_paths:
-                safe = str(video.resolve()).replace("'", "'\\''")
-                filelist_handle.write(f"file '{safe}'\n")
-
         try:
-            copy_cmd = [
+            if len(resolved_inputs) == 1:
+                # 单场景不需要转场，直接 remux；多场景一律走 xfade，避免
+                # 多场景不能回退到无转场的直接拼接。
+                single_cmd = [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(resolved_inputs[0]),
+                    "-c",
+                    "copy",
+                    str(temporary_output),
+                ]
+                if self._run_ffmpeg(
+                    single_cmd, temporary_output, "single-video"
+                ) and self._verify_output(temporary_output, profile, "single-video"):
+                    temporary_output.replace(output)
+                    output.chmod(0o600)
+                    return output
+                raise RuntimeError("FFmpeg 拼接失败（单视频处理失败）")
+
+            metadata = [verify_video(path, profile) for path in resolved_inputs]
+            xfade_cmd, expected_audio, expected_duration = self._build_xfade_command(
                 ffmpeg,
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(filelist),
-                "-c",
-                "copy",
-                str(temporary_output),
-            ]
-            if self._run_ffmpeg(copy_cmd, temporary_output, "stream copy") and self._verify_output(
-                temporary_output, profile, "stream copy"
+                resolved_inputs,
+                metadata,
+                profile,
+                temporary_output,
+            )
+            if self._run_ffmpeg(xfade_cmd, temporary_output, "xfade") and self._verify_output(
+                temporary_output,
+                profile,
+                "xfade",
+                expected_audio=expected_audio,
+                expected_duration=expected_duration,
             ):
                 temporary_output.replace(output)
                 output.chmod(0o600)
                 return output
+            raise RuntimeError("FFmpeg xfade 拼接失败")
+        finally:
             with suppress(OSError):
                 temporary_output.unlink(missing_ok=True)
 
-            width = profile.pixel_width
-            height = profile.pixel_height
-            fps = profile.frame_rate
-            video_filter = (
-                f"fps={fps},"
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-                "setsar=1,format=yuv420p"
+    @staticmethod
+    def _build_xfade_command(
+        ffmpeg: str,
+        inputs: list[Path],
+        metadata: list[VideoMetadata],
+        profile: RenderProfile,
+        output: Path,
+    ) -> tuple[list[str], bool, float]:
+        """构造链式 xfade/acrossfade 命令，并返回音频和时长预期。"""
+
+        if len(inputs) < 2:
+            raise ValueError("xfade 至少需要两个输入视频")
+        if len(inputs) != len(metadata):
+            raise ValueError("输入视频与视频元数据数量不一致")
+        transition = min(
+            settings.TRANSITION_DURATION, min(item.duration_seconds for item in metadata) / 2
+        )
+        if transition <= 0.01:
+            raise RuntimeError("视频时长过短，无法安全添加转场")
+        width = profile.pixel_width
+        height = profile.pixel_height
+        fps = profile.frame_rate
+        video_filter = (
+            f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+            "settb=AVTB,format=yuv420p"
+        )
+        filter_parts = [f"[{index}:v]{video_filter}[v{index}]" for index in range(len(inputs))]
+        current_label = "v0"
+        elapsed = 0.0
+        for index in range(1, len(inputs)):
+            elapsed += metadata[index - 1].duration_seconds
+            offset = max(0.0, elapsed - index * transition)
+            next_label = f"vxf{index}"
+            filter_parts.append(
+                f"[{current_label}][v{index}]xfade=transition={settings.TRANSITION_TYPE}:"
+                f"duration={transition:.6f}:offset={offset:.6f}[{next_label}]"
             )
-            reencode_cmd = [
-                ffmpeg,
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(filelist),
-                "-vf",
-                video_filter,
+            current_label = next_label
+        command = [ffmpeg, "-y"]
+        command.extend(item for path in inputs for item in ("-i", str(path)))
+        has_any_audio = any(item.has_audio for item in metadata)
+        expected_audio = has_any_audio
+        audio_indices: list[int] = list(range(len(inputs)))
+        next_audio_input = len(inputs)
+        if has_any_audio:
+            # 对无音频场景补同长度静音，使 acrossfade 在混合输入时仍可用。
+            for index, item in enumerate(metadata):
+                if not item.has_audio:
+                    audio_indices[index] = next_audio_input
+                    next_audio_input += 1
+                    command.extend(
+                        [
+                            "-f",
+                            "lavfi",
+                            "-t",
+                            f"{item.duration_seconds:.6f}",
+                            "-i",
+                            "anullsrc=channel_layout=stereo:sample_rate=48000",
+                        ]
+                    )
+            audio_labels: list[str] = []
+            for index, source_index in enumerate(audio_indices):
+                label = f"a{index}"
+                filter_parts.append(
+                    f"[{source_index}:a]aresample=48000,asetpts=PTS-STARTPTS[{label}]"
+                )
+                audio_labels.append(label)
+            current_audio = audio_labels[0]
+            for index in range(1, len(audio_labels)):
+                next_audio = f"axf{index}"
+                filter_parts.append(
+                    f"[{current_audio}][{audio_labels[index]}]acrossfade=d={transition:.6f}:"
+                    f"c1=tri:c2=tri[{next_audio}]"
+                )
+                current_audio = next_audio
+            audio_output_label = current_audio
+        else:
+            audio_output_label = ""
+
+        filter_complex = ";".join(filter_parts)
+        command.extend(["-filter_complex", filter_complex, "-map", f"[{current_label}]"])
+        if expected_audio:
+            command.extend(["-map", f"[{audio_output_label}]"])
+            command.extend(["-c:a", "aac", "-b:a", "192k"])
+        else:
+            command.append("-an")
+        command.extend(
+            [
                 "-c:v",
                 "libx264",
                 "-preset",
                 "medium",
                 "-crf",
                 "18",
-                "-c:a",
-                "aac",
+                "-pix_fmt",
+                "yuv420p",
                 "-movflags",
                 "+faststart",
-                str(temporary_output),
+                str(output),
             ]
-            if self._run_ffmpeg(
-                reencode_cmd, temporary_output, "re-encode"
-            ) and self._verify_output(temporary_output, profile, "re-encode"):
-                temporary_output.replace(output)
-                output.chmod(0o600)
-                return output
-            raise RuntimeError("FFmpeg 拼接失败（stream copy 和重编码均失败）")
-        finally:
-            with suppress(OSError):
-                filelist.unlink(missing_ok=True)
-            with suppress(OSError):
-                temporary_output.unlink(missing_ok=True)
+        )
+        expected_duration = sum(item.duration_seconds for item in metadata) - transition * (
+            len(metadata) - 1
+        )
+        return command, expected_audio, expected_duration
 
     @staticmethod
     def _run_ffmpeg(cmd: list[str], output: Path, label: str) -> bool:
@@ -261,9 +330,26 @@ class VideoMerger:
         return True
 
     @staticmethod
-    def _verify_output(output: Path, profile: RenderProfile, label: str) -> bool:
+    def _verify_output(
+        output: Path,
+        profile: RenderProfile,
+        label: str,
+        *,
+        expected_audio: bool | None = None,
+        expected_duration: float | None = None,
+    ) -> bool:
         try:
-            verify_video(output, profile)
+            metadata = verify_video(output, profile)
+            if expected_audio is not None and metadata.has_audio != expected_audio:
+                raise ValueError(f"音频流状态不符合预期: {metadata.has_audio} != {expected_audio}")
+            if (
+                expected_duration is not None
+                and abs(metadata.duration_seconds - expected_duration) > 0.25
+            ):
+                raise ValueError(
+                    f"输出时长不符合预期: {metadata.duration_seconds:.3f} != "
+                    f"{expected_duration:.3f}"
+                )
         except (OSError, RuntimeError, ValueError) as exc:
             console.print(
                 f"[red][Merger][/] ffmpeg {label} 产物验证失败: {exc}",
