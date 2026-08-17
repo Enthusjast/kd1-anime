@@ -1,3 +1,4 @@
+import typer
 from typer.testing import CliRunner
 
 from kd1_anime.cli import _print_comparison, app
@@ -60,6 +61,7 @@ def test_generate_resume_does_not_require_a_dummy_prompt(monkeypatch, tmp_path):
 def test_global_dry_run_is_forwarded_to_generate(monkeypatch, tmp_path):
     import kd1_anime.orchestrator as orchestrator_module
 
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
     calls = []
 
     class FakeOrchestrator:
@@ -80,8 +82,24 @@ def test_global_dry_run_is_forwarded_to_generate(monkeypatch, tmp_path):
     assert calls == [("demo", True)]
 
 
+def test_generate_exits_before_pipeline_when_healthcheck_fails(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "model")
+
+    def fail_healthcheck():
+        raise typer.Exit(1)
+
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", fail_healthcheck)
+
+    result = CliRunner().invoke(app, ["generate", "demo", "--dry-run"])
+
+    assert result.exit_code == 1
+
+
 def test_generate_does_not_clear_configured_overwrite_setting(monkeypatch):
     import kd1_anime.orchestrator as orchestrator_module
+
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
 
     class FakeOrchestrator:
         def __init__(self):
@@ -104,6 +122,7 @@ def test_generate_does_not_clear_configured_overwrite_setting(monkeypatch):
 def test_global_dry_run_is_forwarded_to_batch(monkeypatch, tmp_path):
     from kd1_anime.batch import BatchProcessor
 
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
     prompts = tmp_path / "prompts.txt"
     prompts.write_text("demo\n", encoding="utf-8")
     monkeypatch.setattr(settings, "LLM_API_KEY", "key")

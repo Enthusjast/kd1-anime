@@ -23,6 +23,63 @@ def test_valid_json_escape_is_not_rewritten():
     assert result.text == "line1\nnext"
 
 
+def test_healthcheck_sends_minimal_request_with_short_timeout(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "health-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "health-model")
+    calls = []
+    options = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace()])
+
+    class FakeClient:
+        chat = SimpleNamespace(completions=FakeCompletions())
+
+        def with_options(self, **kwargs):
+            options.update(kwargs)
+            return self
+
+    class HealthAgent(BaseAgent):
+        @property
+        def client(self):
+            return FakeClient()
+
+    HealthAgent().check_api_available(timeout=3.5)
+
+    assert options == {"timeout": 3.5, "max_retries": 0}
+    assert calls == [
+        {
+            "model": "health-model",
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 1,
+        }
+    ]
+
+
+def test_healthcheck_failure_redacts_api_key(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "super-secret-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "health-model")
+
+    class FailingCompletions:
+        def create(self, **kwargs):
+            raise RuntimeError("connection failed for super-secret-key")
+
+    class HealthAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
+
+    with pytest.raises(RuntimeError, match="LLM API 不可用") as exc_info:
+        HealthAgent().check_api_available(timeout=1)
+
+    assert "super-secret-key" not in str(exc_info.value)
+    assert "<redacted>" in str(exc_info.value)
+
+
 class PositiveResult(BaseModel):
     value: int
 

@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     LLM_SILENT_STREAM: bool = Field(
         default=True, description="stream=False 时仍走流式传输但静默收集，避免长生成超时"
     )
+    # CLI 启动时的最小可用性探测超时；不能复用完整生成请求的长读取超时，
+    # 否则端点不可用时用户需要等待数分钟才看到明确错误。
+    LLM_HEALTHCHECK_TIMEOUT: float = Field(
+        default=15.0, ge=1.0, le=120.0, description="CLI 启动时 LLM 可用性探测超时（秒）"
+    )
     # 空响应重试时补上的 max_tokens 兜底值：推理模型常把输出预算耗尽在思考上，
     # 导致 content 为空；补足预算后重试可避免反复拿到空响应。
     LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=16384, ge=1024, le=65536)

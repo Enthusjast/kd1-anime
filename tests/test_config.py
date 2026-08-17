@@ -98,6 +98,7 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_TIMEOUT_CONNECT == 30.0
     assert config.LLM_TIMEOUT_READ == 600.0
     assert config.LLM_SILENT_STREAM is True
+    assert config.LLM_HEALTHCHECK_TIMEOUT == 15.0
     assert config.LLM_MAX_TOKENS == 32768
     assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
 
@@ -105,6 +106,8 @@ def test_llm_timeout_and_silent_stream_defaults():
 def test_llm_timeout_and_silent_stream_validation():
     with pytest.raises(ValueError):
         Settings(_env_file=None, LLM_TIMEOUT_READ=5.0)  # 低于下限 10s
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, LLM_HEALTHCHECK_TIMEOUT=0.5)
     with pytest.raises(ValueError):
         Settings(_env_file=None, LLM_EMPTY_RETRY_MAX_TOKENS=100)  # 低于下限
 

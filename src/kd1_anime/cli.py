@@ -40,6 +40,18 @@ app = typer.Typer(
 console = Console()
 
 
+def _ensure_llm_api_available() -> None:
+    """在进入会话/流水线前验证 LLM 配置、网络和模型路由。"""
+
+    from kd1_anime.agents.base import BaseAgent
+
+    try:
+        BaseAgent().check_api_available()
+    except Exception as exc:
+        console.print(f"[bold red]LLM API 不可用:[/] {exc}", markup=False)
+        raise typer.Exit(1) from exc
+
+
 @app.callback()
 def main_callback(
     ctx: typer.Context,
@@ -61,6 +73,7 @@ def main_callback(
 
     # 没有子命令时默认启动 chat
     if ctx.invoked_subcommand is None:
+        _ensure_llm_api_available()
         _start_chat(dry_run=dry_run)
 
 
@@ -70,6 +83,7 @@ def chat(
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成代码不提交 Slurm"),
 ):
     """启动交互式会话 (默认命令)"""
+    _ensure_llm_api_available()
     _start_chat(dry_run=dry_run or bool((ctx.obj or {}).get("dry_run")))
 
 
@@ -141,7 +155,7 @@ def generate(
             manifest = RunRepository(settings.WORKSPACE_DIR).load(resume)
             requires_llm = manifest.state in RESUME_LLM_STATES
         if requires_llm:
-            settings.require_llm_key()
+            _ensure_llm_api_available()
     except (OSError, ValueError) as e:
         console.print(f"[bold red]错误:[/] {e}", markup=False)
         raise typer.Exit(1) from e
@@ -193,11 +207,7 @@ def plan(
             "[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助"
         )
         raise typer.Exit(1)
-    try:
-        settings.require_llm_key()
-    except ValueError as e:
-        console.print(f"[bold red]错误:[/] {e}", markup=False)
-        raise typer.Exit(1) from e
+    _ensure_llm_api_available()
 
     from kd1_anime.agents.planner import PlannerAgent
 
@@ -379,12 +389,14 @@ def resume(
     try:
         manifest = repository.load(run_id)
         if manifest.state in RESUME_LLM_STATES:
-            settings.require_llm_key()
+            _ensure_llm_api_available()
         if force:
             settings.OVERWRITE_OUTPUT = True
         from kd1_anime.orchestrator import Orchestrator
 
         final_video = Orchestrator().resume(run_id, interactive=interactive)
+    except typer.Exit:
+        raise
     except KeyboardInterrupt as exc:
         console.print("\n[yellow]用户中断 (已记录恢复点并清理 Slurm 任务)[/]")
         raise typer.Exit(130) from exc
@@ -507,11 +519,7 @@ def batch(
 ):
     """批量并行处理多个动画项目。"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
-    try:
-        settings.require_llm_key()
-    except ValueError as e:
-        console.print(f"[bold red]错误:[/] {e}", markup=False)
-        raise typer.Exit(1) from e
+    _ensure_llm_api_available()
 
     from kd1_anime.batch import BatchConfig, BatchProcessor
 
@@ -894,6 +902,8 @@ def evaluate(
     from kd1_anime.eval import Evaluator
 
     visual_enabled = settings.ENABLE_VISUAL_EVAL if visual is None else visual
+    if visual_enabled:
+        _ensure_llm_api_available()
     evaluator = Evaluator(
         enable_visual_eval=visual_enabled,
         visual_eval_model=visual_model,

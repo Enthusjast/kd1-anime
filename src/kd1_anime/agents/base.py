@@ -68,6 +68,54 @@ class BaseAgent:
             )
         return self._client
 
+    def check_api_available(self, *, timeout: float | None = None) -> None:
+        """发送一次最小聊天请求，确认当前端点和模型确实可调用。
+
+        只检查连接、鉴权和模型路由，不消费业务提示词。请求使用一个 token
+        上限，且禁用 SDK 重试，避免 CLI 启动时因端点故障长时间等待或重复计费。
+        某些推理模型/兼容端点不接受 ``max_tokens``，会再尝试一次不带该参数
+        的请求；其他错误直接交给调用方转换为启动失败。
+        """
+
+        settings.require_llm_key()
+        health_timeout = settings.LLM_HEALTHCHECK_TIMEOUT if timeout is None else float(timeout)
+        request = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+        }
+        if settings.LLM_SEND_MAX_TOKENS:
+            request["max_tokens"] = 1
+
+        try:
+            client = self.client
+            with_options = getattr(client, "with_options", None)
+            if callable(with_options):
+                client = with_options(timeout=health_timeout, max_retries=0)
+            response = client.chat.completions.create(**request)
+        except BadRequestError as exc:
+            # 兼容只支持 max_completion_tokens 或完全忽略 token 上限的端点。
+            if "max_tokens" not in request or "max_tokens" not in str(exc).lower():
+                raise RuntimeError(self._healthcheck_error(exc)) from exc
+            request.pop("max_tokens")
+            try:
+                response = client.chat.completions.create(**request)
+            except Exception as retry_error:
+                raise RuntimeError(self._healthcheck_error(retry_error)) from retry_error
+        except Exception as exc:
+            raise RuntimeError(self._healthcheck_error(exc)) from exc
+
+        if not getattr(response, "choices", None):
+            raise RuntimeError(self._healthcheck_error("API 返回了空 choices"))
+
+    @staticmethod
+    def _healthcheck_error(error: object) -> str:
+        """生成不泄露 API Key 的启动探测错误。"""
+
+        detail = str(error).strip() or type(error).__name__
+        if settings.LLM_API_KEY:
+            detail = detail.replace(settings.LLM_API_KEY, "<redacted>")
+        return f"LLM API 不可用（{settings.LLM_BASE_URL}，模型 {settings.LLM_MODEL}）：{detail}"
+
     def _log(self, message: str, style: str = "bold cyan") -> None:
         """打印 Agent 思考过程（仪表盘激活时抑制，避免破坏 Live 渲染）"""
         # 延迟导入避免循环依赖

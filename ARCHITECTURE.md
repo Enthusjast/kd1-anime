@@ -39,7 +39,7 @@ kd1_anime.orchestrator ───── callback events ────────�
 ## 3. 执行模型
 
 ```text
-全局：INIT → PLANNING
+全局：INIT → LLM 可用性探测 → PLANNING
 
 分镜屏障：所有 Scene 并行 DETAILING → 全片连续性审查
 
@@ -56,6 +56,7 @@ Scene 1 CODING → REVIEWING → Scene 2 CODING → REVIEWING → …
 FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行，但编码/审查按场景顺序执行：Scene N 审查通过后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，而不是仅凭 Planner 描述猜测的状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
+CLI 在进入 chat、规划、生成、恢复未完成运行或启用视觉评估前，会用短超时发送一次最小 LLM 请求；探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。`status`、`render`、`doctor`、`clean`、已完成运行恢复和纯代码评估不依赖该探测。
 
 `ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。
 

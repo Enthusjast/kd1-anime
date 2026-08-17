@@ -18,6 +18,7 @@
 - **可恢复渲染**：监控 Slurm 状态、区分排队/运行超时、失败后读取日志并自动修复。
 - **平滑转场**：多场景使用 FFmpeg `xfade` 淡入淡出，默认 0.5 秒；有音频时同步 `acrossfade`。
 - **通用 LLM 接口**：通过 `.env` 配置任意 OpenAI-compatible API，不绑定 DeepSeek 或其他特定厂商。
+- **启动前 API 探测**：进入会话或 LLM 流水线前发送一次最小请求；配置、网络或模型不可用时立即退出，不等待后续阶段才失败。
 
 ## 一行安装（Ubuntu / HPC，无 sudo）
 
@@ -175,6 +176,7 @@ workspace/runs/<timestamp>-<uuid>/
 |---|---:|---|
 | `LLM_BASE_URL` | OpenAI API 地址 | 任意 OpenAI-compatible 端点 |
 | `LLM_MODEL` | 空 | 必须设置为实际模型名 |
+| `LLM_HEALTHCHECK_TIMEOUT` | `15` | 进入会话/流水线前的最小 API 探测超时（秒）；探测失败立即退出 |
 | `LLM_PARALLEL_WORKERS` | `4` | 分镜/连续性审查等可并行 LLM 请求上限；代码交接阶段按场景顺序执行 |
 | `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
