@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.planner import ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, ScenePlan
 from kd1_anime.agents.reviewer import ReviewResult
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import SceneArtifact, VideoMetadata, sha256_file
@@ -230,6 +230,41 @@ def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_pa
     assert captured["state"] is State.MONITORING
     assert captured["context"].scene_states[1].failed is False
     assert captured["context"].scene_states[1].failure_reason == ""
+
+
+def test_resume_reopens_continuity_warning_for_unfinished_scenes(monkeypatch, tmp_path):
+    """带已知连续性 warning 的中断运行应在 resume 时重新开启修正预算。"""
+    from kd1_anime.config import settings
+
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / run_id
+    root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_id,
+        status="running",
+        state="CODING",
+        user_prompt="prompt",
+        output_path=str((root / "output.mp4").resolve()),
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="warning",
+        continuity_review_round=3,
+        continuity_warnings=["达到最大连续性修正轮数"],
+        scenes={1: StoredSceneState(plan=plan(), plan_ready=True)},
+    )
+    write_manifest(root / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    captured = {}
+
+    def fake_execute(self, context, state):
+        captured["context"] = context
+        return None
+
+    monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
+
+    assert Orchestrator().resume(run_id) is None
+    assert captured["context"].continuity_review_status == "pending"
+    assert captured["context"].continuity_review_round == 0
 
 
 def test_run_paths_are_unique(monkeypatch, tmp_path):
@@ -876,7 +911,10 @@ def test_visual_gate_low_score_schedules_bounded_coder_rewrite(monkeypatch, tmp_
     assert restored.scene_states[1].visual_status == "needs_fix"
     assert restored_candidate is not None
     assert restored_candidate.code == state.visual_best_candidate.code
-    assert restored_candidate.artifact.video_sha256 == state.visual_best_candidate.artifact.video_sha256
+    assert (
+        restored_candidate.artifact.video_sha256
+        == state.visual_best_candidate.artifact.video_sha256
+    )
     stored_candidate = manifest.scenes[1].visual_best_candidate
     assert stored_candidate is not None
     (ctx.paths.root / stored_candidate.code_file).write_text("# tampered\n", encoding="utf-8")

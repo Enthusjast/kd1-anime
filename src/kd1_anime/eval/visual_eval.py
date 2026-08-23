@@ -281,9 +281,7 @@ class VisualEvaluator:
                 if sample.timestamp_seconds is not None
                 else ""
             )
-            content.append(
-                {"type": "text", "text": f"Frame {sample.frame_id}{timestamp} follows."}
-            )
+            content.append({"type": "text", "text": f"Frame {sample.frame_id}{timestamp} follows."})
             content.append(self._image_content(sample.path))
         messages = [
             {"role": "system", "content": VISUAL_EVAL_SYSTEM_PROMPT},
@@ -333,7 +331,9 @@ class VisualEvaluator:
             raise ValueError(f"视觉评估引用了不存在的关键帧: {', '.join(unknown)}")
 
     @classmethod
-    def _from_payload(cls, parsed: _VisualPayload, *, raw_response: str = "") -> VisualAnalysisResult:
+    def _from_payload(
+        cls, parsed: _VisualPayload, *, raw_response: str = ""
+    ) -> VisualAnalysisResult:
         evaluation = parsed.evaluation
         return VisualAnalysisResult(
             overall_analysis=parsed.overall_analysis,
@@ -348,7 +348,7 @@ class VisualEvaluator:
 
     @classmethod
     def _parse_response(cls, response: str) -> VisualAnalysisResult:
-        payload = BaseAgent._extract_json(response)
+        payload = BaseAgent._extract_json(response, expected_type="object")
         parsed = _VisualPayload.model_validate_json(payload)
         return cls._from_payload(parsed, raw_response=response)
 

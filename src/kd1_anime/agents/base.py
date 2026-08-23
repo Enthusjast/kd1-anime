@@ -11,7 +11,7 @@ import json
 import random
 import time
 from contextlib import suppress
-from typing import ClassVar, TypeVar
+from typing import ClassVar, Literal, TypeVar
 
 from openai import (
     APIConnectionError,
@@ -334,9 +334,7 @@ class BaseAgent:
                     if attempt < self.profile.max_retries:
                         time.sleep(self._retry_delay(attempt, last_error))
                     continue
-                if self.profile.debug and (
-                    not use_stream_transport or not stream
-                ):
+                if self.profile.debug and (not use_stream_transport or not stream):
                     preview = content[:500] + ("..." if len(content) > 500 else "")
                     console.print(f"[dim]DEBUG [response]: {preview}[/]", markup=False)
                 return content
@@ -597,12 +595,13 @@ class BaseAgent:
                 stream=stream,
             )
 
-            json_str = self._extract_json(raw)
+            json_str = self._extract_json(raw, expected_type="object")
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError as first_error:
                 repaired = self._escape_control_chars_in_json(json_str)
                 repaired = self._fix_latex_escapes_in_json(repaired)
+                repaired = self._close_truncated_json(repaired)
                 try:
                     data = json.loads(repaired)
                 except json.JSONDecodeError as error:
@@ -619,9 +618,7 @@ class BaseAgent:
                     if current_messages is None:
                         current_message = self._append_repair_hint(current_message, hint)
                     else:
-                        current_messages = self._append_messages_repair_hint(
-                            current_messages, hint
-                        )
+                        current_messages = self._append_messages_repair_hint(current_messages, hint)
                     self._log(
                         f"JSON 解析失败, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
                         style="yellow",
@@ -692,12 +689,13 @@ class BaseAgent:
                 json_mode=True,
             )
 
-            json_str = self._extract_json(raw)
+            json_str = self._extract_json(raw, expected_type="array")
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError as first_error:
                 repaired = self._escape_control_chars_in_json(json_str)
                 repaired = self._fix_latex_escapes_in_json(repaired)
+                repaired = self._close_truncated_json(repaired)
                 try:
                     data = json.loads(repaired)
                 except json.JSONDecodeError as error:
@@ -813,7 +811,9 @@ class BaseAgent:
             item = dict(message)
             content = item.get("content")
             if isinstance(content, list):
-                item["content"] = [dict(part) if isinstance(part, dict) else part for part in content]
+                item["content"] = [
+                    dict(part) if isinstance(part, dict) else part for part in content
+                ]
             cloned.append(item)
         return cloned
 
@@ -932,7 +932,48 @@ class BaseAgent:
         return "".join(result)
 
     @staticmethod
-    def _extract_json(text: str) -> str:
+    def _close_truncated_json(json_str: str) -> str:
+        """补齐仅缺失末尾容器闭合符的 JSON.
+
+        部分兼容端点会在模型输出已经完成字符串值后, 丢掉最后的 ``}``
+        或 ``]``。这里只补齐括号配平, 不尝试猜测缺失的字符串内容; 如果
+        字符串本身没有闭合, 原文保持不变, 交给上层重试。
+        """
+        stack: list[str] = []
+        in_string = False
+        escape = False
+
+        for ch in json_str:
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                stack.append("}")
+            elif ch == "[":
+                stack.append("]")
+            elif ch in "}]":
+                if not stack or stack[-1] != ch:
+                    return json_str
+                stack.pop()
+
+        if in_string or not stack:
+            return json_str
+        return json_str + "".join(reversed(stack))
+
+    @staticmethod
+    def _extract_json(
+        text: str,
+        *,
+        expected_type: Literal["any", "object", "array"] = "any",
+    ) -> str:
         """
         从模型输出中提取 JSON.
 
@@ -941,7 +982,9 @@ class BaseAgent:
         2. 散文 + JSON 混合 (如 "Sure! Here is the JSON:\\n{...}")
         3. 裸 JSON
 
-        使用括号配平扫描, 正确处理字符串内的括号.
+        使用括号配平扫描, 正确处理字符串内的括号. ``expected_type`` 用于
+        消除散文中的数学方括号/花括号造成的歧义; 例如 ``[-5, 5]`` 可能
+        出现在 JSON 对象之前, 但调用方实际需要的是后面的 ``{...}``.
         """
         text = text.strip()
 
@@ -957,15 +1000,17 @@ class BaseAgent:
                     if inner:
                         return inner
 
-        # 在原文中找第一个平衡的 {...} 或 [...]
-        return BaseAgent._find_balanced_json(text)
+        # 在原文中找第一个平衡的 JSON 容器. 结构化对象调用方必须优先找
+        # ``{...}``, 否则数学说明中的 ``[-5, 5]`` 会被误当成响应主体.
+        opening = None if expected_type == "any" else ("{" if expected_type == "object" else "[")
+        return BaseAgent._find_balanced_json(text, opening=opening)
 
     @staticmethod
-    def _find_balanced_json(text: str) -> str:
-        """扫描出第一个平衡的 JSON 对象/数组子串; 找不到则返回原文"""
+    def _find_balanced_json(text: str, *, opening: str | None = None) -> str:
+        """扫描出第一个平衡的 JSON 对象/数组子串; 找不到则返回原文。"""
         start = -1
         for i, ch in enumerate(text):
-            if ch in "{[":
+            if ch in (opening or "{["):
                 start = i
                 break
         if start == -1:

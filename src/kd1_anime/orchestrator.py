@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import (
     ContinuityIssue,
     ContinuityReviewerAgent,
+    apply_deterministic_continuity_repairs,
     deterministic_continuity_issues,
     extract_continuity_elements,
     validate_export_contract,
@@ -343,7 +345,10 @@ class Orchestrator:
             / f"scene_{candidate.artifact.scene_id}"
             / f"code_{code_hash}.py"
         )
-        if not code_path.is_file() or sha256_text(code_path.read_text(encoding="utf-8")) != code_hash:
+        if (
+            not code_path.is_file()
+            or sha256_text(code_path.read_text(encoding="utf-8")) != code_hash
+        ):
             self._write_private(code_path, candidate.code)
         code_relative = code_path.resolve().relative_to(ctx.paths.root.resolve()).as_posix()
         return StoredVisualCandidate(
@@ -966,9 +971,7 @@ class Orchestrator:
             if manifest.status == "dry_run_complete":
                 return None
             if ctx.visual_eval_profile.enabled:
-                settings.visual_llm_profile(
-                    model_override=ctx.visual_eval_profile.model
-                ).require()
+                settings.visual_llm_profile(model_override=ctx.visual_eval_profile.model).require()
             try:
                 state = State[manifest.state]
             except KeyError as exc:
@@ -1045,6 +1048,22 @@ class Orchestrator:
             # 核对恢复的 Slurm 作业: 上次会话提交的作业可能早已结束/已不存在,
             # 直接监控会得到连续 UNKNOWN → CANCEL_FAILED → 场景永久判死。
             self._reconcile_restored_jobs(ctx)
+
+            # 上一次运行可能在连续性重规划达到上限后被中断。warning 不是
+            # 已确认通过；显式 resume 应开启一轮新的有限修正，让新版的
+            # 字段级反馈和确定性合同修复有机会处理旧分镜，而不是直接带着
+            # 已知冲突进入编码阶段。
+            if (
+                ctx.continuity_bible is not None
+                and ctx.continuity_review_status == "warning"
+                and any(
+                    not scene.rendered and not scene.failed and not scene.give_up
+                    for scene in ctx.scene_states.values()
+                )
+            ):
+                ctx.continuity_review_status = "pending"
+                ctx.continuity_review_round = 0
+                ctx.continuity_warnings.append("恢复运行：重新开启连续性审查与有限修正")
 
             # schema 2 的早期清单没有 continuity bible。恢复未完成运行时补建并
             # 持久化一份；已经渲染完成的旧场景不再触发连续性重规划。
@@ -1684,6 +1703,71 @@ class Orchestrator:
                 unique.append(issue)
         return unique
 
+    @staticmethod
+    def _continuity_issue_target_fields(issue: ContinuityIssue) -> list[str]:
+        """提取连续性冲突真正涉及的分镜字段。
+
+        新版审查器会直接返回 ``target_fields``；旧版响应没有该字段时，
+        从错误消息和修正指令中推断，避免重规划时把整份快照原样复制回来。
+        """
+
+        allowed = (
+            "visual_design",
+            "camera_movement",
+            "visual_flow",
+            "key_moments",
+            "computation",
+            "persistent_elements",
+            "opening_state",
+            "closing_state",
+            "transition_in",
+            "transition_out",
+            "continuity_references",
+            "global_visual_state",
+            "inherited_elements",
+            "elements_to_remove",
+            "new_elements",
+        )
+        source = f"{issue.message}\n{issue.fix_instruction}"
+        fields = [field for field in issue.target_fields if field in allowed]
+        fields.extend(field for field in allowed if field in source and field not in fields)
+        return fields
+
+    @staticmethod
+    def _continuity_plan_context(ctx: PipelineContext, scene_id: int) -> str:
+        """构造当前场景及相邻场景的最新交接快照。"""
+
+        snapshot = []
+        for current_id, state in sorted(ctx.scene_states.items()):
+            if abs(current_id - scene_id) > 1 or state.failed or state.give_up:
+                continue
+            snapshot.append(
+                {
+                    "relation": (
+                        "previous"
+                        if current_id < scene_id
+                        else "next"
+                        if current_id > scene_id
+                        else "current"
+                    ),
+                    "scene_id": current_id,
+                    "plan": state.plan.model_dump(mode="json"),
+                }
+            )
+        return json.dumps(snapshot, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _supports_continuity_context(planner: object) -> bool:
+        """兼容旧版/测试 Planner，同时让新版 Planner 接收交接快照。"""
+
+        try:
+            parameters = inspect.signature(planner.plan_detail).parameters
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return "continuity_context" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+
     def _run_continuity_review(self, ctx: PipelineContext) -> None:
         """审查全片分镜，并只重规划仍未编码的冲突场景。"""
 
@@ -1774,12 +1858,24 @@ class Orchestrator:
                 return
 
             feedback_by_scene: dict[int, list[str]] = {scene_id: [] for scene_id in affected_ids}
+            target_fields_by_scene: dict[int, list[str]] = {
+                scene_id: [] for scene_id in affected_ids
+            }
             for issue in issues:
                 feedback = issue.fix_instruction or issue.message
+                target_fields = self._continuity_issue_target_fields(issue)
+                field_hint = (
+                    "\n必须重写字段（不得复制这些字段中的冲突原文）：" + ", ".join(target_fields)
+                    if target_fields
+                    else ""
+                )
                 for scene_id in issue.scene_ids:
                     feedback_by_scene.setdefault(scene_id, []).append(
-                        f"[{issue.category}] {issue.message}\n修正要求: {feedback}"
+                        f"[{issue.category}] {issue.message}\n修正要求: {feedback}{field_hint}"
                     )
+                    for field_name in target_fields:
+                        if field_name not in target_fields_by_scene.setdefault(scene_id, []):
+                            target_fields_by_scene[scene_id].append(field_name)
 
             self._emit(
                 "continuity_fixing",
@@ -1792,16 +1888,41 @@ class Orchestrator:
                 if state is None or state.failed or state.give_up:
                     continue
                 outline = next(outline for outline in ctx.outlines if outline.scene_id == scene_id)
-                with self._llm_sem:
-                    revised_plan = PlannerAgent().plan_detail(
-                        outline,
-                        ctx.outlines,
-                        ctx.user_prompt,
-                        stream=False,
-                        renderer=ctx.render_profile.renderer,
-                        continuity_bible=ctx.continuity_bible,
-                        continuity_feedback="\n\n".join(feedback_by_scene[scene_id]),
+                planner = PlannerAgent()
+                replan_kwargs = {
+                    "stream": False,
+                    "renderer": ctx.render_profile.renderer,
+                    "continuity_bible": ctx.continuity_bible,
+                    "continuity_feedback": "\n\n".join(feedback_by_scene[scene_id]),
+                }
+                if self._supports_continuity_context(planner):
+                    replan_kwargs["continuity_context"] = self._continuity_plan_context(
+                        ctx, scene_id
                     )
+                with self._llm_sem:
+                    revised_plan = planner.plan_detail(
+                        outline, ctx.outlines, ctx.user_prompt, **replan_kwargs
+                    )
+                outline_index = next(
+                    index for index, item in enumerate(ctx.outlines) if item.scene_id == scene_id
+                )
+                previous_plan = (
+                    ctx.scene_states[ctx.outlines[outline_index - 1].scene_id].plan
+                    if outline_index > 0
+                    else None
+                )
+                next_outline = (
+                    ctx.outlines[outline_index + 1]
+                    if outline_index + 1 < len(ctx.outlines)
+                    else None
+                )
+                revised_plan = apply_deterministic_continuity_repairs(
+                    revised_plan,
+                    ctx.continuity_bible,
+                    target_fields_by_scene.get(scene_id, []),
+                    previous_plan=previous_plan,
+                    next_outline=next_outline,
+                )
                 with self._state_lock:
                     state.plan = revised_plan
                     state.plan_ready = True
@@ -2746,9 +2867,7 @@ class Orchestrator:
 
         inherited_hash = sha256_text(state.inherited_elements_code)
         if candidate.inherited_elements_sha256 != inherited_hash:
-            raise RuntimeError(
-                f"Scene {scene_id} 的视觉候选基于不同的继承上下文，拒绝恢复"
-            )
+            raise RuntimeError(f"Scene {scene_id} 的视觉候选基于不同的继承上下文，拒绝恢复")
         code_changed = candidate.code != state.code
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate.code)
         state.code = candidate.code
@@ -2786,9 +2905,7 @@ class Orchestrator:
             candidate = state.visual_best_candidate
             if state.rendered or candidate is None or not (state.failed or state.give_up):
                 continue
-            if candidate.inherited_elements_sha256 != sha256_text(
-                state.inherited_elements_code
-            ):
+            if candidate.inherited_elements_sha256 != sha256_text(state.inherited_elements_code):
                 continue
             current_code = state.code
             self._artifact_video_path(ctx, candidate.artifact)
@@ -2837,10 +2954,7 @@ class Orchestrator:
         def evaluate_one(scene_id: int, state: SceneState, artifact: SceneArtifact):
             video = self._artifact_video_path(ctx, artifact)
             frame_dir = (
-                ctx.paths.root
-                / "eval_frames"
-                / f"scene_{scene_id}"
-                / artifact.video_sha256[:12]
+                ctx.paths.root / "eval_frames" / f"scene_{scene_id}" / artifact.video_sha256[:12]
             )
             evaluator = Evaluator(
                 enable_visual_eval=True,
@@ -2895,7 +3009,9 @@ class Orchestrator:
                     {
                         "frame_id": sample.frame_id,
                         "timestamp_seconds": sample.timestamp_seconds,
-                        "path": sample.path.resolve().relative_to(ctx.paths.root.resolve()).as_posix(),
+                        "path": sample.path.resolve()
+                        .relative_to(ctx.paths.root.resolve())
+                        .as_posix(),
                         "sha256": sample.image_sha256,
                     }
                     for sample in samples
@@ -2974,8 +3090,7 @@ class Orchestrator:
             if (
                 best is not None
                 and best.artifact.video_sha256 != artifact.video_sha256
-                and best.inherited_elements_sha256
-                == sha256_text(state.inherited_elements_code)
+                and best.inherited_elements_sha256 == sha256_text(state.inherited_elements_code)
             ):
                 changed = self._restore_visual_candidate_into_state(ctx, scene_id, state, best)
                 state.visual_status = "warning"
@@ -3064,10 +3179,7 @@ class Orchestrator:
                     samples,
                     ctx.original_prompt or ctx.user_prompt,
                     scene_context=json.dumps(
-                        [
-                            state.plan.model_dump(mode="json")
-                            for state in ctx.scene_states.values()
-                        ],
+                        [state.plan.model_dump(mode="json") for state in ctx.scene_states.values()],
                         ensure_ascii=False,
                     )[:30_000],
                     scope="complete video",
@@ -3260,8 +3372,7 @@ class Orchestrator:
         visual_values = [
             state.visual_score
             for state in ctx.scene_states.values()
-            if state.visual_score is not None
-            and state.visual_status in {"passed", "warning"}
+            if state.visual_score is not None and state.visual_status in {"passed", "warning"}
         ]
         self._emit(
             "eval_complete",
@@ -3331,9 +3442,7 @@ class Orchestrator:
                 state.inherited_elements_code = ""
                 state.exported_elements_code = ""
                 state.exported_elements = []
-                state.visual_status = (
-                    "pending" if ctx.visual_eval_profile.enabled else "skipped"
-                )
+                state.visual_status = "pending" if ctx.visual_eval_profile.enabled else "skipped"
                 state.visual_fix_attempts = 0
                 state.visual_score = None
                 state.visual_report_file = ""

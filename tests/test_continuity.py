@@ -10,6 +10,7 @@ from kd1_anime.agents.continuity import (
     ContinuityIssue,
     ContinuityReviewerAgent,
     ContinuityReviewResult,
+    apply_deterministic_continuity_repairs,
     deterministic_continuity_issues,
     extract_continuity_elements,
     validate_export_contract,
@@ -18,6 +19,7 @@ from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
     GlobalVisualState,
+    SceneOutline,
     ScenePlan,
     VisualElementState,
 )
@@ -152,6 +154,32 @@ def test_continuity_prompt_is_closed_and_actionable():
     assert "transition_in" in CONTINUITY_REVIEW_PROMPT
     assert "transition_out" in CONTINUITY_REVIEW_PROMPT
     assert "不要输出 Markdown 或代码" in CONTINUITY_REVIEW_PROMPT
+
+
+def test_deterministic_continuity_repairs_authoritative_transition_and_width():
+    plan = make_plan(1)
+    plan.transition_out = "下一场景从原点开始绘制"
+    plan.visual_flow = ["绘制过程中线宽加粗至 6，其他曲线保持不变"]
+    bible = ContinuityBible(
+        transition_rules=["新对象先右支后左支，排除零点"],
+    )
+
+    repaired = apply_deterministic_continuity_repairs(
+        plan,
+        bible,
+        ["transition_out", "visual_flow"],
+        next_outline=SceneOutline(
+            scene_id=2,
+            title="下一场景",
+            duration_seconds=10,
+            purpose="继续",
+            math_concept="x^{-1}",
+        ),
+    )
+
+    assert "从原点开始绘制" not in repaired.transition_out
+    assert "先右支后左支，排除零点" in repaired.transition_out
+    assert "线宽保持默认值 4" in repaired.visual_flow[0]
 
 
 def test_global_visual_state_and_structured_element_contract():

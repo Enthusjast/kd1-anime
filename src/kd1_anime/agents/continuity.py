@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -291,6 +292,9 @@ class ContinuityIssue(BaseModel):
     severity: Literal["minor", "major"] = "major"
     message: str = Field(min_length=1, max_length=5_000)
     fix_instruction: str = Field(default="", max_length=5_000)
+    # 让重规划只改真正冲突的字段；旧版 Reviewer 没有输出此字段时由
+    # Orchestrator 根据 message/fix_instruction 里的字段名兼容推断。
+    target_fields: list[str] = Field(default_factory=list, max_length=12)
 
 
 class ContinuityReviewResult(BaseModel):
@@ -309,6 +313,74 @@ class ContinuityReviewResult(BaseModel):
         elif not self.issues:
             raise ValueError("连续性审查失败时必须提供 issues")
         return self
+
+
+def apply_deterministic_continuity_repairs(
+    plan: ScenePlan,
+    bible: ContinuityBible,
+    target_fields: Sequence[str],
+    *,
+    previous_plan: ScenePlan | None = None,
+    next_outline: SceneOutline | None = None,
+) -> ScenePlan:
+    """修复可由连续性圣经确定的文本冲突，避免 LLM 在同一错误上循环。
+
+    分镜中的视觉描述仍然由 Planner 负责；这里只处理两类没有创作歧义的
+    合同字段：转场字段必须服从 ``transition_rules``，绘制阶段的线宽必须
+    区分 default/highlight。其余语义问题继续交给 Planner 重规划。
+    """
+
+    fields = set(target_fields)
+    updates: dict[str, object] = {}
+    rules = "；".join(rule.strip() for rule in bible.transition_rules if rule.strip())
+    if "global_visual_state" in fields:
+        updates["global_visual_state"] = bible.global_visual_state.model_copy(deep=True)
+
+    if "transition_in" in fields:
+        previous_state = (
+            "；".join(previous_plan.closing_state) if previous_plan else "上一场景结束时保留的状态"
+        )
+        current_state = (
+            "；".join(plan.opening_state) if plan.opening_state else "本场景 opening_state"
+        )
+        updates["transition_in"] = (
+            f"接管上一场景结束时保留的状态：{previous_state}。"
+            f"本场景开场确认：{current_state}。"
+            f"严格遵守全片转场规则：{rules}"
+        )
+
+    if "transition_out" in fields:
+        retained_state = (
+            "；".join(plan.closing_state) if plan.closing_state else "本场景 closing_state"
+        )
+        next_label = (
+            f"Scene {next_outline.scene_id}（{next_outline.title}）" if next_outline else "下一场景"
+        )
+        updates["transition_out"] = (
+            f"场景结束时保留并交接以下状态：{retained_state}。"
+            f"{next_label}直接接管这些状态，不清空画面或添加连续性圣经未规定的起点。"
+            f"严格遵守全片转场规则：{rules}"
+        )
+
+    if "visual_flow" in fields:
+        default_width = bible.global_visual_state.stroke_widths.get("default", 4.0)
+        normalized_flow: list[str] = []
+        for step in plan.visual_flow:
+            normalized_step = step
+            if (
+                "线宽" in step
+                and any(token in step for token in ("绘制", "画出", "描绘"))
+                and "高亮" not in step
+            ):
+                normalized_step = re.sub(
+                    r"线宽[^0-9。；，,]*\d+(?:\.\d+)?",
+                    f"线宽保持默认值 {default_width:g}",
+                    step,
+                )
+            normalized_flow.append(normalized_step)
+        updates["visual_flow"] = normalized_flow
+
+    return plan.model_copy(update=updates) if updates else plan
 
 
 CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查整部动画的场景分镜连续性。
@@ -342,7 +414,8 @@ CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查�
       "category": "state|style|math|transition|persistent_element|narrative|element_handoff",
       "severity": "minor|major",
       "message": "具体冲突",
-      "fix_instruction": "只修改相关场景的哪些字段以及改成什么状态"
+      "fix_instruction": "只修改相关场景的哪些字段以及改成什么状态",
+      "target_fields": ["transition_out"]
     }
   ]
 }

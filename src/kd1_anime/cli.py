@@ -73,8 +73,7 @@ def _ensure_visual_llm_api_available(
             console.print(f"视觉 LLM API 不可用: {exc}", style="bold red", markup=False)
             raise typer.Exit(1) from exc
         console.print(
-            "视觉 LLM API 当前不可用；主流水线将继续，视觉结果会标记为 unknown。"
-            f" 原因: {exc}",
+            f"视觉 LLM API 当前不可用；主流水线将继续，视觉结果会标记为 unknown。 原因: {exc}",
             style="yellow",
             markup=False,
         )

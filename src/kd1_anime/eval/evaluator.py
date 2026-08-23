@@ -43,9 +43,7 @@ class Evaluator:
         output_dir: Path | None = None,
     ) -> None:
         self.code_evaluator = CodeEvaluator()
-        self.visual_evaluator = (
-            VisualEvaluator(visual_eval_model) if enable_visual_eval else None
-        )
+        self.visual_evaluator = VisualEvaluator(visual_eval_model) if enable_visual_eval else None
         self.output_dir = output_dir or (
             resolve_runtime_path(settings.WORKSPACE_DIR) / "eval_results"
         )
@@ -221,10 +219,7 @@ class Evaluator:
             raise EvaluationError(f"Scene {scene_id} 的渲染视频哈希不匹配")
 
         samples_dir = (
-            run_dir
-            / "eval_frames"
-            / f"manual_scene_{scene_id}"
-            / artifact.video_sha256[:12]
+            run_dir / "eval_frames" / f"manual_scene_{scene_id}" / artifact.video_sha256[:12]
         )
         analysis, samples = self.evaluate_scene_video(
             video,

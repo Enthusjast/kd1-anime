@@ -141,6 +141,35 @@ class OneRoundContinuityReviewer:
         return ContinuityReviewResult(is_valid=True, summary="通过")
 
 
+class ContextAwareContinuityPlanner(ContinuityPlanner):
+    def __init__(self):
+        super().__init__()
+        self.continuity_contexts: list[str] = []
+
+    def plan_detail(
+        self,
+        outline,
+        all_outlines,
+        user_prompt,
+        *,
+        stream=False,
+        renderer=None,
+        continuity_bible=None,
+        continuity_feedback="",
+        continuity_context="",
+    ):
+        self.continuity_contexts.append(continuity_context)
+        return super().plan_detail(
+            outline,
+            all_outlines,
+            user_prompt,
+            stream=stream,
+            renderer=renderer,
+            continuity_bible=continuity_bible,
+            continuity_feedback=continuity_feedback,
+        )
+
+
 class FakeCoder:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []  # (feedback, previous_code)
@@ -779,6 +808,37 @@ def test_continuity_review_replans_only_affected_scenes(monkeypatch, tmp_path):
     assert planner.detail_calls == 2
     assert ctx.continuity_review_status == "passed"
     assert all(state.reviewed for state in ctx.scene_states.values())
+
+
+def test_continuity_replan_passes_latest_neighbor_snapshot(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    planner = ContextAwareContinuityPlanner()
+    continuity_reviewer = OneRoundContinuityReviewer()
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, planner=planner)
+    orchestrator.planner = planner
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", lambda: continuity_reviewer)
+
+    outlines = [make_outline(1), make_outline(2)]
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=outlines,
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="pending",
+        scene_states={
+            sid: SceneState(plan=planner.plan_detail(outline, outlines, "prompt"), plan_ready=True)
+            for sid, outline in enumerate(outlines, 1)
+        },
+    )
+    planner.continuity_contexts.clear()
+
+    orchestrator._run_scheduler(ctx)
+
+    assert ctx.continuity_review_status == "passed"
+    assert len(planner.continuity_contexts) == 2
+    assert all('"scene_id": 1' in context for context in planner.continuity_contexts)
+    assert all('"scene_id": 2' in context for context in planner.continuity_contexts)
 
 
 # ---------------------------------------------------------------------------

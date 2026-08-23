@@ -165,6 +165,18 @@ class TestSceneDetail:
         )
         assert detail.visual_design == "Test design"
 
+    def test_detail_accepts_removal_reason(self):
+        detail = SceneDetail(
+            visual_design="Test design",
+            camera_movement="Fixed",
+            visual_flow=["Step 1"],
+            key_moments=["Moment 1"],
+            computation="r=2",
+            elements_to_remove=[{"element_id": "old_label", "reason": "本场景结束后不再保留"}],
+        )
+
+        assert detail.elements_to_remove[0].reason == "本场景结束后不再保留"
+
     def test_detail_requires_visual_design(self):
         """测试场景细节需要视觉设计。"""
         with pytest.raises(ValidationError):

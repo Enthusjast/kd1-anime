@@ -261,9 +261,7 @@ class Settings(BaseSettings):
         default=3.5, ge=1.0, le=5.0, description="评估通过阈值（1-5分），低于此分数触发改进"
     )
     MAX_EVAL_ROUNDS: int = Field(default=2, ge=0, le=5, description="最大评估-改进轮数")
-    EVAL_VISUAL_MODEL: str | None = Field(
-        default=None, description="VISUAL_LLM_MODEL 的弃用别名"
-    )
+    EVAL_VISUAL_MODEL: str | None = Field(default=None, description="VISUAL_LLM_MODEL 的弃用别名")
     VISUAL_EVAL_FRAME_COUNT: int = Field(default=6, ge=1, le=8)
     VISUAL_EVAL_THRESHOLD: float = Field(default=3.5, ge=1.0, le=5.0)
     MAX_VISUAL_FIX_ATTEMPTS: int = Field(default=2, ge=0, le=5)

@@ -12,7 +12,6 @@ TUI 交互模块
 import locale
 import signal
 import sys
-import time
 from contextlib import suppress
 
 from prompt_toolkit import PromptSession
@@ -137,17 +136,10 @@ class Clarifier:
                 response = self.agent.call_llm(messages=self._bounded_history(), stream=False)
                 self.history.append({"role": "assistant", "content": response})
                 if self.extract_ready(response) is None:
-                    # 非 READY 响应：逐字打印模拟流式效果
+                    # 非 READY 响应按 Markdown 渲染。READY JSON 是内部协议，
+                    # 已在上面拦截，不应直接展示给用户。
                     console.print("[dim cyan]AI:[/]")
-                    for char in response:
-                        console.print(char, end="", highlight=False)
-                        if char in "，。！？、；：''（）":
-                            time.sleep(0.05)
-                        elif char == "\n":
-                            time.sleep(0.08)
-                        else:
-                            time.sleep(0.015)
-                    console.print()  # 最后换行
+                    console.print(Markdown(response))
                 return response
             except Exception as e:
                 console.print()
@@ -226,8 +218,9 @@ class Clarifier:
         if "{" not in text:
             return None
 
-        # 复用 BaseAgent 的健壮 JSON 提取 (去 fence + 括号配平)
-        json_str = self.agent._extract_json(text)
+        # Clarifier 的协议是 JSON 对象. 不能让前置说明中的数学区间
+        # (例如 ``[-5, 5]``) 抢先成为待解析的 JSON。
+        json_str = self.agent._extract_json(text, expected_type="object")
 
         try:
             data = json.loads(json_str)
@@ -236,6 +229,7 @@ class Clarifier:
             # 先修复再解析一次, 否则 READY 会被误判为普通提问而卡在澄清循环。
             repaired = self.agent._escape_control_chars_in_json(json_str)
             repaired = self.agent._fix_latex_escapes_in_json(repaired)
+            repaired = self.agent._close_truncated_json(repaired)
             try:
                 data = json.loads(repaired)
             except json.JSONDecodeError:
@@ -407,9 +401,13 @@ class ChatSession:
         banner.append("  ╚═══════════════════════════════════════╝", style="bold cyan")
         console.print(banner)
 
-        # 显示当前模型
+        # 启动时同时展示主模型和独立视觉模型；视觉评估未启用时仍展示
+        # 已配置的模型名，便于确认当前配置是否生效。
         model_name = settings.LLM_MODEL or "未配置"
-        console.print(f"  模型: [dim]{model_name}[/]")
+        visual_model_name = settings.visual_llm_profile().model or "未配置"
+        visual_state = "已启用" if settings.ENABLE_VISUAL_EVAL else "未启用"
+        console.print(f"  对话模型: [dim]{model_name}[/]")
+        console.print(f"  视觉模型: [dim]{visual_model_name}[/] ([dim]{visual_state}[/])")
 
         # 检查是否有可恢复的中断运行
         resumed = self._check_interrupted_runs()
@@ -601,7 +599,7 @@ class ChatSession:
 
         for _round_num in range(1, max_rounds + 1):
             try:
-                raw = _read_multiline("? ")
+                raw = _read_multiline(">>> ")
             except EOFError:
                 console.print("\n[dim]已退出[/]")
                 return None
@@ -846,8 +844,7 @@ class ChatSession:
                 attempt = data.get("attempt", 0)
                 maximum = data.get("max_attempts", 0)
                 console.print(
-                    f"  [dim]▸[/] Scene {scene_id}: [yellow]安排视觉修复 "
-                    f"{attempt}/{maximum}[/]"
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]安排视觉修复 {attempt}/{maximum}[/]"
                 )
 
             case "scene_visual_warning":

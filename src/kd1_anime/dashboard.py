@@ -378,7 +378,9 @@ class SceneDashboard:
                 status.started_at = 0.0
                 score = data.get("score")
                 status.message = (
-                    f"视觉评估通过 · {score:.2f}/5" if isinstance(score, (int, float)) else "视觉评估通过"
+                    f"视觉评估通过 · {score:.2f}/5"
+                    if isinstance(score, (int, float))
+                    else "视觉评估通过"
                 )
 
         elif event in ("scene_visual_warning", "scene_visual_unknown"):
@@ -429,9 +431,7 @@ class SceneDashboard:
             self.stage = "visual_evaluating"
             score = data.get("score")
             self.stage_label = (
-                f"成片视觉报告 {score:.2f}/5"
-                if isinstance(score, (int, float))
-                else "成片视觉报告"
+                f"成片视觉报告 {score:.2f}/5" if isinstance(score, (int, float)) else "成片视觉报告"
             )
 
         elif event == "final_visual_unknown":

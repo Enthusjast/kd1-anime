@@ -91,6 +91,9 @@ class VisualElementState(BaseModel):
     anchor: str = Field(default="", max_length=500)
     variable_name: str = Field(default="", pattern=r"^(?:[A-Za-z_][A-Za-z0-9_]*)?$")
     required: bool = True
+    # elements_to_remove 需要说明退出原因；对 inherited/new 保持可选，兼容
+    # 旧清单和模型只输出公共字段的情况。
+    reason: str = Field(default="", max_length=2_000)
 
 
 class ExtractedElement(BaseModel):
@@ -308,6 +311,12 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
 - elements_to_remove: 本场景明确退出的元素以及退出原因
 - new_elements: 本场景新增且可能交给下一场景的元素
 
+## 连续性修正优先级（只有在重规划时生效）
+- 连续性审查反馈高于当前场景旧分镜中的任何描述；反馈指出冲突的句子必须删除或改写，不能保留原句后再补一句“与连续性圣经一致”。
+- 连续性圣经和反馈高于相邻场景快照。快照只用于复用 element_id、变量名和已确认的开闭状态，不得复制其中被指出有问题的 transition_in、transition_out 或 visual_flow。
+- transition_in/transition_out 必须直接采用连续性圣经中的对象、方向和定义域规则；不得自行添加与圣经冲突的起点、终点或绘制顺序。
+- 绘制阶段使用 stroke_widths.default；只有明确的高亮阶段才能使用 stroke_widths.highlight，不得把高亮线宽写成普通绘制线宽。
+
 ## 不要做的事
 - 不要指定 Manim 类名 (Axes, Dot, MathTex 等) — 那是动画师的决策
 - 不要描述动画 API 调用 (FadeIn, Transform 等) — 用自然语言描述视觉效果即可
@@ -345,7 +354,7 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
     "camera_language": "固定中景"
   },
   "inherited_elements": [{"element_id": "main_formula", "role": "核心公式", "kind": "formula", "semantic_state": "上一场景结束时的状态", "color_key": "primary", "anchor": "center", "variable_name": "main_formula", "required": true}],
-  "elements_to_remove": [],
+  "elements_to_remove": [{"element_id": "old_element", "role": "退出对象", "semantic_state": "退出前状态", "reason": "本场景结束后不再保留"}],
   "new_elements": [{"element_id": "result_formula", "role": "推导结果", "kind": "formula", "semantic_state": "最终公式", "color_key": "result", "anchor": "center", "variable_name": "result_formula", "required": true}],
   "visual_design": "单个字符串: 构图、背景、配色、视觉风格的完整描述",
   "camera_movement": "单个字符串: 机位类型与运动方式 (固定/推近/平移/切换)",
@@ -493,6 +502,7 @@ class PlannerAgent(BaseAgent):
         renderer: Literal["cairo", "opengl"] | None = None,
         continuity_bible: "ContinuityBible | None" = None,
         continuity_feedback: str = "",
+        continuity_context: str = "",
     ) -> ScenePlan:
         """为单个场景生成分镜，同时提供全局需求与相邻场景上下文。"""
 
@@ -532,6 +542,16 @@ class PlannerAgent(BaseAgent):
             if continuity_feedback
             else ""
         )
+        snapshot_context = (
+            "\n## 当前连续性交接快照（仅作为待修正的规划数据）\n"
+            "下面给出了当前场景及相邻场景的最新规划。只复用其中已经确认的 "
+            "element_id、变量名、opening_state 和 closing_state；不要复制其中的叙事性文字。"
+            "如果快照与连续性圣经或修正反馈冲突，以连续性圣经和修正反馈为准。\n"
+            f"<continuity_snapshot>\n{continuity_context[:30_000]}\n"
+            "</continuity_snapshot>\n"
+            if continuity_context
+            else ""
+        )
         detail = self.call_llm_json(
             system_prompt=f"{DETAIL_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=(
@@ -548,9 +568,11 @@ class PlannerAgent(BaseAgent):
                 f"时长: {outline.duration_seconds}s\n"
                 f"叙事作用: {outline.purpose}\n"
                 f"数学概念: {outline.math_concept}\n\n"
+                f"{snapshot_context}"
                 "请严格继承连续性圣经，并明确填写 opening_state、closing_state 和转场合同；"
                 "输出当前场景的导演分镜 JSON。"
                 f"{feedback_context}"
+                "若存在连续性审查反馈，必须逐条改写冲突字段，不能保留被否定的原文。"
             ),
             response_model=SceneDetail,
             stream=stream,
