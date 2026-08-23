@@ -1,15 +1,23 @@
 # 自动评估与改进指南
 
-kd1-anime 可在视频合并后执行代码质量、渲染效率和可选视觉质量评估。评估报告用于诊断；只有低分能够归因到具体场景代码时，系统才会触发有界改进循环。
+kd1-anime 提供两条相互独立的质量链路：
+
+1. **逐场景视觉质量门**：渲染成功后、合并前，用独立多模态 LLM 检查当前场景视频，并可触发有界 Coder 修复。
+2. **确定性自动评估**：合并后评估代码质量和渲染效率；只有低分能归因到具体场景代码时才触发改进。
+
+视觉模型只输出诊断和结构化分数，不直接生成或执行 Python 代码。Planner、Coder、Reviewer 与 AutoFixer 始终使用主 LLM 配置。
+`ENABLE_VISUAL_EVAL` 与 `ENABLE_AUTO_EVAL` 可独立开启：前者控制场景视觉闭环，后者控制合并后的确定性代码/效率改进循环。
 
 ## 流程
 
 ```text
-场景流水线 → MERGING → EVALUATING
-                         ├─ 分数达到阈值 → DONE
-                         ├─ 分数未知/问题不可归因 → DONE（保留 errors）
-                         └─ 可归因场景低分 → CODING → REVIEWING → RENDERING
-                                              （最多 MAX_EVAL_ROUNDS）
+场景渲染 → VISUAL_EVALUATING
+              ├─ 通过 → MERGING
+              ├─ API/抽帧失败 → unknown → MERGING
+              ├─ 低分 → CODING → REVIEWING → RENDERING（有界）
+              └─ 修复耗尽 → 恢复最佳候选/记录 warning → MERGING
+
+MERGING → 成片视觉报告（只诊断） → EVALUATING（代码/效率） → DONE
 ```
 
 评估不会绕过正常安全门：重新生成的代码仍需确定性校验和 Reviewer 审查，渲染后生成新的产物凭据。
@@ -26,14 +34,22 @@ EVAL_THRESHOLD=3.5
 # 最大自动改进轮数
 MAX_EVAL_ROUNDS=2
 
-# 可选：抽取最终视频关键帧并调用多模态模型
-ENABLE_VISUAL_EVAL=false
+# 启用逐场景视觉质量门与成片报告
+ENABLE_VISUAL_EVAL=true
 
-# 留空则回退 LLM_MODEL
-EVAL_VISUAL_MODEL=
+# 独立多模态端点；不会继承 LLM_API_KEY/BASE_URL/MODEL
+VISUAL_LLM_API_KEY=your-visual-api-key
+VISUAL_LLM_BASE_URL=https://your-visual-endpoint/v1
+VISUAL_LLM_MODEL=your-multimodal-model
+
+# 每段视频关键帧数、通过阈值、每场景最大视觉修复次数
+VISUAL_EVAL_FRAME_COUNT=6
+VISUAL_EVAL_THRESHOLD=3.5
+MAX_VISUAL_FIX_ATTEMPTS=2
+VISUAL_LLM_PARALLEL_WORKERS=2
 ```
 
-启用视觉评估前，应确认 OpenAI-compatible 端点和模型支持 `image_url` 多模态消息。视觉评估会增加调用成本。
+启用前可运行 `kd1-anime doctor --probe-visual-llm`，确认 OpenAI-compatible 端点实际接受 `image_url` 消息。视觉 API 运行时故障会记录为 `unknown`，不会伪造低分或删除已经成功渲染的视频；配置缺失则在启动前直接报错。
 
 ## 使用
 
@@ -41,13 +57,16 @@ EVAL_VISUAL_MODEL=
 # 临时为本次命令启用自动评估（也可写入 .env）
 ENABLE_AUTO_EVAL=true kd1-anime generate "勾股定理的证明"
 
-# 评估已有运行；默认启用视觉维度
+# 评估已有运行；视觉请求使用独立端点
 kd1-anime evaluate 20260801-120000-1234abcd
+
+# 只评估清单中某个场景的精确 SceneArtifact
+kd1-anime evaluate 20260801-120000-1234abcd --scene-id 3
 
 # 只运行确定性代码/效率指标
 kd1-anime evaluate 20260801-120000-1234abcd --no-visual
 
-# 评估单个代码文件或截图
+# 评估单个代码文件或截图；--image 会自动启用视觉评估
 kd1-anime evaluate --code-file scene.py
 kd1-anime evaluate --image screenshot.png --desc "勾股定理"
 
@@ -85,11 +104,12 @@ else:
 ### 视觉质量（可选多模态模型）
 
 - `visual_relevance`
+- `visual_math_accuracy`
 - `visual_quality`
 - `visual_consistency`
 - `element_layout`
 
-系统从最终视频中均匀抽取多帧，并在一次请求中联合评价整段序列，不把单帧分数伪装成完整视频评价。
+系统在 5%–95% 时间范围内抽取有序关键帧，记录帧 ID、时间戳和 SHA-256，并在一次请求中联合评价整段序列，不把单帧分数伪装成完整视频评价。模型返回的问题必须引用实际存在的帧 ID，否则整次结果按无效处理。
 
 ### 运行效率（确定性）
 
@@ -116,7 +136,10 @@ else:
 
 ```text
 workspace/runs/<run-id>/eval_result.json
-workspace/runs/<run-id>/eval_frames/       # 启用视觉评估时
+workspace/runs/<run-id>/eval_frames/              # 关键帧及其哈希
+workspace/runs/<run-id>/eval_reports/scene_<n>/   # 场景每轮视觉报告
+workspace/runs/<run-id>/eval_reports/final_visual.json
+workspace/runs/<run-id>/visual_candidates/        # 可恢复的候选代码
 ```
 
 示例：
@@ -142,7 +165,7 @@ workspace/runs/<run-id>/eval_frames/       # 启用视觉评估时
 
 ## 排障
 
-- **视觉评分 unknown**：确认模型支持图片输入，检查 `errors.visual`、FFmpeg 和最终视频。
-- **一直低于阈值**：检查低分是否来自代码指标；渲染耗时或视觉问题未必能靠重写代码可靠解决。
-- **成本过高**：关闭 `ENABLE_VISUAL_EVAL`，降低 `MAX_EVAL_ROUNDS`，先使用确定性指标。
+- **视觉评分 unknown**：运行 `doctor --probe-visual-llm`，检查场景报告中的 `error`、FFmpeg 和视频哈希。
+- **一直低于阈值**：查看逐帧 evidence；达到 `MAX_VISUAL_FIX_ATTEMPTS` 后系统会停止重写并保留更好的候选。
+- **成本过高**：关闭 `ENABLE_VISUAL_EVAL`，或降低 `VISUAL_EVAL_FRAME_COUNT` / `MAX_VISUAL_FIX_ATTEMPTS`；这不会关闭确定性评估。
 - **对比显示 unknown**：任一运行没有有效指标时，差值也为 unknown，不应解释为 0。

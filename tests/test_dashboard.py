@@ -80,6 +80,45 @@ class TestSceneDashboard:
         assert dash.scenes[1].state == "completed"
         assert dash.scenes[1].done == ["分镜", "编码", "审查", "渲染"]
 
+    def test_visual_enabled_scene_stays_in_progress_until_visual_gate_accepts(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event(
+            "plan_complete",
+            {
+                "scenes": [MagicMock(scene_id=1, title="S1")],
+                "visual_enabled": True,
+            },
+        )
+
+        dash.on_event("scene_rendered", {"scene_id": 1})
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].done == ["渲染"]
+        assert "视觉" in dash.stages
+
+        dash.on_event("scene_visual_evaluating", {"scene_id": 1})
+        assert dash.scenes[1].stage == "视觉"
+        dash.on_event("scene_visual_pass", {"scene_id": 1, "score": 4.2})
+        assert dash.scenes[1].state == "completed"
+        assert dash.scenes[1].done == ["渲染", "视觉"]
+
+    def test_visual_unknown_is_an_accepted_warning_terminal(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event(
+            "plan_complete",
+            {
+                "scenes": [MagicMock(scene_id=1, title="S1")],
+                "visual_enabled": True,
+            },
+        )
+        dash.on_event("scene_rendered", {"scene_id": 1})
+        dash.on_event("scene_visual_unknown", {"scene_id": 1, "reason": "timeout"})
+
+        assert dash.scenes[1].state == "warning"
+        assert dash.scenes[1].icon == "⚠"
+        assert "未知" in dash.scenes[1].message
+
     def test_pipeline_row_shows_done_and_current_stages(self):
         dash = SceneDashboard()
         dash.live = MagicMock()
@@ -117,6 +156,7 @@ class TestSceneDashboard:
         dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
         dash.on_event("scene_failed", {"scene_id": 1, "reason": "LLM timeout"})
         assert dash.scenes[1].state == "failed"
+        assert dash.scenes[1].stage == ""
         assert "LLM timeout" in dash.scenes[1].message
 
         dash.on_event("scene_give_up", {"scene_id": 1})

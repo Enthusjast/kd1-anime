@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,6 +15,44 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 USER_CONFIG_DIR = XDG_CONFIG_HOME / "kd1-anime"
 USER_ENV_FILE = USER_CONFIG_DIR / ".env"
+
+
+@dataclass(frozen=True, slots=True)
+class LLMRuntimeProfile:
+    """一次 Agent 调用使用的不可变 OpenAI-compatible 端点配置。"""
+
+    label: str
+    env_prefix: str
+    api_key: str
+    base_url: str
+    model: str
+    send_max_tokens: bool
+    temperature: float
+    max_tokens: int | None
+    max_retries: int
+    retry_base_delay: float
+    timeout_connect: float
+    timeout_read: float
+    healthcheck_timeout: float
+    silent_stream: bool
+    empty_retry_max_tokens: int
+    json_repair_attempts: int
+    use_json_mode: bool
+    debug: bool
+
+    def require(self) -> None:
+        """验证端点凭据，不把 secret 写入异常文本。"""
+
+        placeholders = {"", "sk-your-key-here", "your-model-name"}
+        missing: list[str] = []
+        if not self.api_key or self.api_key in placeholders:
+            missing.append(f"{self.env_prefix}_API_KEY")
+        if not self.base_url.strip():
+            missing.append(f"{self.env_prefix}_BASE_URL")
+        if not self.model.strip() or self.model in placeholders:
+            missing.append(f"{self.env_prefix}_MODEL")
+        if missing:
+            raise ValueError(f"{self.label}配置不完整（缺少或仍为占位值：{', '.join(missing)}）")
 
 
 def _current_working_directory() -> Path:
@@ -82,6 +122,18 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("LLM_BASE_URL")
+    @classmethod
+    def validate_llm_base_url(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("LLM_BASE_URL 不能为空")
+        parsed = urlparse(value.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("LLM_BASE_URL 必须是带 http/https scheme 的 URL")
+        if any(char in value for char in "\r\n"):
+            raise ValueError("LLM_BASE_URL 不能包含换行")
+        return value.strip().rstrip("/")
+
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)
     LLM_DEBUG: bool = False
@@ -89,6 +141,46 @@ class Settings(BaseSettings):
         default=True,
         description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级",
     )
+
+    # --- 独立视觉 LLM API ---
+    # 视觉评估绝不隐式复用主 LLM 的 Key、端点或模型。未启用时可以留空。
+    VISUAL_LLM_API_KEY: str = ""
+    VISUAL_LLM_BASE_URL: str = ""
+    VISUAL_LLM_MODEL: str = ""
+    VISUAL_LLM_SEND_MAX_TOKENS: bool = True
+    VISUAL_LLM_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
+    VISUAL_LLM_MAX_TOKENS: int | None = Field(default=3000, ge=1, le=1_000_000)
+    VISUAL_LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+    VISUAL_LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
+    VISUAL_LLM_TIMEOUT_CONNECT: float = Field(default=30.0, ge=1.0, le=300.0)
+    VISUAL_LLM_TIMEOUT_READ: float = Field(default=300.0, ge=10.0, le=3600.0)
+    VISUAL_LLM_HEALTHCHECK_TIMEOUT: float = Field(default=20.0, ge=1.0, le=120.0)
+    VISUAL_LLM_JSON_REPAIR_ATTEMPTS: int = Field(default=1, ge=0, le=5)
+    VISUAL_LLM_USE_JSON_MODE: bool = True
+    VISUAL_LLM_PARALLEL_WORKERS: int = Field(default=2, ge=1, le=16)
+    VISUAL_LLM_DEBUG: bool = False
+
+    @field_validator("VISUAL_LLM_BASE_URL")
+    @classmethod
+    def validate_visual_llm_base_url(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("VISUAL_LLM_BASE_URL 必须是字符串")
+        value = value.strip()
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("VISUAL_LLM_BASE_URL 必须是带 http/https scheme 的 URL")
+        if any(char in value for char in "\r\n"):
+            raise ValueError("VISUAL_LLM_BASE_URL 不能包含换行")
+        return value.rstrip("/")
+
+    @field_validator("VISUAL_LLM_MAX_TOKENS", mode="before")
+    @classmethod
+    def validate_visual_max_tokens(cls, value):
+        if value is None or value == "":
+            return None
+        return value
 
     # --- Slurm 集群 ---
     SLURM_PARTITION: str = ""
@@ -123,6 +215,18 @@ class Settings(BaseSettings):
     OVERWRITE_OUTPUT: bool = False
     TRANSITION_TYPE: Literal["fade"] = "fade"
     TRANSITION_DURATION: float = Field(default=0.5, gt=0.0, le=5.0)
+    # --- FFmpeg 合并 ---
+    # 合并配置与 Manim RenderProfile 分离：修改这些项不会让已有场景视频
+    # 被误认为可以复用，但会在最终合并时明确使用用户选择的发布配置。
+    MERGE_VIDEO_CODEC: Literal["libx264", "libx265"] = "libx264"
+    MERGE_VIDEO_PRESET: str = Field(
+        default="medium",
+        pattern=r"^[A-Za-z0-9_-]{1,30}$",
+        description="FFmpeg 编码 preset，限制为单行安全标识",
+    )
+    MERGE_VIDEO_CRF: int = Field(default=18, ge=0, le=51)
+    MERGE_AUDIO_SAMPLE_RATE: int = Field(default=48_000, ge=8_000, le=192_000)
+    MERGE_AUDIO_CHANNEL_LAYOUT: Literal["stereo"] = "stereo"
 
     # --- 路径 ---
     WORKSPACE_DIR: Path = Path("workspace")
@@ -158,8 +262,11 @@ class Settings(BaseSettings):
     )
     MAX_EVAL_ROUNDS: int = Field(default=2, ge=0, le=5, description="最大评估-改进轮数")
     EVAL_VISUAL_MODEL: str | None = Field(
-        default=None, description="视觉评估使用的模型（默认使用 LLM_MODEL）"
+        default=None, description="VISUAL_LLM_MODEL 的弃用别名"
     )
+    VISUAL_EVAL_FRAME_COUNT: int = Field(default=6, ge=1, le=8)
+    VISUAL_EVAL_THRESHOLD: float = Field(default=3.5, ge=1.0, le=5.0)
+    MAX_VISUAL_FIX_ATTEMPTS: int = Field(default=2, ge=0, le=5)
     MAX_SCENES: int = Field(default=12, ge=1, le=100)
     MAX_PROMPT_CHARS: int = Field(default=50_000, ge=100, le=1_000_000)
     # 澄清对话会携带多轮 user/assistant 消息；独立预算避免累计内容超过模型上下文。
@@ -285,6 +392,61 @@ class Settings(BaseSettings):
 配置示例见：{example_path}
             """
             raise ValueError(error_msg)
+
+    def require_visual_llm(self) -> None:
+        """验证独立多模态端点；禁止静默回退到主 LLM。"""
+
+        self.visual_llm_profile().require()
+
+    def main_llm_profile(self) -> LLMRuntimeProfile:
+        """构造主规划/编码模型的运行配置。"""
+
+        return LLMRuntimeProfile(
+            label="LLM ",
+            env_prefix="LLM",
+            api_key=self.LLM_API_KEY,
+            base_url=self.LLM_BASE_URL,
+            model=self.LLM_MODEL,
+            send_max_tokens=self.LLM_SEND_MAX_TOKENS,
+            temperature=self.LLM_TEMPERATURE,
+            max_tokens=self.LLM_MAX_TOKENS,
+            max_retries=self.LLM_MAX_RETRIES,
+            retry_base_delay=self.LLM_RETRY_BASE_DELAY,
+            timeout_connect=self.LLM_TIMEOUT_CONNECT,
+            timeout_read=self.LLM_TIMEOUT_READ,
+            healthcheck_timeout=self.LLM_HEALTHCHECK_TIMEOUT,
+            silent_stream=self.LLM_SILENT_STREAM,
+            empty_retry_max_tokens=self.LLM_EMPTY_RETRY_MAX_TOKENS,
+            json_repair_attempts=self.LLM_JSON_REPAIR_ATTEMPTS,
+            use_json_mode=self.LLM_USE_JSON_MODE,
+            debug=self.LLM_DEBUG,
+        )
+
+    def visual_llm_profile(self, *, model_override: str | None = None) -> LLMRuntimeProfile:
+        """构造视觉评估模型配置；只兼容旧模型名，不继承主 API。"""
+
+        model = model_override or self.VISUAL_LLM_MODEL or self.EVAL_VISUAL_MODEL or ""
+        return LLMRuntimeProfile(
+            label="视觉 LLM ",
+            env_prefix="VISUAL_LLM",
+            api_key=self.VISUAL_LLM_API_KEY,
+            base_url=self.VISUAL_LLM_BASE_URL,
+            model=model,
+            send_max_tokens=self.VISUAL_LLM_SEND_MAX_TOKENS,
+            temperature=self.VISUAL_LLM_TEMPERATURE,
+            max_tokens=self.VISUAL_LLM_MAX_TOKENS,
+            max_retries=self.VISUAL_LLM_MAX_RETRIES,
+            retry_base_delay=self.VISUAL_LLM_RETRY_BASE_DELAY,
+            timeout_connect=self.VISUAL_LLM_TIMEOUT_CONNECT,
+            timeout_read=self.VISUAL_LLM_TIMEOUT_READ,
+            healthcheck_timeout=self.VISUAL_LLM_HEALTHCHECK_TIMEOUT,
+            # 图片消息保持普通非流式，兼容更多 OpenAI-compatible 端点。
+            silent_stream=False,
+            empty_retry_max_tokens=max(1024, self.VISUAL_LLM_MAX_TOKENS or 3000),
+            json_repair_attempts=self.VISUAL_LLM_JSON_REPAIR_ATTEMPTS,
+            use_json_mode=self.VISUAL_LLM_USE_JSON_MODE,
+            debug=self.VISUAL_LLM_DEBUG,
+        )
 
 
 settings = Settings()

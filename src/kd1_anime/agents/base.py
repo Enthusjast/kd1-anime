@@ -25,7 +25,7 @@ from pydantic import BaseModel, ValidationError
 from rich.console import Console
 from rich.panel import Panel
 
-from kd1_anime.config import settings
+from kd1_anime.config import LLMRuntimeProfile, settings
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -45,11 +45,12 @@ class BaseAgent:
 
     name: str = "BaseAgent"
 
-    def __init__(self):
+    def __init__(self, profile: LLMRuntimeProfile | None = None):
         # 延迟构造 client: 避免 API Key 为空时在实例化阶段就崩溃
         # (让调用方有机会先给出友好的配置错误提示)
+        self.profile = profile or settings.main_llm_profile()
         self._client: OpenAI | None = None
-        self.model = settings.LLM_MODEL
+        self.model = self.profile.model
 
     @property
     def client(self) -> OpenAI:
@@ -58,17 +59,22 @@ class BaseAgent:
             import httpx
 
             self._client = OpenAI(
-                api_key=settings.LLM_API_KEY,
-                base_url=settings.LLM_BASE_URL,
+                api_key=self.profile.api_key,
+                base_url=self.profile.base_url,
                 timeout=httpx.Timeout(
-                    settings.LLM_TIMEOUT_READ,
-                    connect=settings.LLM_TIMEOUT_CONNECT,
-                    read=settings.LLM_TIMEOUT_READ,
+                    self.profile.timeout_read,
+                    connect=self.profile.timeout_connect,
+                    read=self.profile.timeout_read,
                 ),
             )
         return self._client
 
-    def check_api_available(self, *, timeout: float | None = None) -> None:
+    def check_api_available(
+        self,
+        *,
+        timeout: float | None = None,
+        messages: list[dict] | None = None,
+    ) -> None:
         """发送一次最小聊天请求，确认当前端点和模型确实可调用。
 
         只检查连接、鉴权和模型路由，不消费业务提示词。请求使用一个 token
@@ -77,13 +83,13 @@ class BaseAgent:
         的请求；其他错误直接交给调用方转换为启动失败。
         """
 
-        settings.require_llm_key()
-        health_timeout = settings.LLM_HEALTHCHECK_TIMEOUT if timeout is None else float(timeout)
+        self.profile.require()
+        health_timeout = self.profile.healthcheck_timeout if timeout is None else float(timeout)
         request = {
             "model": self.model,
-            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "messages": messages or [{"role": "user", "content": "Reply with OK."}],
         }
-        if settings.LLM_SEND_MAX_TOKENS:
+        if self.profile.send_max_tokens:
             request["max_tokens"] = 1
 
         try:
@@ -107,14 +113,16 @@ class BaseAgent:
         if not getattr(response, "choices", None):
             raise RuntimeError(self._healthcheck_error("API 返回了空 choices"))
 
-    @staticmethod
-    def _healthcheck_error(error: object) -> str:
+    def _healthcheck_error(self, error: object) -> str:
         """生成不泄露 API Key 的启动探测错误。"""
 
         detail = str(error).strip() or type(error).__name__
-        if settings.LLM_API_KEY:
-            detail = detail.replace(settings.LLM_API_KEY, "<redacted>")
-        return f"LLM API 不可用（{settings.LLM_BASE_URL}，模型 {settings.LLM_MODEL}）：{detail}"
+        if self.profile.api_key:
+            detail = detail.replace(self.profile.api_key, "<redacted>")
+        return (
+            f"{self.profile.label}API 不可用"
+            f"（{self.profile.base_url}，模型 {self.model}）：{detail}"
+        )
 
     def _log(self, message: str, style: str = "bold cyan") -> None:
         """打印 Agent 思考过程（仪表盘激活时抑制，避免破坏 Live 渲染）"""
@@ -168,10 +176,10 @@ class BaseAgent:
         Raises:
             RuntimeError: 重试耗尽后抛出
         """
-        settings.require_llm_key()
+        self.profile.require()
 
-        temp = temperature if temperature is not None else settings.LLM_TEMPERATURE
-        tokens = max_tokens if max_tokens is not None else settings.LLM_MAX_TOKENS
+        temp = temperature if temperature is not None else self.profile.temperature
+        tokens = max_tokens if max_tokens is not None else self.profile.max_tokens
 
         if messages is None:
             messages = [
@@ -185,28 +193,26 @@ class BaseAgent:
             "temperature": temp,
         }
         # 部分 (推理类) 模型拒绝 max_tokens; 通过设置可关闭
-        if getattr(settings, "LLM_SEND_MAX_TOKENS", True) and tokens:
+        if self.profile.send_max_tokens and tokens:
             kwargs["max_tokens"] = tokens
-        if json_mode and getattr(settings, "LLM_USE_JSON_MODE", True):
+        if json_mode and self.profile.use_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
         last_error: Exception | None = None
         json_fallback_used = False
         stream_fallback_used = False
         # 静默流式: stream=False(不展示内容)时仍使用流式传输, 避免长生成超时
-        use_stream_transport = stream or (
-            not stream and getattr(settings, "LLM_SILENT_STREAM", False)
-        )
+        use_stream_transport = stream or (not stream and self.profile.silent_stream)
         temp_fallback_used = False
         max_tokens_fallback_used = False
         max_tokens_boosted = False
 
         attempt = 0
-        while attempt < settings.LLM_MAX_RETRIES:
+        while attempt < self.profile.max_retries:
             attempt += 1
             try:
-                self._log(f"LLM 调用中... (尝试 {attempt}/{settings.LLM_MAX_RETRIES})")
-                if getattr(settings, "LLM_DEBUG", False):
+                self._log(f"LLM 调用中... (尝试 {attempt}/{self.profile.max_retries})")
+                if self.profile.debug:
                     for i, msg in enumerate(messages):
                         role = msg["role"]
                         body = msg["content"]
@@ -234,7 +240,7 @@ class BaseAgent:
                         # (不消耗业务重试), 而不是立刻把整个场景判死。
                         if not max_tokens_boosted and not max_tokens_fallback_used:
                             max_tokens_val = kwargs.get("max_tokens")
-                            boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
+                            boost = self.profile.empty_retry_max_tokens
                             if max_tokens_val:
                                 boost = max(int(max_tokens_val) * 2, boost)
                             boost = min(boost, 65536)
@@ -254,7 +260,7 @@ class BaseAgent:
                             style="bold yellow",
                         )
                         last_error = TruncatedResponseError("LLM 输出被截断且内容为空")
-                        if attempt < settings.LLM_MAX_RETRIES:
+                        if attempt < self.profile.max_retries:
                             delay = self._retry_delay(attempt, last_error)
                             time.sleep(delay)
                         continue
@@ -290,7 +296,7 @@ class BaseAgent:
                         and not max_tokens_boosted
                         and not max_tokens_fallback_used
                     ):
-                        boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
+                        boost = self.profile.empty_retry_max_tokens
                         self._log(
                             f"空响应: 补充 max_tokens={boost} 后重试 (推理模型可能耗尽输出预算)",
                             style="yellow",
@@ -304,14 +310,14 @@ class BaseAgent:
                         style="bold yellow",
                     )
                     last_error = RuntimeError("LLM 返回空响应")
-                    if attempt < settings.LLM_MAX_RETRIES:
+                    if attempt < self.profile.max_retries:
                         delay = self._retry_delay(attempt, last_error)
                         time.sleep(delay)
                     continue
                 if finish_reason == "length":
                     if not max_tokens_boosted and not max_tokens_fallback_used:
                         current_limit = kwargs.get("max_tokens")
-                        boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
+                        boost = self.profile.empty_retry_max_tokens
                         if current_limit:
                             boost = max(int(current_limit) * 2, boost)
                         boost = min(boost, 65536)
@@ -325,10 +331,10 @@ class BaseAgent:
                         continue
                     last_error = TruncatedResponseError("LLM 输出被截断")
                     self._log("LLM 响应仍被截断，将重新生成", style="bold yellow")
-                    if attempt < settings.LLM_MAX_RETRIES:
+                    if attempt < self.profile.max_retries:
                         time.sleep(self._retry_delay(attempt, last_error))
                     continue
-                if getattr(settings, "LLM_DEBUG", False) and (
+                if self.profile.debug and (
                     not use_stream_transport or not stream
                 ):
                     preview = content[:500] + ("..." if len(content) > 500 else "")
@@ -339,7 +345,7 @@ class BaseAgent:
                 last_error = e
                 # 关闭 client 重建, 避免 httpx 连接池复用死连接
                 self._client = None
-                if attempt < settings.LLM_MAX_RETRIES:
+                if attempt < self.profile.max_retries:
                     delay = self._retry_delay(attempt, e)
                     self._log(
                         f"API 限流/超时/连接错误, {delay:.1f}s 后重试... ({e})",
@@ -405,7 +411,7 @@ class BaseAgent:
                 if any(kw in msg_lower for kw in blocked_keywords):
                     raise RuntimeError(f"[{self.name}] API 请求被拒绝 (不可重试): {e}") from e
                 last_error = e
-                if attempt < settings.LLM_MAX_RETRIES:
+                if attempt < self.profile.max_retries:
                     delay = self._retry_delay(attempt, e)
                     time.sleep(delay)
 
@@ -415,11 +421,10 @@ class BaseAgent:
         if isinstance(last_error, TruncatedResponseError):
             raise TruncatedResponseError(f"[{self.name}] LLM 输出在重试后仍被截断") from last_error
         raise RuntimeError(
-            f"[{self.name}] LLM 调用在 {settings.LLM_MAX_RETRIES} 次重试后仍然失败: {last_error}"
+            f"[{self.name}] LLM 调用在 {self.profile.max_retries} 次重试后仍然失败: {last_error}"
         )
 
-    @staticmethod
-    def _retry_delay(attempt: int, error: Exception | None = None) -> float:
+    def _retry_delay(self, attempt: int, error: Exception | None = None) -> float:
         """指数退避加随机抖动，并优先尊重服务端 Retry-After。"""
         response = getattr(error, "response", None)
         headers = getattr(response, "headers", {}) or {}
@@ -429,8 +434,8 @@ class BaseAgent:
                 return min(300.0, max(0.1, float(retry_after)))
             except (TypeError, ValueError):
                 pass
-        base = settings.LLM_RETRY_BASE_DELAY * (2 ** max(0, attempt - 1))
-        return min(300.0, base + random.uniform(0, settings.LLM_RETRY_BASE_DELAY))
+        base = self.profile.retry_base_delay * (2 ** max(0, attempt - 1))
+        return min(300.0, base + random.uniform(0, self.profile.retry_base_delay))
 
     def _stream_llm(self, kwargs: dict, *, display: bool = True) -> tuple[str, str | None]:
         """流式调用 LLM；可静默收集，显示时 ESC 可取消。
@@ -512,7 +517,7 @@ class BaseAgent:
                         console.print(text, end="", soft_wrap=True, highlight=False)
                 elif not reasoning and not finish:
                     empty_chunks += 1
-                    if display and empty_chunks <= 3 and settings.LLM_DEBUG:
+                    if display and empty_chunks <= 3 and self.profile.debug:
                         delta_fields = {
                             key: value for key, value in delta.__dict__.items() if value is not None
                         }
@@ -536,7 +541,7 @@ class BaseAgent:
 
         if user_cancelled:
             raise StreamCancelledError(f"[{self.name}] 用户取消了流式响应")
-        if display and content_chunks == 0 and settings.LLM_DEBUG:
+        if display and content_chunks == 0 and self.profile.debug:
             console.print(
                 f"[bold red]诊断:[/] 无 content. reasoning={reasoning_chunks}, "
                 "可能是推理模型耗尽 token 或 API 异常."
@@ -557,6 +562,9 @@ class BaseAgent:
         response_model: type[T],
         temperature: float | None = None,
         stream: bool = False,
+        *,
+        messages: list[dict] | None = None,
+        max_tokens: int | None = None,
     ) -> T:
         """
         调用 LLM 并将响应解析为 Pydantic 模型
@@ -574,15 +582,18 @@ class BaseAgent:
         """
         temp = 0.0 if temperature is None else temperature
 
-        repair_attempts = max(0, int(getattr(settings, "LLM_JSON_REPAIR_ATTEMPTS", 2)))
+        repair_attempts = max(0, self.profile.json_repair_attempts)
         current_message = user_message
+        current_messages = self._clone_messages(messages) if messages is not None else None
 
         for attempt in range(repair_attempts + 1):
             raw = self.call_llm(
                 system_prompt=system_prompt,
                 user_message=current_message,
                 temperature=temp,
+                max_tokens=max_tokens,
                 json_mode=True,
+                messages=self._clone_messages(current_messages),
                 stream=stream,
             )
 
@@ -604,10 +615,13 @@ class BaseAgent:
                         raise RuntimeError(
                             f"[{self.name}] LLM 返回了无效的 JSON: {first_error}"
                         ) from error
-                    current_message = self._append_repair_hint(
-                        current_message,
-                        f"上一次输出无法解析为 JSON:\n{raw[-2000:]}",
-                    )
+                    hint = f"上一次输出无法解析为 JSON:\n{raw[-2000:]}"
+                    if current_messages is None:
+                        current_message = self._append_repair_hint(current_message, hint)
+                    else:
+                        current_messages = self._append_messages_repair_hint(
+                            current_messages, hint
+                        )
                     self._log(
                         f"JSON 解析失败, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
                         style="yellow",
@@ -636,11 +650,14 @@ class BaseAgent:
                         style="red",
                     )
                     raise RuntimeError(f"[{self.name}] LLM 输出不符合预期结构: {e}") from e
-                current_message = self._append_repair_hint(
-                    current_message,
-                    f"上一次输出未通过结构校验:\n"
-                    f"{json.dumps(data, ensure_ascii=False, indent=2)}\n\n校验错误: {e}",
+                hint = (
+                    "上一次输出未通过结构校验:\n"
+                    f"{json.dumps(data, ensure_ascii=False, indent=2)}\n\n校验错误: {e}"
                 )
+                if current_messages is None:
+                    current_message = self._append_repair_hint(current_message, hint)
+                else:
+                    current_messages = self._append_messages_repair_hint(current_messages, hint)
                 self._log(
                     f"输出结构不合规, 带错误反馈重试 ({attempt + 1}/{repair_attempts})",
                     style="yellow",
@@ -664,7 +681,7 @@ class BaseAgent:
         """
         temp = 0.0 if temperature is None else temperature
 
-        repair_attempts = max(0, int(getattr(settings, "LLM_JSON_REPAIR_ATTEMPTS", 2)))
+        repair_attempts = max(0, self.profile.json_repair_attempts)
         current_message = user_message
 
         for attempt in range(repair_attempts + 1):
@@ -784,6 +801,39 @@ class BaseAgent:
             "请严格按照要求的 JSON schema 重新输出: 枚举字段必须使用给定取值之一, "
             "不得缺失必填字段, 不要包含额外字段, 只输出 JSON 本身。"
         )
+
+    @staticmethod
+    def _clone_messages(messages: list[dict] | None) -> list[dict] | None:
+        """复制消息容器，避免兼容性降级逻辑改写调用方的多模态消息。"""
+
+        if messages is None:
+            return None
+        cloned: list[dict] = []
+        for message in messages:
+            item = dict(message)
+            content = item.get("content")
+            if isinstance(content, list):
+                item["content"] = [dict(part) if isinstance(part, dict) else part for part in content]
+            cloned.append(item)
+        return cloned
+
+    @classmethod
+    def _append_messages_repair_hint(cls, messages: list[dict], hint: str) -> list[dict]:
+        """向多模态 user 消息追加纯文本 schema 修复提示，保留原图片。"""
+
+        cloned = cls._clone_messages(messages) or []
+        repair_text = cls._append_repair_hint("", hint).strip()
+        for message in reversed(cloned):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                message["content"] = [*content, {"type": "text", "text": repair_text}]
+            else:
+                message["content"] = f"{content or ''}\n\n{repair_text}".strip()
+            return cloned
+        cloned.append({"role": "user", "content": repair_text})
+        return cloned
 
     # ------------------------------------------------------------------
     # 提取工具 (健壮版)

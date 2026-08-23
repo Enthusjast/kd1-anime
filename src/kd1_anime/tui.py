@@ -503,6 +503,13 @@ class ChatSession:
             manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
             if manifest.state in RESUME_LLM_STATES:
                 settings.require_llm_key()
+            if manifest.visual_eval_profile.enabled and manifest.status not in {
+                "completed",
+                "dry_run_complete",
+            }:
+                settings.visual_llm_profile(
+                    model_override=manifest.visual_eval_profile.model
+                ).require()
 
             dashboard = SceneDashboard()
             dashboard_active = dashboard.start()
@@ -743,6 +750,8 @@ class ChatSession:
                         console.print(Rule("[bold magenta]监控渲染[/]", style="magenta"))
                     case "fixing":
                         console.print(Rule("[bold magenta]自动修复[/]", style="magenta"))
+                    case "visual_evaluating":
+                        console.print(Rule("[bold magenta]视觉评估[/]", style="magenta"))
                     case "merging":
                         console.print(Rule("[bold magenta]视频拼接[/]", style="magenta"))
                     case "evaluating":
@@ -820,6 +829,40 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]渲染成功 ✓[/]")
 
+            case "scene_visual_evaluating":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]视觉评估中[/]")
+
+            case "scene_visual_pass":
+                scene_id = data.get("scene_id", "?")
+                score = data.get("score")
+                suffix = f" ({score:.2f}/5)" if isinstance(score, (int, float)) else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [bold green]视觉评估通过 ✓[/]{suffix}"
+                )
+
+            case "scene_visual_fixing":
+                scene_id = data.get("scene_id", "?")
+                attempt = data.get("attempt", 0)
+                maximum = data.get("max_attempts", 0)
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]安排视觉修复 "
+                    f"{attempt}/{maximum}[/]"
+                )
+
+            case "scene_visual_warning":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", "视觉问题已记录"))
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]视觉提示: {reason}[/]")
+
+            case "scene_visual_unknown":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", "视觉端点不可用"))
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]视觉结果 unknown，继续流水线: "
+                    f"{reason}[/]"
+                )
+
             case "scene_failed":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]渲染失败 ✗[/]")
@@ -849,6 +892,16 @@ class ChatSession:
                 size_mb = data.get("size_mb", 0)
                 partial = " [yellow](部分输出)[/]" if data.get("partial") else ""
                 console.print(f"\n  [bold]输出:[/] {esc(path)} [dim]({size_mb:.1f} MB)[/]{partial}")
+
+            case "final_visual_complete":
+                score = data.get("score")
+                suffix = f"{score:.2f}/5" if isinstance(score, (int, float)) else "已生成"
+                console.print(f"  [green]成片视觉报告:[/] {suffix}")
+
+            case "final_visual_unknown":
+                console.print(
+                    f"  [yellow]成片视觉报告不可用:[/] {esc(data.get('reason', 'unknown'))}"
+                )
 
     @staticmethod
     def _show_completion(output_path) -> None:

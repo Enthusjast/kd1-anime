@@ -701,7 +701,7 @@ def test_eval_improvement_state_and_round_are_checkpointed(monkeypatch, tmp_path
     assert restored.eval_round == 1
 
 
-def test_auto_eval_does_not_decide_when_requested_visual_metrics_are_unknown(monkeypatch, tmp_path):
+def test_auto_eval_does_not_repeat_visual_calls_or_depend_on_visual_endpoint(monkeypatch, tmp_path):
     from kd1_anime.config import settings
     from kd1_anime.eval.metrics import EvalMetric, EvalResult, QualityScore
 
@@ -727,15 +727,17 @@ def test_auto_eval_does_not_decide_when_requested_visual_metrics_are_unknown(mon
     run_result = EvalResult(run_id=run_paths.run_id)
     run_result.add_score(QualityScore(EvalMetric.CODE_STYLE, 1))
     run_result.add_error("visual", "vision endpoint unavailable")
+    calls = {}
 
     class FakeEvaluator:
         def __init__(self, **kwargs):
-            pass
+            calls["init"] = kwargs
 
         def evaluate_code(self, source):
             return low_code
 
         def evaluate_run(self, *args, **kwargs):
+            calls["run"] = kwargs
             return run_result
 
     monkeypatch.setattr("kd1_anime.eval.Evaluator", FakeEvaluator)
@@ -744,7 +746,303 @@ def test_auto_eval_does_not_decide_when_requested_visual_metrics_are_unknown(mon
     monkeypatch.setattr(settings, "MAX_EVAL_ROUNDS", 2)
     monkeypatch.setattr(settings, "EVAL_THRESHOLD", 3.5)
 
-    assert Orchestrator()._eval(ctx) is False
-    assert ctx.eval_round == 0
-    assert state.code
+    assert Orchestrator()._eval(ctx) is True
+    assert calls["init"]["enable_visual_eval"] is False
+    assert calls["run"]["enable_visual"] is False
+    assert ctx.eval_round == 1
+    assert state.code == ""
+    assert state.rendered is False
+
+
+def _make_visual_eval_context(tmp_path):
+    from kd1_anime.run_store import VisualEvalProfile
+
+    run_paths = paths(tmp_path)
+    for directory in (run_paths.root, run_paths.scenes, run_paths.logs, run_paths.videos):
+        directory.mkdir(parents=True, exist_ok=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    (run_paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
+    video = run_paths.videos / "scene_1" / "Demo.mp4"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"scene-video")
+    profile = PipelineContext("x").render_profile
+    artifact = SceneArtifact(
+        origin="rendered",
+        source_run_id=run_paths.run_id,
+        job_id="123",
+        scene_id=1,
+        scene_class_name="Demo",
+        code_sha256=sha256_text(code),
+        render_profile_sha256=profile.digest(),
+        video_path=video.relative_to(run_paths.root).as_posix(),
+        video_sha256=sha256_file(video),
+        metadata=VideoMetadata(
+            size_bytes=video.stat().st_size,
+            duration_seconds=1,
+            width=profile.pixel_width,
+            height=profile.pixel_height,
+            frame_rate=profile.frame_rate,
+        ),
+    )
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        rendered=True,
+        artifact=artifact,
+        visual_status="pending",
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={1: state},
+        render_profile=profile,
+        visual_eval_profile=VisualEvalProfile(
+            enabled=True,
+            model="vision-model",
+            frame_count=2,
+            threshold=3.5,
+            max_fix_attempts=2,
+        ),
+    )
+    return ctx, state
+
+
+def test_visual_gate_records_endpoint_failure_as_unknown_without_rewrite(monkeypatch, tmp_path):
+    ctx, state = _make_visual_eval_context(tmp_path)
+    events = []
+
+    class BrokenEvaluator:
+        def __init__(self, **kwargs):
+            pass
+
+        def evaluate_scene_video(self, *args, **kwargs):
+            raise RuntimeError("vision endpoint unavailable")
+
+    monkeypatch.setattr("kd1_anime.eval.Evaluator", BrokenEvaluator)
+    orchestrator = Orchestrator()
+    orchestrator._callback = lambda event, data: events.append((event, data))
+
+    assert orchestrator._visual_gate(ctx) is False
     assert state.rendered is True
+    assert state.visual_status == "unknown"
+    assert state.visual_artifact_sha256 == state.artifact.video_sha256
+    assert state.visual_report_file
+    assert (ctx.paths.root / state.visual_report_file).is_file()
+    assert state.visual_fix_attempts == 0
+    assert any(event == "scene_visual_unknown" for event, _ in events)
+
+
+def test_visual_gate_low_score_schedules_bounded_coder_rewrite(monkeypatch, tmp_path):
+    from kd1_anime.eval.visual_eval import VisualAnalysisResult
+
+    ctx, state = _make_visual_eval_context(tmp_path)
+    dimension = {"score": 2, "comprehensive_evaluation": "元素重叠"}
+    result = VisualAnalysisResult(
+        overall_analysis="布局需要修复",
+        mathematical_accuracy={"score": 4, "comprehensive_evaluation": "数学正确"},
+        visual_relevance=dimension,
+        visual_quality=dimension,
+        visual_consistency=dimension,
+        element_layout=dimension,
+        issues=[],
+    )
+
+    class LowScoreEvaluator:
+        def __init__(self, **kwargs):
+            pass
+
+        def evaluate_scene_video(self, *args, **kwargs):
+            return result, []
+
+    monkeypatch.setattr("kd1_anime.eval.Evaluator", LowScoreEvaluator)
+
+    assert Orchestrator()._visual_gate(ctx) is True
+    assert state.visual_status == "needs_fix"
+    assert state.visual_fix_attempts == 1
+    assert state.rendered is False
+    assert state.artifact is None
+    assert state.reviewed is False
+    assert "Visual Evaluation Feedback" in state.rewrite_feedback
+    assert state.visual_best_candidate is not None
+    assert state.visual_best_candidate.artifact.video_sha256
+    manifest = RunManifest.model_validate_json(
+        (ctx.paths.root / "manifest.json").read_text(encoding="utf-8")
+    )
+    restored = Orchestrator._context_from_manifest(manifest, ctx.paths.root)
+    restored_candidate = restored.scene_states[1].visual_best_candidate
+    assert restored.scene_states[1].visual_status == "needs_fix"
+    assert restored_candidate is not None
+    assert restored_candidate.code == state.visual_best_candidate.code
+    assert restored_candidate.artifact.video_sha256 == state.visual_best_candidate.artifact.video_sha256
+    stored_candidate = manifest.scenes[1].visual_best_candidate
+    assert stored_candidate is not None
+    (ctx.paths.root / stored_candidate.code_file).write_text("# tampered\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="最佳视觉候选代码哈希"):
+        Orchestrator._context_from_manifest(manifest, ctx.paths.root)
+
+
+def test_merge_rejects_visual_receipt_for_a_different_video(tmp_path):
+    ctx, state = _make_visual_eval_context(tmp_path)
+    state.visual_status = "passed"
+    state.visual_artifact_sha256 = "0" * 64
+
+    with pytest.raises(RuntimeError, match="视觉评估记录不属于当前视频"):
+        Orchestrator()._merge(ctx)
+
+
+def test_visual_rebuild_preserves_and_reuses_compatible_passed_downstream_candidate(
+    monkeypatch, tmp_path
+):
+    from kd1_anime.eval.visual_eval import VisualAnalysisResult
+
+    ctx, first = _make_visual_eval_context(tmp_path)
+    code2 = "from manim import *\nclass Demo2(Scene):\n    def construct(self): self.wait()\n"
+    (ctx.paths.scenes / "scene_2.py").write_text(code2, encoding="utf-8")
+    video2 = ctx.paths.videos / "scene_2" / "Demo2.mp4"
+    video2.parent.mkdir(parents=True)
+    video2.write_bytes(b"scene-video-2")
+    plan2 = plan().model_copy(update={"scene_id": 2, "title": "second"})
+    artifact2 = SceneArtifact(
+        origin="rendered",
+        source_run_id=ctx.paths.run_id,
+        job_id="124",
+        scene_id=2,
+        scene_class_name="Demo2",
+        code_sha256=sha256_text(code2),
+        render_profile_sha256=ctx.render_profile.digest(),
+        video_path=video2.relative_to(ctx.paths.root).as_posix(),
+        video_sha256=sha256_file(video2),
+        metadata=VideoMetadata(
+            size_bytes=video2.stat().st_size,
+            duration_seconds=1,
+            width=ctx.render_profile.pixel_width,
+            height=ctx.render_profile.pixel_height,
+            frame_rate=ctx.render_profile.frame_rate,
+        ),
+    )
+    second = SceneState(
+        plan=plan2,
+        code=code2,
+        class_name="Demo2",
+        plan_ready=True,
+        reviewed=True,
+        rendered=True,
+        artifact=artifact2,
+        visual_status="pending",
+    )
+    ctx.scene_states[2] = second
+    low_dimension = {"score": 2, "comprehensive_evaluation": "需修复"}
+    high_dimension = {"score": 5, "comprehensive_evaluation": "清晰"}
+
+    def analysis(dimension):
+        return VisualAnalysisResult(
+            overall_analysis="assessment",
+            mathematical_accuracy=dimension,
+            visual_relevance=dimension,
+            visual_quality=dimension,
+            visual_consistency=dimension,
+            element_layout=dimension,
+            issues=[],
+        )
+
+    class MixedEvaluator:
+        def __init__(self, **kwargs):
+            pass
+
+        def evaluate_scene_video(self, video_path, **kwargs):
+            return (
+                analysis(low_dimension if "scene_1" in str(video_path) else high_dimension),
+                [],
+            )
+
+    monkeypatch.setattr("kd1_anime.eval.Evaluator", MixedEvaluator)
+    orchestrator = Orchestrator()
+
+    assert orchestrator._visual_gate(ctx) is True
+    assert second.code == ""
+    assert second.visual_best_candidate is not None
+    assert second.visual_best_candidate.passed is True
+
+    # 模拟 Scene 1 的视觉重写完成但导出合同未变化；Scene 2 的候选绑定同一
+    # 继承上下文，应直接恢复而不是再次调用 Coder 或 Slurm。
+    first_candidate = first.visual_best_candidate
+    assert first_candidate is not None
+    first.code = first_candidate.code
+    first.class_name = first_candidate.class_name
+    first.artifact = first_candidate.artifact
+    first.rendered = True
+    first.reviewed = True
+    first.rewrite_feedback = ""
+    first.exported_elements_code = ""
+    first.visual_status = "warning"
+    first.visual_artifact_sha256 = first_candidate.artifact.video_sha256
+    monkeypatch.setattr(orchestrator, "_refresh_scene_export", lambda state: None)
+    orchestrator._stop_event.clear()
+
+    orchestrator._run_code_review_barrier(ctx)
+
+    assert second.code == code2
+    assert second.rendered is True
+    assert second.visual_status == "passed"
+    assert second.visual_artifact_sha256 == artifact2.video_sha256
+
+
+def test_auto_eval_invalidates_downstream_continuity_dependents(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+    from kd1_anime.eval.metrics import EvalMetric, EvalResult, QualityScore
+
+    run_paths = paths(tmp_path)
+    for directory in (run_paths.root, run_paths.scenes, run_paths.logs, run_paths.videos):
+        directory.mkdir(parents=True, exist_ok=True)
+    states = {}
+    for scene_id in (1, 2, 3):
+        source = (
+            "from manim import *\n"
+            f"class Scene{scene_id}(Scene):\n"
+            "    def construct(self): self.wait()\n"
+        )
+        (run_paths.scenes / f"scene_{scene_id}.py").write_text(source, encoding="utf-8")
+        scene_plan = plan().model_copy(update={"scene_id": scene_id})
+        states[scene_id] = SceneState(
+            plan=scene_plan,
+            code=source,
+            class_name=f"Scene{scene_id}",
+            plan_ready=True,
+            reviewed=True,
+            rendered=True,
+        )
+    run_paths.output.write_bytes(b"merged")
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states=states,
+        final_video=run_paths.output,
+    )
+
+    low = EvalResult(run_id="low")
+    low.add_score(QualityScore(EvalMetric.CODE_STYLE, 1))
+    high = EvalResult(run_id="high")
+    high.add_score(QualityScore(EvalMetric.CODE_STYLE, 5))
+
+    class FakeEvaluator:
+        def __init__(self, **kwargs):
+            pass
+
+        def evaluate_code(self, source):
+            return low if "Scene1" in source else high
+
+        def evaluate_run(self, *args, **kwargs):
+            return low
+
+    monkeypatch.setattr("kd1_anime.eval.Evaluator", FakeEvaluator)
+    monkeypatch.setattr(settings, "ENABLE_AUTO_EVAL", True)
+    monkeypatch.setattr(settings, "MAX_EVAL_ROUNDS", 2)
+    monkeypatch.setattr(settings, "EVAL_THRESHOLD", 3.5)
+
+    assert Orchestrator()._eval(ctx) is True
+    assert ctx.final_video is None
+    assert [state.code for state in states.values()] == ["", "", ""]
+    assert [state.rendered for state in states.values()] == [False, False, False]

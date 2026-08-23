@@ -567,7 +567,7 @@ def test_poll_all_statuses_sacct_failure_is_unknown_not_gone(monkeypatch):
     assert "sacct" in dispatcher.last_status_diagnostic
 
 
-def test_monitor_query_exception_cancels_remote_job(monkeypatch, tmp_path):
+def test_monitor_query_exception_is_graced_and_recovers(monkeypatch, tmp_path):
     dispatcher = SlurmDispatcher()
     job = make_job(tmp_path)
     cancelled = []
@@ -581,12 +581,23 @@ def test_monitor_query_exception_cancels_remote_job(monkeypatch, tmp_path):
     monitor = JobMonitor(dispatcher, poll_interval=1)
     monitor.add_job(job)
 
+    # 一次控制面查询异常只记为 UNKNOWN，不能误杀远端作业。
+    assert monitor.poll_once() is False
+    assert monitor.pending == {"123": job}
+    assert monitor.results == {}
+    assert cancelled == []
+    assert job.status == "UNKNOWN"
+
+    statuses = iter([{"123": "RUNNING"}, {"123": "COMPLETED"}])
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: next(statuses))
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda current: True)
+
+    assert monitor.poll_once() is False
+    assert job.status == "RUNNING"
     assert monitor.poll_once() is True
     assert monitor.pending == {}
-    assert monitor.results == {"123": False}
-    assert cancelled == ["123"]
-    assert job.status == "MONITOR_QUERY_FAILED"
-    assert job.cancelled is True
+    assert monitor.results == {"123": True}
+    assert cancelled == []
 
 
 def test_isolated_attempt_video_ignores_wall_clock_skew(monkeypatch, tmp_path):

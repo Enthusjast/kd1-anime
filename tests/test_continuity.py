@@ -12,9 +12,11 @@ from kd1_anime.agents.continuity import (
     ContinuityReviewResult,
     deterministic_continuity_issues,
     extract_continuity_elements,
+    validate_export_contract,
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    ExtractedElement,
     GlobalVisualState,
     ScenePlan,
     VisualElementState,
@@ -190,3 +192,38 @@ class Demo(Scene):
     unsafe = code.replace('formula = MathTex(r"x^2")', 'formula = open("secret")')
     with pytest.raises(ValueError, match="禁止"):
         extract_continuity_elements(unsafe)
+
+
+def test_extract_continuity_elements_rejects_external_variable_dependency():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        formula = MathTex(expression)
+        # KD1_CONTINUITY_EXPORT_END
+        self.add(formula)
+"""
+
+    with pytest.raises(ValueError, match="未定义变量: expression"):
+        extract_continuity_elements(code)
+
+
+def test_export_contract_requires_declared_structured_elements():
+    plan = make_plan(1).model_copy(
+        update={"new_elements": [VisualElementState(element_id="formula", variable_name="formula")]}
+    )
+    with pytest.raises(ValueError, match="未出现在连续性导出区"):
+        validate_export_contract(plan, [])
+
+    validate_export_contract(
+        plan,
+        [
+            # 只测试合同映射；代码语法由 extract_continuity_elements 单独负责。
+            ExtractedElement(
+                element_id="formula",
+                variable_name="formula",
+                code="formula = MathTex(r'x')",
+            )
+        ],
+    )

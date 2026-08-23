@@ -48,8 +48,46 @@ def _ensure_llm_api_available() -> None:
     try:
         BaseAgent().check_api_available()
     except Exception as exc:
-        console.print(f"[bold red]LLM API 不可用:[/] {exc}", markup=False)
+        console.print(f"LLM API 不可用: {exc}", style="bold red", markup=False)
         raise typer.Exit(1) from exc
+
+
+def _ensure_visual_llm_api_available(
+    *,
+    model_override: str | None = None,
+    endpoint_required: bool = False,
+) -> bool:
+    """验证独立视觉端点；流水线探测失败时降级为 unknown，显式评估则失败。"""
+
+    from kd1_anime.eval.visual_eval import VisualEvaluator
+
+    try:
+        settings.visual_llm_profile(model_override=model_override).require()
+    except Exception as exc:
+        console.print(f"视觉 LLM 配置不可用: {exc}", style="bold red", markup=False)
+        raise typer.Exit(1) from exc
+    try:
+        VisualEvaluator(model_override).check_api_available()
+    except Exception as exc:
+        if endpoint_required:
+            console.print(f"视觉 LLM API 不可用: {exc}", style="bold red", markup=False)
+            raise typer.Exit(1) from exc
+        console.print(
+            "视觉 LLM API 当前不可用；主流水线将继续，视觉结果会标记为 unknown。"
+            f" 原因: {exc}",
+            style="yellow",
+            markup=False,
+        )
+        return False
+    return True
+
+
+def _ensure_generation_apis(*, dry_run: bool) -> None:
+    """生成入口统一预检，避免不同 CLI 命令出现不一致行为。"""
+
+    _ensure_llm_api_available()
+    if settings.ENABLE_VISUAL_EVAL and not dry_run:
+        _ensure_visual_llm_api_available(endpoint_required=False)
 
 
 @app.callback()
@@ -73,7 +111,7 @@ def main_callback(
 
     # 没有子命令时默认启动 chat
     if ctx.invoked_subcommand is None:
-        _ensure_llm_api_available()
+        _ensure_generation_apis(dry_run=dry_run)
         _start_chat(dry_run=dry_run)
 
 
@@ -83,8 +121,9 @@ def chat(
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成代码不提交 Slurm"),
 ):
     """启动交互式会话 (默认命令)"""
-    _ensure_llm_api_available()
-    _start_chat(dry_run=dry_run or bool((ctx.obj or {}).get("dry_run")))
+    effective_dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
+    _ensure_generation_apis(dry_run=effective_dry_run)
+    _start_chat(dry_run=effective_dry_run)
 
 
 @app.command()
@@ -156,6 +195,17 @@ def generate(
             requires_llm = manifest.state in RESUME_LLM_STATES
         if requires_llm:
             _ensure_llm_api_available()
+        if resume:
+            if manifest.visual_eval_profile.enabled and manifest.status not in {
+                "completed",
+                "dry_run_complete",
+            }:
+                _ensure_visual_llm_api_available(
+                    model_override=manifest.visual_eval_profile.model,
+                    endpoint_required=False,
+                )
+        elif settings.ENABLE_VISUAL_EVAL and not dry_run:
+            _ensure_visual_llm_api_available(endpoint_required=False)
     except (OSError, ValueError) as e:
         console.print(f"[bold red]错误:[/] {e}", markup=False)
         raise typer.Exit(1) from e
@@ -294,7 +344,8 @@ def render(
 
 def _scene_status(scene) -> str:
     if scene.rendered:
-        return "rendered"
+        visual_status = getattr(scene, "visual_status", "skipped")
+        return "rendered" if visual_status == "skipped" else f"rendered/{visual_status}"
     if scene.failed:
         return "failed"
     if scene.give_up:
@@ -313,6 +364,13 @@ def _print_run_details(manifest: RunManifest) -> None:
     console.print(f"Created:      {manifest.created_at.astimezone().isoformat(timespec='seconds')}")
     console.print(f"Updated:      {manifest.updated_at.astimezone().isoformat(timespec='seconds')}")
     console.print(f"Output:       {manifest.final_video or manifest.output_path}", markup=False)
+    integrity_errors = manifest.integrity_errors()
+    if integrity_errors:
+        console.print(
+            "清单完整性警告: " + "; ".join(integrity_errors),
+            style="yellow",
+            markup=False,
+        )
 
     table = Table(title="Scenes")
     table.add_column("ID", justify="right")
@@ -390,6 +448,14 @@ def resume(
         manifest = repository.load(run_id)
         if manifest.state in RESUME_LLM_STATES:
             _ensure_llm_api_available()
+        if manifest.visual_eval_profile.enabled and manifest.status not in {
+            "completed",
+            "dry_run_complete",
+        }:
+            _ensure_visual_llm_api_available(
+                model_override=manifest.visual_eval_profile.model,
+                endpoint_required=False,
+            )
         if force:
             settings.OVERWRITE_OUTPUT = True
         from kd1_anime.orchestrator import Orchestrator
@@ -519,7 +585,7 @@ def batch(
 ):
     """批量并行处理多个动画项目。"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
-    _ensure_llm_api_available()
+    _ensure_generation_apis(dry_run=dry_run)
 
     from kd1_anime.batch import BatchConfig, BatchProcessor
 
@@ -566,7 +632,7 @@ def version_cmd():
 
         current_version = version("kd1-anime")
     except Exception:
-        current_version = "0.3.0-dev"
+        current_version = "0.4.0-dev"
     console.print(f"kd1-anime v{current_version}")
     console.print("AI Agent 驱动的 Manim 数学动画自动渲染流水线")
 
@@ -583,6 +649,21 @@ def doctor(
         True,
         "--strict/--no-strict",
         help="依赖检查失败时返回非零退出码（默认启用）",
+    ),
+    probe_llm: bool = typer.Option(
+        False,
+        "--probe-llm",
+        help="发送一次最小 LLM 请求验证网络、鉴权和模型路由",
+    ),
+    probe_visual_llm: bool = typer.Option(
+        False,
+        "--probe-visual-llm",
+        help="发送图片消息验证独立视觉 LLM 的网络、鉴权、模型和多模态能力",
+    ),
+    security_strict: bool = typer.Option(
+        False,
+        "--security-strict",
+        help="要求生成代码使用存在的 Apptainer 镜像并启用 fail-closed 策略",
     ),
 ):
     """检查环境依赖和配置是否完整。"""
@@ -672,18 +753,81 @@ def doctor(
     if probe:
         _run_doctor_probes(checks)
 
-    # 检查 LLM 配置
+    # 检查 LLM 配置；默认只做本地配置检查，避免 doctor 在离线环境意外
+    # 产生 API 请求。需要真实验证时显式使用 --probe-llm。
     llm_ok = bool(settings.LLM_API_KEY and settings.LLM_MODEL)
     llm_info = "已配置" if llm_ok else "未配置 (需要 LLM_API_KEY 和 LLM_MODEL)"
     checks.append(("LLM 配置", llm_ok, llm_info))
-    if not settings.SLURM_CONTAINER_IMAGE:
+    if probe_llm:
+        if not llm_ok:
+            checks.append(("LLM API 探测", False, "配置不完整，未发送请求"))
+        else:
+            from kd1_anime.agents.base import BaseAgent
+
+            started = datetime.now().timestamp()
+            try:
+                BaseAgent().check_api_available()
+            except Exception as exc:
+                checks.append(("LLM API 探测", False, str(exc)))
+            else:
+                elapsed_ms = (datetime.now().timestamp() - started) * 1000
+                checks.append(("LLM API 探测", True, f"可用，耗时 {elapsed_ms:.0f} ms"))
+
+    visual_profile = settings.visual_llm_profile()
+    try:
+        visual_profile.require()
+    except ValueError as exc:
+        visual_config_ok = False
+        visual_config_detail = str(exc)
+    else:
+        visual_config_ok = True
+        visual_config_detail = f"已配置模型 {visual_profile.model}"
+    visual_required = settings.ENABLE_VISUAL_EVAL or probe_visual_llm
+    checks.append(
+        (
+            "视觉 LLM 配置",
+            visual_config_ok if visual_required else True,
+            visual_config_detail if visual_required else "未启用（独立配置可留空）",
+        )
+    )
+    if probe_visual_llm:
+        if not visual_config_ok:
+            checks.append(("视觉 LLM API 探测", False, "配置不完整，未发送请求"))
+        else:
+            from kd1_anime.eval.visual_eval import VisualEvaluator
+
+            started = datetime.now().timestamp()
+            try:
+                VisualEvaluator().check_api_available()
+            except Exception as exc:
+                checks.append(("视觉 LLM API 探测", False, str(exc)))
+            else:
+                elapsed_ms = (datetime.now().timestamp() - started) * 1000
+                checks.append(("视觉 LLM API 探测", True, f"可用，耗时 {elapsed_ms:.0f} ms"))
+    container_configured = bool(settings.SLURM_CONTAINER_IMAGE)
+    if not container_configured:
+        isolation_ok = not settings.SLURM_REQUIRE_CONTAINER and not security_strict
+        checks.append(
+            (
+                "生成代码隔离",
+                isolation_ok,
+                (
+                    "SLURM_REQUIRE_CONTAINER=true 但未配置镜像"
+                    if settings.SLURM_REQUIRE_CONTAINER
+                    else "未配置容器；兼容模式可运行，但共享集群建议启用严格隔离"
+                ),
+            )
+        )
+    elif security_strict and not settings.SLURM_REQUIRE_CONTAINER:
         checks.append(
             (
                 "生成代码隔离",
                 False,
-                "未配置容器；兼容模式可运行，但共享集群建议启用严格隔离",
+                "已配置容器但 SLURM_REQUIRE_CONTAINER=false，严格模式要求 fail-closed",
             )
         )
+    elif container_configured:
+        checks.append(("生成代码隔离", True, "Apptainer 镜像已配置"))
 
     # 显示结果
     table = Table(title="环境检查结果")
@@ -694,7 +838,7 @@ def doctor(
     all_ok = True
     for name, ok, detail in checks:
         status = "[green]✓[/]" if ok else "[red]✗[/]"
-        if not ok and name not in ["apptainer (可选)", "生成代码隔离"]:
+        if not ok and name not in ["apptainer (可选)"]:
             all_ok = False
         table.add_row(name, status, detail)
 
@@ -877,6 +1021,13 @@ def _start_chat(dry_run: bool = False) -> None:
 @app.command()
 def evaluate(
     run_id: str | None = typer.Argument(None, help="运行 ID (留空则评估最近的运行)"),
+    scene_id: int | None = typer.Option(
+        None,
+        "--scene-id",
+        "-s",
+        min=1,
+        help="只评估指定运行中某个 Scene 的精确渲染产物",
+    ),
     code: str | None = typer.Option(None, "--code", "-c", help="直接评估代码字符串"),
     code_file: Path | None = typer.Option(None, "--code-file", "-f", help="评估代码文件"),
     image: Path | None = typer.Option(None, "--image", "-i", help="评估渲染截图"),
@@ -895,15 +1046,71 @@ def evaluate(
 
     支持多种评估模式：
     - 评估完整运行: kd1-anime evaluate <run-id>
+    - 评估单个场景: kd1-anime evaluate <run-id> --scene-id 2
     - 评估代码: kd1-anime evaluate --code "..." 或 --code-file scene.py
     - 评估截图: kd1-anime evaluate --image screenshot.png
     - 对比运行: kd1-anime evaluate <run-id> --compare <baseline-id>
     """
     from kd1_anime.eval import Evaluator
 
-    visual_enabled = settings.ENABLE_VISUAL_EVAL if visual is None else visual
+    # 一个命令只能有一个评估目标。此前多个参数同时传入时会按内部
+    # if/elif 顺序静默忽略，容易让用户误评估了另一个对象。
+    explicit_targets = [
+        ("run-id", run_id is not None),
+        ("--code", code is not None),
+        ("--code-file", code_file is not None),
+        ("--image", image is not None),
+    ]
+    selected_targets = [name for name, selected in explicit_targets if selected]
+    if scene_id is not None and run_id is None:
+        console.print("[red]--scene-id 必须与运行 ID 一起使用[/]")
+        raise typer.Exit(2)
+    if compare is not None:
+        if run_id is None:
+            console.print("[red]--compare 必须与运行 ID 一起使用[/]")
+            raise typer.Exit(2)
+        if len(selected_targets) != 1 or selected_targets != ["run-id"]:
+            console.print("[red]--compare 不能与 --code、--code-file 或 --image 混用[/]")
+            raise typer.Exit(2)
+        if scene_id is not None:
+            console.print("[red]--scene-id 暂不支持与 --compare 混用[/]")
+            raise typer.Exit(2)
+    elif len(selected_targets) > 1:
+        console.print("[red]评估目标互斥：run-id、--code、--code-file、--image 只能选择一个[/]")
+        raise typer.Exit(2)
+    if code_file is not None and not code_file.is_file():
+        console.print(f"[red]文件不存在: {code_file}[/]")
+        raise typer.Exit(1)
+    if image is not None and not image.is_file():
+        console.print(f"[red]图片不存在: {image}[/]")
+        raise typer.Exit(1)
+
+    # 截图评估本身就是视觉评估。即使配置默认关闭视觉评估，也不能让
+    # 文档中公开的 `evaluate --image` 进入一个必然抛出“视觉评估已禁用”的路径。
+    if scene_id is not None:
+        if visual is False:
+            console.print("[red]--scene-id 视觉评估不能与 --no-visual 一起使用[/]")
+            raise typer.Exit(2)
+        visual_enabled = True
+    elif image is not None:
+        if visual is False:
+            console.print("[red]--image 需要启用视觉评估，不能与 --no-visual 一起使用[/]")
+            raise typer.Exit(2)
+        visual_enabled = True
+    elif code is not None or code_file is not None:
+        # 纯代码目标没有可信视频/关键帧，不能因为全局默认开启视觉评估
+        # 就做一次无关的多模态 API 请求。
+        if visual is True or visual_model is not None:
+            console.print("[red]--visual/--visual-model 只能用于运行或图片评估[/]")
+            raise typer.Exit(2)
+        visual_enabled = False
+    else:
+        visual_enabled = settings.ENABLE_VISUAL_EVAL if visual is None else visual
     if visual_enabled:
-        _ensure_llm_api_available()
+        _ensure_visual_llm_api_available(
+            model_override=visual_model,
+            endpoint_required=True,
+        )
     evaluator = Evaluator(
         enable_visual_eval=visual_enabled,
         visual_eval_model=visual_model,
@@ -911,7 +1118,7 @@ def evaluate(
 
     try:
         # 对比模式
-        if compare and run_id:
+        if compare is not None and run_id is not None:
             console.print(f"[bold]对比运行 {compare} 和 {run_id}[/]")
             comparison = evaluator.compare_runs(compare, run_id)
 
@@ -922,35 +1129,34 @@ def evaluate(
             return
 
         # 评估代码字符串
-        if code:
+        if code is not None:
             console.print("[bold]评估代码质量[/]")
             result = evaluator.evaluate_code(code)
 
         # 评估代码文件
-        elif code_file:
-            if not code_file.exists():
-                console.print(f"[red]文件不存在: {code_file}[/]")
-                raise typer.Exit(1)
-
+        elif code_file is not None:
             console.print(f"[bold]评估代码文件: {code_file}[/]")
             code_content = code_file.read_text(encoding="utf-8")
             result = evaluator.evaluate_code(code_content)
 
         # 评估截图
-        elif image:
-            if not image.exists():
-                console.print(f"[red]图片不存在: {image}[/]")
-                raise typer.Exit(1)
-
+        elif image is not None:
             console.print(f"[bold]评估视觉效果: {image}[/]")
             result = evaluator.evaluate_visual(image, description)
 
         # 评估运行
-        elif run_id:
+        elif run_id is not None:
             console.print(f"[bold]评估运行: {run_id}[/]")
-            result = evaluator.evaluate_run(
-                run_id, description=description, enable_visual=visual_enabled
-            )
+            if scene_id is not None:
+                result = evaluator.evaluate_run_scene(
+                    run_id,
+                    scene_id,
+                    description=description,
+                )
+            else:
+                result = evaluator.evaluate_run(
+                    run_id, description=description, enable_visual=visual_enabled
+                )
 
         # 评估最近的运行
         else:

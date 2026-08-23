@@ -214,3 +214,60 @@ def test_multi_video_merge_uses_xfade_and_expected_offsets(monkeypatch, tmp_path
     assert "duration=0.500000" in command
     assert "offset=1.500000" in command
     assert "concat" not in command
+
+
+def test_xfade_uses_configured_encoding_and_silent_audio_settings(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    output = tmp_path / "output.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    profile = RenderProfile(
+        renderer="cairo", quality="l", pixel_width=320, pixel_height=180, frame_rate=30
+    )
+    monkeypatch.setattr(settings, "MERGE_VIDEO_CODEC", "libx265")
+    monkeypatch.setattr(settings, "MERGE_VIDEO_PRESET", "fast")
+    monkeypatch.setattr(settings, "MERGE_VIDEO_CRF", 23)
+    monkeypatch.setattr(settings, "MERGE_AUDIO_SAMPLE_RATE", 44100)
+    monkeypatch.setattr(settings, "MERGE_AUDIO_CHANNEL_LAYOUT", "stereo")
+    monkeypatch.setattr(
+        merger_module,
+        "verify_video",
+        lambda path, render_profile: VideoMetadata(
+            size_bytes=path.stat().st_size,
+            duration_seconds=2.0,
+            width=render_profile.pixel_width,
+            height=render_profile.pixel_height,
+            frame_rate=render_profile.frame_rate,
+            has_audio=path == first,
+        ),
+    )
+    merger = VideoMerger()
+    captured = {}
+
+    def fake_ffmpeg(cmd, temporary_output, label):
+        captured["cmd"] = cmd
+        temporary_output.write_bytes(b"merged")
+        return True
+
+    monkeypatch.setattr(merger, "_run_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(merger, "_verify_output", lambda *args, **kwargs: True)
+
+    merger.merge([first, second], output, replace_existing=True, render_profile=profile)
+
+    command = " ".join(captured["cmd"])
+    assert "anullsrc=channel_layout=stereo:sample_rate=44100" in command
+    assert "-c:v libx265" in command
+    assert "-preset fast" in command
+    assert "-crf 23" in command
+
+
+def test_run_ffmpeg_handles_process_start_failure(monkeypatch, tmp_path):
+    def fail_run(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(merger_module.subprocess, "run", fail_run)
+
+    assert not VideoMerger._run_ffmpeg(["ffmpeg"], tmp_path / "output.mp4", "test")

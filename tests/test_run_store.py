@@ -372,7 +372,7 @@ def test_v1_reused_job_is_migrated_to_safe_rerender(tmp_path):
     manifest = RunRepository(workspace).load(RUN_ID)
     scene = manifest.scenes[1]
 
-    assert manifest.schema_version == 2
+    assert manifest.schema_version == 3
     assert scene.plan_ready is True
     assert scene.rendered is False
     assert scene.slurm_job is None

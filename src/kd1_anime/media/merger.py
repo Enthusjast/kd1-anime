@@ -261,14 +261,23 @@ class VideoMerger:
                             "-t",
                             f"{item.duration_seconds:.6f}",
                             "-i",
-                            "anullsrc=channel_layout=stereo:sample_rate=48000",
+                            (
+                                "anullsrc=channel_layout="
+                                f"{settings.MERGE_AUDIO_CHANNEL_LAYOUT}:"
+                                f"sample_rate={settings.MERGE_AUDIO_SAMPLE_RATE}"
+                            ),
                         ]
                     )
             audio_labels: list[str] = []
             for index, source_index in enumerate(audio_indices):
                 label = f"a{index}"
                 filter_parts.append(
-                    f"[{source_index}:a]aresample=48000,asetpts=PTS-STARTPTS[{label}]"
+                    f"[{source_index}:a]aresample={settings.MERGE_AUDIO_SAMPLE_RATE},"
+                    f"aformat=sample_fmts=fltp:sample_rates={settings.MERGE_AUDIO_SAMPLE_RATE}:"
+                    f"channel_layouts={settings.MERGE_AUDIO_CHANNEL_LAYOUT},"
+                    f"atrim=duration={metadata[index].duration_seconds:.6f},"
+                    f"apad=whole_dur={metadata[index].duration_seconds:.6f},"
+                    f"asetpts=PTS-STARTPTS[{label}]"
                 )
                 audio_labels.append(label)
             current_audio = audio_labels[0]
@@ -293,13 +302,14 @@ class VideoMerger:
         command.extend(
             [
                 "-c:v",
-                "libx264",
+                settings.MERGE_VIDEO_CODEC,
                 "-preset",
-                "medium",
+                settings.MERGE_VIDEO_PRESET,
                 "-crf",
-                "18",
+                str(settings.MERGE_VIDEO_CRF),
                 "-pix_fmt",
                 "yuv420p",
+                "-shortest",
                 "-movflags",
                 "+faststart",
                 str(output),
@@ -317,15 +327,22 @@ class VideoMerger:
         except subprocess.TimeoutExpired:
             console.print(f"[red][Merger][/] ffmpeg {label} 超时")
             return False
-        if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+        except OSError as exc:
+            console.print(f"[red][Merger][/] ffmpeg {label} 无法启动: {exc}", markup=False)
+            return False
+        try:
+            output_size = output.stat().st_size if output.is_file() else 0
+        except OSError as exc:
+            console.print(f"[red][Merger][/] ffmpeg {label} 产物无法读取: {exc}", markup=False)
+            return False
+        if result.returncode != 0 or output_size == 0:
             console.print(
                 f"[red][Merger][/] ffmpeg {label} 失败: {result.stderr[-1000:]}",
                 markup=False,
             )
             return False
         console.print(
-            f"[bold green][Merger][/] 拼接完成 ({label}): "
-            f"{output.stat().st_size / (1024 * 1024):.1f} MB"
+            f"[bold green][Merger][/] 拼接完成 ({label}): {output_size / (1024 * 1024):.1f} MB"
         )
         return True
 

@@ -355,6 +355,16 @@ class TestScene(Scene):
         with pytest.raises(ValueError, match="run_id 格式无效"):
             Evaluator(enable_visual_eval=False).evaluate_batch(["../outside"])
 
+    def test_explicit_batch_base_dir_rejects_path_traversal_run_id(self, tmp_path):
+        with pytest.raises(ValueError, match="不安全路径"):
+            Evaluator(enable_visual_eval=False).evaluate_batch(["../outside"], base_dir=tmp_path)
+
+    def test_explicit_compare_base_dir_rejects_path_traversal_run_id(self, tmp_path):
+        with pytest.raises(ValueError, match="不安全路径"):
+            Evaluator(enable_visual_eval=False).compare_runs(
+                "../outside", "current", base_dir=tmp_path
+            )
+
     def test_default_compare_rejects_path_traversal_run_id(self, monkeypatch, tmp_path):
         from kd1_anime.config import settings
 

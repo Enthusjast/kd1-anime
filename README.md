@@ -18,7 +18,9 @@
 - **可恢复渲染**：监控 Slurm 状态、区分排队/运行超时、失败后读取日志并自动修复。
 - **平滑转场**：多场景使用 FFmpeg `xfade` 淡入淡出，默认 0.5 秒；有音频时同步 `acrossfade`。
 - **通用 LLM 接口**：通过 `.env` 配置任意 OpenAI-compatible API，不绑定 DeepSeek 或其他特定厂商。
-- **启动前 API 探测**：进入会话或 LLM 流水线前发送一次最小请求；配置、网络或模型不可用时立即退出，不等待后续阶段才失败。
+- **启动前 API 探测**：进入会话或 LLM 流水线前探测主 LLM；配置、网络或模型不可用时立即退出。视觉端点单独探测，暂时不可用时安全降级为 `unknown`。
+- **独立视觉质量门**：可为每个已渲染场景抽取带时间戳和哈希的关键帧，用单独的多模态 LLM 检查数学正确性、相关性、可读性、布局和跨帧一致性；主 Planner/Coder 端点不会被替换。
+- **有界视觉修复**：低分场景把纯诊断反馈交回 Coder，重新经过校验、审查和渲染；达到上限时保留更好的可验证版本，视觉端点故障则记为 `unknown` 并继续。
 
 ## 一行安装（Ubuntu / HPC，无 sudo）
 
@@ -35,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.s
 发布时建议同时公布该 tag 源码 ZIP 的 SHA-256，用户可执行强校验安装：
 
 ```bash
-export KD1_ANIME_REF=v0.3.0
+export KD1_ANIME_REF=v0.4.0
 export KD1_ANIME_ARCHIVE_SHA256=<release-zip-sha256>
 # 可选：同时固定 TeX Live 安装器摘要；设置为 1 后两项摘要都必须提供
 export KD1_ANIME_TEXLIVE_INSTALLER_SHA256=<install-tl-unx-tar-gz-sha256>
@@ -104,6 +106,14 @@ LLM_BASE_URL=https://your-openai-compatible-endpoint/v1
 LLM_MODEL=your-model-name
 ```
 
+若启用 `ENABLE_VISUAL_EVAL=true`，还必须单独配置支持 `image_url` 的多模态端点；它不会继承主 LLM 的 Key、URL 或模型：
+
+```dotenv
+VISUAL_LLM_API_KEY=your-visual-api-key
+VISUAL_LLM_BASE_URL=https://your-visual-endpoint/v1
+VISUAL_LLM_MODEL=your-multimodal-model
+```
+
 完整示例见 `.env.example`。安装脚本也会生成：
 
 ```text
@@ -144,10 +154,22 @@ kd1-anime resume 20260728-120000-1234abcd
 
 # 检查依赖；--probe 会额外运行本地最小 FFmpeg/XeLaTeX/Manim 探测，不提交 Slurm
 kd1-anime doctor --probe
+# 分别探测主 LLM 与独立视觉 LLM（视觉探测会发送一张 1×1 图片）
+kd1-anime doctor --probe-llm --probe-visual-llm
+
+# 对已有运行执行独立视觉评估
+kd1-anime evaluate 20260728-120000-1234abcd --visual
+# 只评估清单中 Scene 2 的精确视频产物
+kd1-anime evaluate 20260728-120000-1234abcd --scene-id 2
 
 # 清理 30 天前的已结束运行目录
 kd1-anime clean --older-than 30d --yes
 ```
+
+启动交互会话、规划或生成流水线前，程序会先发送一次最小请求检查主 LLM
+的配置、网络、鉴权和模型路由；检查失败会立即退出，不进入后续 Agent 流程。
+`status`、`version`、`doctor`、`clean` 等只读或诊断命令不会自动发送业务请求，
+需要真实探测时可使用 `kd1-anime doctor --probe-llm`。
 `render` 不带 `--wait` 时只负责提交并立即返回，终端会显示 run ID。之后使用
 
 `kd1-anime status <run-id>` 查看清单，或用 `kd1-anime resume <run-id>` 继续监控并合并。
@@ -159,10 +181,13 @@ kd1-anime clean --older-than 30d --yes
 ```text
 workspace/runs/<timestamp>-<uuid>/
 ├── prompt.md
-├── manifest.json         # schema v2：场景阶段、Job、渲染配置与产物凭据
+├── manifest.json         # schema v3：阶段、Job、渲染/视觉配置与产物凭据
 ├── scenes/              # 生成的 Python 和 sbatch 脚本
 ├── logs/                # Slurm stdout/stderr
 ├── videos/              # 当前 run 的 Manim 媒体目录
+├── eval_frames/         # 场景/成片关键帧（启用视觉评估时）
+├── eval_reports/        # 严格结构化的场景与成片视觉报告
+├── visual_candidates/  # 视觉修复失败时可恢复的候选代码
 └── output_final.mp4
 ```
 
@@ -179,6 +204,9 @@ workspace/runs/<timestamp>-<uuid>/
 | `LLM_HEALTHCHECK_TIMEOUT` | `15` | 进入会话/流水线前的最小 API 探测超时（秒）；探测失败立即退出 |
 | `LLM_PARALLEL_WORKERS` | `4` | 分镜/连续性审查等可并行 LLM 请求上限；代码交接阶段按场景顺序执行 |
 | `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
+| `VISUAL_LLM_BASE_URL` | 空 | 独立多模态 OpenAI-compatible 端点；不回退主端点 |
+| `VISUAL_LLM_MODEL` | 空 | 支持 `image_url` 输入的视觉模型；启用视觉评估时必须设置 |
+| `VISUAL_LLM_PARALLEL_WORKERS` | `2` | 进程级并行视觉请求上限，与主 LLM 并发池分离；批处理任务共享此配额 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 全片连续性审查发现冲突后的局部分镜重规划轮数 |
 | `MAX_PROMPT_CHARS` | `50000` | 用户需求最大字符数 |
@@ -201,11 +229,19 @@ workspace/runs/<timestamp>-<uuid>/
 | `OVERWRITE_OUTPUT` | `false` | 是否允许覆盖已存在的自定义输出文件 |
 | `TRANSITION_TYPE` | `fade` | 相邻场景的视频转场类型 |
 | `TRANSITION_DURATION` | `0.5` | 相邻场景转场秒数，短视频会自动缩短 |
+| `MERGE_VIDEO_CODEC` | `libx264` | 最终视频编码器 |
+| `MERGE_VIDEO_PRESET` | `medium` | FFmpeg 编码速度/压缩 preset |
+| `MERGE_VIDEO_CRF` | `18` | 最终视频质量参数（0–51） |
+| `MERGE_AUDIO_SAMPLE_RATE` | `48000` | 跨场景音频统一采样率 |
+| `MERGE_AUDIO_CHANNEL_LAYOUT` | `stereo` | 跨场景音频统一声道布局 |
 | `SLURM_CONTAINER_IMAGE` | 空 | 可选 Apptainer 镜像路径 |
 | `SLURM_REQUIRE_CONTAINER` | `false` | 为 `true` 时未配置镜像即拒绝执行 |
 | `SLURM_CONTAINER_DISABLE_NETWORK` | `false` | 容器支持时通过独立网络命名空间禁用网络；需先在目标集群验证 |
-| `ENABLE_AUTO_EVAL` | `false` | 合并后执行确定性代码/效率评估，可选视觉评估与改进循环 |
-| `ENABLE_VISUAL_EVAL` | `false` | 抽取关键帧并调用支持图像输入的模型；失败记为未知，不生成虚假分数 |
+| `ENABLE_AUTO_EVAL` | `false` | 合并后执行确定性代码/效率评估改进循环 |
+| `ENABLE_VISUAL_EVAL` | `false` | 合并前执行逐场景视觉质量门，并在合并后生成成片视觉报告 |
+| `VISUAL_EVAL_FRAME_COUNT` | `6` | 每个场景/成片均匀抽取的关键帧数（1–8） |
+| `VISUAL_EVAL_THRESHOLD` | `3.5` | 场景视觉通过阈值（1–5）；重大问题无论均分都会触发修复 |
+| `MAX_VISUAL_FIX_ATTEMPTS` | `2` | 每个场景最多由视觉诊断触发的 Coder 修复次数 |
 
 ### 并行与 GPU 说明
 
@@ -224,6 +260,10 @@ LLM 生成代码在提交前会经过 AST 校验，包括顶层动态执行、�
 4. 若集群允许无特权网络命名空间，测试通过后设置 `SLURM_CONTAINER_DISABLE_NETWORK=true`。
 
 容器作业使用 `--containall --cleanenv --no-home`，仅绑定当前 run 目录；OpenGL 模式额外使用 `--nv` 并显式传递 `PYOPENGL_PLATFORM`（例如 `egl`）。未配置容器时程序保持兼容运行，但 `doctor` 和生成流程会给出醒目的安全提示。
+
+可使用 `kd1-anime doctor --probe-llm` 验证主 LLM endpoint，使用
+`kd1-anime doctor --probe-visual-llm` 验证视觉端点确实接受图片消息；使用
+`kd1-anime doctor --security-strict` 检查是否启用了容器 fail-closed 策略。
 
 ## 开发与验证
 
@@ -292,7 +332,8 @@ EOF
 
 kd1-anime batch prompts.json
 
-# 输出固定为 videos/task_001.mp4、task_002.mp4……
+# 指定 --output-dir 后输出为 videos/task_001.mp4、task_002.mp4……；
+# 未指定时，输出保存在每个任务自己的 workspace/runs/<run-id>/ 目录。
 kd1-anime batch prompts.json --output-dir videos --max-parallel 3
 ```
 

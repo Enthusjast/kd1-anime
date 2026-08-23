@@ -42,6 +42,33 @@ _BANNED_EXPORT_NAMES = {
     "vars",
 }
 
+# 这些名称由 `from manim import *`、Coder 约定的全局视觉映射或
+# construct() 开头的 TexTemplate 初始化提供。它们不是连续性导出区的
+# 外部业务依赖；除此之外的自由变量都必须在导出区内先定义，避免把一个
+# 看似合法但无法在下一场景独立重建的 NameError 传递下去。
+_SAFE_EXPORT_CONTEXT_NAMES = {
+    "COLORS",
+    "FONTS",
+    "FONT_SIZES",
+    "STROKE_WIDTHS",
+    "LAYOUT_ANCHORS",
+    "tex_template",
+    "config",
+    "np",
+    "math",
+    "abs",
+    "float",
+    "int",
+    "str",
+    "len",
+    "max",
+    "min",
+    "round",
+    "range",
+    "tuple",
+    "list",
+}
+
 
 def _call_name(node: ast.Call) -> str:
     function = node.func
@@ -52,8 +79,11 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
-def _validate_export_statement(statement: ast.stmt) -> tuple[str, str]:
-    """校验一条导出语句，只允许无副作用的 Mobject 赋值。"""
+def _validate_export_statement(
+    statement: ast.stmt,
+    bound_names: set[str] | None = None,
+) -> tuple[str, str]:
+    """校验一条导出语句，只允许可独立重建的无副作用 Mobject 赋值。"""
 
     if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
         raise ValueError("连续性导出区只能包含变量赋值")
@@ -64,6 +94,9 @@ def _validate_export_statement(statement: ast.stmt) -> tuple[str, str]:
     value = statement.value
     if not isinstance(value, (ast.Call, ast.Name, ast.Attribute)):
         raise ValueError(f"元素 {variable_name} 的定义不是 Mobject 表达式")
+    if isinstance(value, ast.Call) and not _call_name(value):
+        raise ValueError(f"元素 {variable_name} 的构造器必须是明确的名称或属性")
+    defined = bound_names or set()
     for node in ast.walk(statement):
         if isinstance(node, ast.Call) and _call_name(node) in _BANNED_EXPORT_NAMES:
             raise ValueError(f"连续性导出区包含禁止调用: {_call_name(node)}")
@@ -71,6 +104,20 @@ def _validate_export_statement(statement: ast.stmt) -> tuple[str, str]:
             raise ValueError(f"连续性导出区包含禁止属性: {node.attr}")
         if isinstance(node, ast.Name) and node.id in {"self", "__builtins__"}:
             raise ValueError("连续性导出区不能引用 self 或运行时内建对象")
+        # Manim 构造器/常量通常是首字母大写；允许它们，但不允许任意
+        # 未声明的小写业务变量泄漏进下一场景。
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id not in defined
+            and node.id not in _SAFE_EXPORT_CONTEXT_NAMES
+            and not node.id[:1].isupper()
+        ):
+            raise ValueError(f"元素 {variable_name} 引用了导出区外未定义变量: {node.id}")
+        if isinstance(
+            node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        ):
+            raise ValueError(f"元素 {variable_name} 使用了不允许的动态表达式")
     return variable_name, variable_name
 
 
@@ -92,6 +139,7 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
         raise ValueError(f"连续性导出区不是合法 Python: {exc}") from exc
     elements: list[ExtractedElement] = []
     pending_id = ""
+    bound_names: set[str] = set()
     block_source_lines = block.splitlines()
     for statement in tree.body:
         if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
@@ -99,7 +147,7 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
         source = ast.get_source_segment(block, statement)
         if not source:
             raise ValueError("无法读取连续性导出语句")
-        variable_name, _ = _validate_export_statement(statement)
+        variable_name, _ = _validate_export_statement(statement, bound_names)
         element_id = variable_name
         # 支持紧邻赋值前的 ``# element_id: ...`` 注释；没有注释时使用变量名。
         comment_lines = []
@@ -121,6 +169,7 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
                 code=source.strip(),
             )
         )
+        bound_names.add(variable_name)
     if len({item.element_id for item in elements}) != len(elements):
         raise ValueError("连续性导出区包含重复 element_id")
     return block, elements
@@ -158,6 +207,7 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
 
     tree = parsed_tree
     candidates: list[ExtractedElement] = []
+    bound_names: set[str] = set()
     for node in ast.walk(tree):
         if (
             not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -181,7 +231,7 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
             # 注入下一场景；完整安全性仍由 validate_manim_code 负责。
             if not constructor[0].isupper():
                 continue
-            _validate_export_statement(statement)
+            _validate_export_statement(statement, bound_names)
             source = ast.get_source_segment(code, statement)
             if source:
                 candidates.append(
@@ -191,11 +241,44 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
                         code=source.strip(),
                     )
                 )
+            bound_names.add(variable_name)
         break
     unique: dict[str, ExtractedElement] = {}
     for item in candidates:
         unique[item.element_id] = item
     return "\n".join(item.code for item in unique.values()), list(unique.values())
+
+
+def validate_export_contract(
+    plan: ScenePlan,
+    elements: list[ExtractedElement],
+) -> None:
+    """把结构化分镜交接合同与实际导出代码做确定性对齐。
+
+    旧计划没有结构化元素列表时保持兼容；新计划一旦声明了 required
+    元素，就必须在代码导出区中出现，并且显式 variable_name 不能漂移。
+    """
+
+    removed_ids = {item.element_id for item in plan.elements_to_remove}
+    declared = [
+        item
+        for item in [*plan.inherited_elements, *plan.new_elements]
+        if item.element_id not in removed_ids
+    ]
+    if not declared:
+        return
+    exported_by_id = {item.element_id: item for item in elements}
+    for expected in declared:
+        if not expected.required:
+            continue
+        actual = exported_by_id.get(expected.element_id)
+        if actual is None:
+            raise ValueError(f"结构化元素 {expected.element_id} 未出现在连续性导出区")
+        if expected.variable_name and actual.variable_name != expected.variable_name:
+            raise ValueError(
+                f"元素 {expected.element_id} 的变量名不一致: "
+                f"期望 {expected.variable_name}，实际 {actual.variable_name}"
+            )
 
 
 class ContinuityIssue(BaseModel):

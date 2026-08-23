@@ -30,8 +30,8 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── rendering.py            RenderProfile、ffprobe、SceneArtifact
        ├── resources.py            跨批量项目的进程级 LLM/Slurm 配额
        ├── media/merger.py         精确输入列表、FFmpeg xfade/acrossfade 原子合并
-       ├── eval/                   代码/效率评估与可选多帧视觉评估
-       └── run_store.py            Manifest v2、原子检查点、运行锁
+       ├── eval/                   代码/效率评估与独立多模态视觉质量门
+       └── run_store.py            Manifest v3、原子检查点、运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。非空但 `finish_reason=length` 的响应不会被消费；系统会提高输出预算并完整重试，持续截断时抛出明确错误。
@@ -50,13 +50,15 @@ Scene 1 CODING → REVIEWING → Scene 2 CODING → REVIEWING → …
                                       ▲              │
                                       └── FIXING ◀────┘
 
-全部线程结束：MERGING → (EVALUATING → 可定位场景回到 CODING) → DONE
+全部线程结束：VISUAL_EVALUATING → (低分回到 CODING) → MERGING
+                                      → 成片视觉报告
+                                      → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
 FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行，但编码/审查按场景顺序执行：Scene N 审查通过后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，而不是仅凭 Planner 描述猜测的状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
-CLI 在进入 chat、规划、生成、恢复未完成运行或启用视觉评估前，会用短超时发送一次最小 LLM 请求；探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。`status`、`render`、`doctor`、`clean`、已完成运行恢复和纯代码评估不依赖该探测。
+CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
 
 `ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。
 
@@ -129,7 +131,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v2 包含单调 revision、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、场景产物凭据和最终视频哈希。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile，不受当前进程配置变化影响。
+Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v3 包含单调 revision、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、场景产物凭据、视觉 profile/收据/最佳候选和最终视频哈希。API Key 与端点不写入清单。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -164,11 +166,14 @@ VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifa
 
 默认 `ALLOW_PARTIAL_OUTPUT=false`。增量运行仍完成新代码的生成、校验和审查；只有代码哈希、RenderProfile 哈希和旧视频哈希全部一致时才复用旧 `SceneArtifact`，不会创建伪 Job ID。
 
-### 3.7 EVALUATING
+### 3.7 VISUAL_EVALUATING / EVALUATING
 
 - 代码和效率指标由确定性逻辑计算；运行对比会聚合同一指标的所有场景分数。
-- 视觉评估从最终视频均匀抽取多帧，在一次多模态请求中联合评分。
-- 抽帧、端点或结构化响应失败时记录为 unknown 并从总分排除，不填充假分数；若自动评估明确要求视觉指标，指标缺失时不作通过/改进决策。
+- 每个场景在合并前从精确 `SceneArtifact` 抽取 1–8 帧；每帧保存可信时间戳和 SHA-256，一次多模态请求联合检查数学正确性、相关性、可读性、布局与跨帧一致性。
+- 响应使用关闭的 Pydantic schema；问题必须引用本次存在的帧 ID。视觉输出被当作不可信诊断，不能直接提供或执行代码。
+- 低于阈值或存在 major 问题时，诊断交给主 Coder，代码重新经过 AST 校验、Reviewer 和 Slurm 渲染。每场景修复次数有界；失败时可恢复完整、哈希可验证的最佳候选。
+- 抽帧、端点或结构化响应失败时记录为 `unknown`，不填充假分数，也不丢弃已经成功渲染的视频。`passed`、`warning`、`unknown` 收据都必须绑定当前视频哈希，合并前再次校验。
+- 合并后再生成一份成片视觉报告，但不依据难以归因的成片问题直接改写代码。
 - 自动改进只有在低分可定位到具体场景代码时才重生成；无法归因时停止循环并保留报告。
 
 ## 4. 运行目录
@@ -181,7 +186,9 @@ workspace/runs/<YYYYMMDD-HHMMSS>-<uuid8>/
 ├── scenes/
 ├── logs/
 ├── videos/
-├── eval_frames/          # 启用视觉评估时
+├── eval_frames/          # 场景与成片关键帧
+├── eval_reports/         # 每轮场景报告和成片报告
+├── visual_candidates/   # 可恢复候选代码
 └── output_final.mp4
 ```
 

@@ -13,10 +13,10 @@ from typing import Any
 from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.eval.code_eval import CodeEvaluator
 from kd1_anime.eval.metrics import ComparisonResult, EvalMetric, EvalResult, QualityScore
-from kd1_anime.eval.visual_eval import VisualEvaluator
+from kd1_anime.eval.visual_eval import FrameSample, VisualAnalysisResult, VisualEvaluator
 from kd1_anime.exceptions import KD1Error
 from kd1_anime.rendering import probe_video, sha256_file
-from kd1_anime.run_store import RunRepository, atomic_write_json
+from kd1_anime.run_store import RunRepository, atomic_write_json, restore_run_path
 
 
 class EvaluationError(KD1Error):
@@ -25,6 +25,14 @@ class EvaluationError(KD1Error):
 
 MAX_VISUAL_FRAMES = 8
 MAX_VISUAL_FRAME_BYTES = 2 * 1024 * 1024
+
+
+def _validate_run_id_for_base_dir(run_id: str) -> None:
+    """即使调用方显式提供 base_dir，也拒绝路径遍历和绝对路径。"""
+
+    candidate = Path(run_id)
+    if not run_id or candidate.is_absolute() or candidate.name != run_id or ".." in candidate.parts:
+        raise ValueError(f"run_id 包含不安全路径: {run_id!r}")
 
 
 class Evaluator:
@@ -36,9 +44,7 @@ class Evaluator:
     ) -> None:
         self.code_evaluator = CodeEvaluator()
         self.visual_evaluator = (
-            VisualEvaluator(visual_eval_model or settings.EVAL_VISUAL_MODEL)
-            if enable_visual_eval
-            else None
+            VisualEvaluator(visual_eval_model) if enable_visual_eval else None
         )
         self.output_dir = output_dir or (
             resolve_runtime_path(settings.WORKSPACE_DIR) / "eval_results"
@@ -63,12 +69,12 @@ class Evaluator:
         return result
 
     @staticmethod
-    def extract_video_frames(
+    def extract_video_samples(
         video_path: Path,
         output_dir: Path,
         *,
         frame_count: int = 6,
-    ) -> list[Path]:
+    ) -> list[FrameSample]:
         if not 1 <= frame_count <= MAX_VISUAL_FRAMES:
             raise ValueError(f"frame_count 必须在 1..{MAX_VISUAL_FRAMES} 之间")
         metadata = probe_video(video_path)
@@ -77,9 +83,13 @@ class Evaluator:
             raise EvaluationError("未找到 ffmpeg，无法抽取视觉评估关键帧")
         output_dir.mkdir(parents=True, exist_ok=True)
         output_dir.chmod(0o700)
-        frames: list[Path] = []
+        samples: list[FrameSample] = []
+        if frame_count == 1:
+            positions = [0.5]
+        else:
+            positions = [0.05 + index * 0.9 / (frame_count - 1) for index in range(frame_count)]
         for index in range(frame_count):
-            timestamp = metadata.duration_seconds * (index + 1) / (frame_count + 1)
+            timestamp = metadata.duration_seconds * positions[index]
             output = output_dir / f"frame_{index + 1:02d}.jpg"
             try:
                 result = subprocess.run(
@@ -117,8 +127,134 @@ class Evaluator:
                     f"{output.stat().st_size} bytes > {MAX_VISUAL_FRAME_BYTES}"
                 )
             output.chmod(0o600)
-            frames.append(output)
-        return frames
+            samples.append(
+                FrameSample(
+                    frame_id=f"F{index + 1:02d}",
+                    path=output,
+                    timestamp_seconds=timestamp,
+                    image_sha256=sha256_file(output),
+                )
+            )
+        return samples
+
+    @staticmethod
+    def extract_video_frames(
+        video_path: Path,
+        output_dir: Path,
+        *,
+        frame_count: int = 6,
+    ) -> list[Path]:
+        """兼容旧 API；新场景评估使用带时间戳的 extract_video_samples。"""
+
+        return [
+            sample.path
+            for sample in Evaluator.extract_video_samples(
+                video_path,
+                output_dir,
+                frame_count=frame_count,
+            )
+        ]
+
+    def evaluate_scene_video(
+        self,
+        video_path: Path,
+        *,
+        description: str,
+        scene_context: str,
+        output_dir: Path,
+        frame_count: int | None = None,
+    ) -> tuple[VisualAnalysisResult, list[FrameSample]]:
+        """评估一个经过上游哈希校验的精确场景视频。"""
+
+        if self.visual_evaluator is None:
+            raise EvaluationError("Visual evaluation is disabled")
+        samples = self.extract_video_samples(
+            video_path,
+            output_dir,
+            frame_count=frame_count or settings.VISUAL_EVAL_FRAME_COUNT,
+        )
+        result = self.visual_evaluator.evaluate_video_frames(
+            samples,
+            description,
+            scene_context=scene_context,
+            scope="scene",
+        )
+        return result, samples
+
+    def evaluate_run_scene(
+        self,
+        run_id: str,
+        scene_id: int,
+        *,
+        description: str = "",
+        frame_count: int | None = None,
+    ) -> EvalResult:
+        """按 manifest 的精确 SceneArtifact 评估单个已渲染场景。"""
+
+        if self.visual_evaluator is None:
+            raise EvaluationError("Visual evaluation is disabled")
+        repository = RunRepository(settings.WORKSPACE_DIR)
+        manifest = repository.load(run_id)
+        run_dir = repository.run_root(run_id)
+        scene = manifest.scenes.get(scene_id)
+        if scene is None:
+            raise EvaluationError(f"Run {run_id} 不包含 Scene {scene_id}")
+        artifact = scene.artifact
+        if not scene.rendered or artifact is None or not artifact.verified:
+            raise EvaluationError(f"Scene {scene_id} 没有可验证的渲染产物")
+        if (
+            artifact.scene_id != scene_id
+            or artifact.scene_class_name != scene.class_name
+            or artifact.code_sha256 != scene.code_sha256
+            or artifact.render_profile_sha256 != manifest.render_profile.digest()
+        ):
+            raise EvaluationError(f"Scene {scene_id} 的渲染产物身份与运行清单不一致")
+        source_root = (
+            run_dir
+            if artifact.source_run_id == run_id
+            else repository.run_root(artifact.source_run_id)
+        )
+        video = restore_run_path(source_root, artifact.video_path)
+        if not video.is_file() or video.stat().st_size <= 0:
+            raise EvaluationError(f"Scene {scene_id} 的渲染视频不存在")
+        if sha256_file(video) != artifact.video_sha256:
+            raise EvaluationError(f"Scene {scene_id} 的渲染视频哈希不匹配")
+
+        samples_dir = (
+            run_dir
+            / "eval_frames"
+            / f"manual_scene_{scene_id}"
+            / artifact.video_sha256[:12]
+        )
+        analysis, samples = self.evaluate_scene_video(
+            video,
+            description=description or manifest.user_prompt,
+            scene_context=json.dumps(scene.plan.model_dump(mode="json"), ensure_ascii=False),
+            output_dir=samples_dir,
+            frame_count=frame_count,
+        )
+        result = EvalResult(
+            run_id=f"{run_id}:scene:{scene_id}",
+            metadata={
+                "run_id": run_id,
+                "scene_id": scene_id,
+                "video_sha256": artifact.video_sha256,
+                "frames": [
+                    {
+                        "frame_id": sample.frame_id,
+                        "timestamp_seconds": sample.timestamp_seconds,
+                        "path": sample.path.relative_to(run_dir).as_posix(),
+                        "sha256": sample.image_sha256,
+                    }
+                    for sample in samples
+                ],
+                "overall_analysis": analysis.overall_analysis,
+            },
+        )
+        for score in analysis.to_quality_scores():
+            result.add_score(score)
+        result.summary = self._generate_summary(result)
+        return result
 
     def evaluate_run(
         self,
@@ -132,6 +268,7 @@ class Evaluator:
             manifest = repository.load(run_id)
             run_dir = repository.run_root(run_id)
         else:
+            _validate_run_id_for_base_dir(run_id)
             run_dir = run_dir.resolve()
             if not run_dir.is_dir():
                 raise EvaluationError(f"Run directory not found: {run_dir}")
@@ -351,6 +488,15 @@ class Evaluator:
             for run_id in run_ids:
                 repository.run_root(run_id)
             base_dir = repository.runs_root
+        else:
+            base_dir = base_dir.resolve()
+            for run_id in run_ids:
+                _validate_run_id_for_base_dir(run_id)
+                candidate = (base_dir / run_id).resolve()
+                try:
+                    candidate.relative_to(base_dir)
+                except ValueError as exc:
+                    raise ValueError(f"run_id 越出 base_dir: {run_id!r}") from exc
         results: dict[int, EvalResult] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -385,6 +531,15 @@ class Evaluator:
             repository.run_root(baseline_run_id)
             repository.run_root(current_run_id)
             base_dir = repository.runs_root
+        else:
+            base_dir = base_dir.resolve()
+            for run_id in (baseline_run_id, current_run_id):
+                _validate_run_id_for_base_dir(run_id)
+                candidate = (base_dir / run_id).resolve()
+                try:
+                    candidate.relative_to(base_dir)
+                except ValueError as exc:
+                    raise ValueError(f"run_id 越出 base_dir: {run_id!r}") from exc
         baseline = self.evaluate_run(baseline_run_id, base_dir / baseline_run_id)
         current = self.evaluate_run(current_run_id, base_dir / current_run_id)
         improvements: list[str] = []

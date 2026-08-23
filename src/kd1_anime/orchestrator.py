@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ from kd1_anime.agents.continuity import (
     ContinuityReviewerAgent,
     deterministic_continuity_issues,
     extract_continuity_elements,
+    validate_export_contract,
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
@@ -60,6 +62,9 @@ from kd1_anime.run_store import (
     RunManifest,
     RunRepository,
     StoredSceneState,
+    StoredVisualCandidate,
+    VisualEvalProfile,
+    atomic_write_json,
     get_reusable_video_path,
     lock_run,
     restore_run_path,
@@ -94,6 +99,7 @@ class State(Enum):
     DISPATCHING = auto()
     MONITORING = auto()
     FIXING = auto()
+    VISUAL_EVALUATING = auto()
     MERGING = auto()
     EVALUATING = auto()  # 新增：评估状态
     DONE = auto()
@@ -156,6 +162,30 @@ class SceneState:
     inherited_elements_code: str = ""
     exported_elements_code: str = ""
     exported_elements: list[ExtractedElement] = field(default_factory=list)
+    visual_status: str = "skipped"
+    visual_fix_attempts: int = 0
+    visual_score: float | None = None
+    visual_report_file: str = ""
+    visual_report_sha256: str = ""
+    visual_artifact_sha256: str = ""
+    visual_feedback: str = ""
+    visual_best_candidate: VisualCandidate | None = None
+
+
+@dataclass
+class VisualCandidate:
+    score: float
+    has_major_issue: bool
+    passed: bool
+    inherited_elements_sha256: str
+    code: str
+    class_name: str
+    slurm_job: SlurmJob | None
+    artifact: SceneArtifact
+    exported_elements_code: str
+    exported_elements: list[ExtractedElement]
+    report_file: str
+    report_sha256: str
 
 
 @dataclass
@@ -190,6 +220,7 @@ class PipelineContext:
     scenes_to_improve: list[int] = field(default_factory=list)
     # 渲染阶段上游 AutoFix 改变代码后，需要停止当前渲染批次并重建下游交接。
     continuity_rebuild_required: bool = False
+    visual_eval_profile: VisualEvalProfile = field(default_factory=VisualEvalProfile)
 
 
 class Orchestrator:
@@ -208,6 +239,39 @@ class Orchestrator:
         self._phase_lock = threading.Lock()
         self._emitted_phases: set[str] = set()
         self._resource_coordinator = resource_coordinator
+
+    @staticmethod
+    def _configured_visual_profile(*, enabled: bool | None = None) -> VisualEvalProfile:
+        use_visual = settings.ENABLE_VISUAL_EVAL if enabled is None else enabled
+        model = settings.VISUAL_LLM_MODEL or settings.EVAL_VISUAL_MODEL or ""
+        return VisualEvalProfile(
+            enabled=use_visual,
+            model=model if use_visual else "",
+            frame_count=settings.VISUAL_EVAL_FRAME_COUNT,
+            threshold=settings.VISUAL_EVAL_THRESHOLD,
+            max_fix_attempts=settings.MAX_VISUAL_FIX_ATTEMPTS,
+        )
+
+    @staticmethod
+    def _reset_visual_receipt(
+        ctx: PipelineContext,
+        state: SceneState,
+        *,
+        clear_candidate: bool = False,
+        reset_attempts: bool = False,
+    ) -> None:
+        """使当前视频的视觉收据失效，同时可保留跨修复的最佳候选。"""
+
+        state.visual_status = "pending" if ctx.visual_eval_profile.enabled else "skipped"
+        state.visual_score = None
+        state.visual_report_file = ""
+        state.visual_report_sha256 = ""
+        state.visual_artifact_sha256 = ""
+        state.visual_feedback = ""
+        if clear_candidate:
+            state.visual_best_candidate = None
+        if reset_attempts:
+            state.visual_fix_attempts = 0
 
     def _emit(self, event: str, **data) -> None:
         if self._callback:
@@ -262,8 +326,45 @@ class Orchestrator:
 
     @staticmethod
     def _write_private(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
         path.write_text(content, encoding="utf-8")
         path.chmod(0o600)
+
+    def _store_visual_candidate(
+        self,
+        ctx: PipelineContext,
+        candidate: VisualCandidate,
+    ) -> StoredVisualCandidate:
+        code_hash = sha256_text(candidate.code)
+        code_path = (
+            ctx.paths.root
+            / "visual_candidates"
+            / f"scene_{candidate.artifact.scene_id}"
+            / f"code_{code_hash}.py"
+        )
+        if not code_path.is_file() or sha256_text(code_path.read_text(encoding="utf-8")) != code_hash:
+            self._write_private(code_path, candidate.code)
+        code_relative = code_path.resolve().relative_to(ctx.paths.root.resolve()).as_posix()
+        return StoredVisualCandidate(
+            score=candidate.score,
+            has_major_issue=candidate.has_major_issue,
+            passed=candidate.passed,
+            inherited_elements_sha256=candidate.inherited_elements_sha256,
+            code_file=code_relative,
+            code_sha256=code_hash,
+            class_name=candidate.class_name,
+            slurm_job=(
+                store_slurm_job(candidate.slurm_job, ctx.paths.root)
+                if candidate.slurm_job is not None
+                else None
+            ),
+            artifact=candidate.artifact,
+            exported_elements_code=candidate.exported_elements_code,
+            exported_elements=candidate.exported_elements,
+            report_file=candidate.report_file,
+            report_sha256=candidate.report_sha256,
+        )
 
     def _checkpoint(
         self,
@@ -309,6 +410,18 @@ class Orchestrator:
                     inherited_elements_code=scene.inherited_elements_code,
                     exported_elements_code=scene.exported_elements_code,
                     exported_elements=scene.exported_elements,
+                    visual_status=scene.visual_status,
+                    visual_fix_attempts=scene.visual_fix_attempts,
+                    visual_score=scene.visual_score,
+                    visual_report_file=scene.visual_report_file,
+                    visual_report_sha256=scene.visual_report_sha256,
+                    visual_artifact_sha256=scene.visual_artifact_sha256,
+                    visual_feedback=scene.visual_feedback,
+                    visual_best_candidate=(
+                        self._store_visual_candidate(ctx, scene.visual_best_candidate)
+                        if scene.visual_best_candidate is not None
+                        else None
+                    ),
                 )
             ctx.manifest_revision = (
                 max(
@@ -344,6 +457,7 @@ class Orchestrator:
                 base_run_id=ctx.base_run_id,
                 eval_round=ctx.eval_round,
                 continuity_rebuild_required=ctx.continuity_rebuild_required,
+                visual_eval_profile=ctx.visual_eval_profile,
             )
             write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
             self._manifest = manifest
@@ -359,6 +473,10 @@ class Orchestrator:
 
     @staticmethod
     def _scene_phase(scene: SceneState) -> str:
+        if scene.visual_status == "evaluating":
+            return "visual_evaluating"
+        if scene.rendered and scene.visual_status in {"passed", "warning", "unknown"}:
+            return "visual_accepted"
         if scene.rendered and scene.artifact:
             return "rendered"
         if scene.failed or scene.give_up:
@@ -372,6 +490,39 @@ class Orchestrator:
         if scene.plan_ready:
             return "detailed"
         return "pending"
+
+    @staticmethod
+    def _restore_visual_candidate(
+        stored: StoredVisualCandidate | None,
+        root: Path,
+    ) -> VisualCandidate | None:
+        if stored is None:
+            return None
+        code_path = restore_run_path(root, stored.code_file)
+        if code_path.is_symlink() or not code_path.is_file():
+            raise ValueError("最佳视觉候选代码文件不存在或不安全")
+        code = code_path.read_text(encoding="utf-8")
+        if sha256_text(code) != stored.code_sha256:
+            raise ValueError("最佳视觉候选代码哈希不一致")
+        report_path = restore_run_path(root, stored.report_file)
+        if report_path.is_symlink() or not report_path.is_file():
+            raise ValueError("最佳视觉候选报告不存在或不安全")
+        if sha256_file(report_path) != stored.report_sha256:
+            raise ValueError("最佳视觉候选报告哈希不一致")
+        return VisualCandidate(
+            score=stored.score,
+            has_major_issue=stored.has_major_issue,
+            passed=stored.passed,
+            inherited_elements_sha256=stored.inherited_elements_sha256,
+            code=code,
+            class_name=stored.class_name,
+            slurm_job=(restore_slurm_job(stored.slurm_job, root) if stored.slurm_job else None),
+            artifact=stored.artifact,
+            exported_elements_code=stored.exported_elements_code,
+            exported_elements=list(stored.exported_elements),
+            report_file=stored.report_file,
+            report_sha256=stored.report_sha256,
+        )
 
     @staticmethod
     def _context_from_manifest(manifest: RunManifest, root: Path) -> PipelineContext:
@@ -427,6 +578,38 @@ class Orchestrator:
                     raise ValueError(f"Scene {scene_id} 的渲染产物配置不一致")
             if stored.rendered and artifact is None:
                 raise ValueError(f"Scene {scene_id} 标记为已渲染但缺少产物凭据")
+            visual_status = stored.visual_status
+            visual_score = stored.visual_score
+            visual_report_file = stored.visual_report_file
+            visual_report_sha256 = stored.visual_report_sha256
+            visual_artifact_sha256 = stored.visual_artifact_sha256
+            visual_feedback = stored.visual_feedback
+            if visual_status == "evaluating":
+                # 本地 LLM 请求没有可恢复的远端 Job；中断后重新评估同一视频。
+                visual_status = "pending"
+                visual_score = None
+                visual_report_file = ""
+                visual_report_sha256 = ""
+                visual_artifact_sha256 = ""
+                visual_feedback = ""
+            if visual_report_file:
+                report_path = restore_run_path(root, visual_report_file)
+                if report_path.is_symlink() or not report_path.is_file():
+                    raise ValueError(f"Scene {scene_id} 的视觉报告不存在或不安全")
+                if sha256_file(report_path) != visual_report_sha256:
+                    raise ValueError(f"Scene {scene_id} 的视觉报告哈希不一致")
+            if visual_status in {"passed", "warning", "unknown"}:
+                if artifact is None or not visual_report_file:
+                    raise ValueError(f"Scene {scene_id} 的视觉终态缺少视频或评估报告")
+                if visual_artifact_sha256 != artifact.video_sha256:
+                    # 收据不属于当前视频时不能复用，也不把它伪装成恢复失败；
+                    # 清空当前收据，让视觉门在合并前重新评估精确产物。
+                    visual_status = "pending"
+                    visual_score = None
+                    visual_report_file = ""
+                    visual_report_sha256 = ""
+                    visual_artifact_sha256 = ""
+                    visual_feedback = ""
             scene_states[scene_id] = SceneState(
                 plan=stored.plan,
                 code=code,
@@ -448,6 +631,16 @@ class Orchestrator:
                 inherited_elements_code=getattr(stored, "inherited_elements_code", ""),
                 exported_elements_code=getattr(stored, "exported_elements_code", ""),
                 exported_elements=list(getattr(stored, "exported_elements", [])),
+                visual_status=visual_status,
+                visual_fix_attempts=stored.visual_fix_attempts,
+                visual_score=visual_score,
+                visual_report_file=visual_report_file,
+                visual_report_sha256=visual_report_sha256,
+                visual_artifact_sha256=visual_artifact_sha256,
+                visual_feedback=visual_feedback,
+                visual_best_candidate=Orchestrator._restore_visual_candidate(
+                    stored.visual_best_candidate, root
+                ),
             )
         context = PipelineContext(
             user_prompt=manifest.user_prompt,
@@ -471,6 +664,7 @@ class Orchestrator:
             manifest_revision=manifest.revision,
             eval_round=manifest.eval_round,
             continuity_rebuild_required=getattr(manifest, "continuity_rebuild_required", False),
+            visual_eval_profile=manifest.visual_eval_profile,
         )
         if manifest.incremental and manifest.base_run_id:
             context.base_manifest = RunRepository(settings.WORKSPACE_DIR).load(manifest.base_run_id)
@@ -554,6 +748,11 @@ class Orchestrator:
         output_path: Path | None = None,
     ) -> Path | None:
         """增量渲染：只重新渲染受 prompt 变化影响的场景。"""
+        # CLI 会在进入流水线前做真实网络探测；库调用方至少也必须通过
+        # 同一份配置完整性检查，避免运行几分钟后才因空 Key 失败。
+        settings.require_llm_key()
+        if settings.ENABLE_VISUAL_EVAL and not dry_run:
+            settings.require_visual_llm()
         if len(user_prompt) > settings.MAX_PROMPT_CHARS:
             raise ValueError(
                 f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符\n"
@@ -583,6 +782,9 @@ class Orchestrator:
             base_run_id=base_run_id,
             base_manifest=base_manifest,
             paths=RunPaths.create(output_path),
+            visual_eval_profile=self._configured_visual_profile(
+                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
+            ),
         )
         self._ctx = ctx
         ctx.paths.root.mkdir(parents=True, exist_ok=True)
@@ -599,6 +801,11 @@ class Orchestrator:
         interactive: bool = False,
         output_path: Path | None = None,
     ) -> Path | None:
+        # 保持 programmatic API 与 CLI 的配置门槛一致。网络可用性由 CLI
+        # 的启动探测负责，底层 Agent 仍会在真正调用时给出详细错误。
+        settings.require_llm_key()
+        if settings.ENABLE_VISUAL_EVAL and not dry_run:
+            settings.require_visual_llm()
         if len(user_prompt) > settings.MAX_PROMPT_CHARS:
             raise ValueError(
                 f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符\n提示：可以将需求拆分为多个较短的动画，或使用更简洁的描述"
@@ -613,6 +820,9 @@ class Orchestrator:
             dry_run=dry_run,
             interactive=interactive,
             paths=RunPaths.create(output_path),
+            visual_eval_profile=self._configured_visual_profile(
+                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
+            ),
         )
         self._ctx = ctx
         ctx.paths.root.mkdir(parents=True, exist_ok=True)
@@ -679,6 +889,7 @@ class Orchestrator:
             auto_fix=False,
             scenes=[plan],
             scene_states={scene_id: scene_state},
+            visual_eval_profile=self._configured_visual_profile(enabled=False),
         )
         self._ctx = ctx
         self._manifest = None
@@ -754,6 +965,10 @@ class Orchestrator:
                 raise RuntimeError("运行标记为完成，但最终视频不存在")
             if manifest.status == "dry_run_complete":
                 return None
+            if ctx.visual_eval_profile.enabled:
+                settings.visual_llm_profile(
+                    model_override=ctx.visual_eval_profile.model
+                ).require()
             try:
                 state = State[manifest.state]
             except KeyError as exc:
@@ -854,13 +1069,20 @@ class Orchestrator:
                 self._plan_outline(ctx)
                 self._plan_continuity_bible(ctx)
                 ctx.scene_states = {
-                    outline.scene_id: SceneState(plan=self._placeholder_plan(outline))
+                    outline.scene_id: SceneState(
+                        plan=self._placeholder_plan(outline),
+                        visual_status=("pending" if ctx.visual_eval_profile.enabled else "skipped"),
+                    )
                     for outline in ctx.outlines
                 }
                 # 在任何并行 Detail worker 启动前保存概要和 continuity bible；
                 # 进程此时中断时 resume 不会丢失全片规范或重新生成一份不同的规范。
                 self._checkpoint(ctx, State.DETAILING)
-                self._emit("plan_complete", scenes=ctx.scenes)
+                self._emit(
+                    "plan_complete",
+                    scenes=ctx.scenes,
+                    visual_enabled=ctx.visual_eval_profile.enabled,
+                )
             elif ctx.scenes:
                 # resume 等已有 scene_states 的入口: 补发 plan_complete 供 TUI 表格展示
                 self._emit(
@@ -871,6 +1093,7 @@ class Orchestrator:
                             ctx.scene_states.values(), key=lambda s: s.plan.scene_id
                         )
                     ],
+                    visual_enabled=ctx.visual_eval_profile.enabled,
                 )
 
             # resume: 把已有场景的当前进度以事件补发给 TUI/仪表盘, 否则调度器
@@ -895,7 +1118,14 @@ class Orchestrator:
                     self._stop_event.clear()
                     self._checkpoint(ctx, State.CODING)
                     continue
+                if self._visual_gate(ctx):
+                    if ctx.continuity_rebuild_required:
+                        ctx.continuity_rebuild_required = False
+                        self._stop_event.clear()
+                    self._checkpoint(ctx, State.CODING)
+                    continue
                 self._merge(ctx)
+                self._final_visual_report(ctx)
                 improve = self._eval(ctx)
 
             # ---- 收尾 ----
@@ -1122,6 +1352,15 @@ class Orchestrator:
 
         return self._llm_sem if hasattr(self, "_llm_sem") else nullcontext()
 
+    def _visual_llm_slot(self):
+        """批处理时复用进程级视觉模型配额。"""
+
+        from contextlib import nullcontext
+
+        if self._resource_coordinator is not None:
+            return self._resource_coordinator.visual_llm
+        return nullcontext()
+
     # ------------------------------------------------------------------
     # 场景级并行调度 (per-scene pipeline)
     # 每个 Scene 一个工作线程, 独立推进 分镜→编码→审查→提交→渲染→修复。
@@ -1158,6 +1397,7 @@ class Orchestrator:
                 if self.slurm.validate_completed_job(job):
                     state.artifact = self._artifact_from_job(ctx, state, job)
                     state.rendered = True
+                    self._reset_visual_receipt(ctx, state)
                     self._emit("scene_rendered", scene_id=scene_id)
                 else:
                     # 不要在产物尚未传播时把已完成作业改写成 FAILED；
@@ -1168,6 +1408,7 @@ class Orchestrator:
                 if outcome == "COMPLETED":
                     state.artifact = self._artifact_from_job(ctx, state, job)
                     state.rendered = True
+                    self._reset_visual_receipt(ctx, state)
                     self._emit("scene_rendered", scene_id=scene_id)
                 elif outcome is None:
                     # 已确认不在调度器且没有任何运行痕迹，可安全重新提交。
@@ -1198,6 +1439,27 @@ class Orchestrator:
             # 终态事件
             if state.rendered:
                 self._emit("scene_rendered", scene_id=scene_id)
+                if state.visual_status == "passed":
+                    self._emit(
+                        "scene_visual_pass",
+                        scene_id=scene_id,
+                        score=state.visual_score,
+                    )
+                elif state.visual_status == "unknown":
+                    self._emit(
+                        "scene_visual_unknown",
+                        scene_id=scene_id,
+                        reason=state.visual_feedback,
+                    )
+                elif state.visual_status == "warning":
+                    self._emit(
+                        "scene_visual_warning",
+                        scene_id=scene_id,
+                        score=state.visual_score,
+                        reason=state.visual_feedback or "视觉问题已记录",
+                    )
+                elif state.visual_status == "evaluating":
+                    self._emit("scene_visual_evaluating", scene_id=scene_id)
             elif state.failed:
                 self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason or "")
             elif state.give_up:
@@ -1294,10 +1556,56 @@ class Orchestrator:
                     state.reviewed = False
                     state.rewrite_feedback = ""
                     state.artifact = None
+                    state.rendered = False
                     state.slurm_job = None
                     state.exported_elements_code = ""
                     state.exported_elements = []
+                    self._reset_visual_receipt(
+                        ctx,
+                        state,
+                        clear_candidate=True,
+                        reset_attempts=True,
+                    )
                     self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", "")
+                reusable_visual = state.visual_best_candidate
+                if (
+                    not state.code
+                    and reusable_visual is not None
+                    and reusable_visual.passed
+                    and reusable_visual.inherited_elements_sha256
+                    == sha256_text(state.inherited_elements_code)
+                ):
+                    try:
+                        self._artifact_video_path(ctx, reusable_visual.artifact)
+                        self._restore_visual_candidate_into_state(
+                            ctx,
+                            scene_id,
+                            state,
+                            reusable_visual,
+                        )
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        # 候选只是优化路径；损坏时清除并走正常编码/渲染，
+                        # 不能让一个可重建场景因旧候选失效而永久失败。
+                        state.visual_best_candidate = None
+                        ctx.continuity_warnings.append(
+                            f"Scene {scene_id} 的视觉候选无法复用，已重新生成: {exc}"
+                        )
+                    else:
+                        state.visual_feedback = ""
+                        self._checkpoint(ctx, State.REVIEWING)
+                        self._emit(
+                            "scene_coded",
+                            scene_id=scene_id,
+                            file_path=str(ctx.paths.scenes / f"scene_{scene_id}.py"),
+                        )
+                        self._emit("scene_review_pass", scene_id=scene_id)
+                        self._emit("scene_rendered", scene_id=scene_id)
+                        self._emit(
+                            "scene_visual_pass",
+                            scene_id=scene_id,
+                            score=reusable_visual.score,
+                        )
+                        continue
                 # 已有成功产物仍需补齐导出状态，但不能因恢复而重新调用 LLM。
                 if state.rendered and state.code:
                     if not state.exported_elements_code:
@@ -1690,6 +1998,7 @@ class Orchestrator:
         """从审查通过的最终代码提取下一场景可复用的纯定义。"""
 
         exported_code, exported_elements = extract_continuity_elements(state.code)
+        validate_export_contract(state.plan, exported_elements)
         state.exported_elements_code = exported_code
         code_hash = sha256_text(state.code)
         state.exported_elements = [
@@ -1734,6 +2043,7 @@ class Orchestrator:
             state.rendered = False
             state.exported_elements_code = ""
             state.exported_elements = []
+            self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.CODING)
         self._emit("scene_coded", scene_id=scene_id, file_path=str(path))
 
@@ -1813,10 +2123,17 @@ class Orchestrator:
                 code_sha256=sha256_text(state.code),
                 render_profile=ctx.render_profile,
             )
+            expected_code_hash = sha256_text(state.code)
+            if job.code_sha256 and job.code_sha256 != expected_code_hash:
+                raise RuntimeError("Slurm 返回的作业代码哈希与当前场景不一致")
+            # 外部/测试 Dispatcher 可能没有回填代码身份；由提交边界补齐，
+            # 确保后续 manifest 和 resume 仍然具备不可歧义的代码凭据。
+            job.code_sha256 = expected_code_hash
             with self._state_lock:
                 state.slurm_job = job
                 state.artifact = None
                 state.rendered = False
+                self._reset_visual_receipt(ctx, state)
                 try:
                     self._checkpoint(ctx, State.DISPATCHING)
                 except Exception as checkpoint_error:
@@ -1893,6 +2210,7 @@ class Orchestrator:
             with self._state_lock:
                 state.artifact = self._artifact_from_job(ctx, state, job)
                 state.rendered = True
+                self._reset_visual_receipt(ctx, state)
                 self._checkpoint(ctx, State.MONITORING)
             self._emit("scene_rendered", scene_id=job.scene_id)
             return True
@@ -1980,13 +2298,21 @@ class Orchestrator:
             excerpt = excerpt[-600:]
         return f"{base}\n最近错误日志(尾部):\n{excerpt}"
 
-    def _request_continuity_rebuild(self, ctx: PipelineContext, scene_id: int) -> None:
-        """上游 AutoFix 改码后，安全取消并清空所有下游代码/产物。"""
+    def _request_continuity_rebuild(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        *,
+        reason: str = "上游场景代码变化",
+        preserve_visual_candidates: bool = False,
+        include_failed: bool = False,
+    ) -> None:
+        """上游场景改码后，安全取消并清空所有下游代码/产物。"""
 
         downstream = [
             (sid, state)
             for sid, state in sorted(ctx.scene_states.items())
-            if sid > scene_id and not state.failed and not state.give_up
+            if sid > scene_id and (include_failed or (not state.failed and not state.give_up))
         ]
         if not downstream:
             return
@@ -2014,7 +2340,7 @@ class Orchestrator:
                 if not terminal:
                     job.cancelled = True
                     job.status = "CANCELLED"
-                    job.failure_reason = "上游场景代码变化，连续性重建时取消"
+                    job.failure_reason = f"{reason}，连续性重建时取消"
             with self._state_lock:
                 state.code = ""
                 state.class_name = ""
@@ -2029,10 +2355,16 @@ class Orchestrator:
                 state.inherited_elements_code = ""
                 state.exported_elements_code = ""
                 state.exported_elements = []
+                self._reset_visual_receipt(
+                    ctx,
+                    state,
+                    clear_candidate=not preserve_visual_candidates,
+                    reset_attempts=not preserve_visual_candidates,
+                )
                 self._write_private(ctx.paths.scenes / f"scene_{sid}.py", "")
         ctx.continuity_rebuild_required = True
         ctx.continuity_warnings.append(
-            f"Scene {scene_id} AutoFix 修改了代码，已请求重建后续场景的连续性上下文。"
+            f"Scene {scene_id} 因{reason}，已请求重建后续场景的连续性上下文。"
         )
         self._stop_event.set()
 
@@ -2140,9 +2472,14 @@ class Orchestrator:
             state.rendered = False
             state.exported_elements_code = ""
             state.exported_elements = []
+            self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.FIXING)
         if code_changed:
-            self._request_continuity_rebuild(ctx, scene_id)
+            self._request_continuity_rebuild(
+                ctx,
+                scene_id,
+                preserve_visual_candidates=state.visual_best_candidate is not None,
+            )
         self._emit(
             "scene_coded",
             scene_id=scene_id,
@@ -2203,6 +2540,7 @@ class Orchestrator:
                     state.class_name = validation.scene_classes[0]
                     state.artifact = None
                     state.rendered = False
+                    self._reset_visual_receipt(ctx, state)
                     self._checkpoint(ctx, State.REVIEWING)
                 self._emit(
                     "scene_coded",
@@ -2231,6 +2569,7 @@ class Orchestrator:
             )
             state.artifact = None
             state.rendered = False
+            self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.REVIEWING)
         self._emit("scene_review_fail", scene_id=scene_id, severity="major")
         return True
@@ -2292,6 +2631,7 @@ class Orchestrator:
                         metadata=artifact.metadata,
                         verified=True,
                     )
+                    self._reset_visual_receipt(ctx, state)
                     if scene_id not in ctx.scenes_to_reuse:
                         ctx.scenes_to_reuse.append(scene_id)
                     return
@@ -2378,6 +2718,405 @@ class Orchestrator:
             raise RuntimeError(f"Scene {artifact.scene_id} 的渲染产物哈希不一致")
         return video
 
+    @staticmethod
+    def _scene_visual_context(ctx: PipelineContext, state: SceneState) -> str:
+        payload = {
+            "scene_plan": state.plan.model_dump(mode="json"),
+            "global_continuity": (
+                ctx.continuity_bible.model_dump(mode="json") if ctx.continuity_bible else None
+            ),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)[:30_000]
+
+    @staticmethod
+    def _redact_visual_error(error: Exception) -> str:
+        detail = str(error).strip() or type(error).__name__
+        if settings.VISUAL_LLM_API_KEY:
+            detail = detail.replace(settings.VISUAL_LLM_API_KEY, "<redacted>")
+        return detail[:10_000]
+
+    def _restore_visual_candidate_into_state(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+        candidate: VisualCandidate,
+    ) -> bool:
+        """恢复已验证候选；返回代码是否相对当前状态发生变化。"""
+
+        inherited_hash = sha256_text(state.inherited_elements_code)
+        if candidate.inherited_elements_sha256 != inherited_hash:
+            raise RuntimeError(
+                f"Scene {scene_id} 的视觉候选基于不同的继承上下文，拒绝恢复"
+            )
+        code_changed = candidate.code != state.code
+        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate.code)
+        state.code = candidate.code
+        state.class_name = candidate.class_name
+        state.slurm_job = candidate.slurm_job
+        state.artifact = candidate.artifact
+        state.rendered = True
+        state.reviewed = True
+        state.failed = False
+        state.give_up = False
+        state.failure_reason = ""
+        state.rewrite_feedback = ""
+        state.exported_elements_code = candidate.exported_elements_code
+        state.exported_elements = list(candidate.exported_elements)
+        state.visual_status = "passed" if candidate.passed else "warning"
+        state.visual_score = candidate.score
+        state.visual_report_file = candidate.report_file
+        state.visual_report_sha256 = candidate.report_sha256
+        state.visual_artifact_sha256 = candidate.artifact.video_sha256
+        state.visual_feedback = ""
+        return code_changed
+
+    def _visual_gate(self, ctx: PipelineContext) -> bool:
+        """逐场景评估精确渲染产物；返回是否安排了代码改进。"""
+
+        profile = ctx.visual_eval_profile
+        if not profile.enabled:
+            for state in ctx.scene_states.values():
+                state.visual_status = "skipped"
+            return False
+
+        # 若视觉修复链路自身失败，恢复此前得分最高且可验证的候选，避免丢掉
+        # 原本可用的视频。恢复旧代码后必须重建所有下游连续性上下文。
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            candidate = state.visual_best_candidate
+            if state.rendered or candidate is None or not (state.failed or state.give_up):
+                continue
+            if candidate.inherited_elements_sha256 != sha256_text(
+                state.inherited_elements_code
+            ):
+                continue
+            current_code = state.code
+            self._artifact_video_path(ctx, candidate.artifact)
+            changed = self._restore_visual_candidate_into_state(ctx, scene_id, state, candidate)
+            state.visual_status = "warning"
+            state.visual_feedback = "视觉修复链路失败，已恢复最佳可用版本"
+            self._emit(
+                "scene_visual_warning",
+                scene_id=scene_id,
+                score=candidate.score,
+                reason="视觉修复链路失败，已恢复最佳可用版本",
+            )
+            if changed or candidate.code != current_code:
+                self._request_continuity_rebuild(
+                    ctx,
+                    scene_id,
+                    reason="视觉修复失败后恢复最佳候选",
+                    preserve_visual_candidates=True,
+                    include_failed=True,
+                )
+            self._checkpoint(ctx, State.VISUAL_EVALUATING)
+            return bool(ctx.continuity_rebuild_required)
+
+        targets: list[tuple[int, SceneState, SceneArtifact]] = []
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            artifact = state.artifact
+            if not state.rendered or artifact is None:
+                continue
+            terminal = state.visual_status in {"passed", "warning", "unknown"}
+            if terminal and state.visual_artifact_sha256 == artifact.video_sha256:
+                continue
+            state.visual_status = "evaluating"
+            targets.append((scene_id, state, artifact))
+            self._emit("scene_visual_evaluating", scene_id=scene_id)
+
+        if not targets:
+            return False
+
+        self._emit("stage_start", stage="visual_evaluating")
+        self._checkpoint(ctx, State.VISUAL_EVALUATING)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from kd1_anime.eval import Evaluator
+
+        def evaluate_one(scene_id: int, state: SceneState, artifact: SceneArtifact):
+            video = self._artifact_video_path(ctx, artifact)
+            frame_dir = (
+                ctx.paths.root
+                / "eval_frames"
+                / f"scene_{scene_id}"
+                / artifact.video_sha256[:12]
+            )
+            evaluator = Evaluator(
+                enable_visual_eval=True,
+                visual_eval_model=profile.model,
+                output_dir=ctx.paths.root / "eval_reports",
+            )
+            with self._visual_llm_slot():
+                result, samples = evaluator.evaluate_scene_video(
+                    video,
+                    description=ctx.original_prompt or ctx.user_prompt,
+                    scene_context=self._scene_visual_context(ctx, state),
+                    output_dir=frame_dir,
+                    frame_count=profile.frame_count,
+                )
+            return result, samples
+
+        outcomes: dict[int, tuple[object | None, list, str]] = {}
+        with ThreadPoolExecutor(max_workers=settings.VISUAL_LLM_PARALLEL_WORKERS) as pool:
+            futures = {
+                pool.submit(evaluate_one, scene_id, state, artifact): (scene_id, artifact)
+                for scene_id, state, artifact in targets
+            }
+            for future in as_completed(futures):
+                scene_id, _artifact = futures[future]
+                try:
+                    result, samples = future.result()
+                    outcomes[scene_id] = (result, samples, "")
+                except Exception as exc:
+                    outcomes[scene_id] = (None, [], self._redact_visual_error(exc))
+
+        first_fix_scene: int | None = None
+        first_fix_feedback = ""
+        for scene_id, state, artifact in targets:
+            result, samples, error = outcomes[scene_id]
+            report_dir = ctx.paths.root / "eval_reports" / f"scene_{scene_id}"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_dir.chmod(0o700)
+            report_path = report_dir / (
+                f"attempt_{state.visual_fix_attempts:02d}_{artifact.video_sha256[:12]}.json"
+            )
+            report: dict = {
+                "schema_version": 1,
+                "scope": "scene",
+                "scene_id": scene_id,
+                "model": profile.model,
+                "visual_profile_sha256": profile.digest(),
+                "attempt": state.visual_fix_attempts,
+                "artifact_sha256": artifact.video_sha256,
+                "code_sha256": artifact.code_sha256,
+                "inherited_elements_sha256": sha256_text(state.inherited_elements_code),
+                "frames": [
+                    {
+                        "frame_id": sample.frame_id,
+                        "timestamp_seconds": sample.timestamp_seconds,
+                        "path": sample.path.resolve().relative_to(ctx.paths.root.resolve()).as_posix(),
+                        "sha256": sample.image_sha256,
+                    }
+                    for sample in samples
+                ],
+                "error": error,
+            }
+            if result is not None:
+                report["result"] = result.to_dict()
+            atomic_write_json(report_path, report)
+            report_relative = report_path.relative_to(ctx.paths.root).as_posix()
+            report_hash = sha256_file(report_path)
+
+            state.visual_report_file = report_relative
+            state.visual_report_sha256 = report_hash
+            state.visual_artifact_sha256 = artifact.video_sha256
+            if result is None:
+                state.visual_status = "unknown"
+                state.visual_score = None
+                state.visual_feedback = error
+                self._emit("scene_visual_unknown", scene_id=scene_id, reason=error)
+                continue
+
+            state.visual_score = result.overall_score
+            state.visual_feedback = result.feedback()
+            candidate = VisualCandidate(
+                score=result.overall_score,
+                has_major_issue=result.has_major_issue,
+                passed=not result.needs_fix(profile.threshold),
+                inherited_elements_sha256=sha256_text(state.inherited_elements_code),
+                code=state.code,
+                class_name=state.class_name,
+                slurm_job=state.slurm_job,
+                artifact=artifact,
+                exported_elements_code=state.exported_elements_code,
+                exported_elements=list(state.exported_elements),
+                report_file=report_relative,
+                report_sha256=report_hash,
+            )
+            previous = state.visual_best_candidate
+            candidate_rank = (
+                candidate.passed,
+                not candidate.has_major_issue,
+                candidate.score,
+            )
+            previous_rank = (
+                (previous.passed, not previous.has_major_issue, previous.score)
+                if previous is not None
+                else (False, False, 0.0)
+            )
+            if previous is None or candidate_rank > previous_rank:
+                state.visual_best_candidate = candidate
+
+            if not result.needs_fix(profile.threshold):
+                state.visual_status = "passed"
+                state.visual_feedback = ""
+                self._emit(
+                    "scene_visual_pass",
+                    scene_id=scene_id,
+                    score=result.overall_score,
+                )
+                continue
+
+            can_fix = ctx.auto_fix and state.visual_fix_attempts < profile.max_fix_attempts
+            if can_fix:
+                state.visual_status = "needs_fix"
+                if first_fix_scene is None:
+                    # 一次只修改最早失败场景。它的导出元素会影响所有后继场景；
+                    # 先修后重建可避免并行修复基于即将过期的连续性上下文。
+                    first_fix_scene = scene_id
+                    first_fix_feedback = result.feedback()
+                continue
+
+            # 主观质量问题不应使已经成功渲染的视频消失。达到上限时选择
+            # 历次得分最高候选，并将未解决问题明确记录为 warning。
+            best = state.visual_best_candidate
+            if (
+                best is not None
+                and best.artifact.video_sha256 != artifact.video_sha256
+                and best.inherited_elements_sha256
+                == sha256_text(state.inherited_elements_code)
+            ):
+                changed = self._restore_visual_candidate_into_state(ctx, scene_id, state, best)
+                state.visual_status = "warning"
+                state.visual_feedback = "视觉修复耗尽后已恢复最高分候选"
+                if changed:
+                    self._request_continuity_rebuild(
+                        ctx,
+                        scene_id,
+                        reason="视觉修复耗尽后恢复最高分候选",
+                        preserve_visual_candidates=True,
+                        include_failed=True,
+                    )
+            else:
+                state.visual_status = "warning"
+                if not state.visual_feedback:
+                    state.visual_feedback = (
+                        "已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"
+                    )
+            self._emit(
+                "scene_visual_warning",
+                scene_id=scene_id,
+                score=state.visual_score,
+                reason=("已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"),
+            )
+
+        if first_fix_scene is not None:
+            state = ctx.scene_states[first_fix_scene]
+            state.visual_fix_attempts += 1
+            state.rewrite_feedback = (
+                "## Visual Evaluation Feedback\n"
+                f"{first_fix_feedback}\n\n"
+                "请使用原有全局视觉配置修复这些可见问题，不要改变正确的数学内容或"
+                "跨场景元素合同。"
+            )
+            state.reviewed = False
+            state.rendered = False
+            state.artifact = None
+            state.slurm_job = None
+            ctx.final_video = None
+            ctx.final_video_sha256 = ""
+            self._emit(
+                "scene_visual_fixing",
+                scene_id=first_fix_scene,
+                attempt=state.visual_fix_attempts,
+                max_attempts=profile.max_fix_attempts,
+            )
+            self._request_continuity_rebuild(
+                ctx,
+                first_fix_scene,
+                reason="视觉评估要求修改场景代码",
+                preserve_visual_candidates=True,
+            )
+            self._checkpoint(ctx, State.VISUAL_EVALUATING)
+            return True
+
+        self._checkpoint(ctx, State.VISUAL_EVALUATING)
+        return bool(ctx.continuity_rebuild_required)
+
+    def _final_visual_report(self, ctx: PipelineContext) -> None:
+        """对合并成片生成报告；不据此执行无法可靠归因的代码重写。"""
+
+        profile = ctx.visual_eval_profile
+        if not profile.enabled or ctx.final_video is None:
+            return
+        self._emit("stage_start", stage="visual_evaluating", scope="final")
+        from kd1_anime.eval import Evaluator
+
+        report_path = ctx.paths.root / "eval_reports" / "final_visual.json"
+        samples = []
+        try:
+            evaluator = Evaluator(
+                enable_visual_eval=True,
+                visual_eval_model=profile.model,
+                output_dir=ctx.paths.root / "eval_reports",
+            )
+            if evaluator.visual_evaluator is None:  # 仅用于静态收窄；正常配置不可能发生
+                raise RuntimeError("视觉评估器未初始化")
+            frame_dir = ctx.paths.root / "eval_frames" / "final" / ctx.final_video_sha256[:12]
+            samples = evaluator.extract_video_samples(
+                ctx.final_video,
+                frame_dir,
+                frame_count=profile.frame_count,
+            )
+            with self._visual_llm_slot():
+                result = evaluator.visual_evaluator.evaluate_video_frames(
+                    samples,
+                    ctx.original_prompt or ctx.user_prompt,
+                    scene_context=json.dumps(
+                        [
+                            state.plan.model_dump(mode="json")
+                            for state in ctx.scene_states.values()
+                        ],
+                        ensure_ascii=False,
+                    )[:30_000],
+                    scope="complete video",
+                )
+            report = {
+                "schema_version": 1,
+                "scope": "complete_video",
+                "model": profile.model,
+                "visual_profile_sha256": profile.digest(),
+                "video_sha256": ctx.final_video_sha256,
+                "frames": [
+                    {
+                        "frame_id": sample.frame_id,
+                        "timestamp_seconds": sample.timestamp_seconds,
+                        "path": sample.path.resolve()
+                        .relative_to(ctx.paths.root.resolve())
+                        .as_posix(),
+                        "sha256": sample.image_sha256,
+                    }
+                    for sample in samples
+                ],
+                "result": result.to_dict(),
+                "error": "",
+            }
+            self._emit("final_visual_complete", score=result.overall_score)
+        except Exception as exc:
+            report = {
+                "schema_version": 1,
+                "scope": "complete_video",
+                "model": profile.model,
+                "visual_profile_sha256": profile.digest(),
+                "video_sha256": ctx.final_video_sha256,
+                "frames": [
+                    {
+                        "frame_id": sample.frame_id,
+                        "timestamp_seconds": sample.timestamp_seconds,
+                        "path": sample.path.resolve()
+                        .relative_to(ctx.paths.root.resolve())
+                        .as_posix(),
+                        "sha256": sample.image_sha256,
+                    }
+                    for sample in samples
+                ],
+                "result": None,
+                "error": self._redact_visual_error(exc),
+            }
+            self._emit("final_visual_unknown", reason=report["error"])
+        atomic_write_json(report_path, report)
+
     def _merge(self, ctx: PipelineContext) -> None:
         """按代码、配置和视频哈希验证每个产物后再合并。"""
         self._emit("stage_start", stage="merging")
@@ -2396,6 +3135,14 @@ class Orchestrator:
                 raise RuntimeError(f"Scene {scene_id} 的产物代码哈希与当前代码不一致")
             if artifact.render_profile_sha256 != ctx.render_profile.digest():
                 raise RuntimeError(f"Scene {scene_id} 的产物渲染配置与当前运行不一致")
+            if ctx.visual_eval_profile.enabled:
+                accepted = state.visual_status in {"passed", "warning", "unknown"}
+                if not accepted:
+                    raise RuntimeError(
+                        f"Scene {scene_id} 尚未完成视觉评估（状态: {state.visual_status}）"
+                    )
+                if state.visual_artifact_sha256 != artifact.video_sha256:
+                    raise RuntimeError(f"Scene {scene_id} 的视觉评估记录不属于当前视频")
             rendered_artifacts.append(artifact)
         incomplete = [sid for sid, state in ctx.scene_states.items() if not state.rendered]
         if not rendered_artifacts:
@@ -2483,8 +3230,10 @@ class Orchestrator:
             return False
         try:
             evaluator = Evaluator(
-                enable_visual_eval=settings.ENABLE_VISUAL_EVAL,
-                visual_eval_model=settings.EVAL_VISUAL_MODEL,
+                # 场景级闭环与成片视觉报告由 _visual_gate / _final_visual_report
+                # 使用独立多模态端点完成；这里仅保留确定性代码与效率评估，
+                # 避免重复计费以及把视觉端点故障误当成改码依据。
+                enable_visual_eval=False,
                 output_dir=ctx.paths.root / "eval_reports",
             )
             scene_eval_results = {
@@ -2496,7 +3245,7 @@ class Orchestrator:
                 ctx.paths.run_id,
                 ctx.paths.root,
                 description=ctx.original_prompt or ctx.user_prompt,
-                enable_visual=settings.ENABLE_VISUAL_EVAL,
+                enable_visual=False,
             )
             eval_result.save(ctx.paths.root / "eval_result.json")
         except Exception as exc:
@@ -2509,9 +3258,10 @@ class Orchestrator:
             score.score for score in eval_result.scores if score.metric.value.startswith("code_")
         ]
         visual_values = [
-            score.score
-            for score in eval_result.scores
-            if score.metric.value.startswith("visual_") or score.metric.value == "element_layout"
+            state.visual_score
+            for state in ctx.scene_states.values()
+            if state.visual_score is not None
+            and state.visual_status in {"passed", "warning"}
         ]
         self._emit(
             "eval_complete",
@@ -2521,13 +3271,6 @@ class Orchestrator:
             errors=eval_result.errors,
             threshold=settings.EVAL_THRESHOLD,
         )
-        if settings.ENABLE_VISUAL_EVAL and not visual_values:
-            self._emit(
-                "eval_skipped",
-                reason="visual_metrics_unavailable",
-                errors=eval_result.errors,
-            )
-            return False
         if overall_score is None:
             self._emit("eval_skipped", reason="no_valid_metrics", errors=eval_result.errors)
             return False
@@ -2561,7 +3304,15 @@ class Orchestrator:
         with self._state_lock:
             ctx.eval_round = eval_round + 1
             ctx.scenes_to_improve = low_score_scenes
-            for scene_id in low_score_scenes:
+            # 当前代码交接是按场景顺序建立的：Scene N 的导出定义会成为
+            # Scene N+1 的输入。因此重新生成任一场景时，不能只清空该场景，
+            # 否则后续场景会继续携带旧上下文和旧视频。保守地从最早低分
+            # 场景开始失效所有后继场景，保留它们的导演分镜以减少 LLM 成本。
+            first_changed_scene = min(low_score_scenes)
+            invalidated_ids = [
+                scene_id for scene_id in sorted(ctx.scene_states) if scene_id >= first_changed_scene
+            ]
+            for scene_id in invalidated_ids:
                 state = ctx.scene_states[scene_id]
                 state.rendered = False
                 state.reviewed = False
@@ -2577,6 +3328,25 @@ class Orchestrator:
                 state.failure_reason = ""
                 state.last_error_fp = ""
                 state.identical_error_count = 0
+                state.inherited_elements_code = ""
+                state.exported_elements_code = ""
+                state.exported_elements = []
+                state.visual_status = (
+                    "pending" if ctx.visual_eval_profile.enabled else "skipped"
+                )
+                state.visual_fix_attempts = 0
+                state.visual_score = None
+                state.visual_report_file = ""
+                state.visual_report_sha256 = ""
+                state.visual_artifact_sha256 = ""
+                state.visual_feedback = ""
+                state.visual_best_candidate = None
+                code_path = ctx.paths.scenes / f"scene_{scene_id}.py"
+                self._write_private(code_path, "")
+            ctx.scenes_to_render.clear()
+            ctx.scenes_to_reuse.clear()
+            ctx.final_video = None
+            ctx.final_video_sha256 = ""
             # 轮次和场景重置必须先持久化；检查点失败应终止流水线，不能被
             # 当作可忽略的视觉评估错误，否则 resume 会复用上一轮旧视频。
             self._checkpoint(ctx, State.EVALUATING)
