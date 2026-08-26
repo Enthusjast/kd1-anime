@@ -161,6 +161,8 @@ class SceneDashboard:
         self.scenes: dict[int, SceneStatus] = {}
         self.total: int = 0
         self.visual_enabled: bool = False
+        self.rag_status: str = "disabled"
+        self.rag_models: str = ""
         self._event_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -250,6 +252,15 @@ class SceneDashboard:
             self.run_id = data.get("run_id", "") or self.run_id
             if not self.started_at:
                 self.started_at = time.time()
+
+        elif event == "rag_status":
+            self.rag_status = data.get("status", "disabled") or "disabled"
+            warning = (data.get("warning", "") or "").strip()
+            embedding = data.get("embedding_model", "") or "未配置"
+            reranker = data.get("reranker_model", "") or "未配置"
+            self.rag_models = f"E:{embedding} R:{reranker}"
+            if warning:
+                self.rag_models += " · degraded"
 
         elif event in ("continuity_bible_start", "continuity_reviewing"):
             self.stage = "continuity"
@@ -479,6 +490,13 @@ class SceneDashboard:
             header.append(f"  失败 {failed}", style="red")
         if warnings:
             header.append(f"  提示 {warnings}", style="yellow")
+        if self.rag_status != "disabled":
+            header.append(
+                f"  RAG:{self.rag_status}",
+                style="yellow" if self.rag_status == "degraded" else "cyan",
+            )
+            if self.rag_models:
+                header.append(f" ({self.rag_models})", style="dim")
         if self.started_at:
             header.append(f"  用时 {int(time.time() - self.started_at)}s", style="dim")
 

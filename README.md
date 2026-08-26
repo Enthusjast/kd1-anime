@@ -22,6 +22,7 @@
 - **启动前 API 探测**：进入会话或 LLM 流水线前探测主 LLM；配置、网络或模型不可用时立即退出。视觉端点单独探测，暂时不可用时安全降级为 `unknown`。
 - **独立视觉质量门**：可为每个已渲染场景抽取带时间戳和哈希的关键帧，用单独的多模态 LLM 检查数学正确性、相关性、可读性、布局和跨帧一致性；主 Planner/Coder 端点不会被替换。
 - **有界视觉修复**：低分场景把纯诊断反馈交回 Coder，重新经过校验、审查和渲染；达到上限时保留更好的可验证版本，视觉端点故障则记为 `unknown` 并继续。
+- **可选知识检索**：使用本地 SQLite 索引、独立 Embedding 和 Reranker 服务，为 Planner、Coder 和 AutoFixer 提供受限、可审计的 Manim 文档与示例上下文。
 
 ## 一行安装（Ubuntu / HPC，无 sudo）
 
@@ -114,6 +115,36 @@ VISUAL_LLM_API_KEY=your-visual-api-key
 VISUAL_LLM_BASE_URL=https://your-visual-endpoint/v1
 VISUAL_LLM_MODEL=your-multimodal-model
 ```
+
+如需使用知识检索，可单独配置 Embedding 和 Reranker 服务。RAG 不会继承主 LLM
+或视觉 LLM 的任何凭据；Embedding 使用 OpenAI-compatible `/embeddings` 接口，
+Reranker 使用 Cohere-compatible `/rerank` 接口：
+
+```dotenv
+RAG_ENABLED=true
+RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3
+RAG_DOCS_DIR=/path/to/manim-docs
+RAG_EXAMPLES_DIR=/path/to/manim-examples
+RAG_EMBEDDING_API_KEY=your-embedding-key
+RAG_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
+RAG_EMBEDDING_MODEL=your-embedding-model
+RAG_RERANK_API_KEY=your-rerank-key
+RAG_RERANK_BASE_URL=https://your-rerank-endpoint/v1
+RAG_RERANK_MODEL=your-rerank-model
+```
+
+建立索引并检查服务：
+
+```bash
+kd1-anime rag index
+kd1-anime rag status
+kd1-anime rag search "TransformMatchingTex usage"
+kd1-anime doctor --probe-rag
+```
+
+RAG 运行时服务暂时不可用时会降级继续：Embedding 失败则跳过检索，Reranker
+失败则使用 Embedding 初排结果。索引只读取 `.md`/`.py`，并排除运行目录和疑似
+密钥行。
 
 完整示例见 `.env.example`。安装脚本也会生成：
 
@@ -208,6 +239,13 @@ workspace/runs/<timestamp>-<uuid>/
 | `VISUAL_LLM_BASE_URL` | 空 | 独立多模态 OpenAI-compatible 端点；不回退主端点 |
 | `VISUAL_LLM_MODEL` | 空 | 支持 `image_url` 输入的视觉模型；启用视觉评估时必须设置 |
 | `VISUAL_LLM_PARALLEL_WORKERS` | `2` | 进程级并行视觉请求上限，与主 LLM 并发池分离；批处理任务共享此配额 |
+| `RAG_ENABLED` | `false` | 是否启用本地知识检索；默认关闭 |
+| `RAG_INDEX_PATH` | `~/.cache/kd1-anime/rag/index.sqlite3` | SQLite RAG 索引路径 |
+| `RAG_EMBEDDING_BASE_URL` / `RAG_EMBEDDING_MODEL` | 空 | 独立 Embedding 服务和模型 |
+| `RAG_RERANK_BASE_URL` / `RAG_RERANK_MODEL` | 空 | 独立 Reranker 服务和模型 |
+| `RAG_TOP_K` / `RAG_RERANK_TOP_N` | `8` / `4` | 向量初排和重排数量 |
+| `RAG_MAX_CONTEXT_CHARS` | `12000` | 注入单次 Agent 请求的最大检索上下文 |
+| `RAG_PARALLEL_WORKERS` | `2` | 跨批量任务共享的 RAG 请求并发上限 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 全片连续性审查发现冲突后的局部分镜重规划轮数 |
 | `MAX_PROMPT_CHARS` | `50000` | 用户需求最大字符数 |

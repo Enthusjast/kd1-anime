@@ -758,6 +758,11 @@ class ChatSession:
             case "security_warning":
                 console.print(f"[bold yellow]安全警告:[/] {esc(data.get('message', ''))}")
 
+            case "rag_status":
+                status = esc(data.get("status", "disabled"))
+                warning = esc(data.get("warning", ""))
+                console.print(f"  [dim]RAG:[/] {status}" + (f" — {warning}" if warning else ""))
+
             case "plan_complete":
                 scenes = data.get("scenes", [])
                 table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))

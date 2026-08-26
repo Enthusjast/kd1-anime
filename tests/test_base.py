@@ -423,8 +423,8 @@ def test_escape_control_chars_in_json_keeps_valid_escapes():
 def test_extract_json_skips_latex_braces_before_object():
     """数学公式的上标花括号不能遮蔽后面的 JSON 对象。"""
 
-    response = r'''说明：\( y = x^{1/2} \)
+    response = r"""说明：\( y = x^{1/2} \)
 
-{"value": 1}'''
+{"value": 1}"""
 
     assert BaseAgent._extract_json(response, expected_type="object") == '{"value": 1}'

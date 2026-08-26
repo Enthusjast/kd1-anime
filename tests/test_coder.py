@@ -261,6 +261,24 @@ class TestScene(Scene):
 
         assert "全片连续性圣经" in mock_call_llm.call_args.kwargs["user_message"]
 
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_includes_rag_context(self, mock_call_llm, coder_agent, sample_plan):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+
+        coder_agent.generate_code(
+            sample_plan,
+            rag_context="<reference>Circle API documentation</reference>",
+            stream=False,
+        )
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "RAG Reference Context" in message
+        assert "Circle API documentation" in message
+
 
 class TestCodeExtraction:
     """代码提取边界情况测试。"""

@@ -178,3 +178,32 @@ def test_visual_llm_profile_uses_only_visual_endpoint_and_model_override():
     assert profile.base_url == "https://visual.invalid/v1"
     assert profile.model == "visual-override"
     assert profile.debug is False
+
+
+def test_rag_settings_normalize_empty_source_dirs_and_validate_urls(tmp_path):
+    config = Settings(
+        _env_file=None,
+        RAG_INDEX_PATH=tmp_path / "index.sqlite3",
+        RAG_DOCS_DIR="",
+        RAG_EXAMPLES_DIR="   ",
+        RAG_EMBEDDING_BASE_URL="https://embedding.invalid/v1/",
+        RAG_RERANK_BASE_URL="https://rerank.invalid/v1/",
+    )
+
+    assert config.RAG_DOCS_DIR is None
+    assert config.RAG_EXAMPLES_DIR is None
+    assert config.RAG_EMBEDDING_BASE_URL == "https://embedding.invalid/v1"
+    assert config.RAG_RERANK_BASE_URL == "https://rerank.invalid/v1"
+
+    default_path = Settings(_env_file=None, RAG_INDEX_PATH="").RAG_INDEX_PATH
+    assert str(default_path) == "~/.cache/kd1-anime/rag/index.sqlite3"
+
+
+def test_rag_settings_reject_invalid_url_and_chunk_overlap():
+    with pytest.raises(ValueError, match="RAG 服务 URL"):
+        Settings(_env_file=None, RAG_EMBEDDING_BASE_URL="ftp://embedding.invalid")
+    with pytest.raises(ValueError, match="RAG_CHUNK_OVERLAP"):
+        Settings(_env_file=None, RAG_CHUNK_SIZE=100, RAG_CHUNK_OVERLAP=100)
+    config = Settings(_env_file=None)
+    with pytest.raises(ValueError, match="RAG_CHUNK_OVERLAP"):
+        config.RAG_CHUNK_SIZE = 100

@@ -28,8 +28,9 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/render_context.py renderer 能力与对象生命周期约束
        ├── cluster/slurm.py        sbatch、状态查询、产物验证、超时取消
        ├── rendering.py            RenderProfile、ffprobe、SceneArtifact
-       ├── resources.py            跨批量项目的进程级 LLM/Slurm 配额
+       ├── resources.py            跨批量项目的进程级 LLM/RAG/Slurm 配额
        ├── media/merger.py         精确输入列表、FFmpeg xfade/acrossfade 原子合并
+       ├── rag/                    SQLite 索引、独立 Embedding/Reranker 检索
        ├── eval/                   代码/效率评估与独立多模态视觉质量门
        └── run_store.py            Manifest v3、原子检查点、运行锁
 ```
@@ -57,10 +58,12 @@ Scene 1 CODING → REVIEWING → Scene 2 CODING → REVIEWING → …
 
 FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行，但编码/审查按场景顺序执行：Scene N 审查通过后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，而不是仅凭 Planner 描述猜测的状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
-LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
+LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
 
 `ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。
+
+RAG 索引使用 SQLite 保存文本分块、元数据和 Embedding BLOB。Markdown 按标题/段落切分，Python 按顶层定义切分；索引构建通过临时数据库原子替换。运行时先做本地余弦初排，再调用独立 Reranker；服务故障只记录 `degraded` 并继续原有流水线。Planner、Coder 和 AutoFixer 收到的检索内容均标记为不可信资料，且每次注入都保存查询、索引和分块哈希收据。
 
 ### 3.1 PLANNING / DETAILING
 
@@ -202,7 +205,7 @@ run 根目录权限为 `0700`，prompt、manifest、锁文件和生成代码为 
 进程环境变量 > 当前目录 .env > ~/.config/kd1-anime/.env
 ```
 
-主要分组：LLM、Slurm、Manim、流水线/监控、评估和路径。`MONITOR_TIMEOUT` 只用于旧配置兼容；新配置使用 queue/run/unknown 三类 timeout，并为共享文件系统产物提供完成宽限期。
+主要分组：LLM、独立视觉 LLM、RAG、Slurm、Manim、流水线/监控、评估和路径。RAG 默认关闭；开启后使用单独的 Embedding/Reranker URL、模型和 Key，不从其它 LLM 配置回退。`MONITOR_TIMEOUT` 只用于旧配置兼容；新配置使用 queue/run/unknown 三类 timeout，并为共享文件系统产物提供完成宽限期。
 
 ## 6. 安全边界
 
@@ -224,4 +227,4 @@ pytest -q
 python -m build --wheel
 ```
 
-测试覆盖结构化输出、截断重试、renderer 提示词、AST 安全、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest 迁移/恢复、增量复用、视觉 unknown、批量资源配额和 FFmpeg 原子输出。
+测试覆盖结构化输出、截断重试、renderer 提示词、AST 安全、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest 迁移/恢复、增量复用、视觉 unknown、RAG 文档切分/索引/排序/降级、批量资源配额和 FFmpeg 原子输出。

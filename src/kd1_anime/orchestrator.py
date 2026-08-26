@@ -57,6 +57,8 @@ from kd1_anime.exceptions import (
 )
 from kd1_anime.logging import get_logger
 from kd1_anime.media.merger import VideoMerger
+from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
+from kd1_anime.rag.service import RagService
 from kd1_anime.rendering import RenderProfile, SceneArtifact, sha256_file
 from kd1_anime.resources import ResourceCoordinator
 from kd1_anime.run_store import (
@@ -223,6 +225,9 @@ class PipelineContext:
     # 渲染阶段上游 AutoFix 改变代码后，需要停止当前渲染批次并重建下游交接。
     continuity_rebuild_required: bool = False
     visual_eval_profile: VisualEvalProfile = field(default_factory=VisualEvalProfile)
+    rag_profile: RagRuntimeProfile = field(default_factory=RagRuntimeProfile)
+    rag_receipts: dict[str, RagReceipt] = field(default_factory=dict)
+    rag_warnings: list[str] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -241,6 +246,9 @@ class Orchestrator:
         self._phase_lock = threading.Lock()
         self._emitted_phases: set[str] = set()
         self._resource_coordinator = resource_coordinator
+        self.rag = RagService(
+            rag_semaphore=(resource_coordinator.rag if resource_coordinator is not None else None)
+        )
 
     @staticmethod
     def _configured_visual_profile(*, enabled: bool | None = None) -> VisualEvalProfile:
@@ -278,6 +286,112 @@ class Orchestrator:
     def _emit(self, event: str, **data) -> None:
         if self._callback:
             self._callback(event, data)
+
+    @staticmethod
+    def _supports_keyword(callable_obj: object, name: str) -> bool:
+        """判断可选能力，兼容外部集成和旧测试替身。"""
+
+        try:
+            parameters = inspect.signature(callable_obj).parameters
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return name in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+
+    def _current_rag_profile(self) -> RagRuntimeProfile:
+        if not self.rag.enabled:
+            return RagRuntimeProfile()
+        runtime = self.rag.runtime_status()
+        return RagRuntimeProfile(
+            enabled=bool(runtime["enabled"]),
+            status=runtime["status"],
+            index_sha256=(runtime.get("index") or {}).get("index_sha256", ""),
+            embedding_model=str(runtime.get("embedding_model", "")),
+            reranker_model=str(runtime.get("reranker_model", "")),
+            top_k=self.rag.config.RAG_TOP_K,
+            rerank_top_n=self.rag.config.RAG_RERANK_TOP_N,
+            max_context_chars=self.rag.config.RAG_MAX_CONTEXT_CHARS,
+        )
+
+    def _retrieve_rag(
+        self,
+        ctx: PipelineContext,
+        query: str,
+        *,
+        receipt_key: str,
+        stage: str,
+        source_kinds: set[str] | None = None,
+        code_sha256: str = "",
+        inherited_elements_sha256: str = "",
+    ) -> str:
+        """获取 RAG 上下文并保存不含密钥的检索收据。"""
+
+        try:
+            result = self.rag.search(
+                query[:50_000],
+                stage=stage,
+                source_kinds=source_kinds,
+                code_sha256=code_sha256,
+                inherited_elements_sha256=inherited_elements_sha256,
+            )
+        except Exception as exc:
+            result = None
+            receipt = RagReceipt(
+                stage=stage,
+                query_sha256=sha256_text(query[:50_000]),
+                code_sha256=code_sha256,
+                inherited_elements_sha256=inherited_elements_sha256,
+                status="degraded",
+                warning=f"RAG 检索异常，已跳过: {exc}",
+            )
+        else:
+            receipt = result.receipt
+
+        with self._state_lock:
+            if ctx.rag_profile.index_sha256 != receipt.index_sha256:
+                ctx.rag_receipts.clear()
+            ctx.rag_receipts[receipt_key] = receipt
+            if len(ctx.rag_receipts) > 256:
+                oldest_key = next(iter(ctx.rag_receipts))
+                del ctx.rag_receipts[oldest_key]
+            ctx.rag_profile = RagRuntimeProfile(
+                enabled=self.rag.enabled,
+                status=receipt.status,
+                index_sha256=receipt.index_sha256,
+                embedding_model=self.rag.config.RAG_EMBEDDING_MODEL,
+                reranker_model=self.rag.config.RAG_RERANK_MODEL,
+                top_k=self.rag.config.RAG_TOP_K,
+                rerank_top_n=self.rag.config.RAG_RERANK_TOP_N,
+                max_context_chars=self.rag.config.RAG_MAX_CONTEXT_CHARS,
+            )
+            if receipt.warning and receipt.warning not in ctx.rag_warnings:
+                ctx.rag_warnings.append(f"[{stage}] {receipt.warning}")
+        self._emit(
+            "rag_status",
+            stage=stage,
+            status=receipt.status,
+            warning=receipt.warning,
+            embedding_model=self.rag.config.RAG_EMBEDDING_MODEL,
+            reranker_model=self.rag.config.RAG_RERANK_MODEL,
+        )
+        return result.context if result is not None else ""
+
+    def _reconcile_rag_context(self, ctx: PipelineContext) -> None:
+        """恢复时发现索引/模型变化就丢弃旧收据，后续阶段重新检索。"""
+
+        current = self._current_rag_profile()
+        previous = ctx.rag_profile
+        changed = (
+            previous.enabled != current.enabled
+            or previous.index_sha256 != current.index_sha256
+            or previous.embedding_model != current.embedding_model
+            or previous.reranker_model != current.reranker_model
+        )
+        if changed:
+            ctx.rag_receipts.clear()
+            ctx.rag_warnings.append("恢复运行：RAG 索引或 Embedding 模型已变化，将重新检索")
+        ctx.rag_profile = current
 
     def cancel_all(self) -> None:
         self._cancel_requested.set()
@@ -463,6 +577,9 @@ class Orchestrator:
                 eval_round=ctx.eval_round,
                 continuity_rebuild_required=ctx.continuity_rebuild_required,
                 visual_eval_profile=ctx.visual_eval_profile,
+                rag_profile=ctx.rag_profile,
+                rag_receipts=dict(ctx.rag_receipts),
+                rag_warnings=ctx.rag_warnings[-100:],
             )
             write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
             self._manifest = manifest
@@ -670,6 +787,9 @@ class Orchestrator:
             eval_round=manifest.eval_round,
             continuity_rebuild_required=getattr(manifest, "continuity_rebuild_required", False),
             visual_eval_profile=manifest.visual_eval_profile,
+            rag_profile=getattr(manifest, "rag_profile", RagRuntimeProfile()),
+            rag_receipts=dict(getattr(manifest, "rag_receipts", {})),
+            rag_warnings=list(getattr(manifest, "rag_warnings", [])),
         )
         if manifest.incremental and manifest.base_run_id:
             context.base_manifest = RunRepository(settings.WORKSPACE_DIR).load(manifest.base_run_id)
@@ -687,6 +807,7 @@ class Orchestrator:
         inherited_elements_code: str = "",
         inherited_elements: list[VisualElementState] | None = None,
         elements_to_remove: list[VisualElementState] | None = None,
+        rag_context: str = "",
     ) -> tuple[str, str]:
         agent = CoderAgent()
         current_feedback = feedback
@@ -707,6 +828,8 @@ class Orchestrator:
                 code_kwargs["inherited_elements"] = inherited_elements
             if elements_to_remove:
                 code_kwargs["elements_to_remove"] = elements_to_remove
+            if rag_context and self._supports_keyword(agent.generate_code, "rag_context"):
+                code_kwargs["rag_context"] = rag_context
             code = agent.generate_code(
                 plan,
                 **code_kwargs,
@@ -790,6 +913,7 @@ class Orchestrator:
             visual_eval_profile=self._configured_visual_profile(
                 enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
             ),
+            rag_profile=self._current_rag_profile(),
         )
         self._ctx = ctx
         ctx.paths.root.mkdir(parents=True, exist_ok=True)
@@ -828,6 +952,7 @@ class Orchestrator:
             visual_eval_profile=self._configured_visual_profile(
                 enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
             ),
+            rag_profile=self._current_rag_profile(),
         )
         self._ctx = ctx
         ctx.paths.root.mkdir(parents=True, exist_ok=True)
@@ -958,6 +1083,7 @@ class Orchestrator:
             ctx = self._context_from_manifest(manifest, root)
             ctx.interactive = interactive
             self._ctx = ctx
+            self._reconcile_rag_context(ctx)
 
             if manifest.status == "completed":
                 if ctx.final_video and ctx.final_video.is_file():
@@ -1081,6 +1207,13 @@ class Orchestrator:
 
     def _execute(self, ctx: PipelineContext, state: State) -> Path | None:
         try:
+            self._emit(
+                "rag_status",
+                status=ctx.rag_profile.status,
+                embedding_model=ctx.rag_profile.embedding_model,
+                reranker_model=ctx.rag_profile.reranker_model,
+                warning=ctx.rag_warnings[-1] if ctx.rag_warnings else "",
+            )
             # ---- 准备: 目录 + 全局概要 (仅全新运行; resume 已从清单加载) ----
             if not ctx.scene_states:
                 self._handle_init(ctx)
@@ -1309,7 +1442,17 @@ class Orchestrator:
         """全局场景概要 (一次); 带交互重试。"""
         while True:
             try:
-                outlines = self.planner.plan_outline(ctx.user_prompt)
+                outline_kwargs: dict[str, object] = {}
+                rag_context = self._retrieve_rag(
+                    ctx,
+                    ctx.user_prompt,
+                    receipt_key="outline",
+                    stage="outline",
+                    source_kinds={"manim_doc", "example"},
+                )
+                if self._supports_keyword(self.planner.plan_outline, "rag_context"):
+                    outline_kwargs["rag_context"] = rag_context
+                outlines = self.planner.plan_outline(ctx.user_prompt, **outline_kwargs)
                 break
             except LLMError as exc:
                 logger.error(f"LLM 调用失败: {exc}")
@@ -1344,13 +1487,23 @@ class Orchestrator:
             self._emit("continuity_warning", reason=ctx.continuity_warnings[-1])
             return
         try:
+            rag_context = self._retrieve_rag(
+                ctx,
+                ctx.user_prompt
+                + "\n"
+                + "\n".join(f"{item.title}: {item.math_concept}" for item in ctx.outlines),
+                receipt_key="continuity",
+                stage="continuity",
+                source_kinds={"manim_doc", "example"},
+            )
+            bible_kwargs: dict[str, object] = {
+                "stream": False,
+                "renderer": ctx.render_profile.renderer,
+            }
+            if self._supports_keyword(planner_method, "rag_context"):
+                bible_kwargs["rag_context"] = rag_context
             with self._llm_slot():
-                ctx.continuity_bible = planner_method(
-                    ctx.user_prompt,
-                    ctx.outlines,
-                    stream=False,
-                    renderer=ctx.render_profile.renderer,
-                )
+                ctx.continuity_bible = planner_method(ctx.user_prompt, ctx.outlines, **bible_kwargs)
         except Exception as exc:
             # 连续性增强不能让基础流水线因一次额外 LLM 调用完全不可用；
             # 使用确定的默认圣经并保留 pending，后续仍会进行全片连续性审查。
@@ -2062,6 +2215,13 @@ class Orchestrator:
             scene_id=scene_id,
             title=state.plan.title,
         )
+        rag_context = self._retrieve_rag(
+            ctx,
+            f"{state.plan.title}\n{state.plan.purpose}\n{state.plan.math_concept}",
+            receipt_key=f"scene:{scene_id}:detail",
+            stage="detail",
+            source_kinds={"manim_doc", "example"},
+        )
         with self._llm_sem:
             outline = next(o for o in ctx.outlines if o.scene_id == scene_id)
             planner = PlannerAgent()
@@ -2073,6 +2233,8 @@ class Orchestrator:
                 getattr(planner, "plan_continuity_bible", None)
             ):
                 detail_kwargs["continuity_bible"] = ctx.continuity_bible
+            if self._supports_keyword(planner.plan_detail, "rag_context"):
+                detail_kwargs["rag_context"] = rag_context
             plan = planner.plan_detail(outline, ctx.outlines, ctx.user_prompt, **detail_kwargs)
         with self._state_lock:
             state.plan = plan
@@ -2140,6 +2302,25 @@ class Orchestrator:
             title=state.plan.title,
             reason=state.rewrite_feedback if rewriting else "",
         )
+        rag_context = self._retrieve_rag(
+            ctx,
+            "\n".join(
+                (
+                    state.plan.title,
+                    state.plan.math_concept,
+                    state.plan.computation,
+                    state.plan.camera_movement,
+                    ctx.render_profile.renderer,
+                )
+            ),
+            receipt_key=f"scene:{scene_id}:code",
+            stage="code",
+            source_kinds={"manim_doc", "example"},
+            code_sha256=sha256_text(state.code) if state.code else "",
+            inherited_elements_sha256=sha256_text(state.inherited_elements_code)
+            if state.inherited_elements_code
+            else "",
+        )
         with self._llm_sem:
             code, class_name = self._generate_validated_code(
                 state.plan,
@@ -2151,6 +2332,7 @@ class Orchestrator:
                 inherited_elements_code=state.inherited_elements_code,
                 inherited_elements=state.plan.inherited_elements,
                 elements_to_remove=state.plan.elements_to_remove,
+                rag_context=rag_context,
             )
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
@@ -2550,6 +2732,24 @@ class Orchestrator:
         if terminal:
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
+        rag_context = self._retrieve_rag(
+            ctx,
+            "\n".join(
+                (
+                    error_log[-20_000:],
+                    state.plan.math_concept,
+                    state.plan.computation,
+                    ctx.render_profile.renderer,
+                )
+            ),
+            receipt_key=f"scene:{scene_id}:fix:{attempt}",
+            stage="fix",
+            source_kinds={"manim_doc", "example"},
+            code_sha256=sha256_text(state.code) if state.code else "",
+            inherited_elements_sha256=sha256_text(state.inherited_elements_code)
+            if state.inherited_elements_code
+            else "",
+        )
         self._emit(
             "scene_fixing",
             scene_id=scene_id,
@@ -2557,11 +2757,10 @@ class Orchestrator:
             max_attempts=settings.MAX_FIX_ATTEMPTS,
         )
         with self._llm_sem:
-            candidate = fixer.fix(
-                state.code,
-                error_log,
-                renderer=ctx.render_profile.renderer,
-            )
+            fix_kwargs: dict[str, object] = {"renderer": ctx.render_profile.renderer}
+            if rag_context and self._supports_keyword(fixer.fix, "rag_context"):
+                fix_kwargs["rag_context"] = rag_context
+            candidate = fixer.fix(state.code, error_log, **fix_kwargs)
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             if not validation.is_valid:
                 candidate, class_name = self._generate_validated_code(
@@ -2577,6 +2776,7 @@ class Orchestrator:
                     inherited_elements_code=state.inherited_elements_code,
                     inherited_elements=state.plan.inherited_elements,
                     elements_to_remove=state.plan.elements_to_remove,
+                    rag_context=rag_context,
                 )
             else:
                 class_name = validation.scene_classes[0]

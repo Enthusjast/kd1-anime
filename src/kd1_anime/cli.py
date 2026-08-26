@@ -38,6 +38,86 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 console = Console()
+rag_app = typer.Typer(help="管理本地 RAG 知识库", add_completion=False)
+app.add_typer(rag_app, name="rag")
+
+
+@rag_app.command("index")
+def rag_index(
+    docs_dir: Path | None = typer.Option(None, "--docs-dir", help="Manim 文档目录"),
+    examples_dir: Path | None = typer.Option(None, "--examples-dir", help="Manim 示例目录"),
+    rebuild: bool = typer.Option(False, "--rebuild", help="显式重建整个索引"),
+):
+    """索引 Manim 文档和示例。"""
+
+    from kd1_anime.rag.service import RagService
+
+    if docs_dir is not None and not docs_dir.is_dir():
+        console.print(f"[red]文档目录不存在: {docs_dir}[/]", markup=False)
+        raise typer.Exit(1)
+    if examples_dir is not None and not examples_dir.is_dir():
+        console.print(f"[red]示例目录不存在: {examples_dir}[/]", markup=False)
+        raise typer.Exit(1)
+    try:
+        service = RagService()
+        result = service.build_index(docs_dir=docs_dir, examples_dir=examples_dir)
+    except Exception as exc:
+        console.print(f"[red]RAG 索引失败:[/] {exc}", markup=False)
+        raise typer.Exit(1) from exc
+    action = "重建" if rebuild else "生成"
+    console.print(
+        f"[green]RAG 索引{action}完成[/]：{result.chunk_count} 个分块，"
+        f"{result.source_file_count} 个源文件\n索引: {result.info.index_path}\n"
+        f"SHA-256: {result.info.index_sha256}"
+    )
+    if result.skipped_files:
+        console.print(f"[yellow]跳过 {len(result.skipped_files)} 个文件[/]")
+
+
+@rag_app.command("status")
+def rag_status():
+    """查看 RAG 配置、索引和服务状态（不发起网络请求）。"""
+
+    from kd1_anime.rag.service import RagService
+
+    data = RagService().runtime_status()
+    console.print(f"状态: {data['status']}")
+    console.print(f"启用: {'是' if data['enabled'] else '否'}")
+    console.print(f"索引: {data['index_path']}")
+    console.print(f"Embedding: {data['embedding_model'] or '未配置'}")
+    console.print(f"Reranker: {data['reranker_model'] or '未配置'}")
+    if data["index"]:
+        index = data["index"]
+        console.print(
+            f"分块: {index['chunk_count']}，维度: {index['embedding_dimension']}，"
+            f"索引 SHA-256: {index['index_sha256']}"
+        )
+    elif data["index_error"]:
+        console.print(f"[yellow]索引错误:[/] {data['index_error']}", markup=False)
+
+
+@rag_app.command("search")
+def rag_search(
+    query: str = typer.Argument(..., help="检索问题"),
+    top_k: int | None = typer.Option(None, "--top-k", min=1, max=100, help="覆盖默认 Top-K"),
+):
+    """检索本地知识库并显示参考片段。"""
+
+    from kd1_anime.rag.service import RagService
+
+    try:
+        service = RagService()
+        result = service.search(query, stage="cli-search", top_k=top_k)
+    except Exception as exc:
+        console.print(f"[red]RAG 检索失败:[/] {exc}", markup=False)
+        raise typer.Exit(1) from exc
+    console.print(f"状态: {result.receipt.status}")
+    if result.receipt.warning:
+        console.print(f"[yellow]提示:[/] {result.receipt.warning}", markup=False)
+    if not result.context:
+        console.print("没有检索到参考内容。")
+        return
+    console.print(result.context, markup=False)
 
 
 def _ensure_llm_api_available() -> None:
@@ -262,8 +342,60 @@ def plan(
 
     try:
         planner = PlannerAgent()
-        outlines = planner.plan_outline(prompt)
-        scenes = [planner.plan_detail(o, outlines, prompt, stream=False) for o in outlines]
+        rag_service = None
+        rag_context = ""
+        if settings.RAG_ENABLED:
+            from kd1_anime.rag.service import RagService
+
+            rag_service = RagService()
+            rag_result = rag_service.search(
+                prompt,
+                stage="outline",
+                source_kinds={"manim_doc", "example"},
+            )
+            rag_context = rag_result.context
+            if rag_result.receipt.warning:
+                console.print(
+                    f"[yellow]RAG 提示:[/] {rag_result.receipt.warning}",
+                    markup=False,
+                )
+        outlines = planner.plan_outline(prompt, rag_context=rag_context)
+        bible_context = ""
+        bible = None
+        if callable(getattr(planner, "plan_continuity_bible", None)):
+            if rag_service is not None:
+                bible_result = rag_service.search(
+                    prompt + "\n" + "\n".join(item.math_concept for item in outlines),
+                    stage="continuity",
+                    source_kinds={"manim_doc", "example"},
+                )
+                bible_context = bible_result.context
+            bible = planner.plan_continuity_bible(
+                prompt,
+                outlines,
+                stream=False,
+                rag_context=bible_context,
+            )
+        scenes = []
+        for outline in outlines:
+            detail_context = ""
+            if rag_service is not None:
+                detail_result = rag_service.search(
+                    f"{outline.title}\n{outline.purpose}\n{outline.math_concept}",
+                    stage="detail",
+                    source_kinds={"manim_doc", "example"},
+                )
+                detail_context = detail_result.context
+            scenes.append(
+                planner.plan_detail(
+                    outline,
+                    outlines,
+                    prompt,
+                    stream=False,
+                    continuity_bible=bible,
+                    rag_context=detail_context,
+                )
+            )
     except KeyboardInterrupt as e:
         console.print("\n[yellow]用户中断[/]")
         raise typer.Exit(130) from e
@@ -659,6 +791,11 @@ def doctor(
         "--probe-visual-llm",
         help="发送图片消息验证独立视觉 LLM 的网络、鉴权、模型和多模态能力",
     ),
+    probe_rag: bool = typer.Option(
+        False,
+        "--probe-rag",
+        help="发送最小 Embedding 和 Reranker 请求验证 RAG 服务",
+    ),
     security_strict: bool = typer.Option(
         False,
         "--security-strict",
@@ -803,6 +940,40 @@ def doctor(
             else:
                 elapsed_ms = (datetime.now().timestamp() - started) * 1000
                 checks.append(("视觉 LLM API 探测", True, f"可用，耗时 {elapsed_ms:.0f} ms"))
+
+    from kd1_anime.rag.service import RagService
+
+    rag_service = RagService()
+    rag_status = rag_service.runtime_status()
+    rag_required = settings.RAG_ENABLED or probe_rag
+    rag_config_ok = (
+        rag_status["embedding_configured"]
+        and rag_status["reranker_configured"]
+        and (not settings.RAG_ENABLED or rag_status["index"] is not None)
+    )
+    checks.append(
+        (
+            "RAG 配置",
+            rag_config_ok if rag_required else True,
+            (
+                f"{rag_status['status']}，Embedding={rag_status['embedding_model'] or '未配置'}，"
+                f"Reranker={rag_status['reranker_model'] or '未配置'}"
+                if rag_required
+                else "未启用（独立配置可留空）"
+            ),
+        )
+    )
+    if probe_rag:
+        started = datetime.now().timestamp()
+        try:
+            rag_service.probe()
+        except Exception as exc:
+            checks.append(("RAG 服务探测", False, str(exc)))
+        else:
+            elapsed_ms = (datetime.now().timestamp() - started) * 1000
+            checks.append(
+                ("RAG 服务探测", True, f"Embedding/Reranker 可用，耗时 {elapsed_ms:.0f} ms")
+            )
     container_configured = bool(settings.SLURM_CONTAINER_IMAGE)
     if not container_configured:
         isolation_ok = not settings.SLURM_REQUIRE_CONTAINER and not security_strict

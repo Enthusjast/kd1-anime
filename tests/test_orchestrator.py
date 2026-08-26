@@ -52,6 +52,21 @@ def test_valid_review_after_rewrite_exits_review_loop(tmp_path):
     assert ctx.scene_states[1].review_round == 0
 
 
+def test_disabled_rag_retrieval_is_recorded_without_network(tmp_path):
+    orchestrator = Orchestrator()
+    ctx = PipelineContext("prompt", paths=paths(tmp_path))
+
+    context = orchestrator._retrieve_rag(
+        ctx,
+        "Manim Circle API",
+        receipt_key="scene:1:code",
+        stage="code",
+    )
+
+    assert context == ""
+    assert ctx.rag_receipts["scene:1:code"].status == "disabled"
+
+
 def test_scheduler_stops_when_checkpoint_persistence_fails(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     ctx = PipelineContext(

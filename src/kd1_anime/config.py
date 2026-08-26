@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -181,6 +181,76 @@ class Settings(BaseSettings):
         if value is None or value == "":
             return None
         return value
+
+    # --- 独立 RAG 服务 ---
+    # RAG 的 Embedding/Reranker 端点和主/视觉 LLM 完全隔离；默认关闭，
+    # 因而空 URL 不会影响普通动画生成。
+    RAG_ENABLED: bool = False
+    RAG_INDEX_PATH: Path = Path("~/.cache/kd1-anime/rag/index.sqlite3")
+    RAG_DOCS_DIR: Path | None = None
+    RAG_EXAMPLES_DIR: Path | None = None
+    RAG_EMBEDDING_API_KEY: str = ""
+    RAG_EMBEDDING_BASE_URL: str = ""
+    RAG_EMBEDDING_MODEL: str = ""
+    RAG_EMBEDDING_TIMEOUT: float = Field(default=60.0, ge=1.0, le=3_600.0)
+    RAG_EMBEDDING_BATCH_SIZE: int = Field(default=32, ge=1, le=256)
+    RAG_RERANK_API_KEY: str = ""
+    RAG_RERANK_BASE_URL: str = ""
+    RAG_RERANK_MODEL: str = ""
+    RAG_RERANK_TIMEOUT: float = Field(default=60.0, ge=1.0, le=3_600.0)
+    RAG_TOP_K: int = Field(default=8, ge=1, le=100)
+    RAG_RERANK_TOP_N: int = Field(default=4, ge=1, le=100)
+    RAG_MAX_CONTEXT_CHARS: int = Field(default=12_000, ge=500, le=50_000)
+    RAG_CHUNK_SIZE: int = Field(default=1_800, ge=100, le=100_000)
+    RAG_CHUNK_OVERLAP: int = Field(default=200, ge=0, le=20_000)
+    RAG_PARALLEL_WORKERS: int = Field(default=2, ge=1, le=16)
+
+    @field_validator("RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", mode="before")
+    @classmethod
+    def normalize_rag_source_dir(cls, value):
+        """空的 RAG 源目录必须保持为 None，不能变成 Path('.')。"""
+
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("RAG_INDEX_PATH", mode="before")
+    @classmethod
+    def normalize_rag_index_path(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "~/.cache/kd1-anime/rag/index.sqlite3"
+        return value
+
+    @field_validator("RAG_EMBEDDING_BASE_URL", "RAG_RERANK_BASE_URL")
+    @classmethod
+    def validate_rag_base_url(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("RAG 服务 URL 必须是字符串")
+        value = value.strip()
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("RAG 服务 URL 必须是带 http/https scheme 的 URL")
+        if any(char in value for char in "\r\n"):
+            raise ValueError("RAG 服务 URL 不能包含换行")
+        return value.rstrip("/")
+
+    @field_validator("RAG_CHUNK_OVERLAP")
+    @classmethod
+    def validate_rag_chunk_overlap(cls, value: int, info) -> int:
+        chunk_size = info.data.get("RAG_CHUNK_SIZE", 1_800)
+        if value >= chunk_size:
+            raise ValueError("RAG_CHUNK_OVERLAP 必须小于 RAG_CHUNK_SIZE")
+        return value
+
+    @model_validator(mode="after")
+    def validate_rag_settings(self) -> Settings:
+        if self.RAG_CHUNK_OVERLAP >= self.RAG_CHUNK_SIZE:
+            raise ValueError("RAG_CHUNK_OVERLAP 必须小于 RAG_CHUNK_SIZE")
+        return self
 
     # --- Slurm 集群 ---
     SLURM_PARTITION: str = ""

@@ -10,8 +10,15 @@ def test_cli_registers_all_public_commands():
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0, result.output
-    for command in ("generate", "resume", "batch", "doctor", "evaluate", "test-llm"):
+    for command in ("generate", "resume", "batch", "doctor", "evaluate", "test-llm", "rag"):
         assert command in result.output
+
+
+def test_rag_status_is_read_only():
+    result = CliRunner().invoke(app, ["rag", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "状态: disabled" in result.output
 
 
 def test_default_startup_checks_llm_before_opening_chat(monkeypatch):
