@@ -232,8 +232,45 @@ class TestPlannerAgent:
 
         planner.plan_outline("Test prompt")
 
-        assert "场景数量控制在 2-2 个" in mock_call_llm.call_args.kwargs["system_prompt"]
-        assert "最多不超过 2 个" in mock_call_llm.call_args.kwargs["system_prompt"]
+        system_prompt = mock_call_llm.call_args.kwargs["system_prompt"]
+        assert "本次场景数量应取最小必要数量" in system_prompt
+        assert "通常不超过 2 个" in system_prompt
+        assert "绝对不超过 2 个" in system_prompt
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_outline_coalesces_same_canvas_sequence(self, mock_call_llm, planner):
+        """同一画面中逐个出现并保持的对象应只生成一个场景。"""
+
+        mock_call_llm.return_value = """{"items": [
+            {"scene_id": 1, "title": "直线", "duration_seconds": 15, "purpose": "显示直线", "math_concept": "y=x"},
+            {"scene_id": 2, "title": "抛物线", "duration_seconds": 15, "purpose": "显示抛物线", "math_concept": "y=x^2"},
+            {"scene_id": 3, "title": "立方曲线", "duration_seconds": 15, "purpose": "显示立方曲线", "math_concept": "y=x^3"},
+            {"scene_id": 4, "title": "平方根", "duration_seconds": 15, "purpose": "显示平方根曲线", "math_concept": "y=x^{1/2}"},
+            {"scene_id": 5, "title": "反比例", "duration_seconds": 15, "purpose": "显示反比例曲线", "math_concept": "y=x^{-1}"}
+        ]}"""
+
+        prompt = """在同一坐标系中同时展示五个幂函数图像，函数逐个出现并保持显示直到视频结束。
+视频总时长控制在 1 分钟以内。"""
+        outlines = planner.plan_outline(prompt)
+
+        assert len(outlines) == 1
+        assert outlines[0].title == "幂函数图像整体展示"
+        assert outlines[0].duration_seconds == 60
+        assert "y=x" in outlines[0].math_concept
+        assert "必须只输出 1 个场景概要" in mock_call_llm.call_args.kwargs["system_prompt"]
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_outline_respects_explicit_scene_split(self, mock_call_llm, planner):
+        """用户明确指定多场景时不能被单场景兜底规则吞并。"""
+
+        mock_call_llm.return_value = """{"items": [
+            {"scene_id": 1, "title": "第一章", "duration_seconds": 15, "purpose": "建立问题", "math_concept": "概念"},
+            {"scene_id": 2, "title": "第二章", "duration_seconds": 15, "purpose": "展开推导", "math_concept": "推导"}
+        ]}"""
+
+        outlines = planner.plan_outline("请分成 2 个场景，分别展示问题和推导；两个场景使用同一坐标系。")
+
+        assert len(outlines) == 2
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_outline_rejects_too_many_scenes(self, mock_call_llm, planner):

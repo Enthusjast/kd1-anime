@@ -155,6 +155,21 @@ def test_clarifier_ignores_math_brackets_before_ready_payload():
     assert "y = x^{-1}" in refined
 
 
+def test_clarifier_skips_latex_braces_before_ready_payload():
+    """前置 LaTeX 上标的花括号不能成为 READY JSON 的起点。"""
+
+    clarifier = Clarifier()
+    response = r'''前面的整合说明包含 ( y = x^{1/2} ) 这样的公式。
+
+{"READY": true, "prompt": "## 核心内容
+在同一坐标系中展示 ( y = x^{1/2} )，并保持显示。"}'''
+
+    refined = clarifier.extract_ready(response)
+
+    assert refined is not None
+    assert "y = x^{1/2}" in refined
+
+
 def test_clarifier_accepts_ready_payload_missing_final_brace():
     """模型丢失最末尾的对象闭合符时, 仍可恢复已完整的 READY 载荷。"""
     clarifier = Clarifier()

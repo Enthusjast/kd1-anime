@@ -1007,41 +1007,53 @@ class BaseAgent:
 
     @staticmethod
     def _find_balanced_json(text: str, *, opening: str | None = None) -> str:
-        """扫描出第一个平衡的 JSON 对象/数组子串; 找不到则返回原文。"""
-        start = -1
-        for i, ch in enumerate(text):
-            if ch in (opening or "{["):
-                start = i
-                break
-        if start == -1:
-            return text
+        """扫描出第一个平衡的 JSON 对象/数组子串; 找不到则返回原文。
 
-        open_ch = text[start]
-        close_ch = "}" if open_ch == "{" else "]"
-        depth = 0
-        in_string = False
-        escape = False
+        数学 Markdown 经常在真正的 JSON 前出现 ``x^{1/2}``、``\\boxed{...}``
+        等花括号。不能把这些文本片段当作 JSON 起点；对象候选必须以 JSON
+        的字符串键（或空对象）开始。若候选确实像 JSON 但被截断，仍返回
+        它的剩余文本，交给上层的控制字符/括号修复逻辑处理。
+        """
+        openings = opening or "{["
+        fallback_start: int | None = None
 
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == open_ch:
-                    depth += 1
-                elif ch == close_ch:
-                    depth -= 1
-                    if depth == 0:
-                        return text[start : i + 1]
-        # 未平衡 (模型截断), 返回从 start 到结尾
-        return text[start:]
+        for start, open_ch in enumerate(text):
+            if open_ch not in openings:
+                continue
+
+            if open_ch == "{":
+                remainder = text[start + 1 :].lstrip()
+                if remainder and remainder[0] not in {'"', "}"}:
+                    # 跳过 LaTeX/自然语言中的 {内容}，继续寻找真正的对象。
+                    continue
+
+            fallback_start = start if fallback_start is None else fallback_start
+            close_ch = "}" if open_ch == "{" else "]"
+            depth = 0
+            in_string = False
+            escape = False
+
+            for index in range(start, len(text)):
+                ch = text[index]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                    elif ch == open_ch:
+                        depth += 1
+                    elif ch == close_ch:
+                        depth -= 1
+                        if depth == 0:
+                            return text[start : index + 1]
+
+        # 未平衡 (模型截断), 返回第一个看起来像 JSON 的候选到结尾。
+        return text[fallback_start:] if fallback_start is not None else text
 
     @staticmethod
     def _extract_code_block(text: str) -> str:

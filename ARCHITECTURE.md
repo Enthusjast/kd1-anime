@@ -66,7 +66,7 @@ CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用�
 
 Planner 使用分层结构化输出：
 
-1. `plan_outline()` 生成短小 `SceneOutline` 列表，并按返回顺序规范化 scene ID 为 `1..N`。
+1. `plan_outline()` 按最小必要粒度生成短小 `SceneOutline` 列表，并按返回顺序规范化 scene ID 为 `1..N`。同一画布中逐个出现、保留并对比的对象属于同一个场景；当用户明确要求同屏/整体展示而模型仍按对象拆分时，Planner 会将概要确定性合并为一个场景。只有用户明确要求多场景，或镜头/布局/叙事弧线确实独立时才拆分。
 2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
 3. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state、结构化 `inherited_elements` / `elements_to_remove` / `new_elements` 和转场合同。
 4. 所有 Detail 完成后执行确定性检查和一次全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。
