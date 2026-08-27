@@ -323,6 +323,35 @@ def test_resume_reopens_continuity_warning_for_unfinished_scenes(monkeypatch, tm
     assert captured["context"].continuity_review_round == 0
 
 
+def test_context_derives_pending_plan_review_for_legacy_incomplete_run(tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_paths.run_id,
+        status="failed",
+        state="REVIEWING",
+        user_prompt="prompt",
+        output_path=str(run_paths.output.resolve()),
+        scenes={
+            1: StoredSceneState(
+                plan=plan(),
+                plan_ready=True,
+                reviewed=False,
+            )
+        },
+    )
+    raw = manifest.model_dump(mode="json")
+    raw.pop("plan_review_status", None)
+    (run_paths.root / "manifest.json").write_text(
+        json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+    )
+
+    loaded = RunManifest.model_validate_json((run_paths.root / "manifest.json").read_text())
+    context = Orchestrator._context_from_manifest(loaded, run_paths.root)
+
+    assert context.plan_review_status == "pending"
+
+
 def test_run_paths_are_unique(monkeypatch, tmp_path):
     from kd1_anime.config import settings
 

@@ -787,6 +787,13 @@ class ChatSession:
                 console.print(table)
                 console.print()
 
+            case "plan_reviewing":
+                console.print(Rule("[bold magenta]计划正确性审查[/]", style="magenta"))
+
+            case "continuity_contract_repaired":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]连续性合同已自动修复[/]")
+
             case "scene_detailing":
                 scene_id = data.get("scene_id", "?")
                 title = data.get("title", "")
@@ -795,6 +802,30 @@ class ChatSession:
             case "scene_detailed":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]分镜完成 ✓[/]")
+
+            case "scene_plan_reviewing":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]计划正确性审查中[/]")
+
+            case "scene_plan_review_pass":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]计划审查通过 ✓[/]")
+
+            case "scene_plan_replanned":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]计划已重规划[/]")
+
+            case "scene_plan_review_fail":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]计划审查失败 ✗[/]")
+
+            case "scene_safe_fallback":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]切换为保守教学方案[/]{suffix}"
+                )
 
             case "scene_coding":
                 scene_id = data.get("scene_id", "?")
@@ -872,7 +903,17 @@ class ChatSession:
 
             case "scene_failed":
                 scene_id = data.get("scene_id", "?")
-                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]渲染失败 ✗[/]")
+                category = {
+                    "planning": "计划",
+                    "continuity": "连续性",
+                    "coding": "编码",
+                    "review": "代码审查",
+                    "render": "渲染",
+                    "infrastructure": "环境",
+                    "llm": "模型",
+                    "system": "系统",
+                }.get(data.get("category", ""), "流水线")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]{category}失败 ✗[/]")
 
             case "scene_fixing":
                 scene_id = data.get("scene_id", "?")

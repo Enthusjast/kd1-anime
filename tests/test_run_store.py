@@ -92,6 +92,7 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
         "prompt",
         paths=paths,
         continuity_bible=bible,
+        plan_review_status="passed",
         continuity_review_status="pending",
         continuity_review_round=1,
         continuity_warnings=["warning"],
@@ -101,6 +102,9 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
                 safe_fallback_used=True,
                 safe_fallback_reason="几何方案无法验证",
                 failure_category="review",
+                plan_ready=True,
+                plan_reviewed=True,
+                plan_review_round=0,
             )
         },
     )
@@ -117,6 +121,19 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
     assert restored.scene_states[1].safe_fallback_used is True
     assert restored.scene_states[1].safe_fallback_reason == "几何方案无法验证"
     assert restored.scene_states[1].failure_category == "review"
+    assert restored.scene_states[1].plan_reviewed is True
+
+
+def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        plan_review_status="passed",
+        scenes={1: StoredSceneState(plan=make_plan(), plan_ready=True)},
+    )
+
+    assert any("未通过计划审查" in error for error in manifest.integrity_errors())
 
 
 def test_resume_completed_run_rejects_tampered_final_video(monkeypatch, tmp_path):

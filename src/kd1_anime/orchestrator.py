@@ -31,6 +31,11 @@ from kd1_anime.agents.continuity import (
     normalize_scene_plan_contract,
     validate_export_contract,
 )
+from kd1_anime.agents.plan_reviewer import (
+    PlanReviewerAgent,
+    PlanReviewIssue,
+    deterministic_plan_issues,
+)
 from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
@@ -104,6 +109,7 @@ class State(Enum):
     INIT = auto()
     PLANNING = auto()
     DETAILING = auto()
+    PLAN_REVIEWING = auto()
     CODING = auto()
     REVIEWING = auto()
     DISPATCHING = auto()
@@ -164,6 +170,12 @@ class SceneState:
     safe_fallback_reason: str = ""
     # 导演分镜是否已完成(区别于占位 plan)。场景独立推进时据此判断下一步。
     plan_ready: bool = False
+    # Plan Review 与 Code Review 分离：只有前者通过才允许进入 Coder。
+    plan_review_round: int = 0
+    plan_reviewed: bool = False
+    plan_review_feedback: str = ""
+    plan_review_signature: str = ""
+    identical_plan_review_count: int = 0
     # Reviewer major 反馈待重写时暂存; 调度器据此把场景重新排入编码阶段。
     rewrite_feedback: str = ""
     # 代码和 Reviewer 反馈的联合指纹；相同组合重复出现时提前收敛。
@@ -216,6 +228,7 @@ class PipelineContext:
     scenes: list[ScenePlan] = field(default_factory=list)
     scene_states: dict[int, SceneState] = field(default_factory=dict)
     continuity_bible: ContinuityBible | None = None
+    plan_review_status: str = "skipped"
     continuity_review_status: str = "passed"
     continuity_review_round: int = 0
     continuity_warnings: list[str] = field(default_factory=list)
@@ -545,6 +558,11 @@ class Orchestrator:
                     safe_fallback_used=scene.safe_fallback_used,
                     safe_fallback_reason=scene.safe_fallback_reason,
                     plan_ready=scene.plan_ready,
+                    plan_review_round=scene.plan_review_round,
+                    plan_reviewed=scene.plan_reviewed,
+                    plan_review_feedback=scene.plan_review_feedback,
+                    plan_review_signature=scene.plan_review_signature,
+                    identical_plan_review_count=scene.identical_plan_review_count,
                     rewrite_feedback=scene.rewrite_feedback,
                     review_signature=scene.review_signature,
                     identical_review_count=scene.identical_review_count,
@@ -590,6 +608,7 @@ class Orchestrator:
                 outlines=ctx.outlines,
                 scenes=scenes,
                 continuity_bible=ctx.continuity_bible,
+                plan_review_status=ctx.plan_review_status,
                 continuity_review_status=ctx.continuity_review_status,
                 continuity_review_round=ctx.continuity_review_round,
                 continuity_warnings=ctx.continuity_warnings[-100:],
@@ -629,6 +648,14 @@ class Orchestrator:
             return "failed"
         if scene.slurm_job:
             return "monitoring"
+        if scene.plan_reviewed:
+            if scene.reviewed:
+                return "reviewed"
+            if scene.code:
+                return "coded"
+            return "plan_reviewed"
+        if scene.plan_ready and not scene.plan_reviewed:
+            return "plan_reviewing"
         if scene.reviewed:
             return "reviewed"
         if scene.code:
@@ -774,6 +801,15 @@ class Orchestrator:
                 safe_fallback_used=getattr(stored, "safe_fallback_used", False),
                 safe_fallback_reason=getattr(stored, "safe_fallback_reason", ""),
                 plan_ready=getattr(stored, "plan_ready", False),
+                plan_review_round=getattr(stored, "plan_review_round", 0),
+                plan_reviewed=getattr(
+                    stored,
+                    "plan_reviewed",
+                    stored.reviewed or stored.rendered,
+                ),
+                plan_review_feedback=getattr(stored, "plan_review_feedback", ""),
+                plan_review_signature=getattr(stored, "plan_review_signature", ""),
+                identical_plan_review_count=getattr(stored, "identical_plan_review_count", 0),
                 rewrite_feedback=getattr(stored, "rewrite_feedback", ""),
                 review_signature=getattr(stored, "review_signature", ""),
                 identical_review_count=getattr(stored, "identical_review_count", 0),
@@ -804,6 +840,18 @@ class Orchestrator:
             scenes=[scene_states[key].plan for key in sorted(scene_states)],
             scene_states=scene_states,
             continuity_bible=manifest.continuity_bible,
+            plan_review_status=(
+                "pending"
+                if getattr(manifest, "plan_review_status", "skipped") in {"passed", "skipped"}
+                and any(
+                    state.plan_ready
+                    and not getattr(state, "plan_reviewed", state.reviewed or state.rendered)
+                    and not state.failed
+                    and not state.give_up
+                    for state in manifest.scenes.values()
+                )
+                else getattr(manifest, "plan_review_status", "skipped")
+            ),
             continuity_review_status=manifest.continuity_review_status,
             continuity_review_round=manifest.continuity_review_round,
             continuity_warnings=list(manifest.continuity_warnings),
@@ -1179,6 +1227,15 @@ class Orchestrator:
                     state = State.CODING
                 self._emit("run_resuming_from_error", run_id=run_id, state=state.name)
 
+            if any(
+                not scene.plan_reviewed
+                and scene.plan_ready
+                and not scene.failed
+                and not scene.give_up
+                for scene in ctx.scene_states.values()
+            ):
+                ctx.plan_review_status = "pending"
+
             if reset_give_up:
                 # resume 时仪表盘可能已激活, 避免直接打印破坏 Live 渲染
                 with suppress(Exception):
@@ -1186,7 +1243,12 @@ class Orchestrator:
 
                     if not quiet():
                         console.print("[yellow]发现已放弃的场景，将重置并重试[/]")
-                if state not in {State.CODING, State.REVIEWING, State.DISPATCHING}:
+                if state not in {
+                    State.PLAN_REVIEWING,
+                    State.CODING,
+                    State.REVIEWING,
+                    State.DISPATCHING,
+                }:
                     # 回到审查阶段重新评估已生成的代码
                     state = State.REVIEWING
 
@@ -1269,6 +1331,7 @@ class Orchestrator:
                     )
                     for outline in ctx.outlines
                 }
+                ctx.plan_review_status = "pending"
                 # 在任何并行 Detail worker 启动前保存概要和 continuity bible；
                 # 进程此时中断时 resume 不会丢失全片规范或重新生成一份不同的规范。
                 self._checkpoint(ctx, State.DETAILING)
@@ -1303,6 +1366,13 @@ class Orchestrator:
                     # KeyboardInterrupt；在调度器收尾后转成同一条中断收尾路径，
                     # 确保 manifest 记录 interrupted 而不是误记为 failed。
                     raise KeyboardInterrupt
+                if ctx.plan_review_status == "failed":
+                    details = "; ".join(
+                        f"Scene {scene_id}: {scene.failure_reason or '计划未通过'}"
+                        for scene_id, scene in sorted(ctx.scene_states.items())
+                        if scene.failed or not scene.plan_reviewed
+                    )
+                    raise RuntimeError(f"计划审查未通过，已阻止代码生成: {details}")
                 if ctx.continuity_rebuild_required:
                     # 上游 AutoFix 已经停止本轮渲染并清空下游；下一轮从
                     # 顺序编码屏障重新建立继承代码，再恢复并行渲染。
@@ -1327,7 +1397,10 @@ class Orchestrator:
                 unfinished = [
                     (scene_id, scene)
                     for scene_id, scene in sorted(ctx.scene_states.items())
-                    if not scene.reviewed or scene.failed or scene.give_up
+                    if not scene.reviewed
+                    or scene.failed
+                    or scene.give_up
+                    or (ctx.plan_review_status != "skipped" and not scene.plan_reviewed)
                 ]
                 if unfinished:
                     details = "; ".join(
@@ -1590,7 +1663,8 @@ class Orchestrator:
 
     # ------------------------------------------------------------------
     # 场景级并行调度 (per-scene pipeline)
-    # 每个 Scene 一个工作线程, 独立推进 分镜→编码→审查→提交→渲染→修复。
+    # 每个 Scene 一个工作线程, 独立推进分镜后的代码→渲染→修复流程；
+    # 计划审查已在调度器屏障中完成。
     # LLM 并发受 LLM_PARALLEL_WORKERS 信号量限制; 提交受 SLURM_MAX_IN_FLIGHT 名额限制。
     # ------------------------------------------------------------------
 
@@ -1665,6 +1739,8 @@ class Orchestrator:
                     scene_id=scene_id,
                     reason=state.safe_fallback_reason,
                 )
+            if state.plan_reviewed:
+                self._emit("scene_plan_review_pass", scene_id=scene_id)
             if state.code:
                 self._emit("scene_coded", scene_id=scene_id)
             if state.reviewed:
@@ -1718,8 +1794,8 @@ class Orchestrator:
         with self._phase_lock:
             self._emitted_phases.clear()
 
-        # 正式运行先完成所有场景的 Detail，再做一次全片连续性审查；通过后才
-        # 进入编码/审查/渲染。编码/审查必须顺序执行，因为 Scene N 的真实
+        # 正式运行先完成所有场景的 Detail，再做计划正确性审查和全片连续性审查；
+        # 通过后才进入编码/代码审查/渲染。编码/审查必须顺序执行，因为 Scene N 的真实
         # 最终 Mobject 定义要作为 Scene N+1 的输入；渲染和监控仍然并行。
         self._run_detail_barrier(ctx)
         if self._checkpoint_error is not None:
@@ -1727,22 +1803,57 @@ class Orchestrator:
                 f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
             ) from self._checkpoint_error
         self._normalize_pending_scene_contracts(ctx)
-        if ctx.continuity_bible is not None and ctx.continuity_review_status in {
-            "pending",
-            "reviewing",
-        }:
-            if not self._cancel_requested.is_set():
-                self._run_continuity_review(ctx)
-            if self._checkpoint_error is not None:
-                raise RuntimeError(
-                    f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
-                ) from self._checkpoint_error
+        # 计划审查与全片连续性审查可能互相触发：连续性重规划后需要重新
+        # 审查计划，而计划重规划后也需要再次确认全片交接。最多往返有限次，
+        # 防止两个审查器互相把同一方案推回去。
+        for _ in range(4):
+            if ctx.plan_review_status in {"pending", "reviewing"}:
+                if not self._cancel_requested.is_set():
+                    self._run_plan_review_barrier(ctx)
+                if self._checkpoint_error is not None:
+                    raise RuntimeError(
+                        f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
+                    ) from self._checkpoint_error
+                if ctx.continuity_rebuild_required or self._stop_event.is_set():
+                    return
+            if ctx.plan_review_status == "failed":
+                return
+            if ctx.continuity_bible is not None and ctx.continuity_review_status in {
+                "pending",
+                "reviewing",
+            }:
+                if not self._cancel_requested.is_set():
+                    self._run_continuity_review(ctx)
+                if self._checkpoint_error is not None:
+                    raise RuntimeError(
+                        f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
+                    ) from self._checkpoint_error
+                if ctx.continuity_rebuild_required or self._stop_event.is_set():
+                    return
+            if ctx.plan_review_status in {"pending", "reviewing"}:
+                continue
+            if ctx.continuity_bible is not None and ctx.continuity_review_status in {
+                "pending",
+                "reviewing",
+            }:
+                continue
+            break
+
+        if ctx.plan_review_status in {"pending", "reviewing"}:
+            reason = "计划审查与连续性审查未能在有限轮次内收敛"
+            with self._state_lock:
+                ctx.plan_review_status = "failed"
+                ctx.continuity_warnings.append(reason)
+                self._checkpoint(ctx, State.REVIEWING)
+            return
 
         self._run_code_review_barrier(ctx)
         if self._checkpoint_error is not None:
             raise RuntimeError(
                 f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
             ) from self._checkpoint_error
+        if ctx.continuity_rebuild_required or self._stop_event.is_set():
+            return
 
         threads: list[threading.Thread] = []
         for scene_id, state in sorted(ctx.scene_states.items()):
@@ -1768,6 +1879,8 @@ class Orchestrator:
     def _run_code_review_barrier(self, ctx: PipelineContext) -> None:
         """按 Scene ID 顺序完成编码、审查，并固定代码级连续性上下文。"""
 
+        if ctx.plan_review_status not in {"passed", "skipped"}:
+            return
         for scene_id, state in sorted(ctx.scene_states.items()):
             if self._stop_event.is_set() or state.failed or state.give_up:
                 continue
@@ -1949,6 +2062,244 @@ class Orchestrator:
                 for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
             ]
             self._checkpoint(ctx, State.DETAILING)
+
+    @staticmethod
+    def _dedupe_plan_review_issues(
+        issues: list[PlanReviewIssue],
+    ) -> list[PlanReviewIssue]:
+        """合并确定性检查和 LLM 检查的重复计划问题。"""
+
+        unique: list[PlanReviewIssue] = []
+        seen: set[tuple[str, str, str]] = set()
+        for issue in issues:
+            key = (issue.category, issue.field, issue.message)
+            if key not in seen:
+                seen.add(key)
+                unique.append(issue)
+        return unique
+
+    @staticmethod
+    def _plan_review_feedback(issues: list[PlanReviewIssue]) -> str:
+        return "\n\n".join(
+            f"[{issue.category}] 字段 {issue.field or '未指定'}: {issue.message}\n"
+            f"修正要求: {issue.fix_instruction}"
+            for issue in issues
+        )
+
+    def _plan_review_failure(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+        reason: str,
+    ) -> None:
+        with self._state_lock:
+            state.failed = True
+            state.give_up = False
+            state.failure_category = "planning"
+            state.failure_reason = reason[:50_000]
+            ctx.plan_review_status = "failed"
+            self._checkpoint(ctx, State.PLAN_REVIEWING)
+        self._emit("scene_plan_review_fail", scene_id=scene_id, reason=reason)
+        self._emit("scene_failed", scene_id=scene_id, reason=reason)
+
+    def _run_plan_review_barrier(self, ctx: PipelineContext) -> None:
+        """在 Coder 前逐场景审查计划，阻断不可实现或数学错误的方案。"""
+
+        active_states = [
+            state
+            for state in ctx.scene_states.values()
+            if not state.failed and not state.give_up and state.plan_ready
+        ]
+        if not active_states:
+            ctx.plan_review_status = "passed"
+            return
+
+        self._emit("plan_reviewing", scene_count=len(active_states))
+        max_rounds = max(1, settings.MAX_PLAN_REVIEW_ROUNDS)
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            if state.failed or state.give_up or not state.plan_ready or state.plan_reviewed:
+                continue
+            while not state.plan_reviewed:
+                if self._stop_event.is_set() or state.failed or state.give_up:
+                    break
+                self._emit("scene_plan_reviewing", scene_id=scene_id)
+                deterministic = deterministic_plan_issues(
+                    state.plan,
+                    ctx.continuity_bible,
+                )
+                try:
+                    with self._llm_sem:
+                        result = PlanReviewerAgent().review(
+                            state.plan,
+                            user_prompt=ctx.user_prompt,
+                            all_plans=[
+                                item.plan
+                                for item in sorted(
+                                    ctx.scene_states.values(),
+                                    key=lambda item: item.plan.scene_id,
+                                )
+                                if not item.failed and not item.give_up and item.plan_ready
+                            ],
+                            continuity_bible=ctx.continuity_bible,
+                            deterministic_issues=deterministic,
+                            renderer=ctx.render_profile.renderer,
+                        )
+                except Exception as exc:
+                    self._plan_review_failure(
+                        ctx,
+                        scene_id,
+                        state,
+                        f"Scene {scene_id} 计划审查调用失败: {exc}",
+                    )
+                    break
+
+                issues = self._dedupe_plan_review_issues(
+                    [*deterministic, *(result.issues if not result.is_valid else [])]
+                )
+                if not issues:
+                    with self._state_lock:
+                        state.plan_reviewed = True
+                        state.plan_review_round = 0
+                        state.plan_review_feedback = ""
+                        state.plan_review_signature = ""
+                        state.identical_plan_review_count = 0
+                        self._checkpoint(ctx, State.PLAN_REVIEWING)
+                    self._emit("scene_plan_review_pass", scene_id=scene_id)
+                    break
+
+                feedback = self._plan_review_feedback(issues)
+                signature = sha256_text(
+                    state.plan.model_dump_json() + "\n--- plan review ---\n" + feedback
+                )[:16]
+                with self._state_lock:
+                    state.plan_review_round += 1
+                    if state.plan_review_signature == signature:
+                        state.identical_plan_review_count += 1
+                    else:
+                        state.plan_review_signature = signature
+                        state.identical_plan_review_count = 1
+                    state.plan_review_feedback = feedback
+                    review_round = state.plan_review_round
+                    identical_count = state.identical_plan_review_count
+                    self._checkpoint(ctx, State.PLAN_REVIEWING)
+
+                exhausted = (
+                    review_round >= max_rounds
+                    or identical_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
+                )
+                if exhausted:
+                    if self._activate_safe_fallback(ctx, scene_id, state, feedback):
+                        if self._stop_event.is_set():
+                            break
+                        continue
+                    self._plan_review_failure(
+                        ctx,
+                        scene_id,
+                        state,
+                        f"Scene {scene_id} 计划审查未通过（第 {review_round} 轮）：{feedback}",
+                    )
+                    break
+
+                outline = next(item for item in ctx.outlines if item.scene_id == scene_id)
+                planner = PlannerAgent()
+                replan_kwargs: dict[str, object] = {
+                    "stream": False,
+                    "renderer": ctx.render_profile.renderer,
+                }
+                if self._supports_keyword(planner.plan_detail, "continuity_bible"):
+                    replan_kwargs["continuity_bible"] = ctx.continuity_bible
+                if self._supports_keyword(planner.plan_detail, "continuity_feedback"):
+                    replan_kwargs["continuity_feedback"] = (
+                        "计划审查反馈（必须逐条修正，不能把不可实现方案原样保留）：\n" + feedback
+                    )
+                if self._supports_keyword(planner.plan_detail, "continuity_context"):
+                    replan_kwargs["continuity_context"] = self._continuity_plan_context(
+                        ctx, scene_id
+                    )
+                try:
+                    with self._llm_sem:
+                        revised_plan = planner.plan_detail(
+                            outline,
+                            ctx.outlines,
+                            ctx.user_prompt,
+                            **replan_kwargs,
+                        )
+                except Exception as exc:
+                    self._plan_review_failure(
+                        ctx,
+                        scene_id,
+                        state,
+                        f"Scene {scene_id} 计划重规划失败: {exc}",
+                    )
+                    break
+                previous_plan = None
+                previous_state = ctx.scene_states.get(scene_id - 1)
+                if previous_state is not None and previous_state.plan_ready:
+                    previous_plan = previous_state.plan
+                revised_plan, contract_repairs = normalize_scene_plan_contract(
+                    revised_plan,
+                    ctx.continuity_bible or ContinuityBible(),
+                    previous_plan=previous_plan,
+                )
+                code_invalidated = bool(
+                    state.code or state.reviewed or state.rendered or state.slurm_job
+                )
+                with self._state_lock:
+                    state.plan = revised_plan
+                    state.plan_review_feedback = ""
+                    if code_invalidated:
+                        state.code = ""
+                        state.class_name = ""
+                        state.reviewed = False
+                        state.rewrite_feedback = ""
+                        state.slurm_job = None
+                        state.artifact = None
+                        state.rendered = False
+                        state.exported_elements_code = ""
+                        state.exported_elements = []
+                        state.failure_reason = ""
+                        state.failure_category = ""
+                        self._reset_visual_receipt(
+                            ctx,
+                            state,
+                            clear_candidate=True,
+                            reset_attempts=True,
+                        )
+                        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", "")
+                    if ctx.continuity_bible is not None:
+                        ctx.continuity_review_status = "pending"
+                        ctx.continuity_review_round = 0
+                    ctx.scenes = [
+                        item.plan
+                        for item in sorted(
+                            ctx.scene_states.values(), key=lambda item: item.plan.scene_id
+                        )
+                    ]
+                    if contract_repairs:
+                        ctx.continuity_warnings.append(
+                            f"Scene {scene_id} 计划重规划后自动修复合同："
+                            + "；".join(contract_repairs)
+                        )
+                    self._checkpoint(ctx, State.PLAN_REVIEWING)
+                if code_invalidated:
+                    self._request_continuity_rebuild(
+                        ctx,
+                        scene_id,
+                        reason="计划重规划后代码已失效",
+                        include_failed=True,
+                    )
+                self._emit("scene_plan_replanned", scene_id=scene_id)
+
+            if state.failed:
+                break
+
+        if self._stop_event.is_set() or ctx.continuity_rebuild_required:
+            return
+        failed = any(state.failed for state in ctx.scene_states.values() if state.plan_ready)
+        with self._state_lock:
+            ctx.plan_review_status = "failed" if failed else "passed"
+            self._checkpoint(ctx, State.REVIEWING)
 
     @staticmethod
     def _dedupe_continuity_issues(
@@ -2193,6 +2544,12 @@ class Orchestrator:
                 with self._state_lock:
                     state.plan = revised_plan
                     state.plan_ready = True
+                    state.plan_reviewed = False
+                    state.plan_review_round = 0
+                    state.plan_review_feedback = ""
+                    state.plan_review_signature = ""
+                    state.identical_plan_review_count = 0
+                    ctx.plan_review_status = "pending"
                     if contract_repairs:
                         ctx.continuity_warnings.append(
                             f"Scene {scene_id} 重规划后自动修复连续性合同："
@@ -2385,6 +2742,11 @@ class Orchestrator:
         with self._state_lock:
             state.plan = plan
             state.plan_ready = True
+            state.plan_reviewed = False
+            state.plan_review_round = 0
+            state.plan_review_feedback = ""
+            state.plan_review_signature = ""
+            state.identical_plan_review_count = 0
             ctx.scenes = [
                 item.plan
                 for item in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
@@ -3049,13 +3411,16 @@ class Orchestrator:
         )
         if contract_repairs:
             rewrite_feedback += "\n同时修复连续性合同：" + "；".join(contract_repairs)
-        has_downstream = any(current_id > scene_id for current_id in ctx.scene_states)
-
         with self._state_lock:
             state.plan = fallback_plan
             state.safe_fallback_used = True
             state.safe_fallback_reason = reason
             state.review_round = 0
+            state.plan_review_round = 0
+            state.plan_reviewed = False
+            state.plan_review_feedback = ""
+            state.plan_review_signature = ""
+            state.identical_plan_review_count = 0
             state.code = ""
             state.class_name = ""
             state.reviewed = False
@@ -3072,17 +3437,22 @@ class Orchestrator:
             state.failure_reason = ""
             state.failure_category = ""
             if ctx.continuity_bible is not None:
-                ctx.continuity_review_status = "pending" if has_downstream else "passed"
+                ctx.continuity_review_status = "pending"
                 ctx.continuity_review_round = 0
+            ctx.plan_review_status = "pending"
             ctx.continuity_warnings.append(f"Scene {scene_id} 已切换为保守教学方案：{reason}")
             ctx.scenes = [
                 item.plan
                 for item in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
             ]
             self._reset_visual_receipt(ctx, state, clear_candidate=True, reset_attempts=True)
-            self._checkpoint(ctx, State.REVIEWING)
+            self._checkpoint(ctx, State.PLAN_REVIEWING)
             self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", "")
 
+        # 即使当前场景是最后一个场景，降级也改变了 plan_reviewed 状态；
+        # 让外层 dry-run/正式流水线重新经过计划审查，而不是直接进入渲染。
+        ctx.continuity_rebuild_required = True
+        self._stop_event.set()
         self._request_continuity_rebuild(
             ctx,
             scene_id,

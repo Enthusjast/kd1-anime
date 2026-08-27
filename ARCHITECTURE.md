@@ -20,6 +20,7 @@ kd1_anime.cli / kd1_anime.tui
 kd1_anime.orchestrator ───── callback events ───────────▶ TUI/Rich
        │
        ├── agents/planner.py       概要规划 + 详细分镜
+       ├── agents/plan_reviewer.py 计划正确性、数学与可实现性审查
        ├── agents/continuity.py    全片连续性审查与局部重规划
        ├── agents/coder.py         ManimCE 代码生成/重写
        ├── agents/reviewer.py      结构化语义审查
@@ -35,17 +36,17 @@ kd1_anime.orchestrator ───── callback events ────────�
        └── run_store.py            Manifest v3、原子检查点、运行锁
 ```
 
-`agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
+`agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
 
 ## 3. 执行模型
 
 ```text
 全局：INIT → 主 LLM/RAG 可用性探测 → PLANNING
 
-分镜屏障：所有 Scene 并行 DETAILING → 全片连续性审查
+分镜屏障：所有 Scene 并行 DETAILING → 逐场景计划审查 → 全片连续性审查
 
 顺序代码屏障：
-Scene 1 CODING → REVIEWING → Scene 2 CODING → REVIEWING → …
+Scene 1 CODING → 代码 REVIEWING → Scene 2 CODING → 代码 REVIEWING → …
 
 渲染阶段：各 Scene 并行 DISPATCHING → MONITORING
                                       ▲              │
@@ -56,7 +57,7 @@ Scene 1 CODING → REVIEWING → Scene 2 CODING → REVIEWING → …
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行，但编码/审查按场景顺序执行：Scene N 审查通过后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，而不是仅凭 Planner 描述猜测的状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
+FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行；每个 Scene 必须先通过计划审查，确认数学关系、几何可行性和时间线正确，再进入编码。编码/代码审查按场景顺序执行：Scene N 代码审查通过后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，而不是仅凭 Planner 描述猜测的状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
@@ -72,7 +73,8 @@ Planner 使用分层结构化输出：
 1. `plan_outline()` 按最小必要粒度生成短小 `SceneOutline` 列表，并按返回顺序规范化 scene ID 为 `1..N`。同一画布中逐个出现、保留并对比的对象属于同一个场景；当用户明确要求同屏/整体展示而模型仍按对象拆分时，Planner 会将概要确定性合并为一个场景。只有用户明确要求多场景，或镜头/布局/叙事弧线确实独立时才拆分。
 2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
 3. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state、结构化 `inherited_elements` / `elements_to_remove` / `new_elements` 和转场合同。
-4. 所有 Detail 完成后执行确定性检查和一次全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。
+4. 所有 Detail 完成后先逐场景执行 Plan Review，检查数学正确性、几何可实现性、时间线和交接合同；问题只回到 Planner 重规划，受 `MAX_PLAN_REVIEW_ROUNDS` 限制，未通过的计划不会进入 Coder。
+5. Plan Review 通过后执行全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。高风险几何方案在计划审查或代码审查耗尽后，可切换为保守的面积/等式教学方案。
 
 Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。用户需求被明确标记为不可信数据，不能改变系统规则。
 `GlobalVisualState` 固定全片颜色、字体、字号、线宽、布局锚点和镜头语言；每个 `ScenePlan` 都携带同一份只读配置。`VisualElementState` 为跨场景对象分配稳定的 `element_id`。
@@ -101,7 +103,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - `minor`：至少一条可精确唯一匹配的查找替换；
 - `major`：带具体反馈并回到 Coder 重写。
 
-审查受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Reviewer；major 反馈仍回到 CODING，绝不直接提交。
+Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
 
 连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除旧交接代码并按顺序重新编码；恢复旧清单时会优先重新提取导出区，提取失败不会静默复用下游状态。
 

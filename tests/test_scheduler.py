@@ -9,6 +9,7 @@ from pathlib import Path
 
 import kd1_anime.orchestrator as module
 from kd1_anime.agents.continuity import ContinuityReviewResult
+from kd1_anime.agents.plan_reviewer import PlanReviewResult
 from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
 from kd1_anime.agents.reviewer import ReviewResult
 from kd1_anime.agents.validator import CodeValidationResult
@@ -74,7 +75,12 @@ class FakePlanner:
             time.sleep(self.detail_delay)
         if self.events is not None:
             self.events.append(("detail_end", outline.scene_id, time.time()))
-        return make_plan(outline)
+        plan = make_plan(outline)
+        plan.opening_state = ["核心对象进入画面"]
+        plan.closing_state = ["核心对象保留到场景结束"]
+        plan.transition_in = "核心对象从初始状态接入"
+        plan.transition_out = "保留核心对象交给下一场景"
+        return plan
 
 
 class ContinuityPlanner(FakePlanner):
@@ -116,6 +122,36 @@ class PassingContinuityReviewer:
     def review(self, *args, **kwargs):
         self.calls += 1
         return ContinuityReviewResult(is_valid=True, summary="通过")
+
+
+class PassingPlanReviewer:
+    calls = 0
+
+    def review(self, *args, **kwargs):
+        self.calls += 1
+        return PlanReviewResult(is_valid=True, summary="计划通过")
+
+
+class RejectingPlanReviewer:
+    def __init__(self):
+        self.calls = 0
+
+    def review(self, *args, **kwargs):
+        self.calls += 1
+        return PlanReviewResult(
+            is_valid=False,
+            severity="major",
+            summary="不可实现",
+            issues=[
+                {
+                    "category": "feasibility",
+                    "severity": "major",
+                    "field": "visual_flow",
+                    "message": "方案无法实现",
+                    "fix_instruction": "删除不可实现的步骤",
+                }
+            ],
+        )
 
 
 class OneRoundContinuityReviewer:
@@ -304,6 +340,7 @@ def make_orchestrator(
     *,
     slurm=None,
     planner=None,
+    plan_reviewer=None,
     coder=None,
     reviewer=None,
     autofixer=None,
@@ -316,6 +353,11 @@ def make_orchestrator(
     )
     orchestrator.slurm = slurm or FakeSlurm(run_paths)
     monkeypatch.setattr(module, "PlannerAgent", _CallableAgent(planner or FakePlanner()))
+    monkeypatch.setattr(
+        module,
+        "PlanReviewerAgent",
+        _CallableAgent(plan_reviewer or PassingPlanReviewer()),
+    )
     monkeypatch.setattr(module, "CoderAgent", _CallableAgent(coder or FakeCoder()))
     monkeypatch.setattr(module, "ReviewerAgent", _CallableAgent(reviewer or FakeReviewer()))
     monkeypatch.setattr(module, "AutoFixerAgent", _CallableAgent(autofixer or FakeAutoFixer()))
@@ -740,6 +782,106 @@ def test_dry_run_completes_without_submission(monkeypatch, tmp_path):
     assert ctx.scene_states[1].plan_ready is True
     assert ctx.scene_states[1].reviewed is True
     assert ctx.scene_states[1].rendered is False
+
+
+def test_plan_review_blocks_coding_when_plan_is_invalid(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    plan_reviewer = RejectingPlanReviewer()
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        plan_reviewer=plan_reviewer,
+    )
+    monkeypatch.setattr(settings, "MAX_PLAN_REVIEW_ROUNDS", 1)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=[make_outline(1)],
+        continuity_bible=ContinuityBible(),
+        plan_review_status="pending",
+        scene_states={
+            1: SceneState(
+                plan=make_plan(make_outline(1)),
+                plan_ready=True,
+            )
+        },
+    )
+
+    orchestrator._run_scheduler(ctx)
+
+    state = ctx.scene_states[1]
+    assert plan_reviewer.calls == 1
+    assert state.failed is True
+    assert state.plan_reviewed is False
+    assert state.reviewed is False
+    assert state.failure_category == "planning"
+    assert state.code == ""
+
+
+def test_plan_review_passes_before_code_review(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    events = []
+
+    class OneRoundPlanReviewer:
+        calls = 0
+
+        def review(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return PlanReviewResult(
+                    is_valid=False,
+                    severity="major",
+                    issues=[
+                        {
+                            "category": "timing",
+                            "field": "key_moments",
+                            "message": "时间线需要重新安排",
+                            "fix_instruction": "重新安排关键时刻",
+                        }
+                    ],
+                )
+            return PlanReviewResult(is_valid=True)
+
+    planner = ContinuityPlanner()
+    plan_reviewer = OneRoundPlanReviewer()
+    coder = FakeCoder()
+    reviewer = FakeReviewer()
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        planner=planner,
+        plan_reviewer=plan_reviewer,
+        coder=coder,
+        reviewer=reviewer,
+    )
+    orchestrator.planner = planner
+    orchestrator._callback = lambda event, data: events.append(event)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=[make_outline(1)],
+        continuity_bible=ContinuityBible(),
+        plan_review_status="pending",
+        continuity_review_status="passed",
+        scene_states={
+            1: SceneState(
+                plan=planner.plan_detail(make_outline(1), [make_outline(1)], "prompt"),
+                plan_ready=True,
+            )
+        },
+    )
+
+    orchestrator._run_scheduler(ctx)
+
+    assert plan_reviewer.calls == 2
+    assert coder.calls
+    assert ctx.scene_states[1].plan_reviewed is True
+    assert ctx.scene_states[1].reviewed is True
+    assert events.index("scene_plan_review_pass") < events.index("scene_coding")
 
 
 def test_continuity_review_is_a_barrier_before_coding(monkeypatch, tmp_path):

@@ -41,6 +41,7 @@ RESUME_LLM_STATES = frozenset(
         "INIT",
         "PLANNING",
         "DETAILING",
+        "PLAN_REVIEWING",
         "CODING",
         "REVIEWING",
         "FIXING",
@@ -54,6 +55,7 @@ FSMState = Literal[
     "INIT",
     "PLANNING",
     "DETAILING",
+    "PLAN_REVIEWING",
     "CODING",
     "REVIEWING",
     "DISPATCHING",
@@ -68,6 +70,8 @@ FSMState = Literal[
 ScenePhase = Literal[
     "pending",
     "detailed",
+    "plan_reviewing",
+    "plan_reviewed",
     "coded",
     "reviewed",
     "monitoring",
@@ -171,6 +175,11 @@ class StoredSceneState(BaseModel):
     infra_retries: int = Field(default=0, ge=0)
     reviewed: bool = False
     plan_ready: bool = False
+    plan_review_round: int = Field(default=0, ge=0)
+    plan_reviewed: bool = False
+    plan_review_feedback: str = Field(default="", max_length=50_000)
+    plan_review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
+    identical_plan_review_count: int = Field(default=0, ge=0)
     rewrite_feedback: str = Field(default="", max_length=50_000)
     review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
     identical_review_count: int = Field(default=0, ge=0)
@@ -234,6 +243,7 @@ class RunManifest(BaseModel):
     # 新运行在分镜生成前固定全片规范；旧 manifest 缺少这些字段时按已完成兼容，
     # 不会在恢复已有代码/作业时擅自重规划场景。
     continuity_bible: ContinuityBible | None = None
+    plan_review_status: Literal["pending", "reviewing", "passed", "failed", "skipped"] = "skipped"
     continuity_review_status: Literal["pending", "reviewing", "passed", "warning"] = "passed"
     continuity_review_round: int = Field(default=0, ge=0)
     continuity_warnings: list[str] = Field(default_factory=list, max_length=100)
@@ -277,6 +287,8 @@ class RunManifest(BaseModel):
         for scene_id, scene in self.scenes.items():
             if scene.plan.scene_id != scene_id:
                 errors.append(f"Scene key {scene_id} 与 plan.scene_id {scene.plan.scene_id} 不一致")
+            if scene.plan_reviewed and not scene.plan_ready:
+                errors.append(f"Scene {scene_id} 标记为 plan_reviewed 但 plan_ready=false")
             if scene.rendered and scene.artifact is None:
                 errors.append(f"Scene {scene_id} 标记为 rendered 但缺少 artifact")
             if scene.artifact is not None:
@@ -319,6 +331,15 @@ class RunManifest(BaseModel):
             for receipt_key, receipt in self.rag_receipts.items():
                 if receipt.index_sha256 and receipt.index_sha256 != self.rag_profile.index_sha256:
                     errors.append(f"RAG 收据 {receipt_key} 的索引哈希与运行配置不一致")
+        if self.plan_review_status == "passed":
+            for scene_id, scene in self.scenes.items():
+                if (
+                    scene.plan_ready
+                    and not scene.plan_reviewed
+                    and not scene.failed
+                    and not scene.give_up
+                ):
+                    errors.append(f"Scene {scene_id} 未通过计划审查但运行标记为 passed")
         if self.status == "completed" and not self.final_video:
             errors.append("运行标记为 completed 但缺少 final_video")
         return errors

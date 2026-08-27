@@ -44,7 +44,7 @@ Never commit `.env` or print API keys. The API is provider-neutral: `LLM_API_KEY
 ## Pipeline
 
 ```text
-INIT → (主 LLM/RAG 可用性检查) → PLANNING → DETAILING → CODING → REVIEWING
+INIT → (主 LLM/RAG 可用性检查) → PLANNING → DETAILING → PLAN_REVIEWING → CODING → REVIEWING
      → DISPATCHING → MONITORING → (FIXING → REVIEWING)
      → VISUAL_EVALUATING → MERGING → EVALUATING → DONE
 ```
@@ -81,6 +81,7 @@ Key invariants:
 - `src/kd1_anime/run_store.py`: versioned manifests, atomic checkpoints, code hashes and run locks.
 - `src/kd1_anime/agents/base.py`: OpenAI-compatible calls, retries, streaming, JSON/code parsing.
 - `src/kd1_anime/agents/planner.py`: outline and detailed scene planning models/prompts.
+- `src/kd1_anime/agents/plan_reviewer.py`: pre-code mathematical and feasibility review of ScenePlan.
 - `src/kd1_anime/agents/coder.py`: ManimCE code generation and rewrite prompt.
 - `src/kd1_anime/agents/reviewer.py`: closed structured review contract and checklist.
 - `src/kd1_anime/agents/validator.py`: deterministic AST and Scene-structure checks.
