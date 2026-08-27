@@ -86,8 +86,14 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - 必须输出以下连续性导出区。区内只能包含无副作用的 Mobject 定义，不能出现 `self.play`、
   `self.add`、文件/网络调用或动态执行：
   `# KD1_CONTINUITY_EXPORT_BEGIN` 到 `# KD1_CONTINUITY_EXPORT_END`。
+- 复合 Mobject（例如由多条 Line 组成的 VGroup）需要的纯 helper 定义可以放在同一个导出区内；
+  用 `# element_id: <最终元素 ID>` 标记该组，并让该组最后一条赋值把对象绑定到对应的
+  `variable_name`。helper 赋值只能服务于这个最终对象，不能添加动画或副作用。
 - 导出区只能导出 closing_state 中仍然存在、且在 `[Inherited Elements State]` 或 `[New Elements]`
   中声明的元素；不要导出临时碎片、辅助线、标题过渡对象或 `[Elements To Remove]` 中的元素。
+- 导出区内所有 helper 依赖（坐标数组、子 Mobject、组合对象的局部变量）都必须在导出区内定义；
+  不得引用导出区外的 `A_point`、`triangle_parts` 等业务变量。导出区外只允许使用全局配置
+  和 Manim/NumPy 已导入的名称。
 - 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
   面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；

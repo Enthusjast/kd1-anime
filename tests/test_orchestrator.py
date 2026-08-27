@@ -352,6 +352,44 @@ def test_context_derives_pending_plan_review_for_legacy_incomplete_run(tmp_path)
     assert context.plan_review_status == "pending"
 
 
+def test_resume_does_not_block_code_recovery_on_stale_plan_failure(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / run_id
+    root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_id,
+        status="failed",
+        state="REVIEWING",
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
+        plan_review_status="failed",
+        scenes={
+            1: StoredSceneState(
+                plan=plan(),
+                plan_ready=True,
+                plan_reviewed=True,
+                failed=True,
+                failure_reason="代码审查失败",
+            )
+        },
+    )
+    write_manifest(root / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    captured = {}
+
+    def fake_execute(self, context, state):
+        captured["context"] = context
+        return None
+
+    monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
+
+    assert Orchestrator().resume(run_id) is None
+    assert captured["context"].plan_review_status == "passed"
+
+
 def test_run_paths_are_unique(monkeypatch, tmp_path):
     from kd1_anime.config import settings
 
@@ -524,6 +562,58 @@ class Demo(Scene):
     assert called is False
     assert state.reviewed is False
     assert "连续性导出区无效" in state.rewrite_feedback
+
+
+def test_code_generation_validates_continuity_contract_before_code_review(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={"new_elements": [VisualElementState(element_id="formula", variable_name="formula")]}
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        other = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return invalid if len(self.calls) == 1 else valid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    generated, class_name = Orchestrator()._generate_validated_code(
+        scene_plan,
+        stream=False,
+    )
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 2
+    assert "连续性导出合同" in coder.calls[1]
 
 
 def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path):

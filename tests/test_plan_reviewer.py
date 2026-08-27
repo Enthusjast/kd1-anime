@@ -69,6 +69,19 @@ def test_deterministic_plan_review_accepts_explicit_geometry_calculation():
     assert not any(issue.category == "geometry" for issue in issues)
 
 
+def test_deterministic_plan_review_does_not_reject_explicit_safe_fallback():
+    plan = make_plan().model_copy(
+        update={
+            "purpose": "已切换为保守教学表达",
+            "visual_flow": ["不执行未经验证的碎片拼接，改用等式展示"],
+        }
+    )
+
+    issues = deterministic_plan_issues(plan, ContinuityBible(), safe_fallback=True)
+
+    assert not any(issue.category == "geometry" for issue in issues)
+
+
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")
 def test_plan_reviewer_sends_plan_and_deterministic_findings(mock_call_llm):
     mock_call_llm.return_value = '{"is_valid": true, "severity": "info", "issues": []}'
@@ -97,6 +110,15 @@ def test_plan_reviewer_sends_plan_and_deterministic_findings(mock_call_llm):
     assert "<current_scene_plan>" in message
     assert "<deterministic_findings>" in message
     assert "a²+b²=c²" in message
+
+
+@patch("kd1_anime.agents.base.BaseAgent.call_llm")
+def test_plan_reviewer_marks_safe_fallback_context(mock_call_llm):
+    mock_call_llm.return_value = '{"is_valid": true, "severity": "info", "issues": []}'
+
+    PlanReviewerAgent().review(make_plan(), safe_fallback=True)
+
+    assert "safe_fallback_mode" in mock_call_llm.call_args.kwargs["user_message"]
 
 
 def test_plan_review_prompt_requires_math_and_geometry_validation():

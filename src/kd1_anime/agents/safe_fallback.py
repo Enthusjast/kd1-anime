@@ -65,6 +65,13 @@ def is_high_confidence_geometry_conflict(plan: ScenePlan, feedback: str) -> bool
     ).lower()
     feedback_text = (feedback or "").lower()
     has_geometry = any(term.lower() in plan_text for term in _GEOMETRY_TERMS)
+    feedback_marks_geometry = "[geometry]" in feedback_text or any(
+        term in feedback_text for term in ("几何", "顶点", "正方形", "三角形")
+    )
+    if feedback_marks_geometry and any(
+        term in plan_text for term in ("正方形", "三角形", "坐标", "顶点", "面积")
+    ):
+        has_geometry = True
     has_structured_risk = any(
         any(term.lower() in item.element_id.lower() for term in _GEOMETRY_TERMS)
         for item in plan.new_elements

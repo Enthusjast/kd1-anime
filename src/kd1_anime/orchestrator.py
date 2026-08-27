@@ -890,6 +890,7 @@ class Orchestrator:
         current_feedback = feedback
         current_previous = previous_code
         last_validation: CodeValidationResult | None = None
+        last_continuity_error = ""
         for _ in range(settings.CODE_VALIDATION_ATTEMPTS):
             code_kwargs = {
                 "feedback": current_feedback,
@@ -913,11 +914,22 @@ class Orchestrator:
             )
 
             validation = self._validate(code, renderer=renderer)
-            if validation.is_valid:
+            continuity_error = ""
+            try:
+                _, exported_elements = extract_continuity_elements(code)
+                validate_export_contract(plan, exported_elements)
+            except ValueError as exc:
+                continuity_error = str(exc)
+            if validation.is_valid and not continuity_error:
                 return code, validation.scene_classes[0]
             last_validation = validation
+            last_continuity_error = continuity_error
             # 提供详细的修复指导
             feedback_parts = [f"确定性校验未通过，必须修复以下问题：\n{validation.feedback}"]
+            if continuity_error:
+                feedback_parts.append(
+                    "\n连续性导出合同校验未通过，必须修复以下问题：\n- " + continuity_error
+                )
 
             # 如果是 TexTemplate 相关错误，提供正确示例
             if any("TexTemplate" in err or "tex_template" in err for err in validation.errors):
@@ -939,7 +951,19 @@ class Orchestrator:
             current_previous = code
         raise ValidationError(
             "生成代码未通过确定性校验：\n"
-            + (last_validation.feedback if last_validation else "未知错误"),
+            + (
+                "\n".join(
+                    part
+                    for part in (
+                        last_validation.feedback if last_validation else "",
+                        f"连续性导出合同错误: {last_continuity_error}"
+                        if last_continuity_error
+                        else "",
+                    )
+                    if part
+                )
+                or "未知错误"
+            ),
             hint="尝试简化场景或调整 prompt",
         )
 
@@ -1227,14 +1251,19 @@ class Orchestrator:
                     state = State.CODING
                 self._emit("run_resuming_from_error", run_id=run_id, state=state.name)
 
-            if any(
+            pending_plan_review = any(
                 not scene.plan_reviewed
                 and scene.plan_ready
                 and not scene.failed
                 and not scene.give_up
                 for scene in ctx.scene_states.values()
-            ):
+            )
+            if pending_plan_review:
                 ctx.plan_review_status = "pending"
+            elif ctx.plan_review_status == "failed":
+                # 计划本身已经审查通过，但上次可能在代码审查阶段失败；
+                # 恢复时不能把后续失败误当成计划屏障失败。
+                ctx.plan_review_status = "passed"
 
             if reset_give_up:
                 # resume 时仪表盘可能已激活, 避免直接打印破坏 Live 渲染
@@ -2127,6 +2156,7 @@ class Orchestrator:
                 deterministic = deterministic_plan_issues(
                     state.plan,
                     ctx.continuity_bible,
+                    safe_fallback=state.safe_fallback_used,
                 )
                 try:
                     with self._llm_sem:
@@ -2144,6 +2174,7 @@ class Orchestrator:
                             continuity_bible=ctx.continuity_bible,
                             deterministic_issues=deterministic,
                             renderer=ctx.render_profile.renderer,
+                            safe_fallback=state.safe_fallback_used,
                         )
                 except Exception as exc:
                     self._plan_review_failure(
@@ -2267,7 +2298,7 @@ class Orchestrator:
                             reset_attempts=True,
                         )
                         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", "")
-                    if ctx.continuity_bible is not None:
+                    if ctx.continuity_bible is not None and ctx.continuity_review_round == 0:
                         ctx.continuity_review_status = "pending"
                         ctx.continuity_review_round = 0
                     ctx.scenes = [
