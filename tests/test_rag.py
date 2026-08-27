@@ -53,10 +53,27 @@ def test_chunker_splits_python_and_removes_sensitive_lines(tmp_path):
     assert any("make_circle" in chunk.text for chunk in chunks)
 
 
+def test_chunker_indexes_restructuredtext_documents(tmp_path):
+    source = tmp_path / "guide.rst"
+    source.write_text(
+        "Overview\n========\n\n"
+        + "Intro text. " * 12
+        + "\n\nAPI usage\n---------\n\nUse Circle().\n",
+        encoding="utf-8",
+    )
+
+    chunks = chunk_file(source, "manim_doc", chunk_size=100, overlap=10)
+
+    assert len(chunks) >= 2
+    assert chunks[0].text.startswith("Overview")
+    assert any("API usage" in chunk.text for chunk in chunks)
+
+
 def test_iter_source_files_excludes_runtime_and_unknown_files(tmp_path):
     docs = tmp_path / "docs"
     docs.mkdir()
     (docs / "api.md").write_text("# API", encoding="utf-8")
+    (docs / "guide.rst").write_text("Guide\n=====\n", encoding="utf-8")
     (docs / "secrets.env").write_text("TOKEN=x", encoding="utf-8")
     runtime = docs / "workspace"
     runtime.mkdir()
@@ -68,7 +85,10 @@ def test_iter_source_files_excludes_runtime_and_unknown_files(tmp_path):
 
     files = iter_source_files(docs, None)
 
-    assert [(path.name, kind) for path, kind in files] == [("api.md", "manim_doc")]
+    assert [(path.name, kind) for path, kind in files] == [
+        ("api.md", "manim_doc"),
+        ("guide.rst", "manim_doc"),
+    ]
 
 
 def test_embedding_client_reorders_and_validates_batch(monkeypatch):

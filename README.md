@@ -163,12 +163,12 @@ kd1-anime rag search "TransformMatchingTex usage"
 kd1-anime doctor --probe-rag
 ```
 
-将可索引的 `.md`/`.py` 文档复制到上面的两个默认目录后执行 `rag index`；也可以
+将可索引的 `.md`/`.rst`/`.py` 文档复制到上面的两个默认目录后执行 `rag index`；也可以
 通过 `--docs-dir`、`--examples-dir` 或配置项指定其它源目录。索引文件始终默认写入
 `~/.kd1-anime/rag/index.sqlite3`。
 
 RAG 运行时服务暂时不可用时会降级继续：Embedding 失败则跳过检索，Reranker
-失败则使用 Embedding 初排结果。索引只读取 `.md`/`.py`，并排除运行目录和疑似
+失败则使用 Embedding 初排结果。索引只读取 `.md`/`.rst`/`.py`，并排除运行目录和疑似
 密钥行。
 
 完整示例见 `.env.example`。安装脚本也会生成：

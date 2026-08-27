@@ -11,7 +11,7 @@ from typing import Literal
 
 from kd1_anime.rag.models import RagChunk
 
-ALLOWED_SUFFIXES = frozenset({".md", ".py"})
+ALLOWED_SUFFIXES = frozenset({".md", ".rst", ".py"})
 EXCLUDED_PARTS = frozenset(
     {
         ".git",
@@ -104,6 +104,19 @@ def _markdown_segments(text: str) -> list[str]:
     return [segment for segment in segments if segment]
 
 
+def _rst_segments(text: str) -> list[str]:
+    """按 reStructuredText 的标题下划线切分文档。"""
+
+    heading = re.compile(r"(?m)^[^\s].*\n[=\-`:\.'\"~^_*+#]{3,}\s*$")
+    starts = [match.start() for match in heading.finditer(text)]
+    if not starts:
+        return [text]
+    if starts[0] > 0:
+        starts.insert(0, 0)
+    boundaries = [*starts, len(text)]
+    return [text[boundaries[index] : boundaries[index + 1]].strip() for index in range(len(starts))]
+
+
 def _python_segments(text: str) -> list[str]:
     lines = text.splitlines()
     try:
@@ -166,7 +179,13 @@ def chunk_file(
     text, source_sha256 = _read_source(path)
     if not text:
         return []
-    segments = _markdown_segments(text) if path.suffix.lower() == ".md" else _python_segments(text)
+    suffix = path.suffix.lower()
+    if suffix == ".md":
+        segments = _markdown_segments(text)
+    elif suffix == ".rst":
+        segments = _rst_segments(text)
+    else:
+        segments = _python_segments(text)
     contents = _pack_segments(segments, chunk_size, overlap)
     result: list[SourceChunk] = []
     for ordinal, content in enumerate(contents):

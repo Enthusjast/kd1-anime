@@ -357,7 +357,7 @@ class RagService:
         sources = iter_source_files(docs_root, examples_root)
         if not sources:
             raise ValueError(
-                "没有找到可索引的 .md/.py 文档或示例，请配置 RAG_DOCS_DIR/RAG_EXAMPLES_DIR"
+                "没有找到可索引的 .md/.rst/.py 文档或示例，请配置 RAG_DOCS_DIR/RAG_EXAMPLES_DIR"
             )
         chunks: list[SourceChunk] = []
         skipped: list[str] = []
