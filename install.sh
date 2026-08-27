@@ -27,8 +27,11 @@ if [[ ! "$TEXLIVE_PLATFORM" =~ ^[A-Za-z0-9_-]+$ ]]; then
     err "KD1_ANIME_TEXLIVE_PLATFORM 包含不安全字符: $TEXLIVE_PLATFORM"
     exit 1
 fi
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kd1-anime"
+CONFIG_DIR="$HOME/.kd1-anime"
 CONFIG_FILE="$CONFIG_DIR/.env"
+LEGACY_CONFIG_DIR="$HOME/.config/kd1-anime"
+LEGACY_CONFIG_FILE="$LEGACY_CONFIG_DIR/.env"
+LEGACY_CONFIG_EXAMPLE_FILE="$LEGACY_CONFIG_DIR/.env.example"
 USER_BIN_DIR="${KD1_ANIME_USER_BIN_DIR:-$HOME/.local/bin}"
 REQUIRE_CHECKSUM="${KD1_ANIME_REQUIRE_CHECKSUM:-0}"
 case "$REQUIRE_CHECKSUM" in
@@ -394,11 +397,43 @@ install_python_package() {
     fi
 }
 
+rewrite_legacy_storage_defaults() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    sed -i \
+        -e 's|^RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3$|RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3|' \
+        -e 's|^RAG_DOCS_DIR=$|RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs|' \
+        -e 's|^RAG_EXAMPLES_DIR=$|RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples|' \
+        -e 's|^WORKSPACE_DIR=workspace$|WORKSPACE_DIR=~/.kd1-anime/workspace|' \
+        -e 's|^SCENES_DIR=workspace/scenes$|SCENES_DIR=~/.kd1-anime/workspace/scenes|' \
+        -e 's|^LOGS_DIR=workspace/logs$|LOGS_DIR=~/.kd1-anime/workspace/logs|' \
+        -e 's|^VIDEOS_DIR=workspace/videos$|VIDEOS_DIR=~/.kd1-anime/workspace/videos|' \
+        "$file"
+}
+
 write_user_config() {
-    mkdir -p "$CONFIG_DIR"
+    mkdir -p \
+        "$CONFIG_DIR" \
+        "$CONFIG_DIR/knowledge/docs" \
+        "$CONFIG_DIR/knowledge/examples" \
+        "$CONFIG_DIR/rag" \
+        "$CONFIG_DIR/workspace"
     chmod 700 "$CONFIG_DIR"
     if [ -f "$CONFIG_FILE" ]; then
+        chmod 600 "$CONFIG_FILE"
         warn "用户配置已存在，未覆盖: $CONFIG_FILE"
+        return
+    fi
+    if [ -f "$LEGACY_CONFIG_FILE" ]; then
+        cp "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
+        rewrite_legacy_storage_defaults "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        if [ -f "$LEGACY_CONFIG_EXAMPLE_FILE" ] && [ ! -f "$CONFIG_DIR/.env.example" ]; then
+            cp "$LEGACY_CONFIG_EXAMPLE_FILE" "$CONFIG_DIR/.env.example"
+            rewrite_legacy_storage_defaults "$CONFIG_DIR/.env.example"
+            chmod 600 "$CONFIG_DIR/.env.example"
+        fi
+        warn "已将旧用户配置迁移到: $CONFIG_FILE（旧文件未删除）"
         return
     fi
     cat > "$CONFIG_DIR/.env.example" <<EOF
@@ -434,9 +469,9 @@ VISUAL_LLM_USE_JSON_MODE=true
 VISUAL_LLM_PARALLEL_WORKERS=2
 VISUAL_LLM_DEBUG=false
 RAG_ENABLED=false
-RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3
-RAG_DOCS_DIR=
-RAG_EXAMPLES_DIR=
+RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
+RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
+RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
 RAG_EMBEDDING_API_KEY=
 RAG_EMBEDDING_BASE_URL=
 RAG_EMBEDDING_MODEL=
@@ -510,7 +545,7 @@ MAX_EVAL_ROUNDS=2
 VISUAL_EVAL_FRAME_COUNT=6
 VISUAL_EVAL_THRESHOLD=3.5
 MAX_VISUAL_FIX_ATTEMPTS=2
-WORKSPACE_DIR=workspace
+WORKSPACE_DIR=~/.kd1-anime/workspace
 OUTPUT_FILE=output_final.mp4
 EOF
     cp "$CONFIG_DIR/.env.example" "$CONFIG_FILE"

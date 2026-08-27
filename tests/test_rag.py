@@ -262,6 +262,27 @@ def test_disabled_rag_does_not_need_index_or_network(tmp_path):
     assert result.context == ""
 
 
+def test_rag_service_migrates_legacy_default_index(tmp_path, monkeypatch):
+    import kd1_anime.rag.service as service_module
+
+    legacy_index = tmp_path / "legacy" / "index.sqlite3"
+    current_index = tmp_path / "current" / "index.sqlite3"
+    RagIndex.build(
+        legacy_index,
+        [_source_chunk("legacy reference")],
+        [[1, 0]],
+        embedding_model="embed-test",
+    )
+    monkeypatch.setattr(service_module, "DEFAULT_RAG_INDEX_PATH", current_index)
+    monkeypatch.setattr(service_module, "LEGACY_RAG_INDEX_PATH", legacy_index)
+
+    service = RagService(Settings(_env_file=None, RAG_INDEX_PATH=current_index))
+
+    assert current_index.is_file()
+    assert current_index.stat().st_mode & 0o777 == 0o600
+    assert service.runtime_status()["index"]["chunk_count"] == 1
+
+
 def test_rag_configuration_is_separate_from_main_and_visual_profiles(tmp_path):
     config = Settings(
         _env_file=None,

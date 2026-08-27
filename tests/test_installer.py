@@ -284,6 +284,76 @@ print_completion
     assert f"命令目录: {user_bin}" in result.stdout
 
 
+def test_installer_uses_private_application_home_for_user_storage(tmp_path):
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        ["bash", "-c", f"source {shlex.quote(str(INSTALLER))}; write_user_config"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    config_dir = tmp_path / ".kd1-anime"
+    config_file = config_dir / ".env"
+    assert config_file.is_file()
+    assert config_file.stat().st_mode & 0o777 == 0o600
+    content = config_file.read_text(encoding="utf-8")
+    assert "RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3" in content
+    assert "RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs" in content
+    assert "RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples" in content
+    assert "WORKSPACE_DIR=~/.kd1-anime/workspace" in content
+    assert (config_dir / "knowledge" / "docs").is_dir()
+    assert (config_dir / "knowledge" / "examples").is_dir()
+    assert not (tmp_path / ".config" / "kd1-anime").exists()
+
+
+def test_installer_migrates_legacy_user_config_without_overwriting_it(tmp_path):
+    legacy_dir = tmp_path / ".config" / "kd1-anime"
+    legacy_dir.mkdir(parents=True)
+    legacy_file = legacy_dir / ".env"
+    legacy_file.write_text(
+        "RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3\n"
+        "RAG_DOCS_DIR=\n"
+        "RAG_EXAMPLES_DIR=\n"
+        "WORKSPACE_DIR=workspace\n"
+        "LLM_MODEL=legacy-model\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    result = subprocess.run(
+        ["bash", "-c", f"source {shlex.quote(str(INSTALLER))}; write_user_config"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    migrated = tmp_path / ".kd1-anime" / ".env"
+    assert migrated.read_text(encoding="utf-8") == (
+        "RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3\n"
+        "RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs\n"
+        "RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples\n"
+        "WORKSPACE_DIR=~/.kd1-anime/workspace\n"
+        "LLM_MODEL=legacy-model\n"
+    )
+    assert legacy_file.read_text(encoding="utf-8") == (
+        "RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3\n"
+        "RAG_DOCS_DIR=\n"
+        "RAG_EXAMPLES_DIR=\n"
+        "WORKSPACE_DIR=workspace\n"
+        "LLM_MODEL=legacy-model\n"
+    )
+
+
 def test_installer_creates_runnable_wrappers_and_idempotent_shell_config(tmp_path):
     conda_base = tmp_path / "conda"
     conda_sh = conda_base / "etc" / "profile.d" / "conda.sh"

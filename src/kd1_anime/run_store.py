@@ -437,7 +437,7 @@ class RunRepository:
         if candidate.exists() and (
             candidate.is_symlink() or candidate.resolve().parent != self.runs_root
         ):
-            raise ValueError("运行目录不是 workspace/runs 下的真实目录")
+            raise ValueError("运行目录不是配置的 workspace/runs 下的真实目录")
         return candidate
 
     def manifest_path(self, run_id: str) -> Path:
@@ -521,7 +521,7 @@ def get_reusable_video_path(
         source_root = old_root
         if artifact.source_run_id != old_manifest.run_id:
             source_root = old_root.parent / artifact.source_run_id
-            # 跨 run 复用只能访问 workspace/runs 下的真实兄弟目录，不能让
+            # 跨 run 复用只能访问配置的 runs 目录下的真实兄弟目录，不能让
             # 清单中的合法 run-id 通过符号链接逃逸到 workspace 之外。
             if (
                 source_root.is_symlink()

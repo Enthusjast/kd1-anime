@@ -12,7 +12,7 @@
 - **多 Agent 流水线**：Planner → Coder → Reviewer → AutoFixer，不依赖 LangChain 等重型框架。
 - **分阶段并行**：场景分镜并行生成；为保证视觉交接，编码/审查按场景顺序执行；所有已审查场景仍可并行提交 Slurm 渲染。
 - **确定性安全校验**：在 LLM 审查之外，使用 Python AST 检查语法、Scene 结构、导入和危险调用。
-- **运行隔离**：每次运行写入独立的 `workspace/runs/<run-id>/`，避免并发运行和旧产物互相污染。
+- **运行隔离**：每次运行写入 `~/.kd1-anime/workspace/runs/<run-id>/` 下的独立目录，避免并发运行和旧产物互相污染。
 - **可验证产物**：每个 MP4 都绑定代码哈希、渲染配置哈希、视频哈希和 ffprobe 元数据，避免把旧文件误判为本次结果。
 - **中断恢复**：版本化、原子 `manifest.json` 保存阶段、代码哈希、Slurm Job ID 和产物凭据，可查询并恢复中断运行。
 - **可选容器隔离**：可用 Apptainer 执行 LLM 生成的 Manim 代码。
@@ -73,8 +73,28 @@ kd1-anime
 manim-env
 
 # 配置 OpenAI-compatible API
-$EDITOR ~/.config/kd1-anime/.env
+$EDITOR ~/.kd1-anime/.env
 ```
+
+### 用户数据目录
+
+除非通过配置显式覆盖，程序生成的持久化文件统一位于 `~/.kd1-anime/`：
+
+```text
+~/.kd1-anime/
+├── .env                         # 用户配置
+├── .env.example                 # 配置模板
+├── knowledge/
+│   ├── docs/                    # 默认 Manim 文档源文件
+│   └── examples/                # 默认 Manim 示例源文件
+├── rag/index.sqlite3            # 本地 RAG 索引
+└── workspace/runs/<run-id>/     # 场景代码、日志、视频和评估报告
+```
+
+旧版本的 `~/.config/kd1-anime/.env` 会在首次加载配置时复制到新位置并更新旧的
+默认路径；旧文件不会被删除。旧的 RAG 索引也会在首次使用 RAG 时复制到新位置。
+为避免意外复制大型视频，旧项目目录中的相对 `workspace/` 不会自动搬迁；如需保留
+旧运行，请先将它移动到 `~/.kd1-anime/workspace/`，或显式设置 `WORKSPACE_DIR`。
 
 > `install.sh` 针对具有 Environment Modules、Miniconda 和 Slurm 的 Ubuntu/HPC 环境。可通过 `KD1_ANIME_CONDA_BASE` 和 `KD1_ANIME_ENV_NAME` 覆盖 conda 路径与环境名。
 
@@ -97,7 +117,7 @@ python -m pip install -e '.[dev]'
 配置加载优先级为：
 
 ```text
-系统环境变量 > 当前目录 .env > ~/.config/kd1-anime/.env
+系统环境变量 > 当前目录 .env > ~/.kd1-anime/.env
 ```
 
 最少需要填写：
@@ -122,9 +142,10 @@ Reranker 使用 Cohere-compatible `/rerank` 接口：
 
 ```dotenv
 RAG_ENABLED=true
-RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3
-RAG_DOCS_DIR=/path/to/manim-docs
-RAG_EXAMPLES_DIR=/path/to/manim-examples
+RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
+# 也可以把文档和示例复制到这两个默认目录，或改为其它绝对路径。
+RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
+RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
 RAG_EMBEDDING_API_KEY=your-embedding-key
 RAG_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 RAG_EMBEDDING_MODEL=your-embedding-model
@@ -142,6 +163,10 @@ kd1-anime rag search "TransformMatchingTex usage"
 kd1-anime doctor --probe-rag
 ```
 
+将可索引的 `.md`/`.py` 文档复制到上面的两个默认目录后执行 `rag index`；也可以
+通过 `--docs-dir`、`--examples-dir` 或配置项指定其它源目录。索引文件始终默认写入
+`~/.kd1-anime/rag/index.sqlite3`。
+
 RAG 运行时服务暂时不可用时会降级继续：Embedding 失败则跳过检索，Reranker
 失败则使用 Embedding 初排结果。索引只读取 `.md`/`.py`，并排除运行目录和疑似
 密钥行。
@@ -149,8 +174,8 @@ RAG 运行时服务暂时不可用时会降级继续：Embedding 失败则跳过
 完整示例见 `.env.example`。安装脚本也会生成：
 
 ```text
-~/.config/kd1-anime/.env
-~/.config/kd1-anime/.env.example
+~/.kd1-anime/.env
+~/.kd1-anime/.env.example
 ```
 
 ## 使用
@@ -211,7 +236,7 @@ kd1-anime clean --older-than 30d --yes
 默认输出位于：
 
 ```text
-workspace/runs/<timestamp>-<uuid>/
+~/.kd1-anime/workspace/runs/<timestamp>-<uuid>/
 ├── prompt.md
 ├── manifest.json         # schema v3：阶段、Job、渲染/视觉配置与产物凭据
 ├── scenes/              # 生成的 Python 和 sbatch 脚本
@@ -240,12 +265,14 @@ workspace/runs/<timestamp>-<uuid>/
 | `VISUAL_LLM_MODEL` | 空 | 支持 `image_url` 输入的视觉模型；启用视觉评估时必须设置 |
 | `VISUAL_LLM_PARALLEL_WORKERS` | `2` | 进程级并行视觉请求上限，与主 LLM 并发池分离；批处理任务共享此配额 |
 | `RAG_ENABLED` | `false` | 是否启用本地知识检索；默认关闭 |
-| `RAG_INDEX_PATH` | `~/.cache/kd1-anime/rag/index.sqlite3` | SQLite RAG 索引路径 |
+| `RAG_INDEX_PATH` | `~/.kd1-anime/rag/index.sqlite3` | SQLite RAG 索引路径 |
 | `RAG_EMBEDDING_BASE_URL` / `RAG_EMBEDDING_MODEL` | 空 | 独立 Embedding 服务和模型 |
 | `RAG_RERANK_BASE_URL` / `RAG_RERANK_MODEL` | 空 | 独立 Reranker 服务和模型 |
 | `RAG_TOP_K` / `RAG_RERANK_TOP_N` | `8` / `4` | 向量初排和重排数量 |
 | `RAG_MAX_CONTEXT_CHARS` | `12000` | 注入单次 Agent 请求的最大检索上下文 |
 | `RAG_PARALLEL_WORKERS` | `2` | 跨批量任务共享的 RAG 请求并发上限 |
+| `RAG_DOCS_DIR` / `RAG_EXAMPLES_DIR` | `~/.kd1-anime/knowledge/{docs,examples}` | 默认知识库源目录 |
+| `WORKSPACE_DIR` | `~/.kd1-anime/workspace` | 运行、场景、日志、视频和评估产物根目录 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 全片连续性审查发现冲突后的局部分镜重规划轮数 |
 | `MAX_PROMPT_CHARS` | `50000` | 用户需求最大字符数 |
@@ -371,9 +398,9 @@ EOF
 
 kd1-anime batch prompts.json
 
-# 指定 --output-dir 后输出为 videos/task_001.mp4、task_002.mp4……；
-# 未指定时，输出保存在每个任务自己的 workspace/runs/<run-id>/ 目录。
-kd1-anime batch prompts.json --output-dir videos --max-parallel 3
+# 指定 --output-dir 后输出为 ~/.kd1-anime/exports/task_001.mp4、task_002.mp4……；
+# 未指定时，输出保存在每个任务自己的 ~/.kd1-anime/workspace/runs/<run-id>/ 目录。
+kd1-anime batch prompts.json --output-dir ~/.kd1-anime/exports --max-parallel 3
 ```
 
 ### 批量处理选项

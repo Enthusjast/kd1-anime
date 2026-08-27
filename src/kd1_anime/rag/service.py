@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
+import tempfile
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kd1_anime.config import Settings, resolve_runtime_path, settings
+from kd1_anime.config import (
+    DEFAULT_RAG_INDEX_PATH,
+    LEGACY_RAG_INDEX_PATH,
+    Settings,
+    resolve_runtime_path,
+    settings,
+)
 from kd1_anime.rag.chunker import SourceChunk, chunk_file, iter_source_files
 from kd1_anime.rag.clients import EmbeddingClient, RagClientError, RerankerClient
 from kd1_anime.rag.models import (
@@ -36,6 +46,40 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _copy_private_file_if_missing(source: Path, destination: Path) -> bool:
+    """原子复制旧缓存，避免迁移过程中留下半个 SQLite 文件。"""
+
+    if destination.exists() or not source.is_file():
+        return False
+    temporary: Path | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.parent.chmod(0o700)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        shutil.copyfile(source, temporary)
+        temporary.chmod(0o600)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        # 不覆盖并发创建的新索引；临时文件与目标位于同一目录，因此硬链接
+        # 的创建是原子的，失败时只需保留已经存在的目标。
+        os.link(temporary, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        if temporary is not None and temporary.exists():
+            with suppress(OSError):
+                temporary.unlink()
+        return False
+    return True
+
+
 class RagService:
     """进程内共享的 RAG 服务；默认关闭且不会在构造时访问网络。"""
 
@@ -44,6 +88,7 @@ class RagService:
     ):
         self.config = config or settings
         self.index_path = resolve_runtime_path(self.config.RAG_INDEX_PATH)
+        self._migrate_legacy_index()
         self.embedding = EmbeddingClient(
             api_key=self.config.RAG_EMBEDDING_API_KEY,
             base_url=self.config.RAG_EMBEDDING_BASE_URL,
@@ -61,6 +106,13 @@ class RagService:
         )
         self._cache_lock = threading.Lock()
         self._query_cache: dict[tuple[object, ...], RagSearchResult] = {}
+
+    def _migrate_legacy_index(self) -> None:
+        """把旧默认索引复制到新的应用目录；显式路径不受影响。"""
+
+        if self.index_path != DEFAULT_RAG_INDEX_PATH.resolve():
+            return
+        _copy_private_file_if_missing(LEGACY_RAG_INDEX_PATH, self.index_path)
 
     @property
     def enabled(self) -> bool:
@@ -101,6 +153,16 @@ class RagService:
             "status": status,
             "enabled": self.enabled,
             "index_path": str(self.index_path),
+            "docs_dir": (
+                str(resolve_runtime_path(self.config.RAG_DOCS_DIR))
+                if self.config.RAG_DOCS_DIR is not None
+                else ""
+            ),
+            "examples_dir": (
+                str(resolve_runtime_path(self.config.RAG_EXAMPLES_DIR))
+                if self.config.RAG_EXAMPLES_DIR is not None
+                else ""
+            ),
             "index": info.model_dump(mode="json") if info is not None else None,
             "index_error": index_error,
             "embedding_model": self.config.RAG_EMBEDDING_MODEL,

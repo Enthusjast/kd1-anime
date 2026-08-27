@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -12,9 +13,138 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-USER_CONFIG_DIR = XDG_CONFIG_HOME / "kd1-anime"
-USER_ENV_FILE = USER_CONFIG_DIR / ".env"
+# 应用产生的配置、知识库、缓存和运行产物统一放在一个私有目录中。
+# 不跟随 XDG_CONFIG_HOME：集群上不同 shell/module 配置的 XDG 值经常不一致，
+# 而单一固定根目录更容易备份、迁移和排查。
+APP_HOME = Path.home() / ".kd1-anime"
+USER_CONFIG_DIR = APP_HOME
+USER_ENV_FILE = APP_HOME / ".env"
+
+# 仅用于从早期版本平滑迁移；新文件永远只写入 APP_HOME。
+LEGACY_USER_CONFIG_DIR = Path.home() / ".config" / "kd1-anime"
+LEGACY_USER_ENV_FILE = LEGACY_USER_CONFIG_DIR / ".env"
+
+DEFAULT_RAG_INDEX_PATH = APP_HOME / "rag" / "index.sqlite3"
+LEGACY_RAG_INDEX_PATH = Path.home() / ".cache" / "kd1-anime" / "rag" / "index.sqlite3"
+DEFAULT_KNOWLEDGE_DIR = APP_HOME / "knowledge"
+DEFAULT_RAG_DOCS_DIR = DEFAULT_KNOWLEDGE_DIR / "docs"
+DEFAULT_RAG_EXAMPLES_DIR = DEFAULT_KNOWLEDGE_DIR / "examples"
+DEFAULT_WORKSPACE_DIR = APP_HOME / "workspace"
+DEFAULT_SCENES_DIR = DEFAULT_WORKSPACE_DIR / "scenes"
+DEFAULT_LOGS_DIR = DEFAULT_WORKSPACE_DIR / "logs"
+DEFAULT_VIDEOS_DIR = DEFAULT_WORKSPACE_DIR / "videos"
+
+_LEGACY_STORAGE_DEFAULTS = {
+    "RAG_INDEX_PATH": ("~/.cache/kd1-anime/rag/index.sqlite3", str(DEFAULT_RAG_INDEX_PATH)),
+    "RAG_DOCS_DIR": ("", str(DEFAULT_RAG_DOCS_DIR)),
+    "RAG_EXAMPLES_DIR": ("", str(DEFAULT_RAG_EXAMPLES_DIR)),
+    "WORKSPACE_DIR": ("workspace", str(DEFAULT_WORKSPACE_DIR)),
+    "SCENES_DIR": ("workspace/scenes", str(DEFAULT_SCENES_DIR)),
+    "LOGS_DIR": ("workspace/logs", str(DEFAULT_LOGS_DIR)),
+    "VIDEOS_DIR": ("workspace/videos", str(DEFAULT_VIDEOS_DIR)),
+}
+
+
+def _rewrite_legacy_storage_defaults(content: str) -> str:
+    """只改写旧模板的默认路径，不覆盖用户显式选择的其它路径。"""
+
+    rewritten: list[str] = []
+    for line in content.splitlines(keepends=True):
+        newline = ""
+        body = line
+        if body.endswith("\n"):
+            body = body[:-1]
+            newline = "\n"
+            if body.endswith("\r"):
+                body = body[:-1]
+                newline = "\r\n"
+        for key, (legacy, current) in _LEGACY_STORAGE_DEFAULTS.items():
+            match = re.match(rf"^(\s*{re.escape(key)}\s*=\s*)(.*)$", body)
+            if match is None:
+                continue
+            raw_value = match.group(2).strip()
+            quote = ""
+            value = raw_value
+            if len(raw_value) >= 2 and raw_value[0] == raw_value[-1] and raw_value[0] in "\"'":
+                quote = raw_value[0]
+                value = raw_value[1:-1]
+            if value == legacy:
+                body = f"{match.group(1)}{quote}{current}{quote}"
+            break
+        rewritten.append(body + newline)
+    return "".join(rewritten)
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    """以 0600 原子写入迁移后的配置文件。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # 使用同目录硬链接实现“仅当目标不存在时创建”。相比 os.replace，
+        # 并发启动时不会把用户刚创建的新配置覆盖掉。
+        os.link(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def migrate_legacy_user_config(
+    legacy_config_dir: Path | None = None,
+    user_config_dir: Path | None = None,
+) -> tuple[Path, ...]:
+    """把旧用户配置非破坏性迁移到 ``~/.kd1-anime``。
+
+    迁移只在目标文件不存在时执行，旧目录和旧文件不会被删除；如果文件系统
+    不允许迁移，也由 Settings 的只读旧路径回退继续兼容，不会阻断启动。
+    """
+
+    legacy_dir = legacy_config_dir or LEGACY_USER_CONFIG_DIR
+    target_dir = user_config_dir or USER_CONFIG_DIR
+    if target_dir == legacy_dir:
+        return ()
+    migrated: list[Path] = []
+    for source, destination in (
+        (legacy_dir / ".env", target_dir / ".env"),
+        (legacy_dir / ".env.example", target_dir / ".env.example"),
+    ):
+        if destination.exists() or not source.is_file():
+            continue
+        try:
+            content = source.read_text(encoding="utf-8")
+            _write_private_text(destination, _rewrite_legacy_storage_defaults(content))
+        except (OSError, UnicodeError):
+            continue
+        migrated.append(destination)
+    return tuple(migrated)
+
+
+# 在构造 Settings 前完成一次非破坏迁移。若目标文件已经存在，则不再把旧文件
+# 加入配置源，避免旧配置中的相对 workspace 值补入新配置。
+migrate_legacy_user_config()
+
+
+def _settings_env_files() -> tuple[str, ...]:
+    if USER_ENV_FILE.is_file():
+        return (str(USER_ENV_FILE), ".env")
+    return (str(LEGACY_USER_ENV_FILE), ".env")
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +207,8 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         # 后面的文件优先级更高，因此项目目录 .env 可覆盖用户级默认配置。
-        env_file=(str(USER_ENV_FILE), ".env"),
+        # 旧文件只作为迁移失败时的只读回退；新配置优先级高于旧配置。
+        env_file=_settings_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
         validate_assignment=True,
@@ -186,9 +317,10 @@ class Settings(BaseSettings):
     # RAG 的 Embedding/Reranker 端点和主/视觉 LLM 完全隔离；默认关闭，
     # 因而空 URL 不会影响普通动画生成。
     RAG_ENABLED: bool = False
-    RAG_INDEX_PATH: Path = Path("~/.cache/kd1-anime/rag/index.sqlite3")
-    RAG_DOCS_DIR: Path | None = None
-    RAG_EXAMPLES_DIR: Path | None = None
+    RAG_INDEX_PATH: Path = DEFAULT_RAG_INDEX_PATH
+    # 知识库源文件也有固定的用户目录；用户仍可用绝对路径接入其它文档。
+    RAG_DOCS_DIR: Path | None = DEFAULT_RAG_DOCS_DIR
+    RAG_EXAMPLES_DIR: Path | None = DEFAULT_RAG_EXAMPLES_DIR
     RAG_EMBEDDING_API_KEY: str = ""
     RAG_EMBEDDING_BASE_URL: str = ""
     RAG_EMBEDDING_MODEL: str = ""
@@ -220,7 +352,7 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_rag_index_path(cls, value):
         if value is None or (isinstance(value, str) and not value.strip()):
-            return "~/.cache/kd1-anime/rag/index.sqlite3"
+            return DEFAULT_RAG_INDEX_PATH
         return value
 
     @field_validator("RAG_EMBEDDING_BASE_URL", "RAG_RERANK_BASE_URL")
@@ -299,13 +431,13 @@ class Settings(BaseSettings):
     MERGE_AUDIO_CHANNEL_LAYOUT: Literal["stereo"] = "stereo"
 
     # --- 路径 ---
-    WORKSPACE_DIR: Path = Path("workspace")
+    WORKSPACE_DIR: Path = DEFAULT_WORKSPACE_DIR
     OUTPUT_FILE: Path = Path("output_final.mp4")
 
-    # 兼容旧调用；实际流水线使用 workspace/runs/<run_id>/ 下的隔离目录。
-    SCENES_DIR: Path = Path("workspace/scenes")
-    LOGS_DIR: Path = Path("workspace/logs")
-    VIDEOS_DIR: Path = Path("workspace/videos")
+    # 兼容旧调用；实际流水线使用 ~/.kd1-anime/workspace/runs/<run_id>/ 下的隔离目录。
+    SCENES_DIR: Path = DEFAULT_SCENES_DIR
+    LOGS_DIR: Path = DEFAULT_LOGS_DIR
+    VIDEOS_DIR: Path = DEFAULT_VIDEOS_DIR
 
     # --- Agent 与监控 ---
     MAX_REVIEW_ROUNDS: int = Field(default=5, ge=1, le=10)

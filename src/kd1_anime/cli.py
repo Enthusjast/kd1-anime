@@ -84,6 +84,8 @@ def rag_status():
     console.print(f"状态: {data['status']}")
     console.print(f"启用: {'是' if data['enabled'] else '否'}")
     console.print(f"索引: {data['index_path']}")
+    console.print(f"文档目录: {data['docs_dir'] or '未配置'}")
+    console.print(f"示例目录: {data['examples_dir'] or '未配置'}")
     console.print(f"Embedding: {data['embedding_model'] or '未配置'}")
     console.print(f"Reranker: {data['reranker_model'] or '未配置'}")
     if data["index"]:

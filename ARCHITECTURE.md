@@ -181,8 +181,12 @@ VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifa
 
 ## 4. 运行目录
 
+默认用户数据根目录是 `~/.kd1-anime/`。配置、RAG 索引和知识库源文件分别位于
+`.env`、`rag/` 和 `knowledge/`；运行目录位于 `workspace/`。这些路径都可由
+用户显式配置覆盖，外部配置的输出文件不会被强制搬迁。
+
 ```text
-workspace/runs/<YYYYMMDD-HHMMSS>-<uuid8>/
+~/.kd1-anime/workspace/runs/<YYYYMMDD-HHMMSS>-<uuid8>/
 ├── prompt.md
 ├── manifest.json
 ├── .run.lock
@@ -202,8 +206,11 @@ run 根目录权限为 `0700`，prompt、manifest、锁文件和生成代码为 
 加载顺序：
 
 ```text
-进程环境变量 > 当前目录 .env > ~/.config/kd1-anime/.env
+进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env
 ```
+
+早期版本的用户配置和默认 RAG 索引会以非破坏方式复制到新目录；旧文件保留作为
+备份。大型旧 `workspace/` 不会在导入模块时自动复制，避免启动时意外消耗大量磁盘。
 
 主要分组：LLM、独立视觉 LLM、RAG、Slurm、Manim、流水线/监控、评估和路径。RAG 默认关闭；开启后使用单独的 Embedding/Reranker URL、模型和 Key，不从其它 LLM 配置回退。`MONITOR_TIMEOUT` 只用于旧配置兼容；新配置使用 queue/run/unknown 三类 timeout，并为共享文件系统产物提供完成宽限期。
 
