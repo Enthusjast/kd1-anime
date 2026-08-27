@@ -259,7 +259,7 @@ class SceneDashboard:
             embedding = data.get("embedding_model", "") or "未配置"
             reranker = data.get("reranker_model", "") or "未配置"
             self.rag_models = f"E:{embedding} R:{reranker}"
-            if warning:
+            if warning and self.rag_status == "degraded":
                 self.rag_models += " · degraded"
 
         elif event in ("continuity_bible_start", "continuity_reviewing"):
