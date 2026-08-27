@@ -163,12 +163,31 @@ def _ensure_visual_llm_api_available(
     return True
 
 
+def _ensure_rag_apis_available() -> None:
+    """在启用 RAG 的生成入口前验证 Embedding 与 Reranker。"""
+
+    if not settings.RAG_ENABLED:
+        return
+    from kd1_anime.rag.service import RagService
+
+    try:
+        RagService().probe()
+    except Exception as exc:
+        console.print(
+            f"Embedding/Reranker API 不可用: {exc}",
+            style="bold red",
+            markup=False,
+        )
+        raise typer.Exit(1) from exc
+
+
 def _ensure_generation_apis(*, dry_run: bool) -> None:
     """生成入口统一预检，避免不同 CLI 命令出现不一致行为。"""
 
     _ensure_llm_api_available()
     if settings.ENABLE_VISUAL_EVAL and not dry_run:
         _ensure_visual_llm_api_available(endpoint_required=False)
+    _ensure_rag_apis_available()
 
 
 @app.callback()
@@ -287,6 +306,8 @@ def generate(
                 )
         elif settings.ENABLE_VISUAL_EVAL and not dry_run:
             _ensure_visual_llm_api_available(endpoint_required=False)
+        if not resume or requires_llm:
+            _ensure_rag_apis_available()
     except (OSError, ValueError) as e:
         console.print(f"[bold red]错误:[/] {e}", markup=False)
         raise typer.Exit(1) from e
@@ -338,7 +359,7 @@ def plan(
             "[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助"
         )
         raise typer.Exit(1)
-    _ensure_llm_api_available()
+    _ensure_generation_apis(dry_run=True)
 
     from kd1_anime.agents.planner import PlannerAgent
 
@@ -581,6 +602,7 @@ def resume(
         manifest = repository.load(run_id)
         if manifest.state in RESUME_LLM_STATES:
             _ensure_llm_api_available()
+            _ensure_rag_apis_available()
         if manifest.visual_eval_profile.enabled and manifest.status not in {
             "completed",
             "dry_run_complete",

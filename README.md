@@ -19,7 +19,7 @@
 - **可恢复渲染**：监控 Slurm 状态、区分排队/运行超时、失败后读取日志并自动修复。
 - **平滑转场**：多场景使用 FFmpeg `xfade` 淡入淡出，默认 0.5 秒；有音频时同步 `acrossfade`。
 - **通用 LLM 接口**：通过 `.env` 配置任意 OpenAI-compatible API，不绑定 DeepSeek 或其他特定厂商。
-- **启动前 API 探测**：进入会话或 LLM 流水线前探测主 LLM；配置、网络或模型不可用时立即退出。视觉端点单独探测，暂时不可用时安全降级为 `unknown`。
+- **启动前 API 探测**：进入会话或 LLM 流水线前探测主 LLM；启用 RAG 时同时探测 Embedding 和 Reranker。配置、网络或模型不可用时立即退出。视觉端点单独探测，暂时不可用时安全降级为 `unknown`。
 - **独立视觉质量门**：可为每个已渲染场景抽取带时间戳和哈希的关键帧，用单独的多模态 LLM 检查数学正确性、相关性、可读性、布局和跨帧一致性；主 Planner/Coder 端点不会被替换。
 - **有界视觉修复**：低分场景把纯诊断反馈交回 Coder，重新经过校验、审查和渲染；达到上限时保留更好的可验证版本，视觉端点故障则记为 `unknown` 并继续。
 - **可选知识检索**：使用本地 SQLite 索引、独立 Embedding 和 Reranker 服务，为 Planner、Coder 和 AutoFixer 提供受限、可审计的 Manim 文档与示例上下文。
@@ -225,7 +225,8 @@ kd1-anime clean --older-than 30d --yes
 ```
 
 启动交互会话、规划或生成流水线前，程序会先发送一次最小请求检查主 LLM
-的配置、网络、鉴权和模型路由；检查失败会立即退出，不进入后续 Agent 流程。
+的配置、网络、鉴权和模型路由；启用 RAG 时还会检查 Embedding 与 Reranker
+模型。检查失败会立即退出，不进入后续 Agent 流程。
 `status`、`version`、`doctor`、`clean` 等只读或诊断命令不会自动发送业务请求，
 需要真实探测时可使用 `kd1-anime doctor --probe-llm`。
 `render` 不带 `--wait` 时只负责提交并立即返回，终端会显示 run ID。之后使用
@@ -265,7 +266,7 @@ kd1-anime clean --older-than 30d --yes
 | `VISUAL_LLM_BASE_URL` | 空 | 独立多模态 OpenAI-compatible 端点；不回退主端点 |
 | `VISUAL_LLM_MODEL` | 空 | 支持 `image_url` 输入的视觉模型；启用视觉评估时必须设置 |
 | `VISUAL_LLM_PARALLEL_WORKERS` | `2` | 进程级并行视觉请求上限，与主 LLM 并发池分离；批处理任务共享此配额 |
-| `RAG_ENABLED` | `false` | 是否启用本地知识检索；默认关闭 |
+| `RAG_ENABLED` | `false` | 是否启用本地知识检索；启用后启动前检查 Embedding/Reranker |
 | `RAG_INDEX_PATH` | `~/.kd1-anime/rag/index.sqlite3` | SQLite RAG 索引路径 |
 | `RAG_EMBEDDING_BASE_URL` / `RAG_EMBEDDING_MODEL` | 空 | 独立 Embedding 服务和模型 |
 | `RAG_RERANK_BASE_URL` / `RAG_RERANK_MODEL` | 空 | 独立 Reranker 服务和模型 |

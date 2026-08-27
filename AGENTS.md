@@ -44,7 +44,7 @@ Never commit `.env` or print API keys. The API is provider-neutral: `LLM_API_KEY
 ## Pipeline
 
 ```text
-INIT → PLANNING → DETAILING → CODING → REVIEWING
+INIT → (主 LLM/RAG 可用性检查) → PLANNING → DETAILING → CODING → REVIEWING
      → DISPATCHING → MONITORING → (FIXING → REVIEWING)
      → VISUAL_EVALUATING → MERGING → EVALUATING → DONE
 ```
