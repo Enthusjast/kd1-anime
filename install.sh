@@ -11,6 +11,9 @@ info() { echo -e "${CYAN}[→]${NC} $*"; }
 
 ENV_NAME="${KD1_ANIME_ENV_NAME:-manim_env}"
 MANIM_SPEC="${KD1_ANIME_MANIM_SPEC:-manim>=0.20,<0.21}"
+MANIM_KNOWLEDGE_VERSION="0.20.1"
+MANIM_KNOWLEDGE_ARCHIVE="resources/manim-0.20.1-knowledge.tar.gz"
+MANIM_KNOWLEDGE_ARCHIVE_SHA256="e202d20612f443a40c54b50e5a1e0d27b142e93f606939b04d0db38022c02372"
 KNOWN_CONDA_BASE="${KD1_ANIME_CONDA_BASE:-}"
 LIVE_REPO="https://mirrors.ustc.edu.cn/CTAN/systems/texlive/tlnet"
 TEXLIVE_HOME="$HOME/texlive"
@@ -554,6 +557,106 @@ EOF
     warn "首次运行前请编辑该文件并填写 LLM_API_KEY、LLM_BASE_URL 和 LLM_MODEL"
 }
 
+install_manim_knowledge() {
+    local archive ref archive_url expected actual tmp extract source_root source relative target
+    archive="$SCRIPT_DIR/$MANIM_KNOWLEDGE_ARCHIVE"
+    if [ ! -f "$archive" ]; then
+        ref="${KD1_ANIME_REF:-main}"
+        if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$ref" == *".."* ]] || [[ "$ref" == /* ]]; then
+            err "KD1_ANIME_REF 包含不安全字符: $ref"
+            return 1
+        fi
+        tmp="$(mktemp -d)"
+        cleanup_dirs+=("$tmp")
+        archive="$tmp/manim-knowledge.tar.gz"
+        archive_url="https://raw.githubusercontent.com/Enthusjast/kd1-anime/${ref}/${MANIM_KNOWLEDGE_ARCHIVE}"
+        info "下载 Manim ${MANIM_KNOWLEDGE_VERSION} 文档和示例包"
+        download "$archive_url" "$archive"
+    fi
+
+    expected="${KD1_ANIME_KNOWLEDGE_ARCHIVE_SHA256:-$MANIM_KNOWLEDGE_ARCHIVE_SHA256}"
+    expected="${expected,,}"
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        err "KD1_ANIME_KNOWLEDGE_ARCHIVE_SHA256 必须是 64 位十六进制 SHA-256"
+        return 1
+    fi
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        err "Manim 知识包 SHA-256 不匹配"
+        err "expected: $expected"
+        err "actual:   $actual"
+        return 1
+    fi
+
+    local entries
+    entries="$(tar -tzf "$archive")" || {
+        err "无法读取 Manim 知识包: $archive"
+        return 1
+    }
+    while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        if [[ "$relative" == /* || "$relative" == *".."* ]]; then
+            err "Manim 知识包包含不安全路径: $relative"
+            return 1
+        fi
+        case "$relative" in
+            knowledge/|knowledge/docs/|knowledge/docs/manim-${MANIM_KNOWLEDGE_VERSION}/|\
+            knowledge/docs/manim-${MANIM_KNOWLEDGE_VERSION}/*|knowledge/examples/|\
+            knowledge/examples/manim-${MANIM_KNOWLEDGE_VERSION}/|\
+            knowledge/examples/manim-${MANIM_KNOWLEDGE_VERSION}/*.py) ;;
+            *)
+                err "Manim 知识包包含未允许的路径: $relative"
+                return 1
+                ;;
+        esac
+    done <<< "$entries"
+
+    extract="$(mktemp -d)"
+    cleanup_dirs+=("$extract")
+    tar -xzf "$archive" -C "$extract" --no-same-owner --no-same-permissions
+    source_root="$extract/knowledge"
+    [ -d "$source_root/docs/manim-${MANIM_KNOWLEDGE_VERSION}" ] || {
+        err "Manim 知识包缺少文档目录"
+        return 1
+    }
+    [ -d "$source_root/examples/manim-${MANIM_KNOWLEDGE_VERSION}" ] || {
+        err "Manim 知识包缺少示例目录"
+        return 1
+    }
+    if find "$source_root" -type l -print -quit | grep -q .; then
+        err "Manim 知识包不允许包含符号链接"
+        return 1
+    fi
+
+    mkdir -p "$CONFIG_DIR/knowledge"
+    chmod 700 "$CONFIG_DIR/knowledge"
+    while IFS= read -r -d '' source; do
+        relative="${source#"$source_root/"}"
+        case "$relative" in
+            docs/manim-${MANIM_KNOWLEDGE_VERSION}/*.md|\
+            docs/manim-${MANIM_KNOWLEDGE_VERSION}/*.rst|\
+            examples/manim-${MANIM_KNOWLEDGE_VERSION}/*.py) ;;
+            *)
+                err "Manim 知识包包含未允许的文件: $relative"
+                return 1
+                ;;
+        esac
+        target="$CONFIG_DIR/knowledge/$relative"
+        mkdir -p "$(dirname "$target")"
+        chmod 700 "$(dirname "$target")"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            if [ -f "$target" ] && cmp -s "$source" "$target"; then
+                continue
+            fi
+            warn "知识库文件已存在，保留用户版本: $target"
+            continue
+        fi
+        cp "$source" "$target"
+        chmod 600 "$target"
+    done < <(find "$source_root" -type f -print0 | sort -z)
+    log "Manim ${MANIM_KNOWLEDGE_VERSION} 文档和示例已安装到 $CONFIG_DIR/knowledge"
+}
+
 install_command_wrappers() {
     local cli_target env_target cli_tmp env_tmp env_dir_q tex_bin_q conda_sh_q env_name_q
     if [[ "$USER_BIN_DIR" != /* ]]; then
@@ -709,6 +812,7 @@ if [ -f "$HOME/.zshrc" ] || command -v zsh >/dev/null 2>&1; then
 fi
 
 write_user_config
+install_manim_knowledge
 
 info "最终验证"
 env_python -c 'from manim import *; print("Python + Manim: OK")'

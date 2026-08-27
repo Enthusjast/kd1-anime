@@ -59,7 +59,8 @@ bash /tmp/kd1-anime-install.sh
 5. 仅当现有 TeX Live 缺失或无法无 sudo 补齐依赖时，才从 USTC CTAN 镜像安装最小用户目录版到 `~/texlive/<release>/`。
 6. 只安装 Manim/XeLaTeX 所需包及 `ctex`、`xeCJK`、`fontspec`，不安装完整 TeX Live scheme/collection。
 7. 安装 `kd1-anime` 命令，不保留远程源码目录。
-8. 在 `~/.local/bin` 安装 `kd1-anime` / `manim-env` 包装器，并写入 conda 激活钩子、shell 函数和用户级配置模板。
+8. 将 Manim Community Edition 0.20.1 文档和示例程序解压到 `~/.kd1-anime/knowledge/`。
+9. 在 `~/.local/bin` 安装 `kd1-anime` / `manim-env` 包装器，并写入 conda 激活钩子、shell 函数和用户级配置模板。
 
 Coder 生成的 `Tex`/`MathTex` 统一使用 `xelatex` 和 `.xdv`，并加载 `ctex`；普通中文文字使用 Noto CJK 字体和 Manim `Text`（Pango）。
 

@@ -354,6 +354,35 @@ def test_installer_migrates_legacy_user_config_without_overwriting_it(tmp_path):
     )
 
 
+def test_installer_extracts_bundled_manim_knowledge(tmp_path):
+    script = f"""
+source {shlex.quote(str(INSTALLER))}
+CONFIG_DIR={shlex.quote(str(tmp_path / ".kd1-anime"))}
+SCRIPT_DIR={shlex.quote(str(INSTALLER.parent))}
+install_manim_knowledge
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    docs = tmp_path / ".kd1-anime" / "knowledge" / "docs" / "manim-0.20.1"
+    examples = tmp_path / ".kd1-anime" / "knowledge" / "examples" / "manim-0.20.1"
+    assert (docs / "SOURCE.md").is_file()
+    assert (docs / "guides" / "configuration.rst").is_file()
+    assert (examples / "basic.py").is_file()
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in docs.rglob("*") if path.is_file())
+    assert all(
+        path.stat().st_mode & 0o777 == 0o600 for path in examples.rglob("*") if path.is_file()
+    )
+    assert all(path.stat().st_mode & 0o777 == 0o700 for path in docs.rglob("*") if path.is_dir())
+
+
 def test_installer_creates_runnable_wrappers_and_idempotent_shell_config(tmp_path):
     conda_base = tmp_path / "conda"
     conda_sh = conda_base / "etc" / "profile.d" / "conda.sh"
