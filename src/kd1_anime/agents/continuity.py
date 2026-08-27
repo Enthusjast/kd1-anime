@@ -17,6 +17,7 @@ from kd1_anime.agents.planner import (
     ExtractedElement,
     SceneOutline,
     ScenePlan,
+    VisualElementState,
 )
 from kd1_anime.agents.render_context import renderer_guidance
 
@@ -257,11 +258,22 @@ def validate_export_contract(
 ) -> None:
     """把结构化分镜交接合同与实际导出代码做确定性对齐。
 
-    旧计划没有结构化元素列表时保持兼容；新计划一旦声明了 required
-    元素，就必须在代码导出区中出现，并且显式 variable_name 不能漂移。
+    旧计划没有结构化元素列表时保持兼容；新计划一旦声明了结构化元素，
+    导出区只能包含仍需交接的元素，required 元素必须出现且显式 variable_name
+    不能漂移。
     """
 
+    inherited_ids = {item.element_id for item in plan.inherited_elements}
     removed_ids = {item.element_id for item in plan.elements_to_remove}
+    unknown_removals = removed_ids - inherited_ids
+    if unknown_removals:
+        raise ValueError(
+            "elements_to_remove 包含未继承的元素: " + ", ".join(sorted(unknown_removals))
+        )
+    exported_ids = {item.element_id for item in elements}
+    removed_exports = exported_ids & removed_ids
+    if removed_exports:
+        raise ValueError("连续性导出区不能包含已移除元素: " + ", ".join(sorted(removed_exports)))
     declared = [
         item
         for item in [*plan.inherited_elements, *plan.new_elements]
@@ -269,6 +281,16 @@ def validate_export_contract(
     ]
     if not declared:
         return
+    declared_ids = {item.element_id for item in declared}
+    undeclared_exports = exported_ids - declared_ids
+    if undeclared_exports:
+        raise ValueError("连续性导出区包含未声明元素: " + ", ".join(sorted(undeclared_exports)))
+    declared_by_id = {item.element_id: item for item in declared}
+    optional_exports = {
+        element_id for element_id in exported_ids if not declared_by_id[element_id].required
+    }
+    if optional_exports:
+        raise ValueError("连续性导出区不能包含非交接元素: " + ", ".join(sorted(optional_exports)))
     exported_by_id = {item.element_id: item for item in elements}
     for expected in declared:
         if not expected.required:
@@ -281,6 +303,107 @@ def validate_export_contract(
                 f"元素 {expected.element_id} 的变量名不一致: "
                 f"期望 {expected.variable_name}，实际 {actual.variable_name}"
             )
+
+
+def normalize_scene_plan_contract(
+    plan: ScenePlan,
+    bible: ContinuityBible,
+    *,
+    previous_plan: ScenePlan | None = None,
+) -> tuple[ScenePlan, list[str]]:
+    """确定性修复分镜交接合同中的机械性错误。
+
+    这个函数不替 Planner 决定叙事或几何方案，只处理可以从合同本身确定的
+    问题：重复 ID、无效移除、第一场景误继承、未知颜色键以及上一场景没有
+    导出的继承对象。这样 Reviewer 不会把同一个结构错误反复交给 LLM。
+    """
+
+    repairs: list[str] = []
+
+    def unique(items: list[VisualElementState], field_name: str) -> list[VisualElementState]:
+        result: list[VisualElementState] = []
+        seen: set[str] = set()
+        for item in items:
+            if item.element_id in seen:
+                repairs.append(f"{field_name} 删除重复元素 {item.element_id}")
+                continue
+            seen.add(item.element_id)
+            result.append(item)
+        return result
+
+    inherited = unique(list(plan.inherited_elements), "inherited_elements")
+    removals = unique(list(plan.elements_to_remove), "elements_to_remove")
+    new_elements = unique(list(plan.new_elements), "new_elements")
+
+    if plan.scene_id == 1 and inherited:
+        existing_new_ids = {item.element_id for item in new_elements}
+        moved = [item for item in inherited if item.element_id not in existing_new_ids]
+        new_elements.extend(moved)
+        inherited = []
+        repairs.append("Scene 1 清空 inherited_elements，并将未重复的元素移入 new_elements")
+
+    if previous_plan is not None:
+        previous_removed = {item.element_id for item in previous_plan.elements_to_remove}
+        previous_available = {
+            item.element_id
+            for item in [*previous_plan.inherited_elements, *previous_plan.new_elements]
+            if item.element_id not in previous_removed
+        }
+        if previous_available:
+            kept = [item for item in inherited if item.element_id in previous_available]
+            dropped = [
+                item.element_id for item in inherited if item.element_id not in previous_available
+            ]
+            if dropped:
+                repairs.append("删除上一场景未声明导出的继承元素: " + ", ".join(sorted(dropped)))
+            inherited = kept
+
+    inherited_ids = {item.element_id for item in inherited}
+    valid_removals: list[VisualElementState] = []
+    for item in removals:
+        if item.element_id not in inherited_ids:
+            repairs.append(f"删除无效的 elements_to_remove: {item.element_id}")
+            continue
+        valid_removals.append(item)
+    removals = valid_removals
+
+    removal_ids = {item.element_id for item in removals}
+    inherited_ids = {item.element_id for item in inherited}
+    valid_new: list[VisualElementState] = []
+    for item in new_elements:
+        if item.element_id in inherited_ids or item.element_id in removal_ids:
+            repairs.append(f"删除与继承/移除声明冲突的新元素: {item.element_id}")
+            continue
+        valid_new.append(item)
+    new_elements = valid_new
+
+    allowed_colors = set(bible.global_visual_state.colors)
+
+    def normalize_color(item: VisualElementState) -> VisualElementState:
+        if not item.color_key or item.color_key in allowed_colors:
+            return item
+        fallback = (
+            "primary" if "primary" in allowed_colors else next(iter(sorted(allowed_colors)), "")
+        )
+        repairs.append(f"元素 {item.element_id} 的未知颜色键 {item.color_key} 已映射为 {fallback}")
+        return item.model_copy(update={"color_key": fallback})
+
+    inherited = [normalize_color(item) for item in inherited]
+    removals = [normalize_color(item) for item in removals]
+    new_elements = [normalize_color(item) for item in new_elements]
+
+    updates: dict[str, object] = {}
+    if plan.global_visual_state != bible.global_visual_state:
+        updates["global_visual_state"] = bible.global_visual_state.model_copy(deep=True)
+        repairs.append("统一场景 global_visual_state 与连续性圣经")
+    if inherited != plan.inherited_elements:
+        updates["inherited_elements"] = inherited
+    if removals != plan.elements_to_remove:
+        updates["elements_to_remove"] = removals
+    if new_elements != plan.new_elements:
+        updates["new_elements"] = new_elements
+
+    return (plan.model_copy(update=updates) if updates else plan), repairs
 
 
 class ContinuityIssue(BaseModel):
@@ -398,6 +521,8 @@ CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查�
 7. inherited_elements、elements_to_remove、new_elements 的 element_id 是否稳定、唯一且可执行。
 8. 后一场景继承的元素是否确实由前一场景导出，是否存在未经计划的清空、重画或突兀消失。
 9. 所有场景的 global_visual_state 是否完全服从同一份全局颜色、字体、字号、线宽和布局配置。
+10. 涉及切割、碎片、旋转或拼接时，computation 是否给出了足以核验顶点、面积和覆盖关系的
+    数值；如果没有，要求改为面积标签或等式演示，不要继续规划“示意性无缝拼接”。
 
 ## 判定原则
 - 只报告会破坏观众理解或造成明显视觉跳变的问题。
@@ -482,6 +607,29 @@ def deterministic_continuity_issues(
         inherited_ids = set(declared_groups["inherited_elements"])
         removal_ids = set(declared_groups["elements_to_remove"])
         new_ids = set(declared_groups["new_elements"])
+        allowed_colors = set(bible.global_visual_state.colors)
+        for group_name, group_items in (
+            ("inherited_elements", plan.inherited_elements),
+            ("elements_to_remove", plan.elements_to_remove),
+            ("new_elements", plan.new_elements),
+        ):
+            for item in group_items:
+                if item.color_key and item.color_key not in allowed_colors:
+                    issues.append(
+                        ContinuityIssue(
+                            scene_ids=[plan.scene_id],
+                            category="style",
+                            message=(
+                                f"{group_name} 中元素 {item.element_id} 使用未定义颜色键 "
+                                f"{item.color_key}。"
+                            ),
+                            fix_instruction=(
+                                "改用 global_visual_state.colors 中已有的颜色键，"
+                                "复合区域使用已有主色或拆分为多个已定义颜色区域。"
+                            ),
+                            target_fields=[group_name],
+                        )
+                    )
         # 一个元素同时出现在 inherited_elements 和 elements_to_remove 是合法的：
         # 它表示“接管后在本场景明确退出”。真正需要拦截的是同一组内部重复，
         # 或者 inherited/new 之间的冲突声明。

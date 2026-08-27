@@ -172,6 +172,8 @@ class StoredSceneState(BaseModel):
     reviewed: bool = False
     plan_ready: bool = False
     rewrite_feedback: str = Field(default="", max_length=50_000)
+    review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
+    identical_review_count: int = Field(default=0, ge=0)
     last_error_fp: str = Field(default="", max_length=64)
     identical_error_count: int = Field(default=0, ge=0)
     slurm_job: StoredSlurmJob | None = None
@@ -181,6 +183,21 @@ class StoredSceneState(BaseModel):
     give_up: bool = False
     failed: bool = False
     failure_reason: str = Field(default="", max_length=50_000)
+    failure_category: Literal[
+        "",
+        "planning",
+        "continuity",
+        "coding",
+        "review",
+        "render",
+        "infrastructure",
+        "llm",
+        "system",
+    ] = ""
+    # 复杂几何方案审查耗尽后是否已切换到保守教学方案；恢复时不能重复
+    # 触发同一降级，否则会无限消耗 LLM 重试预算。
+    safe_fallback_used: bool = False
+    safe_fallback_reason: str = Field(default="", max_length=5_000)
     inherited_elements_code: str = Field(default="", max_length=30_000)
     exported_elements_code: str = Field(default="", max_length=30_000)
     exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)

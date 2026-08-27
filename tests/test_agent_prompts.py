@@ -43,6 +43,8 @@ def test_coder_prompt_has_continuity_contract():
     assert "persistent_elements" in CODER_SYSTEM_PROMPT
     assert "transition_out" in CODER_SYSTEM_PROMPT
     assert "RAG Reference Context" in CODER_SYSTEM_PROMPT
+    assert "已移除元素绝不能出现在最终连续性导出区" in CODER_SYSTEM_PROMPT
+    assert "未经验证的碎片移动" in CODER_SYSTEM_PROMPT
 
 
 def test_coder_forbids_custom_mobject_subclass_for_opengl(monkeypatch):

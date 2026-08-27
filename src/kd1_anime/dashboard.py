@@ -90,6 +90,7 @@ class SceneStatus:
     message: str = ""  # 最近事件摘要
     started_at: float = 0.0  # 当前阶段开始时间 (用于显示耗时)
     done: list[str] = field(default_factory=list)  # 已完成的流水线阶段
+    safe_fallback_used: bool = False  # 是否采用了保守教学方案
 
     def mark_done(self, stage_name: str) -> None:
         """记录一个阶段完成 (去重)。"""
@@ -143,6 +144,8 @@ class SceneStatus:
             pipeline.append("  ", style="dim")
             pipeline.append("修复⟳", style="cyan")
         message = self.message
+        if self.safe_fallback_used:
+            message = f"保守方案 · {message}" if message else "已采用保守方案"
         if self.state == "running" and self.started_at and self.stage:
             message = f"{message} · {int(time.time() - self.started_at)}s"
         msg = Text(message[:40], style="dim")
@@ -262,6 +265,14 @@ class SceneDashboard:
             if warning and self.rag_status == "degraded":
                 self.rag_models += " · degraded"
 
+        elif event == "scene_safe_fallback":
+            if status:
+                status.safe_fallback_used = True
+                status.message = "已切换为保守教学方案"
+                status.state = "warning"
+                status.stage = "编码"
+                status.started_at = 0.0
+
         elif event in ("continuity_bible_start", "continuity_reviewing"):
             self.stage = "continuity"
             self.stage_label = "全片连续性"
@@ -278,6 +289,12 @@ class SceneDashboard:
                 status = self.scenes.get(scene_id)
                 if status:
                     self._mark_running(status, "", "连续性修正中")
+
+        elif event == "continuity_contract_repaired":
+            self.stage = "continuity"
+            self.stage_label = "连续性合同已修复"
+            if status:
+                status.message = "连续性合同已自动修复"
 
         elif event == "continuity_pass":
             self.stage = "continuity"
@@ -425,14 +442,34 @@ class SceneDashboard:
                 # 失败是终态，不应继续把失败前的阶段渲染成“运行中”。
                 status.stage = ""
                 status.started_at = 0.0
-                status.message = (data.get("reason", "") or "")[:40]
+                category_labels = {
+                    "planning": "分镜",
+                    "continuity": "连续性",
+                    "coding": "编码",
+                    "review": "审查",
+                    "render": "渲染",
+                    "infrastructure": "环境",
+                    "llm": "模型",
+                    "system": "系统",
+                }
+                category = category_labels.get(data.get("category", ""), "")
+                reason = (data.get("reason", "") or "").strip()
+                status.message = (f"[{category}] " if category else "") + reason[:40]
 
         elif event == "scene_give_up":
             if status:
                 status.state = "failed"
                 status.stage = ""
                 status.started_at = 0.0
-                status.message = "已放弃"
+                category = {
+                    "continuity": "连续性",
+                    "coding": "编码",
+                    "review": "审查",
+                    "render": "渲染",
+                    "infrastructure": "环境",
+                    "planning": "分镜",
+                }.get(data.get("category", ""), "")
+                status.message = f"已放弃（{category}）" if category else "已放弃"
 
         elif event == "merge_complete":
             self.stage = "merging"

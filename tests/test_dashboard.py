@@ -119,6 +119,24 @@ class TestSceneDashboard:
         assert dash.scenes[1].icon == "⚠"
         assert "未知" in dash.scenes[1].message
 
+    def test_safe_fallback_is_visible_without_marking_scene_complete(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_safe_fallback",
+            {"scene_id": 1, "reason": "几何方案无法验证"},
+        )
+
+        assert dash.scenes[1].safe_fallback_used is True
+        assert dash.scenes[1].state == "warning"
+        assert dash.scenes[1].icon == "⚠"
+        assert "保守方案" in dash.scenes[1].render_row()[3].plain
+
+        dash.on_event("scene_coding", {"scene_id": 1})
+        assert dash.scenes[1].state == "running"
+        assert "保守方案" in dash.scenes[1].render_row()[3].plain
+
     def test_pipeline_row_shows_done_and_current_stages(self):
         dash = SceneDashboard()
         dash.live = MagicMock()

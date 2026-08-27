@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
 from kd1_anime.agents.reviewer import ReviewResult
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import SceneArtifact, VideoMetadata, sha256_file
@@ -358,6 +358,113 @@ def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
     assert ctx.scene_states[1].review_round == 2
 
 
+def test_review_exhaustion_switches_high_risk_geometry_to_safe_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
+    monkeypatch.setattr(module.settings, "SAFE_FALLBACK_ENABLED", True)
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    geometry_plan = plan().model_copy(
+        update={
+            "visual_flow": ["切割碎片并无缝拼接到目标区域"],
+            "new_elements": [
+                VisualElementState(
+                    element_id="piece_a",
+                    variable_name="piece_a",
+                    color_key="primary",
+                )
+            ],
+        }
+    )
+    state = SceneState(
+        plan=geometry_plan,
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        continuity_bible=ContinuityBible(),
+        scene_states={1: state},
+    )
+    events = []
+    orchestrator = Orchestrator()
+    orchestrator._callback = lambda event, data: events.append((event, data))
+
+    orchestrator._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(
+            is_valid=False,
+            severity="major",
+            feedback="碎片几何关系无法验证，目标区域覆盖不正确",
+        ),
+    )
+
+    assert state.safe_fallback_used is True
+    assert state.reviewed is False
+    assert state.give_up is False
+    assert state.review_round == 0
+    assert state.code == ""
+    assert "保守教学方案" in state.rewrite_feedback
+    assert any(event == "scene_safe_fallback" for event, _ in events)
+
+
+def test_identical_review_feedback_stops_repeated_rewrites(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="缺少一个明确的动画步骤",
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+    assert state.give_up is False
+    # 模拟 Coder 原样返回同一份代码、Reviewer 原样返回同一份反馈。
+    state.rewrite_feedback = ""
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert state.give_up is True
+    assert "相同代码和审查反馈" in state.failure_reason
+
+
+def test_safe_fallback_is_not_repeated_after_resume(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
+    monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    geometry_plan = plan().model_copy(update={"visual_flow": ["切割碎片并无缝拼接到目标区域"]})
+    state = SceneState(
+        plan=geometry_plan,
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+        safe_fallback_used=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+
+    Orchestrator()._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(is_valid=False, severity="major", feedback="几何方案错误"),
+    )
+
+    assert state.give_up is True
+    assert state.safe_fallback_used is True
+    assert "保守教学方案" not in state.failure_reason
+
+
 def test_scene_review_rejects_invalid_export_before_llm(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     run_paths.scenes.mkdir(parents=True)
@@ -415,6 +522,32 @@ def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path)
     )
     assert manifest.status == "failed"
     assert manifest.state == "ERROR"
+
+
+def test_dry_run_repeats_after_continuity_rebuild(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    state = SceneState(plan=plan(), plan_ready=True)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        dry_run=True,
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    calls = 0
+
+    def scheduler(current):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            current.continuity_rebuild_required = True
+        else:
+            current.scene_states[1].reviewed = True
+
+    monkeypatch.setattr(orchestrator, "_run_scheduler", scheduler)
+
+    assert orchestrator._execute(ctx, State.CODING) is None
+    assert calls == 2
 
 
 def test_run_directories_and_prompt_are_private(monkeypatch, tmp_path):

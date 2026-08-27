@@ -71,6 +71,8 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - closing_state 中列出的内容必须在场景结尾真实存在或明确完成退出，并通过 transition_out
   交给下一场景。persistent_elements 不能凭空改名、改色或消失。
 - transition_in/out 必须落实为具体对象和动作，禁止只写“自然过渡”“保持一致”等空泛实现。
+- `[Elements To Remove]` 中的元素必须先在导出区外重新定义、加入画面并明确执行退出动画；
+  已移除元素绝不能出现在最终连续性导出区。
 
 ## 强制上下文继承规则（不可省略）
 - 如果收到 `[Inherited Elements Code]`，必须在 `construct()` 开头（完成必要的全局颜色映射和 TexTemplate 初始化后）重新定义其中的每一个元素；
@@ -84,6 +86,10 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - 必须输出以下连续性导出区。区内只能包含无副作用的 Mobject 定义，不能出现 `self.play`、
   `self.add`、文件/网络调用或动态执行：
   `# KD1_CONTINUITY_EXPORT_BEGIN` 到 `# KD1_CONTINUITY_EXPORT_END`。
+- 导出区只能导出 closing_state 中仍然存在、且在 `[Inherited Elements State]` 或 `[New Elements]`
+  中声明的元素；不要导出临时碎片、辅助线、标题过渡对象或 `[Elements To Remove]` 中的元素。
+- 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
+  面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；
   不需要交给下一场景的临时对象不得导出。
 

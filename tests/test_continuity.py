@@ -13,6 +13,7 @@ from kd1_anime.agents.continuity import (
     apply_deterministic_continuity_repairs,
     deterministic_continuity_issues,
     extract_continuity_elements,
+    normalize_scene_plan_contract,
     validate_export_contract,
 )
 from kd1_anime.agents.planner import (
@@ -22,6 +23,10 @@ from kd1_anime.agents.planner import (
     SceneOutline,
     ScenePlan,
     VisualElementState,
+)
+from kd1_anime.agents.safe_fallback import (
+    build_safe_fallback_plan,
+    is_high_confidence_geometry_conflict,
 )
 
 
@@ -154,6 +159,7 @@ def test_continuity_prompt_is_closed_and_actionable():
     assert "transition_in" in CONTINUITY_REVIEW_PROMPT
     assert "transition_out" in CONTINUITY_REVIEW_PROMPT
     assert "不要输出 Markdown 或代码" in CONTINUITY_REVIEW_PROMPT
+    assert "顶点、面积和覆盖关系" in CONTINUITY_REVIEW_PROMPT
 
 
 def test_deterministic_continuity_repairs_authoritative_transition_and_width():
@@ -254,4 +260,173 @@ def test_export_contract_requires_declared_structured_elements():
                 code="formula = MathTex(r'x')",
             )
         ],
+    )
+
+
+def test_export_contract_rejects_removed_and_undeclared_elements():
+    inherited = VisualElementState(element_id="old_shape", variable_name="old_shape")
+    plan = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [inherited],
+            "elements_to_remove": [inherited],
+        }
+    )
+    exported = [
+        ExtractedElement(
+            element_id="old_shape",
+            variable_name="old_shape",
+            code="old_shape = Circle()",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="已移除元素"):
+        validate_export_contract(plan, exported)
+
+    declared = plan.model_copy(
+        update={
+            "elements_to_remove": [],
+            "new_elements": [VisualElementState(element_id="new_shape", variable_name="new_shape")],
+        }
+    )
+    with pytest.raises(ValueError, match="未声明元素"):
+        validate_export_contract(
+            declared,
+            [
+                ExtractedElement(
+                    element_id="other_shape",
+                    variable_name="other_shape",
+                    code="other_shape = Circle()",
+                )
+            ],
+        )
+
+    optional_plan = make_plan(2).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary",
+                    variable_name="temporary",
+                    required=False,
+                )
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="非交接元素"):
+        validate_export_contract(
+            optional_plan,
+            [
+                ExtractedElement(
+                    element_id="temporary",
+                    variable_name="temporary",
+                    code="temporary = Circle()",
+                )
+            ],
+        )
+
+
+def test_normalize_scene_plan_contract_repairs_mechanical_conflicts():
+    inherited = VisualElementState(element_id="shape", variable_name="shape")
+    plan = make_plan(2).model_copy(
+        update={
+            "global_visual_state": GlobalVisualState(background="#FFFFFF"),
+            "inherited_elements": [inherited, inherited],
+            "elements_to_remove": [VisualElementState(element_id="stale", variable_name="stale")],
+            "new_elements": [
+                VisualElementState(element_id="shape", variable_name="shape"),
+                VisualElementState(
+                    element_id="composite",
+                    variable_name="composite",
+                    color_key="mixed",
+                ),
+            ],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(plan, ContinuityBible())
+
+    assert repairs
+    assert [item.element_id for item in normalized.inherited_elements] == ["shape"]
+    assert normalized.elements_to_remove == []
+    assert [item.element_id for item in normalized.new_elements] == ["composite"]
+    assert normalized.new_elements[0].color_key == "primary"
+    assert normalized.global_visual_state == ContinuityBible().global_visual_state
+
+
+def test_deterministic_continuity_check_reports_unknown_color_key():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="shape",
+                    variable_name="shape",
+                    color_key="mixed",
+                )
+            ]
+        }
+    )
+
+    issues = deterministic_continuity_issues([plan], ContinuityBible())
+
+    assert any("未定义颜色键" in issue.message for issue in issues)
+
+
+def test_normalize_scene_plan_contract_drops_unexported_previous_elements():
+    previous = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="kept", variable_name="kept"),
+            ]
+        }
+    )
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [
+                VisualElementState(element_id="kept", variable_name="kept"),
+                VisualElementState(element_id="missing", variable_name="missing"),
+            ]
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(
+        current,
+        ContinuityBible(),
+        previous_plan=previous,
+    )
+
+    assert [item.element_id for item in normalized.inherited_elements] == ["kept"]
+    assert any("未声明导出" in repair for repair in repairs)
+
+
+def test_safe_fallback_only_targets_high_confidence_geometry_failures():
+    plan = make_plan(2).model_copy(
+        update={
+            "visual_flow": ["切割碎片并无缝拼接到目标正方形"],
+            "new_elements": [
+                VisualElementState(
+                    element_id="reassembled_square",
+                    variable_name="reassembled_square",
+                    color_key="mixed",
+                ),
+                VisualElementState(
+                    element_id="piece_a",
+                    variable_name="piece_a",
+                    color_key="primary",
+                ),
+            ],
+        }
+    )
+
+    assert is_high_confidence_geometry_conflict(plan, "几何关系未验证，碎片无法覆盖目标区域")
+    assert not is_high_confidence_geometry_conflict(make_plan(2), "建议调整布局")
+
+    fallback = build_safe_fallback_plan(
+        plan,
+        ContinuityBible(),
+        reason="碎片目标位置不明确",
+    )
+    assert "保守" in fallback.purpose
+    assert all("拼接" not in step or "不执行" in step for step in fallback.visual_flow)
+    assert (
+        next(item for item in fallback.new_elements if item.element_id == "piece_a").required
+        is False
     )

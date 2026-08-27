@@ -95,7 +95,14 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
         continuity_review_status="pending",
         continuity_review_round=1,
         continuity_warnings=["warning"],
-        scene_states={1: SceneState(plan=make_plan())},
+        scene_states={
+            1: SceneState(
+                plan=make_plan(),
+                safe_fallback_used=True,
+                safe_fallback_reason="几何方案无法验证",
+                failure_category="review",
+            )
+        },
     )
     orchestrator = Orchestrator()
 
@@ -107,6 +114,9 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
     assert restored.continuity_review_status == "pending"
     assert restored.continuity_review_round == 1
     assert restored.continuity_warnings == ["warning"]
+    assert restored.scene_states[1].safe_fallback_used is True
+    assert restored.scene_states[1].safe_fallback_reason == "几何方案无法验证"
+    assert restored.scene_states[1].failure_category == "review"
 
 
 def test_resume_completed_run_rejects_tampered_final_video(monkeypatch, tmp_path):

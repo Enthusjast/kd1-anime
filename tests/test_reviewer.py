@@ -17,6 +17,8 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "KD1_CONTINUITY_EXPORT_BEGIN" in REVIEWER_SYSTEM_PROMPT
     assert "elements_to_remove" in REVIEWER_SYSTEM_PROMPT
     assert "GlobalVisualState" in REVIEWER_SYSTEM_PROMPT
+    assert "面积守恒" in REVIEWER_SYSTEM_PROMPT
+    assert "保守教学方案" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_severity_is_closed_enum():
@@ -92,6 +94,35 @@ def test_reviewer_receives_complete_scene_plan(monkeypatch):
     assert "a dot b" in message
     assert "<scene_plan>" in message
     assert "<continuity_bible>" in message
+
+
+def test_reviewer_receives_safe_fallback_mode(monkeypatch):
+    from kd1_anime.agents.planner import ScenePlan
+    from kd1_anime.agents.reviewer import ReviewerAgent
+
+    scene_plan = ScenePlan(
+        scene_id=1,
+        title="保守方案",
+        duration_seconds=10,
+        purpose="展示关系",
+        math_concept="面积关系",
+        visual_design="基础图形",
+        camera_movement="固定",
+        visual_flow=["显示公式"],
+        key_moments=["停顿"],
+        computation="a²+b²=c²",
+    )
+    captured = {}
+    reviewer = ReviewerAgent()
+
+    def fake_call(**kwargs):
+        captured.update(kwargs)
+        return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call)
+    reviewer.review("from manim import *", scene_plan, safe_fallback=True)
+
+    assert "safe_fallback_mode" in captured["user_message"]
 
 
 def test_reviewer_retries_with_compact_context_after_truncation(monkeypatch):
