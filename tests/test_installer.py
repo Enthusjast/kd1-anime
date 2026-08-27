@@ -383,6 +383,96 @@ install_manim_knowledge
     assert all(path.stat().st_mode & 0o777 == 0o700 for path in docs.rglob("*") if path.is_dir())
 
 
+def test_interactive_model_configuration_wizard_writes_all_profiles(tmp_path):
+    marker = tmp_path / "index-built"
+    script = f"""
+source {shlex.quote(str(INSTALLER))}
+CONFIG_DIR={shlex.quote(str(tmp_path / ".kd1-anime"))}
+CONFIG_FILE="$CONFIG_DIR/.env"
+CONFIGURE_MODE=interactive
+write_user_config
+build_rag_index_from_installer() {{ printf 'built\\n' > {shlex.quote(str(marker))}; }}
+configure_user_models
+"""
+    answers = (
+        "\n".join(
+            [
+                "https://main.example/v1",
+                "main-secret",
+                "main-model",
+                "y",
+                "https://visual.example/v1",
+                "visual-secret",
+                "visual-model",
+                "y",
+                "https://embedding.example/v1",
+                "embedding-secret",
+                "embedding-model",
+                "y",
+                "y",
+                "https://rerank.example/v1",
+                "rerank-secret",
+                "rerank-model",
+            ]
+        )
+        + "\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        input=answers,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "main-secret" not in result.stdout + result.stderr
+    assert "visual-secret" not in result.stdout + result.stderr
+    assert "embedding-secret" not in result.stdout + result.stderr
+    assert "rerank-secret" not in result.stdout + result.stderr
+    content = (tmp_path / ".kd1-anime" / ".env").read_text(encoding="utf-8")
+    assert "LLM_BASE_URL=https://main.example/v1" in content
+    assert "LLM_API_KEY=main-secret" in content
+    assert "LLM_MODEL=main-model" in content
+    assert "ENABLE_VISUAL_EVAL=true" in content
+    assert "VISUAL_LLM_BASE_URL=https://visual.example/v1" in content
+    assert "VISUAL_LLM_API_KEY=visual-secret" in content
+    assert "VISUAL_LLM_MODEL=visual-model" in content
+    assert "RAG_ENABLED=true" in content
+    assert "RAG_EMBEDDING_BASE_URL=https://embedding.example/v1" in content
+    assert "RAG_EMBEDDING_API_KEY=embedding-secret" in content
+    assert "RAG_EMBEDDING_MODEL=embedding-model" in content
+    assert "RAG_RERANK_BASE_URL=https://rerank.example/v1" in content
+    assert "RAG_RERANK_API_KEY=rerank-secret" in content
+    assert "RAG_RERANK_MODEL=rerank-model" in content
+    assert marker.read_text(encoding="utf-8") == "built\n"
+
+
+def test_model_configuration_wizard_skips_non_tty_by_default(tmp_path):
+    script = f"""
+source {shlex.quote(str(INSTALLER))}
+CONFIG_DIR={shlex.quote(str(tmp_path / ".kd1-anime"))}
+CONFIG_FILE="$CONFIG_DIR/.env"
+write_user_config
+configure_user_models
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        input="",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "非交互安装，跳过模型配置" in result.stdout
+    assert "模型配置向导" not in result.stdout
+
+
 def test_installer_creates_runnable_wrappers_and_idempotent_shell_config(tmp_path):
     conda_base = tmp_path / "conda"
     conda_sh = conda_base / "etc" / "profile.d" / "conda.sh"

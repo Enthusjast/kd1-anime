@@ -106,7 +106,7 @@ Key invariants:
 
 ## Installation constraints
 
-`install.sh` must remain non-interactive and sudo-free. It should:
+`install.sh` must remain non-interactive and sudo-free by default (the model configuration wizard is opt-in in non-TTY environments). It should:
 
 - try the required Python/Miniconda modules;
 - create/reuse `manim_env`;

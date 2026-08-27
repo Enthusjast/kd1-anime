@@ -62,6 +62,17 @@ bash /tmp/kd1-anime-install.sh
 8. 将 Manim Community Edition 0.20.1 文档和示例程序解压到 `~/.kd1-anime/knowledge/`。
 9. 在 `~/.local/bin` 安装 `kd1-anime` / `manim-env` 包装器，并写入 conda 激活钩子、shell 函数和用户级配置模板。
 
+在交互式终端中，安装结束前会自动启动模型配置向导，依次配置主模型、视觉模型、
+Embedding 和 Reranker；非交互安装会自动跳过向导。需要显式开启向导时可执行：
+
+```bash
+KD1_ANIME_CONFIGURE_MODE=interactive bash install.sh
+```
+
+向导会在 Embedding 配置完成后询问是否立即建立 RAG 索引；也可以稍后手动执行
+`kd1-anime rag index`。选择关闭视觉、Embedding 或 Reranker 时会保留已有凭据，
+但不会启用对应功能。
+
 Coder 生成的 `Tex`/`MathTex` 统一使用 `xelatex` 和 `.xdv`，并加载 `ctex`；普通中文文字使用 Noto CJK 字体和 Manim `Text`（Pango）。
 
 安装完成后无需手动 `source` RC 文件或激活 conda，即可直接运行：
