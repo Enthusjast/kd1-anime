@@ -1094,7 +1094,11 @@ class Orchestrator:
                         raise RuntimeError("运行标记为完成，但最终视频哈希与清单不一致")
                     return ctx.final_video
                 raise RuntimeError("运行标记为完成，但最终视频不存在")
-            if manifest.status == "dry_run_complete":
+            incomplete_dry_run = manifest.status == "dry_run_complete" and any(
+                not scene.reviewed or scene.failed or scene.give_up
+                for scene in manifest.scenes.values()
+            )
+            if manifest.status == "dry_run_complete" and not incomplete_dry_run:
                 return None
             if ctx.visual_eval_profile.enabled:
                 settings.visual_llm_profile(model_override=ctx.visual_eval_profile.model).require()
@@ -1102,6 +1106,12 @@ class Orchestrator:
                 state = State[manifest.state]
             except KeyError as exc:
                 raise ValueError(f"运行清单包含未知 FSM 状态: {manifest.state}") from exc
+
+            if incomplete_dry_run:
+                # 旧版本会把含失败场景的 dry-run 误标为完成，导致 resume
+                # 看到 DONE 后直接返回。显式恢复这类清单时，从代码审查屏障
+                # 重新开始；已完成的场景仍会被顺序屏障安全跳过。
+                state = State.CODING if ctx.scene_states else State.PLANNING
 
             # resume 明确表示用户愿意再次尝试；先重置放弃标记，再处理 ERROR。
             # 旧逻辑先判断 ERROR，导致“所有场景都已放弃”时无法进入这里的
@@ -1282,6 +1292,19 @@ class Orchestrator:
 
             # ---- 收尾 ----
             if ctx.dry_run:
+                unfinished = [
+                    (scene_id, scene)
+                    for scene_id, scene in sorted(ctx.scene_states.items())
+                    if not scene.reviewed or scene.failed or scene.give_up
+                ]
+                if unfinished:
+                    details = "; ".join(
+                        f"Scene {scene_id}: {scene.failure_reason or '未通过编码/审查'}"
+                        for scene_id, scene in unfinished
+                    )
+                    message = f"Dry-run 未完成，存在失败场景: {details}"
+                    self._checkpoint(ctx, State.ERROR, status="failed", error=message)
+                    raise RuntimeError(message)
                 self._checkpoint(ctx, State.DONE, status="dry_run_complete")
                 self._emit("dry_run_complete", run_dir=str(ctx.paths.root))
                 return None
@@ -2370,14 +2393,27 @@ class Orchestrator:
                 self._emit("scene_reused", scene_id=scene_id)
             return
         self._emit("scene_reviewing", scene_id=scene_id)
-        with self._llm_sem:
-            reviewer = ReviewerAgent()
-            review_kwargs = {"renderer": ctx.render_profile.renderer}
-            if ctx.continuity_bible is not None:
-                review_kwargs["continuity_bible"] = ctx.continuity_bible
-            if state.inherited_elements_code:
-                review_kwargs["inherited_elements_code"] = state.inherited_elements_code
-            result = reviewer.review(state.code, state.plan, **review_kwargs)
+        try:
+            # 导出区是确定性的交接合同。先校验再调用 Reviewer，避免把重复
+            # 导出标记、缺失元素等可直接修复的问题交给 LLM，尤其避免长上下文
+            # 让 Reviewer 输出被截断。
+            _, exported_elements = extract_continuity_elements(state.code)
+            validate_export_contract(state.plan, exported_elements)
+        except ValueError as exc:
+            result = ReviewResult(
+                is_valid=False,
+                severity="major",
+                feedback=f"连续性导出区无效，无法交接给下一场景: {exc}",
+            )
+        else:
+            with self._llm_sem:
+                reviewer = ReviewerAgent()
+                review_kwargs = {"renderer": ctx.render_profile.renderer}
+                if ctx.continuity_bible is not None:
+                    review_kwargs["continuity_bible"] = ctx.continuity_bible
+                if state.inherited_elements_code:
+                    review_kwargs["inherited_elements_code"] = state.inherited_elements_code
+                result = reviewer.review(state.code, state.plan, **review_kwargs)
         if result.is_valid:
             try:
                 self._refresh_scene_export(state)

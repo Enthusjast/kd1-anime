@@ -35,7 +35,7 @@ kd1_anime.orchestrator ───── callback events ────────�
        └── run_store.py            Manifest v3、原子检查点、运行锁
 ```
 
-`agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。非空但 `finish_reason=length` 的响应不会被消费；系统会提高输出预算并完整重试，持续截断时抛出明确错误。
+`agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
 
 ## 3. 执行模型
 

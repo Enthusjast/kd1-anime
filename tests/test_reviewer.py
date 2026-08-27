@@ -1,6 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
+from kd1_anime.agents.base import TruncatedResponseError
 from kd1_anime.agents.reviewer import REVIEWER_SYSTEM_PROMPT, FixSuggestion, ReviewResult
 
 
@@ -91,3 +92,40 @@ def test_reviewer_receives_complete_scene_plan(monkeypatch):
     assert "a dot b" in message
     assert "<scene_plan>" in message
     assert "<continuity_bible>" in message
+
+
+def test_reviewer_retries_with_compact_context_after_truncation(monkeypatch):
+    from kd1_anime.agents.planner import ScenePlan
+    from kd1_anime.agents.reviewer import ReviewerAgent
+
+    scene_plan = ScenePlan(
+        scene_id=1,
+        title="长上下文审查",
+        duration_seconds=10,
+        purpose="测试",
+        math_concept="x",
+        visual_design="布局",
+        camera_movement="固定",
+        visual_flow=["显示"],
+        key_moments=["停顿"],
+        computation="x=1",
+    )
+    calls = []
+    reviewer = ReviewerAgent()
+
+    def fake_call(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise TruncatedResponseError("truncated")
+        return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call)
+    reviewer.review(
+        "from manim import *\nclass Demo(Scene):\n    def construct(self): pass",
+        scene_plan,
+        inherited_elements_code="x = Circle()\n" * 2_000,
+    )
+
+    assert len(calls) == 2
+    assert len(calls[1]["user_message"]) < len(calls[0]["user_message"])
+    assert "继承元素已在 manim_code 中定义" in calls[1]["user_message"]

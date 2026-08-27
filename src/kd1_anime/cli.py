@@ -181,6 +181,16 @@ def _ensure_rag_apis_available() -> None:
         raise typer.Exit(1) from exc
 
 
+def _manifest_requires_generation_apis(manifest: RunManifest) -> bool:
+    """判断恢复是否还会进入需要主 LLM/RAG 的阶段。"""
+
+    if manifest.state in RESUME_LLM_STATES:
+        return True
+    return manifest.status == "dry_run_complete" and any(
+        not scene.reviewed or scene.failed or scene.give_up for scene in manifest.scenes.values()
+    )
+
+
 def _ensure_generation_apis(*, dry_run: bool) -> None:
     """生成入口统一预检，避免不同 CLI 命令出现不一致行为。"""
 
@@ -292,7 +302,7 @@ def generate(
         requires_llm = not resume
         if resume:
             manifest = RunRepository(settings.WORKSPACE_DIR).load(resume)
-            requires_llm = manifest.state in RESUME_LLM_STATES
+            requires_llm = _manifest_requires_generation_apis(manifest)
         if requires_llm:
             _ensure_llm_api_available()
         if resume:
@@ -600,7 +610,7 @@ def resume(
     repository = RunRepository(settings.WORKSPACE_DIR)
     try:
         manifest = repository.load(run_id)
-        if manifest.state in RESUME_LLM_STATES:
+        if _manifest_requires_generation_apis(manifest):
             _ensure_llm_api_available()
             _ensure_rag_apis_available()
         if manifest.visual_eval_profile.enabled and manifest.status not in {

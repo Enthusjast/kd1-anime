@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -200,6 +201,46 @@ def test_resume_error_retries_all_give_up_scenes(monkeypatch, tmp_path):
     assert captured["state"] is State.CODING
 
 
+def test_resume_retries_incomplete_dry_run_instead_of_returning(monkeypatch, tmp_path):
+    """旧版本把含失败场景的 dry-run 标为完成，resume 仍应重新进入编码屏障。"""
+    from kd1_anime.config import settings
+
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / run_id
+    root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_id,
+        status="dry_run_complete",
+        state="DONE",
+        dry_run=True,
+        user_prompt="prompt",
+        output_path=str((root / "output.mp4").resolve()),
+        scenes={
+            1: StoredSceneState(
+                plan=plan(),
+                plan_ready=True,
+                give_up=True,
+                failure_reason="审查未通过",
+            )
+        },
+    )
+    write_manifest(root / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    captured = {}
+
+    def fake_execute(self, context, state):
+        captured["context"] = context
+        captured["state"] = state
+        return None
+
+    monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
+
+    assert Orchestrator().resume(run_id) is None
+    assert captured["state"] is State.CODING
+    assert captured["context"].scene_states[1].give_up is False
+
+
 def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_path):
     """最后检查点停在 MONITORING 时，resume 也不能跳过 failed 场景。"""
     from kd1_anime.config import settings
@@ -315,6 +356,65 @@ def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
     )
     assert ctx.scene_states[1].give_up is True
     assert ctx.scene_states[1].review_round == 2
+
+
+def test_scene_review_rejects_invalid_export_before_llm(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        circle = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        square = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    state = SceneState(plan=plan(), code=code, class_name="Demo", plan_ready=True)
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    called = False
+
+    def reviewer_should_not_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("invalid export should be rejected deterministically")
+
+    monkeypatch.setattr(module.ReviewerAgent, "review", reviewer_should_not_run)
+    orchestrator = Orchestrator()
+    orchestrator._scene_review(ctx, 1, state)
+
+    assert called is False
+    assert state.reviewed is False
+    assert "连续性导出区无效" in state.rewrite_feedback
+
+
+def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        dry_run=True,
+        scene_states={
+            1: SceneState(
+                plan=plan(),
+                plan_ready=True,
+                give_up=True,
+                failure_reason="review failed",
+            )
+        },
+    )
+    monkeypatch.setattr(Orchestrator, "_run_scheduler", lambda self, current: None)
+
+    with pytest.raises(RuntimeError, match="Dry-run 未完成"):
+        Orchestrator()._execute(ctx, State.CODING)
+
+    manifest = RunManifest.model_validate(
+        json.loads((run_paths.root / "manifest.json").read_text(encoding="utf-8"))
+    )
+    assert manifest.status == "failed"
+    assert manifest.state == "ERROR"
 
 
 def test_run_directories_and_prompt_are_private(monkeypatch, tmp_path):
