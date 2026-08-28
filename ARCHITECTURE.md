@@ -22,6 +22,9 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/planner.py       概要规划 + 详细分镜
        ├── agents/plan_compiler.py  确定性计划编译（时间线/等式/几何/生命周期）
        ├── agents/plan_reviewer.py 计划正确性、数学与可实现性审查
+       ├── agents/technical_planner.py TechnicalSpec 生成与确定性编译
+       ├── agents/lifecycle.py     AST 动画生命周期校验
+       ├── agents/prompt_context.py 有界 Prompt 区块构造
        ├── agents/continuity.py    全片连续性审查与局部重规划
        ├── agents/coder.py         ManimCE 代码生成/重写
        ├── agents/reviewer.py      结构化语义审查
@@ -48,7 +51,7 @@ kd1_anime.orchestrator ───── callback events ────────�
 分镜屏障：所有 Scene 并行 DETAILING → 逐场景计划审查 → 全片连续性审查
 
 顺序代码屏障：
-Scene 1 CODING → 代码 REVIEWING → Scene 2 CODING → 代码 REVIEWING → …
+Scene 1 技术设计 → CODING → 代码 REVIEWING → Scene 2 技术设计 → CODING → 代码 REVIEWING → …
 
 渲染阶段：各 Scene 并行 DISPATCHING → MONITORING
                                       ▲              │
@@ -60,14 +63,14 @@ Scene 1 CODING → 代码 REVIEWING → Scene 2 CODING → 代码 REVIEWING → 
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行；每个 Scene 必须先通过计划审查，确认数学关系、几何可行性和时间线正确，再进入编码。编码/代码审查按场景顺序执行：Scene N 代码审查通过后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，而不是仅凭 Planner 描述猜测的状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
+FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行；每个 Scene 必须先通过计划审查，确认数学关系、几何可行性和时间线正确，再进入编码。编码/代码审查按场景顺序执行：Scene N 先由 Technical Planner 生成结构化 TechnicalSpec，确定性编译通过后才允许 Coder 工作；代码通过生命周期校验和 Reviewer 后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，并且必须遵守明确的对象生命周期，而不是仅凭 Planner 描述猜测状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
 
 `ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。
 
-RAG 索引使用 SQLite 保存文本分块、元数据和 Embedding BLOB。Markdown 和 reStructuredText 按标题/段落切分，Python 按顶层定义切分；索引构建通过临时数据库原子替换。运行时先做本地余弦初排，再调用独立 Reranker；服务故障只记录 `degraded` 并继续原有流水线。Planner、Coder 和 AutoFixer 收到的检索内容均标记为不可信资料，且每次注入都保存查询、索引和分块哈希收据。
+RAG 索引使用 SQLite 保存文本分块、元数据和 Embedding BLOB。Markdown 和 reStructuredText 按标题/段落切分，Python 按顶层定义切分；索引构建通过临时数据库原子替换。运行时先做本地余弦初排，再调用独立 Reranker；服务故障只记录 `degraded` 并继续原有流水线。Planner、Technical Planner、Coder 和 AutoFixer 收到的检索内容均标记为不可信资料，且每次注入都保存查询、索引和分块哈希收据。
 
 ### 3.1 PLANNING / DETAILING
 
@@ -83,6 +86,12 @@ Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。Sc
 `GlobalVisualState` 固定全片颜色、字体、字号、线宽、布局锚点和镜头语言；每个 `ScenePlan` 都携带同一份只读配置。`VisualElementState` 为跨场景对象分配稳定的 `element_id`。
 
 ### 3.2 CODING / REVIEWING
+
+TechnicalSpec 是 CODING 内部的强制前置阶段，不改变顶层 FSM 的兼容状态集合。它把
+ScenePlan 的对象声明映射为变量名、构造器、动画事件、Transform 语义、LaTeX 分段、布局
+约束和导出清单；编译器会模拟 active 状态，阻断对已退出对象的继续使用。它和输入哈希、
+规范化 JSON 一起写入 `artifacts/scene_<id>_technical_spec.json` 与 `manifest.json`，计划或
+继承代码变化后自动失效，恢复时校验哈希后才会复用。
 
 Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文件读写、shell、subprocess 和动态执行。Coder、Reviewer 和 AutoFixer 都收到当前 renderer 能力说明：
 
@@ -100,7 +109,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Scene 类必须实现 `construct()`；
 - 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若校验失败，确定性反馈会交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内只允许无副作用的赋值；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接。结构化输出只允许：
+若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；失败反馈交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
 
 - valid / `info`：通过；
 - `minor`：至少一条可精确唯一匹配的查找替换；
@@ -109,6 +118,11 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
 
 连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除旧交接代码并按顺序重新编码；恢复旧清单时会优先重新提取导出区，提取失败不会静默复用下游状态。
+
+当 `LOCAL_SMOKE_RENDER_ENABLED=true` 且不是 dry-run 时，代码在进入 Reviewer 前会以低质量、
+同 renderer 的本地命令运行一次；若配置了 Apptainer，则沿用 containall/cleanenv/no-home、当前
+run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信息的阶段快照，失败直接阻断该场景，
+不会把本地 Smoke Render 产物当作正式视频。
 
 ### 3.3 DISPATCHING / MONITORING
 

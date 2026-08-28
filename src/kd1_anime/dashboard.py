@@ -75,7 +75,7 @@ def suppress_agent_logs() -> bool:
     return _state.active
 
 
-STAGES = ("分镜", "计划审查", "编码", "代码审查", "渲染")
+STAGES = ("分镜", "计划审查", "技术设计", "编码", "代码审查", "渲染")
 VISUAL_STAGE = "视觉"
 _DONE_STAGE_ALIASES = {"审查": "代码审查"}
 
@@ -256,6 +256,7 @@ class SceneDashboard:
                 "planning": "场景概要",
                 "continuity": "全片连续性",
                 "detailing": "导演分镜",
+                "technical": "技术实现设计",
                 "coding": "代码生成",
                 "reviewing": "代码审查",
                 "dispatching": "提交渲染",
@@ -367,6 +368,26 @@ class SceneDashboard:
                 status.invalidate_from("计划审查", self.stages)
                 status.message = "计划已重规划"
 
+        elif event == "scene_technical_planning":
+            if status:
+                status.invalidate_from("技术设计", self.stages)
+                self._mark_running(status, "技术设计", "生成技术实现合同")
+
+        elif event == "scene_technical_ready":
+            if status:
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.mark_done("技术设计")
+                status.message = "技术实现合同完成"
+
+        elif event == "scene_technical_failed":
+            if status:
+                status.state = "failed"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = "技术实现合同失败"
+
         elif event in (
             "scene_detailing",
             "scene_coding",
@@ -374,6 +395,7 @@ class SceneDashboard:
             "scene_reviewing",
             "scene_fixing",
             "scene_retrying",
+            "scene_smoke_rendering",
         ):
             if status:
                 if event == "scene_detailing":
@@ -395,6 +417,9 @@ class SceneDashboard:
                 elif event == "scene_retrying":
                     status.invalidate_from("渲染", self.stages)
                     self._mark_running(status, "渲染", "基础设施故障，重新排队")
+                elif event == "scene_smoke_rendering":
+                    status.invalidate_from("编码", self.stages)
+                    self._mark_running(status, "编码", "本地 Smoke Render")
 
         elif event in ("scene_detailed", "scene_coded"):
             if status:
@@ -408,6 +433,13 @@ class SceneDashboard:
                 else:
                     status.mark_done("编码")
                     status.message = "代码就绪"
+
+        elif event == "scene_smoke_rendered":
+            if status:
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = "Smoke Render 通过"
 
         elif event in ("scene_review_pass", "scene_review_skipped"):
             if status:

@@ -23,6 +23,7 @@ from kd1_anime.agents.planner import (
     SceneOutline,
     ScenePlan,
 )
+from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
@@ -71,6 +72,8 @@ ScenePhase = Literal[
     "detailed",
     "plan_reviewing",
     "plan_reviewed",
+    "technical_planning",
+    "technical_validating",
     "coded",
     "reviewed",
     "monitoring",
@@ -88,6 +91,7 @@ VisualStatus = Literal[
     "unknown",
     "skipped",
 ]
+TechnicalStatus = Literal["pending", "generating", "passed", "failed"]
 
 
 def utc_now() -> datetime:
@@ -179,6 +183,11 @@ class StoredSceneState(BaseModel):
     plan_review_feedback: str = Field(default="", max_length=50_000)
     plan_review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
     identical_plan_review_count: int = Field(default=0, ge=0)
+    technical_spec: TechnicalSpec | None = None
+    technical_spec_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    technical_input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    technical_status: TechnicalStatus = "pending"
+    technical_error: str = Field(default="", max_length=50_000)
     rewrite_feedback: str = Field(default="", max_length=50_000)
     review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
     identical_review_count: int = Field(default=0, ge=0)
@@ -291,6 +300,27 @@ class RunManifest(BaseModel):
                 errors.append(f"Scene key {scene_id} 与 plan.scene_id {scene.plan.scene_id} 不一致")
             if scene.plan_reviewed and not scene.plan_ready:
                 errors.append(f"Scene {scene_id} 标记为 plan_reviewed 但 plan_ready=false")
+            if scene.technical_status == "passed":
+                if scene.technical_spec is None:
+                    errors.append(f"Scene {scene_id} 标记为 technical passed 但缺少 TechnicalSpec")
+                elif not scene.technical_input_sha256:
+                    errors.append(f"Scene {scene_id} 的 TechnicalSpec 缺少输入哈希")
+                elif (
+                    sha256_text(scene.technical_spec.model_dump_json())
+                    != scene.technical_spec_sha256
+                ):
+                    errors.append(f"Scene {scene_id} 的 TechnicalSpec 哈希不一致")
+            elif (
+                scene.technical_spec is not None
+                and scene.technical_spec_sha256
+                and sha256_text(scene.technical_spec.model_dump_json())
+                != scene.technical_spec_sha256
+            ):
+                errors.append(f"Scene {scene_id} 的 TechnicalSpec 哈希不一致")
+            if scene.technical_spec is None and (
+                scene.technical_spec_sha256 or scene.technical_input_sha256
+            ):
+                errors.append(f"Scene {scene_id} 存在 TechnicalSpec 哈希但缺少 TechnicalSpec")
             if scene.rendered and scene.artifact is None:
                 errors.append(f"Scene {scene_id} 标记为 rendered 但缺少 artifact")
             if scene.artifact is not None:

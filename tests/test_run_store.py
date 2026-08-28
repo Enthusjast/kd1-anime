@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 import kd1_anime.run_store as store_module
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan
+from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 from kd1_anime.cli import app
 from kd1_anime.config import settings
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
@@ -18,6 +19,7 @@ from kd1_anime.run_store import (
     StoredSceneState,
     StoredSlurmJob,
     lock_run,
+    sha256_text,
     write_manifest,
 )
 
@@ -122,6 +124,41 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
     assert restored.scene_states[1].safe_fallback_reason == "几何方案无法验证"
     assert restored.scene_states[1].failure_category == "review"
     assert restored.scene_states[1].plan_reviewed is True
+
+
+def test_checkpoint_round_trip_persists_technical_spec_identity(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = make_paths(workspace)
+    paths.scenes.mkdir(parents=True)
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula", exported=True)],
+        export_element_ids=["formula"],
+    )
+    state = SceneState(
+        plan=make_plan(),
+        plan_ready=True,
+        plan_reviewed=True,
+        technical_spec=spec,
+        technical_spec_sha256=sha256_text(spec.model_dump_json()),
+        technical_input_sha256="a" * 64,
+        technical_status="passed",
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths,
+        plan_review_status="passed",
+        scene_states={1: state},
+    )
+
+    Orchestrator()._checkpoint(ctx, State.REVIEWING)
+
+    manifest = RunRepository(workspace).load(RUN_ID)
+    restored = Orchestrator._context_from_manifest(manifest, paths.root)
+    restored_spec = restored.scene_states[1].technical_spec
+    assert restored_spec == spec
+    assert restored.scene_states[1].technical_status == "passed"
+    assert manifest.integrity_errors() == []
 
 
 def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():

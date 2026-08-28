@@ -280,6 +280,13 @@ class Settings(BaseSettings):
     )
     LLM_CACHE_PATH: Path = APP_HOME / "cache" / "llm.sqlite3"
     LLM_CACHE_MAX_ENTRIES: int = Field(default=512, ge=0, le=100_000)
+    # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
+    # 裁剪，低优先级的 RAG/自然语言说明会优先让出空间。
+    LLM_MAX_CONTEXT_CHARS: int = Field(default=120_000, ge=10_000, le=2_000_000)
+    LLM_MAX_CODE_CONTEXT_CHARS: int = Field(default=60_000, ge=5_000, le=1_000_000)
+    LLM_MAX_REVIEW_CONTEXT_CHARS: int = Field(default=90_000, ge=10_000, le=2_000_000)
+    LLM_MAX_TECHNICAL_SPEC_CHARS: int = Field(default=30_000, ge=5_000, le=500_000)
+    MAX_TECHNICAL_SPEC_ATTEMPTS: int = Field(default=3, ge=1, le=10)
 
     # --- 独立视觉 LLM API ---
     # 视觉评估绝不隐式复用主 LLM 的 Key、端点或模型。未启用时可以留空。
@@ -429,6 +436,11 @@ class Settings(BaseSettings):
     )
     SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
+    # 本地生成/无 Slurm 环境的可选运行时预检；默认关闭，避免在 dry-run
+    # 或共享登录节点上执行不可信生成代码。
+    LOCAL_SMOKE_RENDER_ENABLED: bool = False
+    LOCAL_SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
+    LOCAL_SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
     ALLOW_PARTIAL_OUTPUT: bool = False
     OVERWRITE_OUTPUT: bool = False
     TRANSITION_TYPE: Literal["fade"] = "fade"

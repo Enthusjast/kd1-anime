@@ -100,6 +100,13 @@ class TestSceneDashboard:
 
         dash.on_event("scene_plan_review_pass", {"scene_id": 1})
         assert "计划审查" in dash.scenes[1].done
+        dash.on_event("stage_start", {"stage": "technical"})
+        assert dash.stage_label == "技术实现设计"
+        dash.on_event("scene_technical_planning", {"scene_id": 1})
+        assert dash.scenes[1].stage == "技术设计"
+        assert "技术设计⟳" in str(dash.scenes[1].render_row()[2])
+        dash.on_event("scene_technical_ready", {"scene_id": 1})
+        assert "技术设计" in dash.scenes[1].done
         dash.on_event("scene_coding", {"scene_id": 1})
         dash.on_event("scene_coded", {"scene_id": 1})
         dash.on_event("scene_reviewing", {"scene_id": 1})

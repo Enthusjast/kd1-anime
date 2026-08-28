@@ -19,7 +19,9 @@ from kd1_anime.agents.planner import (
     ScenePlan,
     VisualElementState,
 )
+from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
+from kd1_anime.config import settings
 
 CONTINUITY_EXPORT_BEGIN = "KD1_CONTINUITY_EXPORT_BEGIN"
 CONTINUITY_EXPORT_END = "KD1_CONTINUITY_EXPORT_END"
@@ -1312,23 +1314,57 @@ class ContinuityReviewerAgent(BaseAgent):
         deterministic_context = [
             issue.model_dump(mode="json") for issue in (deterministic_issues or [])
         ]
-        return self.call_llm_json(
-            system_prompt=f"{CONTINUITY_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
-            user_message=(
+        sections = [
+            PromptSection(
+                "continuity_bible",
                 "<continuity_bible>\n"
                 f"{json.dumps(self._compact_bible(bible), ensure_ascii=False, indent=2)}\n"
-                "</continuity_bible>\n\n"
+                "</continuity_bible>",
+                required=True,
+                priority=110,
+                max_chars=25_000,
+            ),
+            PromptSection(
+                "scene_outlines",
                 "<scene_outlines>\n"
                 f"{json.dumps(outline_context, ensure_ascii=False, indent=2)}\n"
-                "</scene_outlines>\n\n"
+                "</scene_outlines>",
+                required=True,
+                priority=80,
+                max_chars=20_000,
+            ),
+            PromptSection(
+                "scene_plans",
                 "<scene_plans>\n"
                 f"{json.dumps(plan_context, ensure_ascii=False, indent=2)}\n"
-                "</scene_plans>\n\n"
+                "</scene_plans>",
+                required=True,
+                priority=110,
+                max_chars=70_000,
+            ),
+            PromptSection(
+                "deterministic_findings",
                 "<deterministic_findings>\n"
                 f"{json.dumps(deterministic_context, ensure_ascii=False, indent=2)}\n"
-                "</deterministic_findings>\n\n"
-                "请综合这些材料输出全片连续性审查 JSON。"
+                "</deterministic_findings>",
+                required=bool(deterministic_context),
+                priority=120,
+                max_chars=30_000,
             ),
+            PromptSection(
+                "输出要求",
+                "请综合这些材料输出全片连续性审查 JSON。",
+                required=True,
+                priority=110,
+            ),
+        ]
+        user_message = build_bounded_prompt(
+            sections,
+            max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+        )
+        return self.call_llm_json(
+            system_prompt=f"{CONTINUITY_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
+            user_message=user_message,
             response_model=ContinuityReviewResult,
             stream=stream,
             allow_truncated=True,

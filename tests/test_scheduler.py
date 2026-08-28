@@ -12,6 +12,7 @@ from kd1_anime.agents.continuity import ContinuityReviewResult
 from kd1_anime.agents.plan_reviewer import PlanReviewResult
 from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
 from kd1_anime.agents.reviewer import ReviewResult
+from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.agents.validator import CodeValidationResult
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
@@ -238,6 +239,17 @@ class FakeReviewer:
         return ReviewResult(is_valid=True)
 
 
+class FakeTechnicalPlanner:
+    """测试用技术计划器；无元素的简化计划无需额外技术事件。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def plan(self, scene_plan, *, renderer=None, **kwargs):
+        self.calls += 1
+        return TechnicalSpec(scene_id=scene_plan.scene_id, renderer=renderer or "cairo")
+
+
 class FakeAutoFixer:
     def __init__(self, infra: bool = False):
         self.infra = infra
@@ -344,6 +356,7 @@ def make_orchestrator(
     coder=None,
     reviewer=None,
     autofixer=None,
+    technical_planner=None,
 ):
     orchestrator = Orchestrator()
     monkeypatch.setattr(
@@ -360,6 +373,11 @@ def make_orchestrator(
     )
     monkeypatch.setattr(module, "CoderAgent", _CallableAgent(coder or FakeCoder()))
     monkeypatch.setattr(module, "ReviewerAgent", _CallableAgent(reviewer or FakeReviewer()))
+    monkeypatch.setattr(
+        module,
+        "TechnicalPlannerAgent",
+        _CallableAgent(technical_planner or FakeTechnicalPlanner()),
+    )
     monkeypatch.setattr(module, "AutoFixerAgent", _CallableAgent(autofixer or FakeAutoFixer()))
     monkeypatch.setattr(settings, "MONITOR_POLL_INTERVAL", 1)
     return orchestrator
@@ -882,6 +900,75 @@ def test_plan_review_passes_before_code_review(monkeypatch, tmp_path):
     assert ctx.scene_states[1].plan_reviewed is True
     assert ctx.scene_states[1].reviewed is True
     assert events.index("scene_plan_review_pass") < events.index("scene_coding")
+
+
+def test_technical_spec_is_ready_before_code_generation(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    technical_planner = FakeTechnicalPlanner()
+    events = []
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        technical_planner=technical_planner,
+    )
+    orchestrator._callback = lambda event, data: events.append(event)
+    outline = make_outline(1)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=[outline],
+        continuity_bible=ContinuityBible(),
+        plan_review_status="passed",
+        continuity_review_status="passed",
+        scene_states={1: SceneState(plan=make_plan(outline))},
+    )
+
+    orchestrator._run_scheduler(ctx)
+
+    state = ctx.scene_states[1]
+    assert technical_planner.calls == 1
+    assert state.technical_status == "passed"
+    assert state.technical_spec is not None
+    assert events.index("scene_technical_ready") < events.index("scene_coding")
+
+
+def test_invalid_technical_spec_is_regenerated_with_compile_feedback(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    calls: list[str] = []
+
+    class RetryingTechnicalPlanner:
+        def plan(self, scene_plan, *, renderer=None, feedback="", **kwargs):
+            calls.append(feedback)
+            if len(calls) == 1:
+                return TechnicalSpec(scene_id=999, renderer=renderer or "cairo")
+            return TechnicalSpec(scene_id=scene_plan.scene_id, renderer=renderer or "cairo")
+
+    monkeypatch.setattr(settings, "MAX_TECHNICAL_SPEC_ATTEMPTS", 2)
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        technical_planner=RetryingTechnicalPlanner(),
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=[make_outline(1)],
+        continuity_bible=ContinuityBible(),
+        plan_review_status="passed",
+        continuity_review_status="passed",
+        scene_states={1: SceneState(plan=make_plan(make_outline(1)))},
+    )
+
+    orchestrator._run_scheduler(ctx)
+
+    assert len(calls) == 2
+    assert calls[0] == ""
+    assert "scene_id" in calls[1]
+    assert ctx.scene_states[1].technical_status == "passed"
 
 
 def test_continuity_review_is_a_barrier_before_coding(monkeypatch, tmp_path):

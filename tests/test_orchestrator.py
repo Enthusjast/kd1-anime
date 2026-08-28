@@ -6,6 +6,7 @@ import pytest
 import kd1_anime.orchestrator as module
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
 from kd1_anime.agents.reviewer import ReviewResult
+from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import SceneArtifact, VideoMetadata, sha256_file
 from kd1_anime.run_store import RunManifest, StoredSceneState, sha256_text, write_manifest
@@ -397,6 +398,57 @@ def test_run_paths_are_unique(monkeypatch, tmp_path):
     first = RunPaths.create()
     second = RunPaths.create()
     assert first.root != second.root
+
+
+def test_local_smoke_render_is_skipped_for_dry_run(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    source = run_paths.scenes / "scene_1.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n")
+    ctx = PipelineContext("x", paths=run_paths, dry_run=True)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+    called = False
+
+    def unexpected_run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(module.subprocess, "run", unexpected_run)
+
+    orchestrator._local_smoke_render(ctx, state)
+
+    assert called is False
+
+
+def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    source = run_paths.scenes / "scene_1.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n")
+    ctx = PipelineContext("x", paths=run_paths, dry_run=False)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+
+    def successful_run(command, **kwargs):
+        media_index = command.index("--media_dir") + 1
+        media_dir = Path(command[media_index])
+        output = media_dir / "nested" / "Demo.mp4"
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"smoke")
+        return module.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", successful_run)
+    orchestrator._local_smoke_render(ctx, state)
+
+    def failed_run(command, **kwargs):
+        return module.subprocess.CompletedProcess(command, 1, "", "render boom")
+
+    monkeypatch.setattr(module.subprocess, "run", failed_run)
+    with pytest.raises(RuntimeError, match="Smoke Render 失败"):
+        orchestrator._local_smoke_render(ctx, state)
 
 
 def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
@@ -1385,6 +1437,19 @@ def test_visual_rebuild_preserves_and_reuses_compatible_passed_downstream_candid
     first.visual_status = "warning"
     first.visual_artifact_sha256 = first_candidate.artifact.video_sha256
     monkeypatch.setattr(orchestrator, "_refresh_scene_export", lambda state: None)
+
+    class FakeTechnicalPlanner:
+        def plan(self, scene_plan, *, renderer=None, **kwargs):
+            return TechnicalSpec(
+                scene_id=scene_plan.scene_id,
+                renderer=renderer or "cairo",
+            )
+
+    monkeypatch.setattr(
+        module,
+        "TechnicalPlannerAgent",
+        FakeTechnicalPlanner,
+    )
     orchestrator._stop_event.clear()
 
     orchestrator._run_code_review_barrier(ctx)
