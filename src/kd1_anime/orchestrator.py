@@ -2110,6 +2110,7 @@ class Orchestrator:
             if self._stop_event.is_set() or state.failed or state.give_up:
                 continue
             try:
+                self._normalize_plan_contract_for_coding(ctx, state)
                 previous_context = state.inherited_elements_code
                 self._prepare_inherited_context(ctx, scene_id, state)
                 if previous_context != state.inherited_elements_code and state.code:
@@ -2217,6 +2218,55 @@ class Orchestrator:
                     except Exception as checkpoint_error:
                         self._record_checkpoint_failure(checkpoint_error)
                 self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+
+    def _normalize_plan_contract_for_coding(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+    ) -> None:
+        """在代码屏障前修复可确定的元素边界合同漂移。
+
+        运行恢复或旧版清单时，计划可能已经通过了旧的 Plan Review，但其
+        ``new_elements``/``handoff`` 仍不一致。若直接交给 Coder，代码会在
+        连续性导出合同处失败。这里只调用无创作歧义的确定性归一化，不会
+        绕过数学计划审查或改写已经存在的代码。
+        """
+
+        if ctx.continuity_bible is None:
+            return
+        previous_state = ctx.scene_states.get(state.plan.scene_id - 1)
+        previous_plan = (
+            previous_state.plan
+            if previous_state is not None and previous_state.plan_ready
+            else None
+        )
+        normalized, repairs = normalize_scene_plan_contract(
+            state.plan,
+            ctx.continuity_bible,
+            previous_plan=previous_plan,
+        )
+        if not repairs:
+            return
+        with self._state_lock:
+            state.plan = normalized
+            ctx.scenes = [
+                item.plan
+                for item in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            ]
+            ctx.continuity_warnings.append(
+                f"Scene {state.plan.scene_id} 编码前自动修复连续性合同：" + "；".join(repairs)
+            )
+            self._write_stage_artifact(
+                ctx,
+                f"scene_{state.plan.scene_id}_plan.json",
+                {"schema_version": 1, "plan": normalized.model_dump(mode="json")},
+            )
+            self._checkpoint(ctx, State.REVIEWING)
+        self._emit(
+            "continuity_contract_repaired",
+            scene_id=state.plan.scene_id,
+            repairs=repairs,
+        )
 
     def _run_detail_barrier(self, ctx: PipelineContext) -> None:
         """并行完成尚未生成的场景分镜，作为连续性审查的屏障。"""

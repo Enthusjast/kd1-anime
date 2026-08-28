@@ -85,8 +85,10 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   并重新写入连续性导出区，交给下一个场景。
 - `[Global Visual State]` 是只读配置。所有颜色、字体、字号、线宽和布局锚点必须由其中的
   语义变量决定；建议在 construct() 初始化 `COLORS`/`FONTS` 映射后统一引用，不要在场景中另造一套颜色或字体常量。
-- 必须输出以下连续性导出区。区内只能包含无副作用的 Mobject 定义，不能出现 `self.play`、
-  `self.add`、文件/网络调用或动态执行：
+- 必须输出以下连续性导出区。区内只能包含可在下一场景独立重建的 Mobject 定义，或作用于
+  本区已经定义对象的白名单样式/布局调用（如 `set_color`、`set_fill`、`scale`、`move_to`、
+  `next_to`、`to_edge`、`to_corner`、`arrange`、`shift`）；这些调用不能播放动画或产生外部
+  副作用。不能出现 `self.play`、`self.add`、文件/网络调用或动态执行：
   `# KD1_CONTINUITY_EXPORT_BEGIN` 到 `# KD1_CONTINUITY_EXPORT_END`。
 - 复合 Mobject（例如由多条 Line 组成的 VGroup）需要的纯 helper 定义可以放在同一个导出区内；
   用 `# element_id: <最终元素 ID>` 标记该组，并让该组最后一条赋值把对象绑定到对应的

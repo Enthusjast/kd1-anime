@@ -20,6 +20,7 @@ from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
     GlobalVisualState,
+    SceneHandoff,
     SceneOutline,
     ScenePlan,
     VisualElementState,
@@ -245,6 +246,21 @@ class Demo(Scene):
     assert [item.element_id for item in elements] == ["formula"]
 
 
+def test_extract_continuity_elements_without_marker_uses_safe_fallback():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x^2")
+        self.play(Write(formula))
+"""
+
+    exported_code, elements = extract_continuity_elements(code)
+
+    assert "formula = MathTex" in exported_code
+    assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
+
+
 def test_extract_continuity_elements_supports_composite_helpers_in_export_group():
     code = """
 from manim import *
@@ -269,6 +285,47 @@ class Demo(Scene):
         ("main_triangle", "triangle"),
         ("label", "label"),
     ]
+
+
+def test_extract_continuity_elements_accepts_local_styling_and_safe_aliases():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        COLORS = {"text_dark": "#222222"}
+        text_dark = COLORS["text_dark"]
+        A_BLUE = "#123456"
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: title
+        title = Text("title", color=text_dark, t2c={"title": A_BLUE})
+        title.to_edge(UP)
+        if len(title) >= 1:
+            title.set_color(text_dark)
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    exported_code, elements = extract_continuity_elements(code)
+
+    assert 'text_dark = COLORS["text_dark"]' in exported_code
+    assert 'A_BLUE = "#123456"' in exported_code
+    assert elements[0].element_id == "title"
+    assert "title.to_edge(UP)" in elements[0].code
+
+
+def test_extract_continuity_elements_rejects_non_whitelisted_local_method():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = MathTex(r"x")
+        formula.unknown_mutation()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    with pytest.raises(ValueError, match="不允许的方法"):
+        extract_continuity_elements(code)
 
 
 def test_extract_continuity_elements_rejects_external_uppercase_business_variable():
@@ -409,6 +466,37 @@ def test_normalize_scene_plan_contract_repairs_mechanical_conflicts():
     assert [item.element_id for item in normalized.new_elements] == ["composite"]
     assert normalized.new_elements[0].color_key == "primary"
     assert normalized.global_visual_state == ContinuityBible().global_visual_state
+
+
+def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
+    plan = make_plan(2).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="final", variable_name="final"),
+                VisualElementState(element_id="temporary", variable_name="temporary"),
+            ],
+            "handoff": [
+                SceneHandoff(
+                    element_id="final",
+                    variable_name="final",
+                    action="keep",
+                    semantic_state="最终结果",
+                ),
+                SceneHandoff(
+                    element_id="title",
+                    variable_name="title",
+                    action="keep",
+                    semantic_state="场景标题",
+                ),
+            ],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(plan, ContinuityBible())
+
+    required = {item.element_id: item.required for item in normalized.new_elements}
+    assert required == {"final": True, "temporary": False, "title": True}
+    assert any("补入 new_elements" in repair for repair in repairs)
 
 
 def test_deterministic_continuity_check_reports_unknown_color_key():

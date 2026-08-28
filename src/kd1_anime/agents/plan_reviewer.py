@@ -79,7 +79,9 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
 3. 计划声称“无缝拼接”“面积守恒”或“填满目标区域”，但没有给出可以逐项核验的
    碎片顶点、面积、旋转和目标覆盖关系。
 4. 计划要求使用普通 Scene 的 camera.frame，或提出当前 renderer 不支持的能力。
-5. opening/closing/transition 或 inherited/elements_to_remove/new_elements 合同不可执行。
+5. opening/closing/transition 或 inherited/elements_to_remove/new_elements/handoff 合同不可执行；
+   特别是 required=true 的 new_elements 未列入 handoff，或 handoff 的 create/keep 元素没有
+   对应的结构化声明。
 6. 计划中的对象越界、明显重叠，或时间线无法覆盖场景时长并完成核心教学目标。
 
 ## 审查原则
@@ -87,6 +89,8 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
 - 只要复杂几何不能严格验证，就要求改成面积标签、基础图形或等式变换；不要批准
   “先移动到附近，观众会理解”的示意性证明。
 - 每个问题必须定位字段，并给出可直接交给 Planner 的修改指令。
+- 以 handoff 作为场景边界的唯一对象清单：场景内临时步骤不要标记为 required=true，
+  也不要要求 Coder 把已经淡出的中间对象导出到下一场景。
 - 没有阻断问题时返回 is_valid=true、severity=info、issues=[]。
 
 如果收到 `<safe_fallback_mode>true</safe_fallback_mode>`，说明该计划已经主动放弃

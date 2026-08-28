@@ -44,6 +44,51 @@ _BANNED_EXPORT_NAMES = {
     "locals",
     "vars",
 }
+_EXPORT_MUTATION_METHODS = {
+    "add",
+    "add_to_back",
+    "align_to",
+    "arrange",
+    "center",
+    "match_height",
+    "match_width",
+    "move_to",
+    "next_to",
+    "rotate",
+    "scale",
+    "set_color",
+    "set_color_by_tex",
+    "set_fill",
+    "set_opacity",
+    "set_stroke",
+    "set_x",
+    "set_y",
+    "set_z",
+    "set_z_index",
+    "shift",
+    "stretch",
+    "to_corner",
+    "to_edge",
+}
+_EXPORT_PURE_MOBJECT_METHODS = {
+    "copy",
+    "get_bottom",
+    "get_center",
+    "get_corner",
+    "get_end",
+    "get_family",
+    "get_height",
+    "get_left",
+    "get_right",
+    "get_start",
+    "get_top",
+    "get_unit_vector",
+    "get_vertices",
+    "get_width",
+    "get_x",
+    "get_y",
+    "get_z",
+}
 
 # 这些名称由 `from manim import *`、Coder 约定的全局视觉映射或
 # construct() 开头的 TexTemplate 初始化提供。它们不是连续性导出区的
@@ -82,35 +127,34 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
-def _validate_export_statement(
-    statement: ast.stmt,
-    bound_names: set[str] | None = None,
-) -> tuple[str, str]:
-    """校验一条导出语句，只允许可独立重建的无副作用 Mobject 赋值。"""
+def _receiver_name(node: ast.AST) -> str:
+    """返回 Mobject 链式调用最左侧的变量名。"""
 
-    if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-        raise ValueError("连续性导出区只能包含变量赋值")
-    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
-        raise ValueError("连续性导出区的赋值目标必须是单个变量")
-    variable_name = targets[0].id
-    value = statement.value
-    if not isinstance(value, (ast.Call, ast.Name, ast.Attribute)):
-        raise ValueError(f"元素 {variable_name} 的定义不是 Mobject 表达式")
-    if isinstance(value, ast.Call) and not _call_name(value):
-        raise ValueError(f"元素 {variable_name} 的构造器必须是明确的名称或属性")
-    defined = bound_names or set()
+    current = node
+    while isinstance(current, (ast.Attribute, ast.Subscript)):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else ""
+
+
+def _validate_export_expression(statement: ast.AST, defined: set[str], label: str) -> None:
+    """校验赋值或局部方法调用中的表达式，不允许外部业务依赖。"""
+
     for node in ast.walk(statement):
         if isinstance(node, ast.Call) and _call_name(node) in _BANNED_EXPORT_NAMES:
-            raise ValueError(f"连续性导出区包含禁止调用: {_call_name(node)}")
+            raise ValueError(f"元素 {label} 的连续性导出区包含禁止调用: {_call_name(node)}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            method = node.func.attr
+            receiver = _receiver_name(node.func.value)
+            if (
+                method not in _EXPORT_MUTATION_METHODS
+                and method not in _EXPORT_PURE_MOBJECT_METHODS
+                and receiver not in {"np", "math"}
+            ):
+                raise ValueError(f"元素 {label} 的导出区调用了不允许的方法: {method}")
         if isinstance(node, ast.Attribute) and node.attr in _BANNED_EXPORT_NAMES:
-            raise ValueError(f"连续性导出区包含禁止属性: {node.attr}")
+            raise ValueError(f"元素 {label} 的连续性导出区包含禁止属性: {node.attr}")
         if isinstance(node, ast.Name) and node.id in {"self", "__builtins__"}:
-            raise ValueError("连续性导出区不能引用 self 或运行时内建对象")
-        # Manim 构造器/常量通常是首字母大写；只在它确实是调用目标时
-        # 放行 CamelCase 名称，或放行全大写常量。不能把 ``C_point`` 这类
-        # 用户自己的坐标变量误认为 Manim 类，否则提取出的交接代码会在
-        # 下一场景中因缺少外部定义而触发 NameError。
+            raise ValueError(f"元素 {label} 的连续性导出区不能引用 self 或运行时内建对象")
         is_call_target = any(
             isinstance(parent, ast.Call) and parent.func is node for parent in ast.walk(statement)
         )
@@ -122,15 +166,129 @@ def _validate_export_statement(
             and not node.id.isupper()
             and not (node.id[:1].isupper() and is_call_target)
         ):
-            raise ValueError(f"元素 {variable_name} 引用了导出区外未定义变量: {node.id}")
+            raise ValueError(f"元素 {label} 引用了导出区外未定义变量: {node.id}")
         if isinstance(
-            node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            node,
+            (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
         ):
-            raise ValueError(f"元素 {variable_name} 使用了不允许的动态表达式")
+            raise ValueError(f"元素 {label} 使用了不允许的动态表达式")
+
+
+def _validate_export_statement(
+    statement: ast.stmt,
+    bound_names: set[str] | None = None,
+) -> tuple[str, str]:
+    """校验导出定义及其安全的局部样式/布局调用。"""
+
+    defined = bound_names or set()
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        call = statement.value
+        if (
+            not isinstance(call.func, ast.Attribute)
+            or call.func.attr not in _EXPORT_MUTATION_METHODS
+        ):
+            if isinstance(call.func, ast.Attribute):
+                raise ValueError(f"连续性导出区包含不允许的方法: {call.func.attr}")
+            raise ValueError("连续性导出区只能包含变量赋值或白名单内的 Mobject 样式/布局调用")
+        receiver = _receiver_name(call.func.value)
+        if not receiver or receiver not in defined:
+            raise ValueError("连续性导出区的方法调用必须作用于已定义的 Mobject")
+        _validate_export_expression(statement, defined, receiver)
+        return "", receiver
+    if isinstance(statement, ast.If):
+        if statement.orelse:
+            raise ValueError("连续性导出区不允许 else/elif 分支")
+        _validate_export_expression(statement.test, defined, "条件")
+        local_defined = set(defined)
+        for child in statement.body:
+            variable_name, _ = _validate_export_statement(child, local_defined)
+            if variable_name:
+                local_defined.add(variable_name)
+        return "", ""
+    if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        raise ValueError("连续性导出区只能包含变量赋值或白名单内的 Mobject 样式/布局调用")
+    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+        raise ValueError("连续性导出区的赋值目标必须是单个变量")
+    variable_name = targets[0].id
+    value = statement.value
+    if not isinstance(value, (ast.Call, ast.Name, ast.Attribute)):
+        raise ValueError(f"元素 {variable_name} 的定义不是 Mobject 表达式")
+    if isinstance(value, ast.Call) and not _call_name(value):
+        raise ValueError(f"元素 {variable_name} 的构造器必须是明确的名称或属性")
+    _validate_export_expression(statement, defined, variable_name)
     return variable_name, variable_name
 
 
-def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
+def _safe_alias_prefix(code: str, begin_line: int, block: str) -> str:
+    """提取 marker 之前定义的静态颜色/布局别名，随交接代码一起携带。"""
+
+    try:
+        block_tree = ast.parse(block)
+        full_tree = ast.parse(code)
+    except SyntaxError:
+        return ""
+    required = {
+        node.id
+        for node in ast.walk(block_tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id not in _SAFE_EXPORT_CONTEXT_NAMES
+        # 携带小写视觉别名和全大写颜色常量；首字母大写但含小写的
+        # ``C_point`` 一类业务变量仍必须在导出区内定义，不能借别名逃过
+        # 外部依赖检查。
+        and (node.id[:1].islower() or node.id.isupper())
+    }
+    if not required:
+        return ""
+    construct = next(
+        (
+            node
+            for node in ast.walk(full_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "construct"
+            and node.lineno < begin_line <= (node.end_lineno or begin_line)
+        ),
+        None,
+    )
+    if construct is None:
+        return ""
+    known = set(_SAFE_EXPORT_CONTEXT_NAMES)
+    aliases: list[str] = []
+    for statement in construct.body:
+        if (statement.end_lineno or statement.lineno) >= begin_line:
+            break
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in required:
+            continue
+        # 只携带静态常量、全局视觉字典索引和安全的纯计算别名，不把
+        # 任意业务对象或函数调用偷偷带入下一场景。
+        value = statement.value
+        safe_value = isinstance(value, ast.Constant) and isinstance(
+            value.value, (str, int, float, bool, type(None))
+        )
+        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+            safe_value = _receiver_name(value) in _SAFE_EXPORT_CONTEXT_NAMES
+        if not safe_value:
+            continue
+        try:
+            _validate_export_expression(statement, known, target.id)
+        except ValueError:
+            continue
+        source = ast.get_source_segment(code, statement)
+        if source:
+            aliases.append(textwrap.dedent(source).strip())
+            known.add(target.id)
+    return "\n\n".join(aliases)
+
+
+def _parse_export_block(
+    code: str,
+    *,
+    prefix_code: str = "",
+) -> tuple[str, list[ExtractedElement]]:
     lines = code.splitlines()
     begin = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line]
     end = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line]
@@ -141,13 +299,29 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
     block_lines = lines[begin[0] + 1 : end[0]]
     block = textwrap.dedent("\n".join(block_lines)).strip()
     if not block:
-        return "", []
+        return prefix_code, []
+    full_block = "\n\n".join(item for item in (prefix_code, block) if item)
     try:
         tree = ast.parse(block)
     except SyntaxError as exc:
         raise ValueError(f"连续性导出区不是合法 Python: {exc}") from exc
     elements: list[ExtractedElement] = []
     bound_names: set[str] = set()
+    if prefix_code:
+        try:
+            prefix_tree = ast.parse(prefix_code)
+        except SyntaxError as exc:
+            raise ValueError(f"连续性导出别名不是合法 Python: {exc}") from exc
+        prefix_defined = set(_SAFE_EXPORT_CONTEXT_NAMES)
+        for prefix_statement in prefix_tree.body:
+            if not isinstance(prefix_statement, ast.Assign) or len(prefix_statement.targets) != 1:
+                raise ValueError("连续性导出别名只能包含单变量赋值")
+            target = prefix_statement.targets[0]
+            if not isinstance(target, ast.Name):
+                raise ValueError("连续性导出别名的目标必须是变量")
+            _validate_export_expression(prefix_statement, prefix_defined, target.id)
+            prefix_defined.add(target.id)
+        bound_names = prefix_defined
     block_source_lines = block.splitlines()
     statements = [
         statement
@@ -155,7 +329,7 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
         if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))
     ]
     if not statements:
-        return block, []
+        return full_block, []
 
     # ``element_id`` 标记有两种常见写法：
     #   1. 紧邻一个赋值，直接标记该对象；
@@ -218,13 +392,16 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
                 raise ValueError("无法读取连续性导出语句")
             variable_name, _ = _validate_export_statement(statement, bound_names)
             group_variables.append(variable_name)
-            bound_names.add(variable_name)
+            if variable_name:
+                bound_names.add(variable_name)
 
         # 无标记 helper 组只负责为后续对象提供安全的本地依赖。
         if not annotated_id:
             if annotations:
                 continue
             for statement, variable_name in zip(group_statements, group_variables, strict=True):
+                if not variable_name:
+                    raise ValueError("没有 element_id 标记时，样式/布局调用必须和对象赋值一起声明")
                 source = ast.get_source_segment(block, statement)
                 elements.append(
                     ExtractedElement(
@@ -235,17 +412,22 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
                 )
             continue
 
+        bound_group_variables = [variable for variable in group_variables if variable]
+        if not bound_group_variables:
+            raise ValueError(f"元素 {annotated_id} 缺少 Mobject 赋值")
         if len(group_statements) == 1:
-            exported_variable = group_variables[0]
+            exported_variable = bound_group_variables[0]
         else:
             # 复合对象的最后一条赋值就是标记的语义对象；element_id
             # 可以和 variable_name 不同（例如 ``main_triangle`` 对应
             # ``triangle``）。helper 语句保留在 exported_elements_code
             # 中，但不参加 element_id 合同。
-            exported_variable = group_variables[-1]
+            exported_variable = bound_group_variables[-1]
         group_source = "\n\n".join(
             ast.get_source_segment(block, statement).strip() for statement in group_statements
         )
+        if prefix_code:
+            group_source = "\n\n".join((prefix_code, group_source))
         elements.append(
             ExtractedElement(
                 element_id=annotated_id,
@@ -255,7 +437,7 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
         )
     if len({item.element_id for item in elements}) != len(elements):
         raise ValueError("连续性导出区包含重复 element_id")
-    return block, elements
+    return full_block, elements
 
 
 def _marker_is_inside_construct(lines: list[str], node: ast.FunctionDef, line: int) -> bool:
@@ -308,8 +490,15 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
             for node in construct_nodes
         ):
             raise ValueError("连续性导出区必须位于 Scene.construct() 内")
-    marked_code, marked_elements = _parse_export_block(code)
     if marker_lines:
+        lines = code.splitlines()
+        begin_index = next(
+            index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line
+        )
+        end_index = next(index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line)
+        block_text = textwrap.dedent("\n".join(lines[begin_index + 1 : end_index])).strip()
+        prefix_code = _safe_alias_prefix(code, begin_index + 1, block_text)
+        marked_code, marked_elements = _parse_export_block(code, prefix_code=prefix_code)
         return marked_code, marked_elements
 
     tree = parsed_tree
@@ -438,6 +627,7 @@ def normalize_scene_plan_contract(
     inherited = unique(list(plan.inherited_elements), "inherited_elements")
     removals = unique(list(plan.elements_to_remove), "elements_to_remove")
     new_elements = unique(list(plan.new_elements), "new_elements")
+    previous_available_by_id: dict[str, VisualElementState] = {}
 
     if plan.scene_id == 1 and inherited:
         existing_new_ids = {item.element_id for item in new_elements}
@@ -530,6 +720,60 @@ def normalize_scene_plan_contract(
         valid_new.append(item)
     new_elements = valid_new
 
+    # handoff 是场景边界的显式合同：它列出的对象必须能在本场景结束时
+    # 被代码导出；反之，没有出现在 handoff 中的 new_elements 通常只是
+    # 场景内部的临时步骤。模型经常会把这两类对象混在 new_elements 里，
+    # 若照单全收，Coder 会被迫导出已经淡出的中间公式，随后确定性合同
+    # 又会把合法代码判成失败。这里用边界合同消除这种机械歧义，并保留
+    # repair 记录供仪表盘和运行清单追踪。
+    normalized_handoff = list(plan.handoff)
+    if normalized_handoff:
+        handoff_ids = {item.element_id for item in normalized_handoff}
+        declared_ids = {item.element_id for item in [*inherited, *removals, *new_elements]}
+        for handoff_item in normalized_handoff:
+            if handoff_item.element_id in declared_ids or handoff_item.action == "remove":
+                continue
+            previous_item = previous_available_by_id.get(handoff_item.element_id)
+            inferred = VisualElementState(
+                element_id=handoff_item.element_id,
+                role="",
+                kind=previous_item.kind if previous_item is not None else "Mobject",
+                semantic_state=(
+                    handoff_item.semantic_state
+                    or (previous_item.semantic_state if previous_item is not None else "")
+                ),
+                color_key=previous_item.color_key if previous_item is not None else "",
+                anchor=previous_item.anchor if previous_item is not None else "",
+                variable_name=(
+                    handoff_item.variable_name
+                    or (previous_item.variable_name if previous_item is not None else "")
+                ),
+                required=True,
+            )
+            if previous_item is not None:
+                inherited.append(inferred)
+                repairs.append(
+                    f"handoff 中的元素 {handoff_item.element_id} 已补入 inherited_elements"
+                )
+            else:
+                new_elements.append(inferred)
+                repairs.append(f"handoff 中的元素 {handoff_item.element_id} 已补入 new_elements")
+            declared_ids.add(handoff_item.element_id)
+
+        handoff_ids = {item.element_id for item in normalized_handoff}
+        repaired_new: list[VisualElementState] = []
+        for item in new_elements:
+            repaired_item = item
+            if item.element_id in handoff_ids:
+                if not item.required:
+                    repairs.append(f"边界交接元素 {item.element_id} 已标记为 required")
+                    repaired_item = item.model_copy(update={"required": True})
+            elif item.required:
+                repairs.append(f"场景内部元素 {item.element_id} 不参与边界交接，已标记为 optional")
+                repaired_item = item.model_copy(update={"required": False})
+            repaired_new.append(repaired_item)
+        new_elements = repaired_new
+
     allowed_colors = set(bible.global_visual_state.colors)
 
     def normalize_color(item: VisualElementState) -> VisualElementState:
@@ -555,6 +799,8 @@ def normalize_scene_plan_contract(
         updates["elements_to_remove"] = removals
     if new_elements != plan.new_elements:
         updates["new_elements"] = new_elements
+    if normalized_handoff != plan.handoff:
+        updates["handoff"] = normalized_handoff
 
     return (plan.model_copy(update=updates) if updates else plan), repairs
 

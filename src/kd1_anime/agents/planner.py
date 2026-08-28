@@ -641,7 +641,11 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
 - “切割后无缝拼接”“移动碎片填满目标区域”等说法只有在每个碎片的顶点、旋转、目标位置、
   面积和覆盖关系都能逐项核算时才允许出现；否则必须明确改为面积/等式演示，不能用“示意性
   移动”伪装成几何证明。
-- `new_elements` 只填写场景结束后需要交给下一场景的新增对象。场景内部的临时碎片、光效和辅助线不要列入；若确实需要列出但不交接，必须将 `required` 设为 false。
+- `new_elements` 只填写本场景新增的对象；其中只有场景结束后要交给下一场景的对象才设为 `required: true`。
+  场景内部的临时步骤、碎片、光效和辅助线必须设为 `required: false`，或直接不要列入。
+- `handoff` 是边界交接清单：每个 `required: true` 的 `new_elements` 必须在其中出现，
+  每个 `handoff` 中的 `create`/`keep` 元素也必须在 `inherited_elements` 或 `new_elements` 中出现；
+  不要用自然语言 closing_state 代替 element_id。
 
 ## 调色板
 背景 #1C1C1C(深灰), 主色 #58C4DD(蓝), 辅色 #83C167(绿), 强调 #FFFF00(黄), 警告 #FF6666(红)
