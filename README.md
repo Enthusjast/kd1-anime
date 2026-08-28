@@ -240,6 +240,8 @@ kd1-anime clean --older-than 30d --yes
 模型。检查失败会立即退出，不进入后续 Agent 流程。
 `status`、`version`、`doctor`、`clean` 等只读或诊断命令不会自动发送业务请求，
 需要真实探测时可使用 `kd1-anime doctor --probe-llm`。
+交互模式启动时不会扫描或弹出历史可恢复运行；需要恢复时请先用 `status` 找到
+run ID，再显式执行 `kd1-anime resume <run-id>`。
 `render` 不带 `--wait` 时只负责提交并立即返回，终端会显示 run ID。之后使用
 
 `kd1-anime status <run-id>` 查看清单，或用 `kd1-anime resume <run-id>` 继续监控并合并。

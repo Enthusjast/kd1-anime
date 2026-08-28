@@ -310,18 +310,16 @@ def test_pipeline_error_is_concise_and_does_not_render_markup(monkeypatch):
     assert "Traceback" not in rendered
 
 
-def test_show_banner_returns_true_after_resume_selection(monkeypatch):
-    """用户选择恢复运行后 _show_banner 返回 True, 会话应结束。"""
+def test_show_banner_does_not_scan_or_resume_historical_runs(monkeypatch):
+    """启动交互会话时不扫描历史运行，恢复必须由用户显式执行。"""
     session = ChatSession()
-    monkeypatch.setattr(session, "_check_interrupted_runs", lambda: True)
-    assert session._show_banner() is True
-
-
-def test_show_banner_returns_false_when_no_resume(monkeypatch):
-    """没有选择恢复运行 → 返回 False, 继续进入新需求输入。"""
-    session = ChatSession()
-    monkeypatch.setattr(session, "_check_interrupted_runs", lambda: False)
-    assert session._show_banner() is False
+    monkeypatch.setattr(
+        session,
+        "_check_interrupted_runs",
+        lambda: (_ for _ in ()).throw(AssertionError("启动时不应读取历史运行")),
+        raising=False,
+    )
+    session._show_banner()
 
 
 def test_show_banner_displays_main_and_visual_models(monkeypatch):
@@ -335,9 +333,8 @@ def test_show_banner_displays_main_and_visual_models(monkeypatch):
     monkeypatch.setattr(settings, "RAG_ENABLED", True)
 
     session = ChatSession()
-    monkeypatch.setattr(session, "_check_interrupted_runs", lambda: False)
 
-    assert session._show_banner() is False
+    session._show_banner()
     rendered = output.getvalue()
     assert "主模型:" in rendered
     assert "对话模型:" not in rendered
@@ -349,67 +346,3 @@ def test_show_banner_displays_main_and_visual_models(monkeypatch):
     assert "embedding-model" in rendered
     assert "Reranker 模型:" in rendered
     assert "reranker-model" in rendered
-
-
-def test_run_exits_after_resume_instead_of_new_prompt(monkeypatch):
-    """选择恢复运行后 run() 应直接返回, 不再落入"描述你的需求"新提示。"""
-    session = ChatSession()
-    monkeypatch.setattr(session, "_show_banner", lambda: True)
-    calls = []
-    monkeypatch.setattr(session, "_get_initial_prompt", lambda: calls.append("prompt"))
-    session.run()
-    assert calls == []
-
-
-def test_check_interrupted_runs_triggers_resume_and_returns_true(monkeypatch, tmp_path):
-    """在真实 manifest 下选择恢复运行: 返回 True 并调用 _resume_run。"""
-    from datetime import datetime, timedelta, timezone
-
-    from kd1_anime.agents.planner import ScenePlan
-    from kd1_anime.run_store import RunManifest, StoredSceneState
-
-    def make_plan(sid):
-        return ScenePlan(
-            scene_id=sid,
-            title=f"scene {sid}",
-            duration_seconds=10,
-            purpose="test",
-            math_concept="circle",
-            visual_design="dark",
-            camera_movement="fixed",
-            visual_flow=["show"],
-            key_moments=["pause"],
-            computation="radius=1",
-        )
-
-    workspace = tmp_path / "workspace"
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
-
-    run_id = "20260804-223002-337db553"
-    root = workspace / "runs" / run_id
-    root.mkdir(parents=True)
-    now = datetime.now(timezone.utc)
-    manifest = RunManifest(
-        run_id=run_id,
-        status="failed",
-        state="MONITORING",
-        user_prompt="p",
-        output_path=str(tmp_path / "out.mp4"),
-        created_at=now - timedelta(hours=1),
-        updated_at=now,
-        scenes={
-            1: StoredSceneState(plan=make_plan(1), rendered=True),
-            2: StoredSceneState(plan=make_plan(2), rendered=True),
-            3: StoredSceneState(plan=make_plan(3), rendered=True),
-            4: StoredSceneState(plan=make_plan(4), give_up=True),
-        },
-    )
-    (root / "manifest.json").write_text(manifest.model_dump_json(), encoding="utf-8")
-
-    session = ChatSession()
-    resumed: list[str] = []
-    monkeypatch.setattr("builtins.input", lambda _: "1")
-    monkeypatch.setattr(session, "_resume_run", resumed.append)
-
-    assert session._check_interrupted_runs() is True
-    assert resumed == [run_id]
