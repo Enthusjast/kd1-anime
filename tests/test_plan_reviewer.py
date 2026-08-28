@@ -125,3 +125,21 @@ def test_plan_review_prompt_requires_math_and_geometry_validation():
     assert "数学公式" in PLAN_REVIEW_PROMPT
     assert "顶点、面积、旋转和目标覆盖关系" in PLAN_REVIEW_PROMPT
     assert "只输出一个 JSON 对象" in PLAN_REVIEW_PROMPT
+
+
+@patch("kd1_anime.agents.base.BaseAgent.call_llm")
+def test_batch_plan_review_returns_one_result_per_scene(mock_call_llm):
+    mock_call_llm.return_value = (
+        '{"items": ['
+        '{"scene_id": 1, "is_valid": true, "severity": "info", "issues": []},'
+        '{"scene_id": 2, "is_valid": true, "severity": "info", "issues": []}'
+        "]}"
+    )
+    first = make_plan().model_copy(update={"scene_id": 1})
+    second = make_plan().model_copy(update={"scene_id": 2})
+
+    results = PlanReviewerAgent().review_batch([first, second])
+
+    assert set(results) == {1, 2}
+    assert all(result.is_valid for result in results.values())
+    assert "批量审查补充规则" in mock_call_llm.call_args.kwargs["system_prompt"]

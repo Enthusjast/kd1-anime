@@ -29,7 +29,13 @@ from rich.text import Text
 
 from kd1_anime.config import settings
 from kd1_anime.eval.metrics import ComparisonResult, EvalResult
-from kd1_anime.run_store import RESUME_LLM_STATES, RunManifest, RunRepository, lock_run
+from kd1_anime.run_store import (
+    RESUME_LLM_STATES,
+    RunManifest,
+    RunRepository,
+    lock_run,
+    restore_run_path,
+)
 
 app = typer.Typer(
     name="kd1-anime",
@@ -40,6 +46,40 @@ app = typer.Typer(
 console = Console()
 rag_app = typer.Typer(help="管理本地 RAG 知识库", add_completion=False)
 app.add_typer(rag_app, name="rag")
+cache_app = typer.Typer(help="管理本地 LLM 响应缓存", add_completion=False)
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("status")
+def cache_status():
+    """查看缓存路径、条目数和调用统计，不显示响应内容。"""
+
+    from kd1_anime.llm_cache import LLMResponseCache
+
+    data = LLMResponseCache().summary()
+    console.print(f"路径: {data['path']}", markup=False)
+    console.print(f"响应条目: {data['entries']}")
+    console.print(f"调用事件: {data['events']}")
+    console.print(f"本进程统计: {json.dumps(data['stats'], ensure_ascii=False)}")
+
+
+@cache_app.command("clear")
+def cache_clear(
+    yes: bool = typer.Option(False, "--yes", "-y", help="不再询问确认"),
+):
+    """清除本地 LLM 响应缓存。"""
+
+    from kd1_anime.llm_cache import LLMResponseCache
+
+    cache = LLMResponseCache()
+    summary = cache.summary()
+    if (
+        not yes
+        and summary["entries"]
+        and not typer.confirm(f"清除 {summary['entries']} 个缓存响应？", default=False)
+    ):
+        raise typer.Abort()
+    console.print(f"已清除 {cache.clear()} 个缓存响应")
 
 
 @rag_app.command("index")
@@ -300,6 +340,11 @@ def generate(
         None, "--max-fix", min=0, help="最大自动修复尝试次数 (默认: 5, 上限 20)"
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成场景规划和代码,不提交 Slurm 任务"),
+    approve_plan: bool = typer.Option(
+        False,
+        "--approve-plan",
+        help="计划审查后暂停确认；非交互环境下视为显式批准",
+    ),
     incremental: str = typer.Option(
         None,
         "--incremental",
@@ -387,7 +432,10 @@ def generate(
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
             final_video = orchestrator.run_incremental(prompt, incremental, dry_run=dry_run)
         else:
-            final_video = orchestrator.run(prompt, dry_run=dry_run)
+            run_kwargs = {"dry_run": dry_run}
+            if approve_plan:
+                run_kwargs["approve_plan"] = True
+            final_video = orchestrator.run(prompt, **run_kwargs)
 
         if dry_run:
             console.print("\n[bold green]Dry-run 完成[/]")
@@ -437,6 +485,7 @@ def plan(
 
     try:
         from kd1_anime.agents.continuity import normalize_scene_plan_contract
+        from kd1_anime.agents.plan_compiler import PlanCompiler
         from kd1_anime.agents.plan_reviewer import PlanReviewerAgent, deterministic_plan_issues
 
         planner = PlannerAgent()
@@ -508,6 +557,19 @@ def plan(
                 if repairs:
                     contract_repairs.extend(f"Scene {scene.scene_id}: {'；'.join(repairs)}")
             scenes = normalized_scenes
+            compiler_result = PlanCompiler().compile(outlines, scenes, review_bible)
+            for issue in compiler_result.issues:
+                target_ids = issue.scene_ids or [scene.scene_id for scene in scenes]
+                for target_id in target_ids:
+                    plan_review_failures.append(
+                        (
+                            target_id,
+                            [
+                                f"[{issue.category}] {issue.message}",
+                                f"修正要求: {issue.fix_instruction}",
+                            ],
+                        )
+                    )
             for scene in scenes:
                 deterministic = deterministic_plan_issues(scene, review_bible)
                 result = PlanReviewerAgent().review(
@@ -668,13 +730,18 @@ def _print_run_details(manifest: RunManifest) -> None:
 def status(
     run_id: str = typer.Argument(None, help="运行 ID；省略时列出最近运行"),
     limit: int = typer.Option(20, "--limit", min=1, max=200, help="列表最多显示条数"),
+    json_output: bool = typer.Option(False, "--json", help="以机器可读 JSON 输出"),
 ):
     """查看持久化运行状态，不调用 LLM 或 Slurm。"""
 
     repository = RunRepository(settings.WORKSPACE_DIR)
     if run_id:
         try:
-            _print_run_details(repository.load(run_id))
+            manifest = repository.load(run_id)
+            if json_output:
+                console.print_json(manifest.model_dump_json())
+            else:
+                _print_run_details(manifest)
         except Exception as exc:
             console.print(f"[bold red]读取失败:[/] {exc}", markup=False)
             raise typer.Exit(1) from exc
@@ -688,6 +755,14 @@ def status(
         )
     if not manifests:
         console.print("没有可用的运行记录")
+        return
+    if json_output:
+        console.print_json(
+            json.dumps(
+                [manifest.model_dump(mode="json") for manifest in manifests],
+                ensure_ascii=False,
+            )
+        )
         return
     table = Table(title="Recent runs")
     table.add_column("Run ID")
@@ -748,6 +823,95 @@ def resume(
         console.print(f"[bold green]Dry-run 已完成[/] 运行目录: {repository.run_root(run_id)}")
     else:
         console.print(f"[bold green]运行已完成[/] 输出文件: {final_video}")
+
+
+@app.command()
+def retry(
+    run_id: str = typer.Argument(..., help="运行 ID"),
+    scene_id: int = typer.Option(..., "--scene-id", "-s", min=1, help="只重试这个场景"),
+    interactive: bool = typer.Option(False, "--interactive", help="失败时允许终端询问重试"),
+):
+    """只重试一个场景，保留同一运行中其它已完成场景。"""
+
+    repository = RunRepository(settings.WORKSPACE_DIR)
+    try:
+        manifest = repository.load(run_id)
+        if manifest.dry_run:
+            raise ValueError("dry-run 运行请使用 resume，而不是 retry")
+        if _manifest_requires_generation_apis(manifest):
+            _ensure_llm_api_available()
+            _ensure_rag_apis_available()
+        if manifest.visual_eval_profile.enabled:
+            _ensure_visual_llm_api_available(
+                model_override=manifest.visual_eval_profile.model,
+                endpoint_required=False,
+            )
+        from kd1_anime.orchestrator import Orchestrator
+
+        final_video = Orchestrator().resume(
+            run_id,
+            interactive=interactive,
+            retry_scene_id=scene_id,
+        )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]场景重试失败:[/] {exc}", markup=False)
+        raise typer.Exit(1) from exc
+    console.print(f"[bold green]场景重试完成[/] 输出文件: {final_video}")
+
+
+@app.command()
+def logs(
+    run_id: str = typer.Argument(..., help="运行 ID"),
+    scene_id: int | None = typer.Option(None, "--scene-id", "-s", min=1),
+    lines: int = typer.Option(80, "--lines", "-n", min=1, max=5000),
+    stderr: bool = typer.Option(False, "--stderr", help="只显示 stderr"),
+):
+    """查看某次运行的渲染日志尾部，不调用 LLM 或提交任务。"""
+
+    repository = RunRepository(settings.WORKSPACE_DIR)
+    try:
+        manifest = repository.load(run_id)
+        root = repository.run_root(run_id)
+        if scene_id is not None:
+            if scene_id not in manifest.scenes:
+                raise ValueError(f"运行 {run_id} 不包含 Scene {scene_id}")
+            selected = [(scene_id, manifest.scenes[scene_id])]
+        else:
+            selected = sorted(manifest.scenes.items())
+        for current_id, scene in selected:
+            paths: list[tuple[str, Path]] = []
+            if scene.slurm_job is not None:
+                paths.extend(
+                    [
+                        ("stderr", restore_run_path(root, scene.slurm_job.log_err)),
+                        ("stdout", restore_run_path(root, scene.slurm_job.log_out)),
+                    ]
+                )
+            else:
+                paths.extend(
+                    ("stdout", path)
+                    for path in sorted((root / "logs").glob(f"scene_{current_id}_*.out"))
+                )
+                paths.extend(
+                    ("stderr", path)
+                    for path in sorted((root / "logs").glob(f"scene_{current_id}_*.err"))
+                )
+            if stderr:
+                paths = [item for item in paths if item[0] == "stderr"]
+            if not paths:
+                console.print(f"Scene {current_id}: 没有日志", markup=False)
+                continue
+            for label, path in paths:
+                if not path.is_file():
+                    continue
+                content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                console.print(f"\n--- Scene {current_id} {label}: {path} ---", markup=False)
+                console.print("\n".join(content[-lines:]), markup=False)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]读取日志失败:[/] {exc}", markup=False)
+        raise typer.Exit(1) from exc
 
 
 def _parse_retention(value: str) -> timedelta:

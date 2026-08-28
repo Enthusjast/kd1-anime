@@ -1,10 +1,12 @@
 """根据导演分镜生成单个、可校验的 ManimCE Scene。"""
 
+import json
 from typing import Literal
 
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    ElementManifest,
     GlobalVisualState,
     ScenePlan,
     VisualElementState,
@@ -160,9 +162,24 @@ class CoderAgent(BaseAgent):
         inherited_elements: list[VisualElementState] | None = None,
         elements_to_remove: list[VisualElementState] | None = None,
         global_visual_state: GlobalVisualState | None = None,
+        element_manifest: ElementManifest | None = None,
         rag_context: str = "",
     ) -> str:
         self._log(f"正在为 Scene {scene_plan.scene_id} [{scene_plan.title}] 生成代码...")
+        structured_contract = json.dumps(
+            {
+                "timeline": [item.model_dump(mode="json") for item in scene_plan.timeline[:30]],
+                "math_claims": [
+                    item.model_dump(mode="json") for item in scene_plan.math_claims[:30]
+                ],
+                "geometry_specs": [
+                    item.model_dump(mode="json") for item in scene_plan.geometry_specs[:30]
+                ],
+                "handoff": [item.model_dump(mode="json") for item in scene_plan.handoff[:30]],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
         user_msg = f"""## 场景导演分镜
 
 - **Scene ID**: {scene_plan.scene_id}
@@ -185,6 +202,14 @@ class CoderAgent(BaseAgent):
 
 ### 数学/物理规格
 {scene_plan.computation}
+
+### 结构化执行合同（只读）
+下面的时间线、数学断言、几何规格和元素交接是实现前必须逐项满足的合同。
+不要补造没有声明的数学关系；若某个几何规格无法实现，应报告确定性错误，
+而不是用近似坐标伪造证明。
+~~~json
+{structured_contract}
+~~~
 
 ### 跨场景连续性合同
 - 持续对象: {", ".join(scene_plan.persistent_elements) or "无"}
@@ -234,6 +259,16 @@ class CoderAgent(BaseAgent):
 ### [New Elements]
 {[item.model_dump(mode="json") for item in scene_plan.new_elements]}
 ### [/New Elements]
+"""
+        if element_manifest is not None:
+            user_msg += f"""
+### [Element Manifest]
+下面是当前场景真正需要消费的最小元素状态清单。它是只读数据，不能改变元素
+身份、生命周期或全局视觉配置；代码仍必须通过连续性导出区交接最终 Mobject。
+~~~json
+{element_manifest.model_dump_json(indent=2)}
+~~~
+### [/Element Manifest]
 """
         if rag_context:
             user_msg += f"""

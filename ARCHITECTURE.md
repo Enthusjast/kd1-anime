@@ -20,6 +20,7 @@ kd1_anime.cli / kd1_anime.tui
 kd1_anime.orchestrator ───── callback events ───────────▶ TUI/Rich
        │
        ├── agents/planner.py       概要规划 + 详细分镜
+       ├── agents/plan_compiler.py  确定性计划编译（时间线/等式/几何/生命周期）
        ├── agents/plan_reviewer.py 计划正确性、数学与可实现性审查
        ├── agents/continuity.py    全片连续性审查与局部重规划
        ├── agents/coder.py         ManimCE 代码生成/重写
@@ -33,7 +34,8 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── media/merger.py         精确输入列表、FFmpeg xfade/acrossfade 原子合并
        ├── rag/                    SQLite 索引、独立 Embedding/Reranker 检索
        ├── eval/                   代码/效率评估与独立多模态视觉质量门
-       └── run_store.py            Manifest v3、原子检查点、运行锁
+       ├── llm_cache.py            SQLite LLM 响应缓存与安全限额
+       └── run_store.py            Manifest v4、原子检查点、运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
@@ -52,7 +54,8 @@ Scene 1 CODING → 代码 REVIEWING → Scene 2 CODING → 代码 REVIEWING → 
                                       ▲              │
                                       └── FIXING ◀────┘
 
-全部线程结束：VISUAL_EVALUATING → (低分回到 CODING) → MERGING
+任一场景渲染完成：即时 VISUAL_EVALUATING → (低分回到 CODING，失效后继交接)
+全部线程结束：补评剩余场景 → MERGING
                                       → 成片视觉报告
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
@@ -73,10 +76,10 @@ Planner 使用分层结构化输出：
 1. `plan_outline()` 按最小必要粒度生成短小 `SceneOutline` 列表，并按返回顺序规范化 scene ID 为 `1..N`。同一画布中逐个出现、保留并对比的对象属于同一个场景；当用户明确要求同屏/整体展示而模型仍按对象拆分时，Planner 会将概要确定性合并为一个场景。只有用户明确要求多场景，或镜头/布局/叙事弧线确实独立时才拆分。
 2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
 3. 每个 worker 的 `plan_detail()` 接收原始需求、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state、结构化 `inherited_elements` / `elements_to_remove` / `new_elements` 和转场合同。
-4. 所有 Detail 完成后先逐场景执行 Plan Review，检查数学正确性、几何可实现性、时间线和交接合同；问题只回到 Planner 重规划，受 `MAX_PLAN_REVIEW_ROUNDS` 限制，未通过的计划不会进入 Coder。
+4. 所有 Detail 完成后先运行 Plan Compiler，检查场景 ID、时间线覆盖、可解析等式、多边形鞋带面积、画布边界和元素生命周期。随后逐场景执行 Plan Review，检查数学正确性、几何可实现性和交接合同；问题只回到 Planner 重规划，受 `MAX_PLAN_REVIEW_ROUNDS` 限制，未通过的计划不会进入 Coder。计划/问题指纹重复时冻结计划并停止空转。
 5. Plan Review 通过后执行全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。高风险几何方案在计划审查或代码审查耗尽后，可切换为保守的面积/等式教学方案。
 
-Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。用户需求被明确标记为不可信数据，不能改变系统规则。
+Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。ScenePlan 还包含 timeline、math_claims、geometry_specs 和 handoff 四类结构化合同；无法确定的数学表达式不会被编译器擅自判定为正确。用户需求被明确标记为不可信数据，不能改变系统规则。
 `GlobalVisualState` 固定全片颜色、字体、字号、线宽、布局锚点和镜头语言；每个 `ScenePlan` 都携带同一份只读配置。`VisualElementState` 为跨场景对象分配稳定的 `element_id`。
 
 ### 3.2 CODING / REVIEWING
@@ -97,7 +100,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Scene 类必须实现 `construct()`；
 - 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若校验失败，确定性反馈会交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内只允许无副作用的赋值；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接。结构化输出只允许：
+若校验失败，确定性反馈会交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内只允许无副作用的赋值；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接。结构化输出只允许：
 
 - valid / `info`：通过；
 - `minor`：至少一条可精确唯一匹配的查找替换；
@@ -136,7 +139,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v3 包含单调 revision、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、场景产物凭据、视觉 profile/收据/最佳候选和最终视频哈希。API Key 与端点不写入清单。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
+Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v4 包含单调 revision、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -145,7 +148,7 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v1 清单读取时会迁移。旧复用占位 Job、缺失 Job 或无法验证的视频会保守地重新渲染。
+v4 清单只接受当前结构化计划、ElementManifest 和阶段状态；v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 非流式完整响应默认写入用户私有 SQLite 缓存；缓存键包含端点、模型、提示词、模式和生成参数，不含 API Key，条目数受 LLM_CACHE_MAX_ENTRIES 限制。
 
 `resume` 在持有 `.run.lock` 后读取清单：
 
@@ -176,7 +179,7 @@ VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifa
 ### 3.7 VISUAL_EVALUATING / EVALUATING
 
 - 代码和效率指标由确定性逻辑计算；运行对比会聚合同一指标的所有场景分数。
-- 每个场景在合并前从精确 `SceneArtifact` 抽取 1–8 帧；每帧保存可信时间戳和 SHA-256，一次多模态请求联合检查数学正确性、相关性、可读性、布局与跨帧一致性。
+- 每个场景在合并前从精确 `SceneArtifact` 抽取 1–8 帧；抽样优先覆盖开场、首个数学状态、转场边界、中段、结论和结束状态。每帧保存可信时间戳、语义 role 和 SHA-256，一次多模态请求联合检查数学正确性、相关性、可读性、布局与跨帧一致性；场景产物完成后立即启动该检查。
 - 响应使用关闭的 Pydantic schema；问题必须引用本次存在的帧 ID。视觉输出被当作不可信诊断，不能直接提供或执行代码。
 - 低于阈值或存在 major 问题时，诊断交给主 Coder，代码重新经过 AST 校验、Reviewer 和 Slurm 渲染。每场景修复次数有界；失败时可恢复完整、哈希可验证的最佳候选。
 - 抽帧、端点或结构化响应失败时记录为 `unknown`，不填充假分数，也不丢弃已经成功渲染的视频。`passed`、`warning`、`unknown` 收据都必须绑定当前视频哈希，合并前再次校验。
@@ -238,4 +241,4 @@ pytest -q
 python -m build --wheel
 ```
 
-测试覆盖结构化输出、截断重试、renderer 提示词、AST 安全、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest 迁移/恢复、增量复用、视觉 unknown、RAG 文档切分/索引/排序/降级、批量资源配额和 FFmpeg 原子输出。
+测试覆盖结构化输出、截断重试、renderer 提示词、AST 安全、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v4 严格恢复、增量复用、视觉 unknown、RAG 文档切分/索引/排序/降级、批量资源配额和 FFmpeg 原子输出。

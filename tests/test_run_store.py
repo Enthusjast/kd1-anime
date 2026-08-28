@@ -11,7 +11,7 @@ from kd1_anime.agents.planner import ContinuityBible, ScenePlan
 from kd1_anime.cli import app
 from kd1_anime.config import settings
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
-from kd1_anime.rendering import VideoMetadata, sha256_file
+from kd1_anime.rendering import sha256_file
 from kd1_anime.run_store import (
     RunManifest,
     RunRepository,
@@ -338,8 +338,28 @@ def test_repository_rejects_malformed_legacy_scene_mapping(tmp_path):
     )
 
     assert RunRepository(workspace).list() == []
-    with pytest.raises(ValueError, match="scenes 必须是对象"):
+    with pytest.raises(ValueError, match="不支持旧版"):
         RunRepository(workspace).load(RUN_ID)
+
+
+def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp_path):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text(
+        json.dumps({"schema_version": 3, "run_id": RUN_ID}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"schema_version=3.*重新生成"):
+        RunRepository(workspace).load(RUN_ID)
+
+
+def test_current_manifest_uses_v4_schema():
+    assert (
+        RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
+        == 4
+    )
 
 
 def _write_v1_manifest(workspace: Path, *, reused_job: bool = False) -> Path:
@@ -396,52 +416,24 @@ def test_v1_reused_job_is_migrated_to_safe_rerender(tmp_path):
     workspace = tmp_path / "workspace"
     _write_v1_manifest(workspace, reused_job=True)
 
-    manifest = RunRepository(workspace).load(RUN_ID)
-    scene = manifest.scenes[1]
-
-    assert manifest.schema_version == 3
-    assert scene.plan_ready is True
-    assert scene.rendered is False
-    assert scene.slurm_job is None
-    assert scene.artifact is None
-    assert "重新渲染" in scene.failure_reason
+    with pytest.raises(ValueError, match="不支持旧版"):
+        RunRepository(workspace).load(RUN_ID)
 
 
-def test_v1_rendered_video_gets_verified_artifact(monkeypatch, tmp_path):
+def test_v1_rendered_video_is_rejected_without_unsafe_migration(tmp_path):
     workspace = tmp_path / "workspace"
     _write_v1_manifest(workspace)
-    video = workspace / "runs" / RUN_ID / "videos" / "scene_1" / "Demo.mp4"
-    video.parent.mkdir(parents=True)
-    video.write_bytes(b"legacy video")
-    metadata = VideoMetadata(
-        size_bytes=video.stat().st_size,
-        duration_seconds=1,
-        width=settings.MANIM_PIXEL_WIDTH,
-        height=settings.MANIM_PIXEL_HEIGHT,
-        frame_rate=settings.MANIM_FRAME_RATE,
-    )
-    monkeypatch.setattr(store_module, "verify_video", lambda path, profile: metadata)
 
-    manifest = RunRepository(workspace).load(RUN_ID)
-    scene = manifest.scenes[1]
-
-    assert scene.rendered is True
-    assert scene.artifact is not None
-    assert scene.artifact.verified is True
-    assert scene.slurm_job is not None
-    assert scene.slurm_job.output_path == "videos/scene_1/Demo.mp4"
+    with pytest.raises(ValueError, match="不支持旧版"):
+        RunRepository(workspace).load(RUN_ID)
 
 
 def test_v1_unverifiable_video_is_forced_to_rerender(tmp_path):
     workspace = tmp_path / "workspace"
     _write_v1_manifest(workspace)
 
-    scene = RunRepository(workspace).load(RUN_ID).scenes[1]
-
-    assert scene.plan_ready is True
-    assert scene.rendered is False
-    assert scene.artifact is None
-    assert scene.phase == "reviewed"
+    with pytest.raises(ValueError, match="不支持旧版"):
+        RunRepository(workspace).load(RUN_ID)
 
 
 def test_v1_rendered_scene_without_job_is_forced_to_rerender(tmp_path):
@@ -451,12 +443,8 @@ def test_v1_rendered_scene_without_job_is_forced_to_rerender(tmp_path):
     raw["scenes"]["1"]["slurm_job"] = None
     path.write_text(json.dumps(raw), encoding="utf-8")
 
-    scene = RunRepository(workspace).load(RUN_ID).scenes[1]
-
-    assert scene.rendered is False
-    assert scene.artifact is None
-    assert scene.phase == "reviewed"
-    assert "缺少可验证" in scene.failure_reason
+    with pytest.raises(ValueError, match="不支持旧版"):
+        RunRepository(workspace).load(RUN_ID)
 
 
 def test_checkpoint_revision_is_monotonic_under_threads(tmp_path):

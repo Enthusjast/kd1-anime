@@ -85,7 +85,50 @@ class Evaluator:
         if frame_count == 1:
             positions = [0.5]
         else:
-            positions = [0.05 + index * 0.9 / (frame_count - 1) for index in range(frame_count)]
+            # 首尾和数学状态/转场边界比单纯等距中间帧更有诊断价值。
+            positions = {
+                2: [0.02, 0.98],
+                3: [0.02, 0.5, 0.98],
+                4: [0.02, 0.22, 0.78, 0.98],
+                5: [0.02, 0.2, 0.5, 0.8, 0.98],
+                6: [0.02, 0.16, 0.38, 0.62, 0.84, 0.98],
+                7: [0.02, 0.14, 0.3, 0.5, 0.7, 0.86, 0.98],
+                8: [0.02, 0.12, 0.25, 0.4, 0.6, 0.75, 0.88, 0.98],
+            }[frame_count]
+        roles = {
+            1: ["middle"],
+            2: ["opening", "ending"],
+            3: ["opening", "middle", "ending"],
+            4: ["opening", "first_math_state", "conclusion", "ending"],
+            5: ["opening", "first_math_state", "middle", "conclusion", "ending"],
+            6: [
+                "opening",
+                "first_math_state",
+                "transition_boundary",
+                "middle",
+                "conclusion",
+                "ending",
+            ],
+            7: [
+                "opening",
+                "first_math_state",
+                "transition_boundary",
+                "middle",
+                "transition_boundary",
+                "conclusion",
+                "ending",
+            ],
+            8: [
+                "opening",
+                "first_math_state",
+                "transition_boundary",
+                "middle",
+                "transition_boundary",
+                "conclusion",
+                "transition_boundary",
+                "ending",
+            ],
+        }[frame_count]
         for index in range(frame_count):
             timestamp = metadata.duration_seconds * positions[index]
             output = output_dir / f"frame_{index + 1:02d}.jpg"
@@ -131,6 +174,7 @@ class Evaluator:
                     path=output,
                     timestamp_seconds=timestamp,
                     image_sha256=sha256_file(output),
+                    role=roles[index],
                 )
             )
         return samples

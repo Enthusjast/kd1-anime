@@ -27,6 +27,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from kd1_anime.config import LLMRuntimeProfile, settings
+from kd1_anime.llm_cache import LLMResponseCache, make_cache_key
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -52,6 +53,8 @@ class BaseAgent:
         self.profile = profile or settings.main_llm_profile()
         self._client: OpenAI | None = None
         self.model = self.profile.model
+        self.last_call_metrics: dict[str, object] = {}
+        self._last_usage: dict[str, int] = {}
 
     @property
     def client(self) -> OpenAI:
@@ -125,6 +128,22 @@ class BaseAgent:
             f"（{self.profile.base_url}，模型 {self.model}）：{detail}"
         )
 
+    @staticmethod
+    def _extract_usage(usage: object) -> dict[str, int]:
+        if usage is None:
+            return {}
+        values: dict[str, int] = {}
+        for target, names in (
+            ("prompt_tokens", ("prompt_tokens", "input_tokens")),
+            ("completion_tokens", ("completion_tokens", "output_tokens")),
+        ):
+            for name in names:
+                value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+                if isinstance(value, int) and value >= 0:
+                    values[target] = value
+                    break
+        return values
+
     def _log(self, message: str, style: str = "bold cyan") -> None:
         """打印 Agent 思考过程（仪表盘激活时抑制，避免破坏 Live 渲染）"""
         # 延迟导入避免循环依赖
@@ -159,6 +178,7 @@ class BaseAgent:
         messages: list[dict] | None = None,
         stream: bool = False,
         allow_truncated: bool = False,
+        cache_namespace: str = "",
     ) -> str:
         """
         调用 LLM API,内置指数退避重试
@@ -190,6 +210,43 @@ class BaseAgent:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ]
+
+        # 只对调用方明确要求的非流式请求启用缓存。交互式流式输出包含
+        # 用户取消、实时显示等语义，不能被缓存；静默流式传输仍属于可缓存的
+        # 非流式业务调用。缓存命中直接跳过网络和重试，不会绕过 profile.require。
+        cache: LLMResponseCache | None = None
+        cache_key: str | None = None
+        started_at = time.monotonic()
+        uses_default_client = getattr(type(self), "client", None) is BaseAgent.client
+        if not stream and settings.LLM_CACHE_ENABLED and uses_default_client:
+            cache = LLMResponseCache()
+            cache_key = make_cache_key(
+                self.profile,
+                messages,
+                temperature=temp,
+                max_tokens=tokens,
+                json_mode=json_mode,
+                allow_truncated=allow_truncated,
+                extra=(
+                    f"{self.name}:{type(self).__module__}.{type(self).__qualname__}:"
+                    f"{cache_namespace}"
+                ),
+            )
+            cached = cache.get(cache_key)
+            if cached is not None:
+                cache.record_call(
+                    cache_key,
+                    cache_hit=True,
+                    latency_ms=0.0,
+                    model=self.model,
+                )
+                self.last_call_metrics = {
+                    "cache_hit": True,
+                    "latency_ms": 0.0,
+                    "attempts": 0,
+                    "model": self.model,
+                }
+                return cached
 
         kwargs: dict = {
             "model": self.model,
@@ -229,12 +286,14 @@ class BaseAgent:
                                 if isinstance(item, dict)
                             )
                         console.print(f"[dim]DEBUG [{role} #{i}]: {preview}[/]", markup=False)
+                self._last_usage = {}
                 if use_stream_transport:
                     content, finish_reason = self._stream_llm(kwargs, display=stream)
                 else:
                     response = self.client.chat.completions.create(**kwargs)
                     content = response.choices[0].message.content or ""
                     finish_reason = getattr(response.choices[0], "finish_reason", None)
+                    self._last_usage = self._extract_usage(getattr(response, "usage", None))
                     content = content.strip()
                 if not content:
                     finish = finish_reason or "stream_empty"
@@ -320,6 +379,29 @@ class BaseAgent:
                     continue
                 if finish_reason == "length":
                     if allow_truncated:
+                        if cache is not None and cache_key is not None:
+                            cache.set(
+                                cache_key,
+                                content,
+                                latency_ms=(time.monotonic() - started_at) * 1000,
+                                prompt_tokens=self._last_usage.get("prompt_tokens"),
+                                completion_tokens=self._last_usage.get("completion_tokens"),
+                            )
+                            cache.record_call(
+                                cache_key,
+                                cache_hit=False,
+                                latency_ms=(time.monotonic() - started_at) * 1000,
+                                prompt_tokens=self._last_usage.get("prompt_tokens"),
+                                completion_tokens=self._last_usage.get("completion_tokens"),
+                                model=self.model,
+                            )
+                        self.last_call_metrics = {
+                            "cache_hit": False,
+                            "latency_ms": (time.monotonic() - started_at) * 1000,
+                            "attempts": attempt,
+                            "model": self.model,
+                            **self._last_usage,
+                        }
                         return content
                     if not max_tokens_boosted and not max_tokens_fallback_used:
                         current_limit = kwargs.get("max_tokens")
@@ -343,6 +425,29 @@ class BaseAgent:
                 if self.profile.debug and (not use_stream_transport or not stream):
                     preview = content[:500] + ("..." if len(content) > 500 else "")
                     console.print(f"[dim]DEBUG [response]: {preview}[/]", markup=False)
+                if cache is not None and cache_key is not None:
+                    cache.set(
+                        cache_key,
+                        content,
+                        latency_ms=(time.monotonic() - started_at) * 1000,
+                        prompt_tokens=self._last_usage.get("prompt_tokens"),
+                        completion_tokens=self._last_usage.get("completion_tokens"),
+                    )
+                    cache.record_call(
+                        cache_key,
+                        cache_hit=False,
+                        latency_ms=(time.monotonic() - started_at) * 1000,
+                        prompt_tokens=self._last_usage.get("prompt_tokens"),
+                        completion_tokens=self._last_usage.get("completion_tokens"),
+                        model=self.model,
+                    )
+                self.last_call_metrics = {
+                    "cache_hit": False,
+                    "latency_ms": (time.monotonic() - started_at) * 1000,
+                    "attempts": attempt,
+                    "model": self.model,
+                    **self._last_usage,
+                }
                 return content
 
             except (RateLimitError, APITimeoutError, APIConnectionError) as e:
@@ -459,6 +564,7 @@ class BaseAgent:
         empty_chunks = 0
         cancelled = threading.Event()
         last_finish: str | None = None
+        self._last_usage = {}
 
         def _watch_esc() -> None:
             try:
@@ -494,6 +600,9 @@ class BaseAgent:
         try:
             stream = self.client.chat.completions.create(**kwargs)
             for chunk in stream:
+                chunk_usage = self._extract_usage(getattr(chunk, "usage", None))
+                if chunk_usage:
+                    self._last_usage.update(chunk_usage)
                 if cancelled.is_set():
                     user_cancelled = True
                     if display:
@@ -600,6 +709,10 @@ class BaseAgent:
                 "json_mode": True,
                 "messages": self._clone_messages(current_messages),
             }
+            if getattr(type(self), "call_llm", None) is BaseAgent.call_llm:
+                call_kwargs["cache_namespace"] = (
+                    f"{response_model.__module__}.{response_model.__qualname__}"
+                )
             if allow_truncated:
                 call_kwargs["allow_truncated"] = True
             raw = self.call_llm(
@@ -682,6 +795,8 @@ class BaseAgent:
         user_message: str,
         item_model: type[T],
         temperature: float | None = None,
+        *,
+        allow_truncated: bool = False,
     ) -> list[T]:
         """
         调用 LLM 并将响应解析为 Pydantic 模型列表
@@ -695,12 +810,19 @@ class BaseAgent:
         current_message = user_message
 
         for attempt in range(repair_attempts + 1):
-            raw = self.call_llm(
-                system_prompt=system_prompt,
-                user_message=current_message,
-                temperature=temp,
-                json_mode=True,
-            )
+            call_kwargs = {
+                "system_prompt": system_prompt,
+                "user_message": current_message,
+                "temperature": temp,
+                "json_mode": True,
+            }
+            if getattr(type(self), "call_llm", None) is BaseAgent.call_llm:
+                call_kwargs["cache_namespace"] = (
+                    f"{item_model.__module__}.{item_model.__qualname__}"
+                )
+            if allow_truncated:
+                call_kwargs["allow_truncated"] = True
+            raw = self.call_llm(**call_kwargs)
 
             json_str = self._extract_json(raw, expected_type="array")
             try:

@@ -169,6 +169,10 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_HEALTHCHECK_TIMEOUT == 15.0
     assert config.LLM_MAX_TOKENS == 32768
     assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
+    assert config.LLM_CACHE_ENABLED is True
+    assert config.LLM_CACHE_MAX_ENTRIES == 512
+    assert config.SMOKE_RENDER_ENABLED is True
+    assert config.SMOKE_RENDER_QUALITY == "l"
 
 
 def test_llm_timeout_and_silent_stream_validation():

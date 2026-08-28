@@ -94,6 +94,45 @@ def test_cairo_script_does_not_pass_write_to_movie(monkeypatch, tmp_path):
     assert "--write_to_movie" not in script
 
 
+def test_script_runs_same_renderer_smoke_before_formal_render(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(settings, "SMOKE_RENDER_QUALITY", "l")
+    monkeypatch.setattr(settings, "SMOKE_RENDER_TIMEOUT", 42)
+
+    script = SlurmDispatcher()._build_script(
+        1,
+        tmp_path / "scene.py",
+        "Demo",
+        tmp_path / "media",
+        tmp_path / "out",
+        tmp_path / "err",
+        run_root=tmp_path,
+    )
+
+    assert script.index("[Smoke]") < script.index("manim render --renderer=cairo -qh")
+    assert "timeout 42s" in script
+    assert "smoke_scene_1.json" in script
+
+
+def test_script_can_disable_smoke_render(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "SMOKE_RENDER_ENABLED", False)
+
+    script = SlurmDispatcher()._build_script(
+        1,
+        tmp_path / "scene.py",
+        "Demo",
+        tmp_path / "media",
+        tmp_path / "out",
+        tmp_path / "err",
+        run_root=tmp_path,
+    )
+
+    assert "[Smoke]" not in script
+    assert '"status": "disabled"' in script
+
+
 def test_script_pins_resolution_and_frame_rate(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
     monkeypatch.setattr(settings, "MANIM_PIXEL_WIDTH", 1280)

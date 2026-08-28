@@ -90,6 +90,10 @@ VISUAL_EVAL_PROMPT = """Evaluate the supplied ordered keyframes as one {scope}.
 {frame_manifest}
 </frame_manifest>
 
+Frame roles such as opening, first_math_state, transition_boundary, conclusion, and ending
+are hints for temporal interpretation; inspect the actual image rather than trusting the label.
+For a scene, pay special attention to opening/ending consistency with its handoff contract.
+
 Score each dimension from 1 to 5:
 1. mathematical_accuracy: formulas, labels, diagrams, and derivation states are mathematically correct.
 2. visual_relevance: the visuals implement the stated teaching goal and scene plan.

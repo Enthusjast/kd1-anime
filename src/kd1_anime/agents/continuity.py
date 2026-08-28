@@ -1019,6 +1019,34 @@ class ContinuityReviewerAgent(BaseAgent):
                     }
                     for item in data[key][:30]
                 ]
+        for key in ("timeline", "math_claims", "geometry_specs", "handoff"):
+            if isinstance(data.get(key), list):
+                data[key] = [
+                    {
+                        field: str(item.get(field, ""))[:1_500]
+                        for field in (
+                            "event_id",
+                            "start_seconds",
+                            "end_seconds",
+                            "action",
+                            "claim_id",
+                            "statement",
+                            "expression_before",
+                            "expression_after",
+                            "geometry_id",
+                            "shape",
+                            "vertices",
+                            "declared_area",
+                            "target_area",
+                            "element_id",
+                            "variable_name",
+                            "semantic_state",
+                            "transition",
+                        )
+                        if isinstance(item, dict) and field in item
+                    }
+                    for item in data[key][:30]
+                ]
         return data
 
     def review(

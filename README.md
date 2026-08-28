@@ -6,9 +6,11 @@
 
 - **对话式终端交互**：先追问受众、时长、内容重点和视觉风格，再开始生成。
 - **分层规划与计划审查**：先生成全片概要，再为每个场景生成详细导演分镜，并在写代码前审查数学正确性与可实现性。
+- **确定性计划编译**：对场景编号、时间线覆盖、可解析等式、多边形面积、画布边界和元素生命周期先做本地检查，再调用计划审查模型。
 - **最小场景粒度**：同一画布中的逐步绘制、叠加和对比默认合并为一个场景，避免按函数或清单条目机械拆分。
 - **全片视觉状态**：Planner 固定全局颜色、字体、字号、线宽与布局，并为每个场景声明继承、移除和新增元素。
 - **代码级场景交接**：计划审查通过后才进入编码；编码/代码审查按顺序执行，上一场景的最终 Mobject 定义会安全注入下一场景。
+- **最小连续性清单**：运行中维护带元素身份、变量名、依赖、语义状态、源代码和哈希的 ElementManifest，只把当前场景需要的交接定义注入 Coder。
 - **多 Agent 流水线**：Planner → 计划审查 → Coder → 代码审查 → AutoFixer，不依赖 LangChain 等重型框架。
 - **分阶段并行**：场景分镜并行生成；计划审查和代码交接按场景顺序执行；所有已通过代码审查的场景仍可并行提交 Slurm 渲染。
 - **确定性安全校验**：在 LLM 审查之外，使用 Python AST 检查语法、Scene 结构、导入和危险调用。
@@ -17,11 +19,14 @@
 - **中断恢复**：版本化、原子 `manifest.json` 保存阶段、代码哈希、Slurm Job ID 和产物凭据，可查询并恢复中断运行。
 - **可选容器隔离**：可用 Apptainer 执行 LLM 生成的 Manim 代码。
 - **可恢复渲染**：监控 Slurm 状态、区分排队/运行超时、失败后读取日志并自动修复。
+- **Smoke Render**：正式渲染前在同一 renderer 和 Slurm 资源中执行轻量运行时检查，提前发现 OpenGL、XeLaTeX、Manim API 和运行时错误；可用 SMOKE_RENDER_ENABLED=false 关闭。
 - **平滑转场**：多场景使用 FFmpeg `xfade` 淡入淡出，默认 0.5 秒；有音频时同步 `acrossfade`。
 - **通用 LLM 接口**：通过 `.env` 配置任意 OpenAI-compatible API，不绑定 DeepSeek 或其他特定厂商。
 - **启动前 API 探测**：进入会话或 LLM 流水线前探测主 LLM；启用 RAG 时同时探测 Embedding 和 Reranker。配置、网络或模型不可用时立即退出。视觉端点单独探测，暂时不可用时安全降级为 `unknown`。
 - **独立视觉质量门**：可为每个已渲染场景抽取带时间戳和哈希的关键帧，用单独的多模态 LLM 检查数学正确性、相关性、可读性、布局和跨帧一致性；主 Planner/Coder 端点不会被替换。
 - **有界视觉修复**：低分场景把纯诊断反馈交回 Coder，重新经过校验、审查和渲染；达到上限时保留更好的可验证版本，视觉端点故障则记为 `unknown` 并继续。
+- **即时视觉门**：场景完成渲染后立即评估，不必等待整批场景结束；低分上游场景会停止并重建后继交接。关键帧包含开场、首个数学状态、转场边界、中段、结论和结束状态。
+- **本地 LLM 缓存**：非流式完整响应默认缓存到用户目录，缓存键包含模型、端点、提示词和生成参数但不含 API Key；可关闭或限制条目数。
 - **可选知识检索**：使用本地 SQLite 索引、独立 Embedding 和 Reranker 服务，为 Planner、Coder 和 AutoFixer 提供受限、可审计的 Manim 文档与示例上下文。
 
 ## 一行安装（Ubuntu / HPC，无 sudo）
@@ -100,6 +105,7 @@ $EDITOR ~/.kd1-anime/.env
 │   ├── docs/                    # 默认 Manim 文档源文件
 │   └── examples/                # 默认 Manim 示例源文件
 ├── rag/index.sqlite3            # 本地 RAG 索引
+├── cache/llm.sqlite3             # 非流式 LLM 响应缓存（可关闭）
 └── workspace/runs/<run-id>/     # 场景代码、日志、视频和评估报告
 ```
 
@@ -220,9 +226,23 @@ kd1-anime generate "..." --output final.mp4 --force
 # 查看最近运行或某次运行的逐场景状态
 kd1-anime status
 kd1-anime status 20260728-120000-1234abcd
+kd1-anime status 20260728-120000-1234abcd --json
+
+# 查看某次运行的日志尾部；不触发模型或 Slurm 请求
+kd1-anime logs 20260728-120000-1234abcd --scene-id 2 --lines 120
+
+# 查看/清理本地 LLM 缓存
+kd1-anime cache status
+kd1-anime cache clear --yes
+
+# 只重试一个失败场景，保留其它场景
+kd1-anime retry 20260728-120000-1234abcd --scene-id 2
 
 # 从清单恢复中断运行；不会重复提交仍有 Job ID 的场景
 kd1-anime resume 20260728-120000-1234abcd
+
+# 计划审查后人工确认再开始编码（默认不暂停）
+kd1-anime generate "解释勾股定理" --approve-plan
 
 # 检查依赖；--probe 会额外运行本地最小 FFmpeg/XeLaTeX/Manim 探测，不提交 Slurm
 kd1-anime doctor --probe
@@ -256,18 +276,19 @@ run ID，再显式执行 `kd1-anime resume <run-id>`。
 ```text
 ~/.kd1-anime/workspace/runs/<timestamp>-<uuid>/
 ├── prompt.md
-├── manifest.json         # schema v3：阶段、Job、渲染/视觉配置与产物凭据
+├── manifest.json         # schema v4：阶段、Job、渲染/视觉配置与产物凭据
 ├── scenes/              # 生成的 Python 和 sbatch 脚本
 ├── logs/                # Slurm stdout/stderr
 ├── videos/              # 当前 run 的 Manim 媒体目录
 ├── eval_frames/         # 场景/成片关键帧（启用视觉评估时）
 ├── eval_reports/        # 严格结构化的场景与成片视觉报告
 ├── visual_candidates/  # 视觉修复失败时可恢复的候选代码
+├── artifacts/          # 计划编译、审查、ElementManifest、Smoke 结果等阶段快照
 └── output_final.mp4
 ```
 
 如设置 `OUTPUT_FILE=/path/to/final.mp4`，最终视频写到该路径；其余中间产物仍保留在独立 run 目录中。
-`manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。旧版清单会在内存中保守迁移；无法验证的旧产物会重新渲染。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
+`manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。由于 v4 引入了结构化计划和 ElementManifest，旧版清单不会猜测迁移；恢复旧版时会给出明确错误，请重新生成。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
 增量运行复用的场景视频会复制到新 run 的私有目录，因此清理基准 run 不会破坏新 run 的恢复或重新拼接。
 
 ## 关键配置
@@ -279,6 +300,9 @@ run ID，再显式执行 `kd1-anime resume <run-id>`。
 | `LLM_HEALTHCHECK_TIMEOUT` | `15` | 进入会话/流水线前的最小 API 探测超时（秒）；探测失败立即退出 |
 | `LLM_PARALLEL_WORKERS` | `4` | 分镜/连续性审查等可并行 LLM 请求上限；代码交接阶段按场景顺序执行 |
 | `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
+| `LLM_CACHE_ENABLED` | `true` | 是否缓存完整的非流式 LLM 响应；流式交互永不缓存 |
+| `LLM_CACHE_PATH` | 用户目录 cache/llm.sqlite3 | LLM 缓存 SQLite 路径 |
+| `LLM_CACHE_MAX_ENTRIES` | `512` | 缓存最大条目数，设为 `0` 等同关闭写入 |
 | `VISUAL_LLM_BASE_URL` | 空 | 独立多模态 OpenAI-compatible 端点；不回退主端点 |
 | `VISUAL_LLM_MODEL` | 空 | 支持 `image_url` 输入的视觉模型；启用视觉评估时必须设置 |
 | `VISUAL_LLM_PARALLEL_WORKERS` | `2` | 进程级并行视觉请求上限，与主 LLM 并发池分离；批处理任务共享此配额 |
@@ -303,6 +327,9 @@ run ID，再显式执行 `kd1-anime resume <run-id>`。
 | `MANIM_QUALITY` | `h` | Manim 质量级别 `l/m/h/p/k` |
 | `MANIM_PIXEL_WIDTH` / `MANIM_PIXEL_HEIGHT` | `1920` / `1080` | 显式输出分辨率，也是产物身份的一部分 |
 | `MANIM_FRAME_RATE` | `60` | 显式输出帧率，也是产物身份的一部分 |
+| `SMOKE_RENDER_ENABLED` | `true` | 正式渲染前是否执行同 renderer 的轻量运行时检查 |
+| `SMOKE_RENDER_QUALITY` | `l` | Smoke Render 质量级别（`l`/`m`） |
+| `SMOKE_RENDER_TIMEOUT` | `180` | 单个 Smoke Render 的最长秒数 |
 | `SLURM_CPUS_PER_TASK` | `4` | 每个场景作业的 CPU 数 |
 | `SLURM_GPU_TYPE` | 空 | OpenGL 模式必须设置；Cairo 模式不会申请 GPU |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
@@ -326,7 +353,7 @@ run ID，再显式执行 `kd1-anime resume <run-id>`。
 | `SLURM_CONTAINER_DISABLE_NETWORK` | `false` | 容器支持时通过独立网络命名空间禁用网络；需先在目标集群验证 |
 | `ENABLE_AUTO_EVAL` | `false` | 合并后执行确定性代码/效率评估改进循环 |
 | `ENABLE_VISUAL_EVAL` | `false` | 合并前执行逐场景视觉质量门，并在合并后生成成片视觉报告 |
-| `VISUAL_EVAL_FRAME_COUNT` | `6` | 每个场景/成片均匀抽取的关键帧数（1–8） |
+| `VISUAL_EVAL_FRAME_COUNT` | `6` | 每个场景/成片抽取的语义关键帧数（1–8，含开场/结论/结束） |
 | `VISUAL_EVAL_THRESHOLD` | `3.5` | 场景视觉通过阈值（1–5）；重大问题无论均分都会触发修复 |
 | `MAX_VISUAL_FIX_ATTEMPTS` | `2` | 每个场景最多由视觉诊断触发的 Coder 修复次数 |
 

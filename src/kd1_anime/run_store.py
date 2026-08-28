@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    ElementManifest,
     ExtractedElement,
     SceneOutline,
     ScenePlan,
@@ -29,12 +30,10 @@ from kd1_anime.rendering import (
     RenderProfile,
     SceneArtifact,
     VideoMetadata,
-    sha256_file,
-    verify_video,
 )
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -225,7 +224,7 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[3] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[4] = MANIFEST_SCHEMA_VERSION
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -236,14 +235,18 @@ class RunManifest(BaseModel):
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    approve_plan: bool = False
+    plan_approved: bool = False
     output_path: str
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     outlines: list[SceneOutline] = Field(default_factory=list)
     scenes: dict[int, StoredSceneState] = Field(default_factory=dict)
-    # 新运行在分镜生成前固定全片规范；旧 manifest 缺少这些字段时按已完成兼容，
-    # 不会在恢复已有代码/作业时擅自重规划场景。
+    # 每个 v4 运行在分镜生成前固定全片规范；恢复时必须存在同一份结构化数据。
     continuity_bible: ContinuityBible | None = None
+    element_manifest: ElementManifest = Field(default_factory=ElementManifest)
     plan_review_status: Literal["pending", "reviewing", "passed", "failed", "skipped"] = "skipped"
+    plan_review_cycle_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    plan_review_cycle_count: int = Field(default=0, ge=0)
     continuity_review_status: Literal["pending", "reviewing", "passed", "warning"] = "passed"
     continuity_review_round: int = Field(default=0, ge=0)
     continuity_warnings: list[str] = Field(default_factory=list, max_length=100)
@@ -279,8 +282,7 @@ class RunManifest(BaseModel):
         """检查跨字段一致性；供读取清单时拒绝语义损坏的数据。
 
         这些约束不能只靠 Pydantic 的字段类型表达，例如 rendered=True
-        必须有经过验证的 artifact。单独提供方法是为了让 v1 迁移先完成，
-        再检查当前 schema，避免把可安全迁移的旧清单提前判死。
+        必须有经过验证的 artifact。
         """
 
         errors: list[str] = []
@@ -340,6 +342,22 @@ class RunManifest(BaseModel):
                     and not scene.give_up
                 ):
                     errors.append(f"Scene {scene_id} 未通过计划审查但运行标记为 passed")
+        entry_ids = [entry.element_id for entry in self.element_manifest.entries]
+        if len(entry_ids) != len(set(entry_ids)):
+            errors.append("element_manifest 包含重复 element_id")
+        for entry in self.element_manifest.entries:
+            if sha256_text(entry.source_code) != entry.source_code_sha256:
+                errors.append(f"element_manifest 元素 {entry.element_id} 的源代码哈希不一致")
+            if entry.source_scene_id not in self.scenes:
+                errors.append(
+                    f"element_manifest 元素 {entry.element_id} 引用了不存在的 Scene "
+                    f"{entry.source_scene_id}"
+                )
+        for scene_id, exported_ids in self.element_manifest.scene_exports.items():
+            if scene_id not in self.scenes:
+                errors.append(f"element_manifest.scene_exports 引用了不存在的 Scene {scene_id}")
+            if len(exported_ids) != len(set(exported_ids)):
+                errors.append(f"Scene {scene_id} 的 element_manifest 导出 ID 重复")
         if self.status == "completed" and not self.final_video:
             errors.append("运行标记为 completed 但缺少 final_video")
         return errors
@@ -594,7 +612,7 @@ def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
     candidates: list[tuple[Path, float]] = []
     try:
         for path in media_dir.rglob(f"{class_name}.mp4"):
-            if "partial_movie_files" in path.parts:
+            if "partial_movie_files" in path.parts or "__smoke__" in path.parts:
                 continue
             try:
                 stat = path.stat()
@@ -608,173 +626,19 @@ def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
     return max(candidates, key=lambda item: item[1])[0] if candidates else None
 
 
-def _legacy_phase(scene: dict) -> str:
-    if scene.get("rendered"):
-        return "rendered"
-    if scene.get("give_up") or scene.get("failed"):
-        return "failed"
-    if scene.get("slurm_job"):
-        return "monitoring"
-    if scene.get("reviewed"):
-        return "reviewed"
-    if scene.get("code_file"):
-        return "coded"
-    if scene.get("plan_ready"):
-        return "detailed"
-    return "pending"
-
-
-def _legacy_plan_ready(scene: dict) -> bool:
-    """从 v1 清单推导分镜是否已完成，避免恢复时重复调用 Planner。"""
-
-    if scene.get("plan_ready") is True:
-        return True
-    if any(
-        scene.get(key) for key in ("rendered", "reviewed", "code_file", "code_sha256", "class_name")
-    ):
-        return True
-    plan = scene.get("plan")
-    if not isinstance(plan, dict):
-        return False
-    # 早期清单可能只保存概要占位计划；只有关键详细字段都存在且不是
-    # 占位省略号时才认为 plan_detail 已完成。
-    detail_values = [
-        plan.get("visual_design"),
-        plan.get("camera_movement"),
-        plan.get("visual_flow"),
-        plan.get("key_moments"),
-        plan.get("computation"),
-    ]
-    return all(value and value != "…" and value != ["…"] for value in detail_values)
-
-
-def _migrate_legacy_artifact(
-    *,
-    root: Path,
-    run_id: str,
-    scene_id: int,
-    scene: dict,
-    profile: RenderProfile,
-) -> SceneArtifact | None:
-    job = scene.get("slurm_job")
-    code_hash = scene.get("code_sha256", "")
-    class_name = scene.get("class_name", "")
-    if not scene.get("rendered") or not job or not code_hash or not class_name:
-        return None
-    if not str(job.get("job_id", "")).isdigit():
-        return None
-    try:
-        media_dir = restore_run_path(root, job["media_dir"])
-        video = _latest_video_candidate(media_dir, class_name)
-        if video is None:
-            return None
-        metadata = verify_video(video, profile)
-        return SceneArtifact(
-            origin="rendered",
-            source_run_id=run_id,
-            job_id=str(job["job_id"]),
-            scene_id=scene_id,
-            scene_class_name=class_name,
-            code_sha256=code_hash,
-            render_profile_sha256=profile.digest(),
-            video_path=_run_relative(root, video),
-            video_sha256=sha256_file(video),
-            metadata=metadata,
-            verified=True,
-        )
-    except (KeyError, OSError, RuntimeError, ValueError):
-        return None
-
-
 def migrate_manifest_data(raw: dict, root: Path) -> dict:
-    """把旧清单升级为当前 schema；未来版本明确拒绝降级读取。"""
+    """只接受当前清单格式；旧格式不再猜测迁移。"""
 
     version = raw.get("schema_version", 1)
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
     if version == MANIFEST_SCHEMA_VERSION:
         return raw
-    if version == 2:
-        data = dict(raw)
-        data["schema_version"] = MANIFEST_SCHEMA_VERSION
-        data.setdefault("visual_eval_profile", VisualEvalProfile().model_dump(mode="json"))
-        scenes = data.get("scenes", {})
-        if not isinstance(scenes, dict):
-            raise ValueError("旧版运行清单的 scenes 必须是对象")
-        migrated_scenes: dict[str, dict] = {}
-        for raw_scene_id, raw_scene in scenes.items():
-            if not isinstance(raw_scene, dict):
-                raise ValueError(f"旧版运行清单 Scene {raw_scene_id} 必须是对象")
-            scene = dict(raw_scene)
-            scene.setdefault("visual_status", "skipped")
-            migrated_scenes[str(raw_scene_id)] = scene
-        data["scenes"] = migrated_scenes
-        return data
-    if version != 1:
-        raise ValueError(f"不支持的 manifest schema_version: {version}")
-
-    data = dict(raw)
-    if not isinstance(data.get("run_id"), str):
-        raise ValueError("旧版运行清单缺少有效 run_id")
-    raw_scenes = data.get("scenes", {})
-    if not isinstance(raw_scenes, dict):
-        raise ValueError("旧版运行清单的 scenes 必须是对象")
-    profile = RenderProfile.current()
-    data["schema_version"] = MANIFEST_SCHEMA_VERSION
-    data["revision"] = 0
-    data["render_profile"] = profile.model_dump(mode="json")
-    migrated_scenes: dict[str, dict] = {}
-    for raw_scene_id, raw_scene in raw_scenes.items():
-        try:
-            scene_id = int(raw_scene_id)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"旧版运行清单包含无效场景 ID: {raw_scene_id!r}") from exc
-        if not isinstance(raw_scene, dict):
-            raise ValueError(f"旧版运行清单 Scene {scene_id} 必须是对象")
-        scene = dict(raw_scene)
-        scene["plan_ready"] = _legacy_plan_ready(scene)
-        scene["phase"] = _legacy_phase(scene)
-        if scene["plan_ready"] and scene["phase"] == "pending":
-            scene["phase"] = "detailed"
-        scene["artifact"] = None
-        job = scene.get("slurm_job")
-        if job is not None and not isinstance(job, dict):
-            raise ValueError(f"旧版运行清单 Scene {scene_id} 的 slurm_job 必须是对象")
-        if job and str(job.get("job_id", "")).startswith("reused-"):
-            scene["slurm_job"] = None
-            scene["rendered"] = False
-            scene["phase"] = "reviewed" if scene.get("reviewed") else "coded"
-            scene["failure_reason"] = "旧版复用记录无法安全验证，将重新渲染"
-        elif job:
-            migrated_job = dict(job)
-            migrated_job["code_sha256"] = scene.get("code_sha256", "")
-            migrated_job["render_profile"] = profile.model_dump(mode="json")
-            migrated_job["output_path"] = None
-            migrated_job["output_metadata"] = None
-            migrated_job["elapsed_seconds"] = None
-            scene["slurm_job"] = migrated_job
-            artifact = _migrate_legacy_artifact(
-                root=root,
-                run_id=data["run_id"],
-                scene_id=scene_id,
-                scene=scene,
-                profile=profile,
-            )
-            if artifact:
-                scene["artifact"] = artifact.model_dump(mode="json")
-                migrated_job["output_path"] = artifact.video_path
-                migrated_job["output_metadata"] = artifact.metadata.model_dump(mode="json")
-                migrated_job["output_sha256"] = artifact.video_sha256
-            elif scene.get("rendered"):
-                scene["rendered"] = False
-                scene["phase"] = "reviewed"
-                scene["failure_reason"] = "旧版渲染产物无法按当前配置验证，将重新渲染"
-        elif scene.get("rendered"):
-            # v1 中 rendered=True 并不保证存在真实 Slurm 作业或最终视频。
-            # 没有可核验作业记录时不能制造 artifact，保守地重新渲染。
-            scene["rendered"] = False
-            scene["phase"] = "reviewed" if scene.get("reviewed") else "coded"
-            scene["failure_reason"] = "旧版场景缺少可验证的渲染作业，将重新渲染"
-        migrated_scenes[str(scene_id)] = scene
-    data["scenes"] = migrated_scenes
-    return data
+    if version < MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"不支持旧版 manifest schema_version={version}；当前版本为 "
+            f"{MANIFEST_SCHEMA_VERSION}。旧运行不能安全恢复，请重新生成。"
+        )
+    raise ValueError(
+        f"不支持的 manifest schema_version: {version}（当前版本为 {MANIFEST_SCHEMA_VERSION}）"
+    )
