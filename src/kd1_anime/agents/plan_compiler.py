@@ -121,7 +121,9 @@ class _PolynomialParser:
         result = self.parse_sum()
         if self.peek() is not None:
             raise ValueError("trailing token")
-        return result
+        # 将常数 0 规范化为空多项式，确保 ``0`` 与 ``-ab + ab``
+        # 在消项后得到同一个表示，而不会被字典中的零系数误判为不等价。
+        return {monomial: coefficient for monomial, coefficient in result.items() if coefficient}
 
     def parse_sum(self):
         result = self.parse_product()

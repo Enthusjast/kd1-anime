@@ -6,10 +6,18 @@ from pydantic import ValidationError
 from kd1_anime.agents.plan_reviewer import (
     PLAN_REVIEW_PROMPT,
     PlanReviewerAgent,
+    PlanReviewIssue,
     PlanReviewResult,
     deterministic_plan_issues,
+    filter_verified_plan_issues,
 )
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    MathClaim,
+    SceneHandoff,
+    ScenePlan,
+    VisualElementState,
+)
 
 
 def make_plan() -> ScenePlan:
@@ -82,6 +90,56 @@ def test_deterministic_plan_review_does_not_reject_explicit_safe_fallback():
     assert not any(issue.category == "geometry" for issue in issues)
 
 
+def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():
+    result_formula = VisualElementState(
+        element_id="result_formula",
+        variable_name="result_formula",
+        required=True,
+    )
+    plan = make_plan().model_copy(
+        update={
+            "new_elements": [result_formula],
+            "handoff": [
+                SceneHandoff(
+                    element_id="result_formula",
+                    variable_name="result_formula",
+                    action="keep",
+                )
+            ],
+            "math_claims": [
+                MathClaim(
+                    claim_id="cancel",
+                    statement="-ab + ab = 0",
+                    expression_before="-ab + ab",
+                    expression_after="0",
+                    relation="equivalent",
+                )
+            ],
+        }
+    )
+    issues = [
+        {
+            "category": "math",
+            "field": "math_claims[cancel]",
+            "message": "前后表达式不等价",
+            "fix_instruction": "修正",
+        },
+        {
+            "category": "contract",
+            "field": "handoff",
+            "message": "new_elements 中的 result_formula 应在 inherited_elements 中声明",
+            "fix_instruction": "将其移到 inherited_elements",
+        },
+    ]
+
+    filtered = filter_verified_plan_issues(
+        plan,
+        [PlanReviewIssue(**issue) for issue in issues],
+    )
+
+    assert filtered == []
+
+
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")
 def test_plan_reviewer_sends_plan_and_deterministic_findings(mock_call_llm):
     mock_call_llm.return_value = '{"is_valid": true, "severity": "info", "issues": []}'
@@ -124,6 +182,7 @@ def test_plan_reviewer_marks_safe_fallback_context(mock_call_llm):
 def test_plan_review_prompt_requires_math_and_geometry_validation():
     assert "数学公式" in PLAN_REVIEW_PROMPT
     assert "顶点、面积、旋转和目标覆盖关系" in PLAN_REVIEW_PROMPT
+    assert "minor" in PLAN_REVIEW_PROMPT
     assert "只输出一个 JSON 对象" in PLAN_REVIEW_PROMPT
 
 

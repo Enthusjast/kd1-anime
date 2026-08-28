@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kd1_anime.agents.base import BaseAgent
+from kd1_anime.agents.plan_compiler import expressions_are_equivalent
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
@@ -88,6 +90,8 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
 
 ## 审查原则
 - 不因个人审美、命名风格或实现方式偏好打回计划。
+- `major` 才是阻断问题；`minor` 只记录可选提示，不要因为“无需修改”或节奏建议
+  把 is_valid 设为 false。
 - 只要复杂几何不能严格验证，就要求改成面积标签、基础图形或等式变换；不要批准
   “先移动到附近，观众会理解”的示意性证明。
 - 每个问题必须定位字段，并给出可直接交给 Planner 的修改指令。
@@ -122,6 +126,85 @@ class PlanReviewBatchItem(PlanReviewResult):
     """批量计划审查中的一个场景结果。"""
 
     scene_id: int = Field(ge=1)
+
+
+def filter_verified_plan_issues(
+    plan: ScenePlan,
+    issues: list[PlanReviewIssue],
+) -> list[PlanReviewIssue]:
+    """丢弃与本地可验证事实矛盾的 LLM 计划问题。
+
+    Plan Reviewer 只能补充本地编译器无法判断的语义风险，不能推翻已经
+    确定证明成立的恒等式或合法的场景边界动作。这样可以避免模型把
+    ``-ab + ab = 0``、以及“本场景新建后继续保留到下一场景”的合法合同
+    误报成阻断问题。
+    """
+
+    claims = {claim.claim_id: claim for claim in plan.math_claims}
+    inherited_ids = {item.element_id for item in plan.inherited_elements}
+    new_ids = {item.element_id for item in plan.new_elements}
+    removed_ids = {item.element_id for item in plan.elements_to_remove}
+    declared_ids = inherited_ids | new_ids | removed_ids
+    role_lists_are_unique = all(
+        len(elements) == len({item.element_id for item in elements})
+        for elements in (
+            plan.inherited_elements,
+            plan.new_elements,
+            plan.elements_to_remove,
+        )
+    )
+    handoff_contract_valid = (
+        role_lists_are_unique
+        and not inherited_ids & new_ids
+        and not removed_ids & new_ids
+        and removed_ids <= inherited_ids
+        and all(
+            item.element_id in declared_ids
+            and item.action
+            in (
+                {"remove"}
+                if item.element_id in removed_ids
+                else {"inherit", "keep"}
+                if item.element_id in inherited_ids
+                else {"create", "keep"}
+            )
+            for item in plan.handoff
+        )
+    )
+    filtered: list[PlanReviewIssue] = []
+    for issue in issues:
+        if issue.category == "math" and issue.field.startswith("math_claims["):
+            issue_text = f"{issue.message}\n{issue.fix_instruction}"
+            claim_id = issue.field.removeprefix("math_claims[").removesuffix("]")
+            claim = claims.get(claim_id)
+            if (
+                claim is not None
+                and claim.relation in {"equivalent", "equals", "area"}
+                and ("不等价" in issue_text or "≠" in issue_text)
+            ):
+                left = claim.expression_before
+                right = claim.expression_after
+                if not left or not right:
+                    parts = re.split(r"=|≡|→|⟶", claim.statement, maxsplit=1)
+                    if len(parts) == 2:
+                        left, right = parts
+                if left and right and expressions_are_equivalent(left, right) is True:
+                    continue
+        if (
+            issue.category == "contract"
+            and issue.field == "handoff"
+            and plan.handoff
+            and handoff_contract_valid
+        ):
+            text = f"{issue.message}\n{issue.fix_instruction}"
+            if (
+                "new_elements" in text
+                and "inherited_elements" in text
+                and ("未" in text or "缺" in text or "不完整" in text or "声明" in text)
+            ):
+                continue
+        filtered.append(issue)
+    return filtered
 
 
 PLAN_REVIEW_BATCH_PROMPT = (

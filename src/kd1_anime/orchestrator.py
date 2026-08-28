@@ -41,6 +41,7 @@ from kd1_anime.agents.plan_reviewer import (
     PlanReviewIssue,
     PlanReviewResult,
     deterministic_plan_issues,
+    filter_verified_plan_issues,
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
@@ -2958,9 +2959,12 @@ class Orchestrator:
                         )
                         break
 
-                issues = self._dedupe_plan_review_issues(
+                all_issues = self._dedupe_plan_review_issues(
                     [*deterministic, *(result.issues if not result.is_valid else [])]
                 )
+                all_issues = filter_verified_plan_issues(state.plan, all_issues)
+                issues = [issue for issue in all_issues if issue.severity == "major"]
+                non_blocking_issues = [issue for issue in all_issues if issue.severity != "major"]
                 self._write_stage_artifact(
                     ctx,
                     f"plan_review_scene_{scene_id}_{state.plan_review_round + 1}.json",
@@ -2972,9 +2976,15 @@ class Orchestrator:
                             item.model_dump(mode="json") for item in deterministic
                         ],
                         "result": result.model_dump(mode="json"),
-                        "issues": [item.model_dump(mode="json") for item in issues],
+                        "issues": [item.model_dump(mode="json") for item in all_issues],
+                        "blocking_issues": [item.model_dump(mode="json") for item in issues],
                     },
                 )
+                if non_blocking_issues:
+                    ctx.continuity_warnings.extend(
+                        f"Scene {scene_id} 计划审查提示：{issue.message}"
+                        for issue in non_blocking_issues
+                    )
                 if not issues:
                     with self._state_lock:
                         state.plan_reviewed = True

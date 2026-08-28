@@ -8,6 +8,7 @@ from kd1_anime.agents.plan_reviewer import (
     PlanReviewIssue,
     PlanReviewResult,
     deterministic_plan_issues,
+    filter_verified_plan_issues,
 )
 from kd1_anime.agents.planner import ContinuityBible, PlannerAgent
 from kd1_anime.agents.prompt_context import (
@@ -49,6 +50,7 @@ __all__ = [
     "build_bounded_prompt",
     "compile_technical_spec",
     "deterministic_plan_issues",
+    "filter_verified_plan_issues",
     "validate_animation_lifecycle",
     "validate_manim_code",
     "validate_review_evidence",

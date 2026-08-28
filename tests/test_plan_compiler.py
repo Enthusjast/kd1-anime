@@ -41,6 +41,8 @@ def make_outline(scene_id=1):
 def test_equivalent_polynomials_are_checked_without_external_cas():
     assert expressions_are_equivalent("(a+b)^2", "a^2+2ab+b^2") is True
     assert expressions_are_equivalent("(a+b)^2", "a^2+b^2") is False
+    assert expressions_are_equivalent("-ab + ab", "0") is True
+    assert expressions_are_equivalent("a^2-ab+ab-b^2", "a^2-b^2") is True
 
 
 def test_compiler_checks_simple_equations_in_free_form_computation():
