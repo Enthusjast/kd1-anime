@@ -802,13 +802,15 @@ def _requested_total_duration(user_prompt: str) -> float | None:
 
     pattern = re.compile(
         r"(?:总时长|视频总时长|全片时长|视频长度)[^。\n]{0,40}?"
-        r"(\d+(?:\.\d+)?)\s*(分钟|分|秒|s)"
+        r"(\d+(?:\.\d+)?)(?:\s*[-~至到]\s*(\d+(?:\.\d+)?))?\s*(分钟|分|秒|s)"
     )
     match = pattern.search(user_prompt)
     if not match:
         return None
-    value = float(match.group(1))
-    return value * 60 if match.group(2) in {"分钟", "分"} else value
+    # 对“3-5 分钟”取上限 5 分钟；“以内”通常只约束不能超出上限，
+    # 不应误取下限把视频压缩到 3 分钟。
+    value = float(match.group(2) or match.group(1))
+    return value * 60 if match.group(3) in {"分钟", "分"} else value
 
 
 def _coalesce_single_visual_unit(
@@ -844,6 +846,35 @@ def _coalesce_single_visual_unit(
         math_concept="；".join(concepts)[:5_000],
     )
     return [merged]
+
+
+def _fit_outline_durations(outlines: list[SceneOutline], user_prompt: str) -> list[SceneOutline]:
+    """按用户明确的总时长上限压缩概要时长，避免成片超出需求。"""
+
+    limit = _requested_total_duration(user_prompt)
+    if limit is None or not outlines:
+        return outlines
+    total = sum(item.duration_seconds for item in outlines)
+    if total <= limit + 0.05:
+        return outlines
+    minimum = 0.1
+    if limit < len(outlines) * minimum:
+        raise ValueError(
+            f"用户给出的总时长 {limit:g}s 不足以容纳 {len(outlines)} 个场景，"
+            "请减少场景数量或增加视频时长。"
+        )
+    remaining = limit - len(outlines) * minimum
+    weights = [max(item.duration_seconds - minimum, 0.0) for item in outlines]
+    weight_total = sum(weights)
+    return [
+        item.model_copy(
+            update={
+                "duration_seconds": minimum
+                + (remaining * weight / weight_total if weight_total else remaining / len(outlines))
+            }
+        )
+        for item, weight in zip(outlines, weights, strict=True)
+    ]
 
 
 def _scene_granularity_guidance(user_prompt: str) -> str:
@@ -925,6 +956,10 @@ class PlannerAgent(BaseAgent):
         if _requests_single_visual_unit(user_prompt) and len(normalized) > 1:
             self._log(f"检测到连续同屏需求，将 {len(normalized)} 个过细概要合并为 1 个场景")
             normalized = _coalesce_single_visual_unit(normalized, user_prompt)
+        fitted = _fit_outline_durations(normalized, user_prompt)
+        if fitted != normalized:
+            self._log("检测到总时长上限，已按比例压缩场景概要时长")
+            normalized = fitted
         if len(normalized) > settings.MAX_SCENES:
             raise RuntimeError(
                 f"Planner 生成了 {len(normalized)} 个场景，超过 MAX_SCENES={settings.MAX_SCENES}"

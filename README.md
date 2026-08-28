@@ -193,6 +193,10 @@ RAG 运行时服务暂时不可用时会降级继续：Embedding 失败则跳过
 密钥行；知识库源文件发生变化后，旧索引会被标记为过期，需重新执行
 `kd1-anime rag index`。
 
+如果 `RAG_ENABLED=true`，启动生成前还会要求索引存在且未过期；索引缺失或过期时先执行
+`kd1-anime rag index`。源文件和 Embedding 模型未变化时，普通 `rag index` 会复用已有索引；
+需要强制重新计算 Embedding 时使用 `kd1-anime rag index --rebuild`。
+
 完整示例见 `.env.example`。安装脚本也会生成：
 
 ```text
@@ -262,8 +266,8 @@ kd1-anime clean --older-than 30d --yes
 ```
 
 启动交互会话、规划或生成流水线前，程序会先发送一次最小请求检查主 LLM
-的配置、网络、鉴权和模型路由；启用 RAG 时还会检查 Embedding 与 Reranker
-模型。检查失败会立即退出，不进入后续 Agent 流程。
+的配置、网络、鉴权和模型路由；启用 RAG 时还会检查索引是否存在/过期以及
+Embedding 与 Reranker 模型。检查失败会立即退出，不进入后续 Agent 流程。
 `status`、`version`、`doctor`、`clean` 等只读或诊断命令不会自动发送业务请求，
 需要真实探测时可使用 `kd1-anime doctor --probe-llm`。
 交互模式启动时不会扫描或弹出历史可恢复运行；需要恢复时请先用 `status` 找到
@@ -271,6 +275,8 @@ run ID，再显式执行 `kd1-anime resume <run-id>`。
 `render` 不带 `--wait` 时只负责提交并立即返回，终端会显示 run ID。之后使用
 
 `kd1-anime status <run-id>` 查看清单，或用 `kd1-anime resume <run-id>` 继续监控并合并。
+`render --wait` 以及之后的 `resume` 只监控用户提供的 Scene，不会调用 Planner、Technical
+Planner、Coder 或 Reviewer。
 
 ### 每次运行的产物
 

@@ -17,6 +17,13 @@ def test_cli_registers_all_public_commands():
         assert command in result.output
 
 
+def test_version_uses_source_package_version():
+    result = CliRunner().invoke(app, ["version"])
+
+    assert result.exit_code == 0, result.output
+    assert "kd1-anime v0.4.0" in result.output
+
+
 def test_rag_status_is_read_only():
     result = CliRunner().invoke(app, ["rag", "status"])
 

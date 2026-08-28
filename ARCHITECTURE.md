@@ -66,7 +66,7 @@ Scene 1 技术设计 → CODING → 代码 REVIEWING → Scene 2 技术设计 �
 FSM 枚举同时用于清单检查点和 TUI 阶段提示。分镜仍然并行；每个 Scene 必须先通过计划审查，确认数学关系、几何可行性和时间线正确，再进入编码。编码/代码审查按场景顺序执行：Scene N 先由 Technical Planner 生成结构化 TechnicalSpec，确定性编译通过后才允许 Coder 工作；代码通过生命周期校验和 Reviewer 后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，并且必须遵守明确的对象生命周期，而不是仅凭 Planner 描述猜测状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
-CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
+CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会确认索引存在且未过期，并探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
 
 `ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。
 
@@ -171,6 +171,8 @@ v4 清单只接受当前结构化计划、ElementManifest 和阶段状态；v1-v
 - COMPLETED/GONE 只有产物验证成功才恢复为 rendered；
 - 已完成、失败、在途场景的事件快照会补发给 TUI；
 - 两个进程不能同时恢复同一 run。
+直接 `render --wait` 创建的运行会持久化 `direct_render` 标记；这类运行在等待和恢复时都
+跳过所有 Planner、Technical Planner、Coder 和 Reviewer 调用，只执行渲染监控与合并。
 
 `status` 只读清单；`clean` 使用同一把锁跳过活跃运行。只有显式使用
 `--include-running` 时才会处理陈旧的 running 清单，并且删除前会先取消其中已知的
@@ -255,4 +257,4 @@ pytest -q
 python -m build --wheel
 ```
 
-测试覆盖结构化输出、截断重试、renderer 提示词、AST 安全、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v4 严格恢复、增量复用、视觉 unknown、RAG 文档切分/索引/排序/降级、批量资源配额和 FFmpeg 原子输出。
+测试覆盖结构化输出、截断重试、renderer 提示词、AST 安全、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v4 严格恢复、增量复用、视觉 unknown、RAG 文档切分/索引/排序/降级、批量资源配额和 FFmpeg 原子输出。手动触发 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。

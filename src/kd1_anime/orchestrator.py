@@ -40,8 +40,8 @@ from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
     PlanReviewResult,
+    classify_plan_review_issues,
     deterministic_plan_issues,
-    filter_verified_plan_issues,
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
@@ -195,6 +195,9 @@ class SceneState:
     technical_input_sha256: str = ""
     technical_status: str = "pending"
     technical_error: str = ""
+    # 本地 Smoke Render 的恢复凭据；未通过或未完成时，恢复/AutoFix 后
+    # 必须在 Reviewer 前重新执行，不能只依赖旧的内存状态。
+    local_smoke_status: str = "pending"
     # Reviewer major 反馈待重写时暂存; 调度器据此把场景重新排入编码阶段。
     rewrite_feedback: str = ""
     # 代码和 Reviewer 反馈的联合指纹；相同组合重复出现时提前收敛。
@@ -243,6 +246,10 @@ class PipelineContext:
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    # Direct ``render`` runs already contain user-reviewed code.  They must
+    # never enter the planning/TechnicalSpec/Reviewer LLM stages, including
+    # after a no-wait run is resumed.
+    direct_render: bool = False
     approve_plan: bool = False
     plan_approved: bool = False
     outlines: list[SceneOutline] = field(default_factory=list)
@@ -347,6 +354,38 @@ class Orchestrator:
         state.technical_input_sha256 = ""
         state.technical_status = "pending"
         state.technical_error = ""
+
+    def _cancel_unfinished_scene_job(self, state: SceneState, *, reason: str) -> None:
+        """在丢弃场景代码/计划前取消仍可能执行的旧 Job。
+
+        计划重规划、技术合同失效和连续性重建都会清空旧状态。若只把
+        ``state.slurm_job`` 设为 ``None``，远端作业仍可能继续写入媒体目录，
+        形成孤儿作业或污染下一次提交。终态 Job 不再调用 ``scancel``；未知
+        或运行中的 Job 必须确认取消成功，否则抛错并拒绝继续重建。
+        """
+
+        with self._state_lock:
+            job = state.slurm_job
+            if job is None:
+                return
+            terminal = job.cancelled or job.status in {
+                "COMPLETED",
+                "CANCELLED",
+                *FAILURE_STATES,
+            }
+            job_id = job.job_id
+        if terminal:
+            return
+        if not self.slurm.cancel_job(job_id):
+            raise RuntimeError(
+                f"Scene {state.plan.scene_id} 的旧 Job {job_id} {reason}，"
+                "取消失败，禁止清空状态并重复提交"
+            )
+        with self._state_lock:
+            if state.slurm_job is job:
+                job.cancelled = True
+                job.status = "CANCELLED"
+                job.failure_reason = f"{reason}，已取消旧作业"
 
     def _emit(self, event: str, **data) -> None:
         if event in {"scene_failed", "scene_give_up"} and "category" not in data:
@@ -622,6 +661,7 @@ class Orchestrator:
                     technical_input_sha256=scene.technical_input_sha256,
                     technical_status=scene.technical_status,
                     technical_error=scene.technical_error,
+                    local_smoke_status=scene.local_smoke_status,
                     rewrite_feedback=scene.rewrite_feedback,
                     review_signature=scene.review_signature,
                     identical_review_count=scene.identical_review_count,
@@ -662,6 +702,7 @@ class Orchestrator:
                 dry_run=ctx.dry_run,
                 interactive=ctx.interactive,
                 auto_fix=ctx.auto_fix,
+                direct_render=ctx.direct_render,
                 approve_plan=ctx.approve_plan,
                 plan_approved=ctx.plan_approved,
                 output_path=str(ctx.paths.output),
@@ -702,14 +743,14 @@ class Orchestrator:
 
     @staticmethod
     def _scene_phase(scene: SceneState) -> str:
+        if scene.failed or scene.give_up:
+            return "failed"
         if scene.visual_status == "evaluating":
             return "visual_evaluating"
         if scene.rendered and scene.visual_status in {"passed", "warning", "unknown"}:
             return "visual_accepted"
         if scene.rendered and scene.artifact:
             return "rendered"
-        if scene.failed or scene.give_up:
-            return "failed"
         if scene.slurm_job:
             return "monitoring"
         if scene.plan_reviewed:
@@ -883,6 +924,7 @@ class Orchestrator:
                 technical_input_sha256=getattr(stored, "technical_input_sha256", ""),
                 technical_status=getattr(stored, "technical_status", "pending"),
                 technical_error=getattr(stored, "technical_error", ""),
+                local_smoke_status=getattr(stored, "local_smoke_status", "pending"),
                 rewrite_feedback=getattr(stored, "rewrite_feedback", ""),
                 review_signature=getattr(stored, "review_signature", ""),
                 identical_review_count=getattr(stored, "identical_review_count", 0),
@@ -902,6 +944,12 @@ class Orchestrator:
                     stored.visual_best_candidate, root
                 ),
             )
+        direct_render = getattr(manifest, "direct_render", False) or (
+            not manifest.auto_fix
+            and manifest.plan_review_status == "skipped"
+            and len(manifest.scenes) == 1
+            and manifest.user_prompt.startswith("Direct render of Scene class ")
+        )
         context = PipelineContext(
             user_prompt=manifest.user_prompt,
             original_prompt=manifest.user_prompt,
@@ -909,6 +957,7 @@ class Orchestrator:
             dry_run=manifest.dry_run,
             interactive=manifest.interactive,
             auto_fix=manifest.auto_fix,
+            direct_render=direct_render,
             approve_plan=getattr(manifest, "approve_plan", False),
             plan_approved=getattr(manifest, "plan_approved", False),
             outlines=manifest.outlines,
@@ -948,6 +997,7 @@ class Orchestrator:
         )
         if manifest.incremental and manifest.base_run_id:
             context.base_manifest = RunRepository(settings.WORKSPACE_DIR).load(manifest.base_run_id)
+            context.base_manifest.validate_for_resume()
         return context
 
     def _generate_validated_code(
@@ -1099,6 +1149,8 @@ class Orchestrator:
         settings.require_llm_key()
         if settings.ENABLE_VISUAL_EVAL and not dry_run:
             settings.require_visual_llm()
+        if self.rag.enabled:
+            self.rag.require_ready()
         if len(user_prompt) > settings.MAX_PROMPT_CHARS:
             raise ValueError(
                 f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符\n"
@@ -1111,6 +1163,7 @@ class Orchestrator:
             base_manifest = repository.load(base_run_id)
         except (OSError, ValueError) as exc:
             raise RunNotFoundError(f"无法加载基础运行 {base_run_id}: {exc}") from exc
+        base_manifest.validate_for_resume()
 
         if base_manifest.status not in ("completed", "dry_run_complete"):
             raise RunError(f"基础运行 {base_run_id} 未完成（状态：{base_manifest.status}）")
@@ -1155,6 +1208,8 @@ class Orchestrator:
         settings.require_llm_key()
         if settings.ENABLE_VISUAL_EVAL and not dry_run:
             settings.require_visual_llm()
+        if self.rag.enabled:
+            self.rag.require_ready()
         if len(user_prompt) > settings.MAX_PROMPT_CHARS:
             raise ValueError(
                 f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符\n提示：可以将需求拆分为多个较短的动画，或使用更简洁的描述"
@@ -1238,6 +1293,7 @@ class Orchestrator:
             original_prompt=prompt,
             paths=paths,
             auto_fix=False,
+            direct_render=True,
             scenes=[plan],
             scene_states={scene_id: scene_state},
             visual_eval_profile=self._configured_visual_profile(enabled=False),
@@ -1298,6 +1354,7 @@ class Orchestrator:
             raise FileNotFoundError(f"找不到运行清单: {run_id}")
         with lock_run(root):
             manifest = repository.load(run_id)
+            manifest.validate_for_resume()
             self._callback = callback
             self._cancel_requested.clear()
             self._stop_event.clear()
@@ -1478,6 +1535,10 @@ class Orchestrator:
             }:
                 state = State.DISPATCHING
 
+            # rendered 标记只对上一次检查点有效；用户可能已经手动清理了
+            # 场景视频。先把失效产物退回渲染队列，再核对仍在集群中的 Job。
+            self._reconcile_rendered_artifacts(ctx)
+
             # 核对恢复的 Slurm 作业: 上次会话提交的作业可能早已结束/已不存在,
             # 直接监控会得到连续 UNKNOWN → CANCEL_FAILED → 场景永久判死。
             self._reconcile_restored_jobs(ctx)
@@ -1583,6 +1644,14 @@ class Orchestrator:
                     self._stop_event.clear()
                     self._checkpoint(ctx, State.CODING)
                     continue
+                if self._stop_event.is_set():
+                    with self._state_lock:
+                        reason = (
+                            ctx.continuity_warnings[-1]
+                            if ctx.continuity_warnings
+                            else "流水线被停止，未能安全完成连续性重建"
+                        )
+                    raise RuntimeError(reason)
                 if ctx.dry_run:
                     break
                 if self._visual_gate(ctx):
@@ -1684,10 +1753,37 @@ class Orchestrator:
         ctx: PipelineContext,
         state: SceneState,
     ) -> None:
+        """运行并持久化本地 Smoke Render 状态。"""
+
+        enabled = not ctx.dry_run and settings.LOCAL_SMOKE_RENDER_ENABLED
+        with self._state_lock:
+            state.local_smoke_status = "running" if enabled else "skipped"
+        if not enabled:
+            return
+        try:
+            with self._state_lock:
+                self._checkpoint(ctx, State.CODING)
+            self._local_smoke_render_impl(ctx, state)
+        except Exception:
+            with self._state_lock:
+                state.local_smoke_status = "failed"
+                try:
+                    self._checkpoint(ctx, State.CODING)
+                except Exception as checkpoint_error:
+                    self._record_checkpoint_failure(checkpoint_error)
+            raise
+        with self._state_lock:
+            state.local_smoke_status = "passed"
+            self._checkpoint(ctx, State.CODING)
+        self._emit("scene_smoke_rendered", scene_id=state.plan.scene_id)
+
+    def _local_smoke_render_impl(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+    ) -> None:
         """可选地在本地低质量渲染当前场景，尽早发现运行时错误。"""
 
-        if ctx.dry_run or not settings.LOCAL_SMOKE_RENDER_ENABLED:
-            return
         source = ctx.paths.scenes / f"scene_{state.plan.scene_id}.py"
         if not source.is_file() or not state.class_name:
             raise RuntimeError("本地 Smoke Render 缺少场景代码或类名")
@@ -1796,7 +1892,6 @@ class Orchestrator:
                 "container": bool(settings.SLURM_CONTAINER_IMAGE),
             },
         )
-        self._emit("scene_smoke_rendered", scene_id=state.plan.scene_id)
 
     def _handle_init(self, ctx: PipelineContext) -> State:
         for directory in (
@@ -2094,6 +2189,50 @@ class Orchestrator:
             else:
                 job.status = status
 
+    def _reconcile_rendered_artifacts(self, ctx: PipelineContext) -> None:
+        """恢复时校验已标记完成的场景产物，并把丢失产物退回渲染队列。
+
+        ``rendered`` 只表示上一次检查点已经验证过视频，不保证用户没有在
+        此后清理文件。若继续保留这个标记，调度器会跳过场景，最终才在合并
+        阶段失败，而且无法自动重渲染。场景视频是可重建的派生物，因此这里
+        只清除失效凭据并保留已校验的代码；仍在集群中的旧 Job 留给后续
+        ``_reconcile_restored_jobs`` 处理，避免在状态不明时重复提交。
+        """
+
+        invalidated = False
+        for scene_id, state in sorted(ctx.scene_states.items()):
+            if not state.rendered or state.artifact is None:
+                continue
+            try:
+                self._artifact_video_path(ctx, state.artifact)
+            except (OSError, RuntimeError, ValueError) as exc:
+                with self._state_lock:
+                    state.rendered = False
+                    state.artifact = None
+                    state.failed = False
+                    state.give_up = False
+                    state.failure_reason = ""
+                    state.failure_category = ""
+                    self._reset_visual_receipt(ctx, state)
+                    state.failure_reason = f"恢复时发现渲染产物不可用，将重新处理: {exc}"
+                    state.failure_category = "render"
+                invalidated = True
+                self._emit("scene_artifact_invalid", scene_id=scene_id, reason=str(exc))
+            else:
+                # 旧版本可能在渲染成功后留下了 stale failed/give_up 标记；
+                # 已验证的产物是更强的事实，清除这两个冲突状态，避免
+                # 调度器跳过场景或合并阶段误报失败。
+                with self._state_lock:
+                    state.failed = False
+                    state.give_up = False
+                    state.failure_reason = ""
+                    state.failure_category = ""
+        if invalidated:
+            with self._state_lock:
+                ctx.final_video = None
+                ctx.final_video_sha256 = ""
+                self._checkpoint(ctx, State.MONITORING)
+
     def _emit_scene_snapshot(self, ctx: PipelineContext) -> None:
         """resume 后把已有场景的当前进度以事件形式补发给 TUI/仪表盘。
 
@@ -2298,6 +2437,8 @@ class Orchestrator:
     def _run_code_review_barrier(self, ctx: PipelineContext) -> None:
         """按 Scene ID 顺序完成编码、审查，并固定代码级连续性上下文。"""
 
+        if ctx.direct_render:
+            return
         if ctx.plan_review_status not in {"passed", "skipped"}:
             return
         for scene_id, state in sorted(ctx.scene_states.items()):
@@ -2396,6 +2537,12 @@ class Orchestrator:
                     if not state.code or state.rewrite_feedback:
                         self._phase_emit("coding")
                         self._scene_code(ctx, scene_id, state)
+                    elif (
+                        not ctx.dry_run
+                        and settings.LOCAL_SMOKE_RENDER_ENABLED
+                        and state.local_smoke_status != "passed"
+                    ):
+                        self._local_smoke_render(ctx, state)
                     self._phase_emit("reviewing")
                     self._scene_review(ctx, scene_id, state)
                 if state.reviewed and state.code and not state.exported_elements_code:
@@ -2447,23 +2594,8 @@ class Orchestrator:
         if not repairs:
             return
         code_invalidated = bool(state.code or state.reviewed or state.slurm_job)
-        if code_invalidated and state.slurm_job is not None and not state.rendered:
-            job = state.slurm_job
-            job_id = job.job_id
-            terminal = job.cancelled or job.status in {
-                "COMPLETED",
-                "CANCELLED",
-                *FAILURE_STATES,
-            }
-            if not terminal and not self.slurm.cancel_job(job_id):
-                raise RuntimeError(
-                    f"Scene {state.plan.scene_id} 的旧 Slurm Job {job_id} 使用旧计划合同，"
-                    "取消失败，禁止重复提交"
-                )
-            if not terminal:
-                job.cancelled = True
-                job.status = "CANCELLED"
-                job.failure_reason = "计划合同自动归一化，已取消旧作业"
+        if code_invalidated:
+            self._cancel_unfinished_scene_job(state, reason="使用旧计划合同")
         with self._state_lock:
             state.plan = normalized
             if code_invalidated:
@@ -2543,23 +2675,7 @@ class Orchestrator:
             and state.code
             and not state.rendered
         ):
-            if state.slurm_job is not None and not state.rendered:
-                job = state.slurm_job
-                job_id = job.job_id
-                terminal = job.cancelled or job.status in {
-                    "COMPLETED",
-                    "CANCELLED",
-                    *FAILURE_STATES,
-                }
-                if not terminal and not self.slurm.cancel_job(job_id):
-                    raise RuntimeError(
-                        f"Scene {state.plan.scene_id} 的旧 Slurm Job {job_id} 仍使用旧技术合同，"
-                        "取消失败，禁止重复提交"
-                    )
-                if not terminal:
-                    job.cancelled = True
-                    job.status = "CANCELLED"
-                    job.failure_reason = "技术合同输入变化，已取消旧作业"
+            self._cancel_unfinished_scene_job(state, reason="仍使用旧技术合同")
             state.code = ""
             state.class_name = ""
             state.reviewed = False
@@ -2801,21 +2917,6 @@ class Orchestrator:
         self._write_stage_artifact(ctx, "plan_compile.json", payload)
 
     @staticmethod
-    def _dedupe_plan_review_issues(
-        issues: list[PlanReviewIssue],
-    ) -> list[PlanReviewIssue]:
-        """合并确定性检查和 LLM 检查的重复计划问题。"""
-
-        unique: list[PlanReviewIssue] = []
-        seen: set[tuple[str, str, str]] = set()
-        for issue in issues:
-            key = (issue.category, issue.field, issue.message)
-            if key not in seen:
-                seen.add(key)
-                unique.append(issue)
-        return unique
-
-    @staticmethod
     def _plan_review_feedback(issues: list[PlanReviewIssue]) -> str:
         return "\n\n".join(
             f"[{issue.category}] 字段 {issue.field or '未指定'}: {issue.message}\n"
@@ -2959,12 +3060,11 @@ class Orchestrator:
                         )
                         break
 
-                all_issues = self._dedupe_plan_review_issues(
-                    [*deterministic, *(result.issues if not result.is_valid else [])]
+                all_issues, issues, non_blocking_issues = classify_plan_review_issues(
+                    state.plan,
+                    deterministic_issues=deterministic,
+                    result=result,
                 )
-                all_issues = filter_verified_plan_issues(state.plan, all_issues)
-                issues = [issue for issue in all_issues if issue.severity == "major"]
-                non_blocking_issues = [issue for issue in all_issues if issue.severity != "major"]
                 self._write_stage_artifact(
                     ctx,
                     f"plan_review_scene_{scene_id}_{state.plan_review_round + 1}.json",
@@ -3073,10 +3173,17 @@ class Orchestrator:
                 code_invalidated = bool(
                     state.code or state.reviewed or state.rendered or state.slurm_job
                 )
+                if code_invalidated:
+                    self._cancel_unfinished_scene_job(state, reason="计划重规划")
                 with self._state_lock:
                     state.plan = revised_plan
                     self._reset_technical_spec(state)
+                    # 重规划后是全新的计划；不能沿用旧计划已经消耗的审查
+                    # 轮数/重复指纹，否则一次合法修正就会被立即判定为耗尽。
                     state.plan_review_feedback = ""
+                    state.plan_review_round = 0
+                    state.plan_review_signature = ""
+                    state.identical_plan_review_count = 0
                     if code_invalidated:
                         state.code = ""
                         state.class_name = ""
@@ -3120,6 +3227,9 @@ class Orchestrator:
                         include_failed=True,
                     )
                 self._compile_scene_plans(ctx)
+                # 批量结果基于重规划前的整片快照；当前场景改变后，剩余
+                # 场景的缓存结果也可能已过期，必须重新逐场景审查。
+                batch_results.clear()
                 self._emit("scene_plan_replanned", scene_id=scene_id)
 
             if state.failed:
@@ -3343,10 +3453,21 @@ class Orchestrator:
                     replan_kwargs["continuity_context"] = self._continuity_plan_context(
                         ctx, scene_id
                     )
-                with self._llm_sem:
-                    revised_plan = planner.plan_detail(
-                        outline, ctx.outlines, ctx.user_prompt, **replan_kwargs
+                try:
+                    with self._llm_sem:
+                        revised_plan = planner.plan_detail(
+                            outline, ctx.outlines, ctx.user_prompt, **replan_kwargs
+                        )
+                except Exception as exc:
+                    warning = (
+                        f"连续性重规划调用失败（Scene {scene_id}，第 {current_round} 轮）：{exc}"
                     )
+                    with self._state_lock:
+                        ctx.continuity_review_status = "warning"
+                        ctx.continuity_warnings.append(warning)
+                        self._checkpoint(ctx, State.REVIEWING)
+                    self._emit("continuity_warning", reason=warning)
+                    return
                 outline_index = next(
                     index for index, item in enumerate(ctx.outlines) if item.scene_id == scene_id
                 )
@@ -3424,6 +3545,12 @@ class Orchestrator:
                     self._scene_code(ctx, scene_id, state)
                     if state.failed or state.give_up:
                         return
+                elif (
+                    not ctx.dry_run
+                    and settings.LOCAL_SMOKE_RENDER_ENABLED
+                    and state.local_smoke_status != "passed"
+                ):
+                    self._local_smoke_render(ctx, state)
                 self._phase_emit("reviewing")
                 self._scene_review(ctx, scene_id, state)
             # 3) dry-run: 不提交渲染
@@ -3469,10 +3596,24 @@ class Orchestrator:
                     if state.rewrite_feedback:
                         self._phase_emit("coding")
                         self._scene_code(ctx, scene_id, state)
+                    elif (
+                        not ctx.dry_run
+                        and settings.LOCAL_SMOKE_RENDER_ENABLED
+                        and state.local_smoke_status != "passed"
+                    ):
+                        self._local_smoke_render(ctx, state)
                     self._phase_emit("reviewing")
                     self._scene_review(ctx, scene_id, state)
         except Exception as exc:
             with self._state_lock:
+                # 视觉门/产物回写可能在渲染成功后抛错；失败状态不能同时
+                # 保留 rendered=True，否则调度器会跳过该场景，合并阶段
+                # 还可能误把不完整状态当成成功。清除派生凭据，resume
+                # 时可重新验证旧 Job 或重新提交。
+                if state.rendered:
+                    state.rendered = False
+                    state.artifact = None
+                    self._reset_visual_receipt(ctx, state)
                 self._mark_failed(state, f"Scene {scene_id} 流水线异常: {exc}", "system")
             try:
                 self._checkpoint(ctx, State.MONITORING)
@@ -3763,6 +3904,7 @@ class Orchestrator:
             state.rendered = False
             state.exported_elements_code = ""
             state.exported_elements = []
+            state.local_smoke_status = "pending"
             self._remove_element_manifest_scene(ctx, scene_id)
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.CODING)
@@ -4108,32 +4250,19 @@ class Orchestrator:
         ]
         if not downstream:
             return
+        cancellation_failed = False
         for sid, state in downstream:
-            job = state.slurm_job
-            if job is not None and not state.rendered:
-                # 监控线程可能刚把作业标成终态，但还没来得及把
-                # ``state.rendered`` 写回。对已经结束的作业不再调用 scancel，
-                # 否则集群会返回 Invalid job id，进而把一个本可安全重建的
-                # 下游场景误判为“取消失败”。
-                terminal = job.cancelled or job.status in {
-                    "COMPLETED",
-                    "CANCELLED",
-                    *FAILURE_STATES,
-                }
-                if not terminal and not self.slurm.cancel_job(job.job_id):
-                    with self._state_lock:
-                        state.give_up = True
-                        state.failed = True
-                        state.failure_category = "continuity"
-                        state.failure_reason = (
-                            f"Scene {sid} 的旧 Job {job.job_id} 使用旧连续性上下文，"
-                            "取消失败，禁止自动重提"
-                        )
-                    continue
-                if not terminal:
-                    job.cancelled = True
-                    job.status = "CANCELLED"
-                    job.failure_reason = f"{reason}，连续性重建时取消"
+            try:
+                self._cancel_unfinished_scene_job(state, reason=f"使用旧连续性上下文（{reason}）")
+            except RuntimeError as exc:
+                with self._state_lock:
+                    state.give_up = True
+                    state.failed = True
+                    state.failure_category = "continuity"
+                    state.failure_reason = str(exc)
+                    ctx.continuity_warnings.append(state.failure_reason)
+                    cancellation_failed = True
+                continue
             with self._state_lock:
                 state.code = ""
                 state.class_name = ""
@@ -4162,10 +4291,19 @@ class Orchestrator:
                     reset_attempts=not preserve_visual_candidates,
                 )
                 self._write_private(ctx.paths.scenes / f"scene_{sid}.py", "")
-        ctx.continuity_rebuild_required = True
-        ctx.continuity_warnings.append(
-            f"Scene {scene_id} 因{reason}，已请求重建后续场景的连续性上下文。"
-        )
+        if cancellation_failed:
+            with self._state_lock:
+                # 未确认取消前绝不能进入新的连续性上下文；将本轮标记为
+                # 阻断并交给外层异常收尾，确保不会悄悄继续或重复提交。
+                ctx.continuity_rebuild_required = False
+                self._checkpoint(ctx, State.REVIEWING)
+            self._stop_event.set()
+            return
+        with self._state_lock:
+            ctx.continuity_rebuild_required = True
+            ctx.continuity_warnings.append(
+                f"Scene {scene_id} 因{reason}，已请求重建后续场景的连续性上下文。"
+            )
         self._stop_event.set()
 
     def _scene_fix(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
@@ -4334,6 +4472,7 @@ class Orchestrator:
             state.rendered = False
             state.exported_elements_code = ""
             state.exported_elements = []
+            state.local_smoke_status = "pending"
             self._remove_element_manifest_scene(ctx, scene_id)
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.FIXING)
@@ -4392,6 +4531,7 @@ class Orchestrator:
         )
         if contract_repairs:
             rewrite_feedback += "\n同时修复连续性合同：" + "；".join(contract_repairs)
+        self._cancel_unfinished_scene_job(state, reason="切换保守方案")
         with self._state_lock:
             state.plan = fallback_plan
             self._reset_technical_spec(state)
@@ -4434,7 +4574,8 @@ class Orchestrator:
 
         # 即使当前场景是最后一个场景，降级也改变了 plan_reviewed 状态；
         # 让外层 dry-run/正式流水线重新经过计划审查，而不是直接进入渲染。
-        ctx.continuity_rebuild_required = True
+        with self._state_lock:
+            ctx.continuity_rebuild_required = True
         self._stop_event.set()
         self._request_continuity_rebuild(
             ctx,
@@ -4548,6 +4689,7 @@ class Orchestrator:
                     state.rendered = False
                     state.exported_elements_code = ""
                     state.exported_elements = []
+                    state.local_smoke_status = "pending"
                     self._remove_element_manifest_scene(ctx, scene_id)
                     self._reset_visual_receipt(ctx, state)
                     self._checkpoint(ctx, State.REVIEWING)
@@ -4767,30 +4909,32 @@ class Orchestrator:
     ) -> bool:
         """恢复已验证候选；返回代码是否相对当前状态发生变化。"""
 
-        inherited_hash = sha256_text(state.inherited_elements_code)
-        if candidate.inherited_elements_sha256 != inherited_hash:
-            raise RuntimeError(f"Scene {scene_id} 的视觉候选基于不同的继承上下文，拒绝恢复")
-        code_changed = candidate.code != state.code
+        with self._state_lock:
+            inherited_hash = sha256_text(state.inherited_elements_code)
+            if candidate.inherited_elements_sha256 != inherited_hash:
+                raise RuntimeError(f"Scene {scene_id} 的视觉候选基于不同的继承上下文，拒绝恢复")
+            code_changed = candidate.code != state.code
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate.code)
-        state.code = candidate.code
-        state.class_name = candidate.class_name
-        state.slurm_job = candidate.slurm_job
-        state.artifact = candidate.artifact
-        state.rendered = True
-        state.reviewed = True
-        state.failed = False
-        state.give_up = False
-        state.failure_reason = ""
-        state.failure_category = ""
-        state.rewrite_feedback = ""
-        state.exported_elements_code = candidate.exported_elements_code
-        state.exported_elements = list(candidate.exported_elements)
-        state.visual_status = "passed" if candidate.passed else "warning"
-        state.visual_score = candidate.score
-        state.visual_report_file = candidate.report_file
-        state.visual_report_sha256 = candidate.report_sha256
-        state.visual_artifact_sha256 = candidate.artifact.video_sha256
-        state.visual_feedback = ""
+        with self._state_lock:
+            state.code = candidate.code
+            state.class_name = candidate.class_name
+            state.slurm_job = candidate.slurm_job
+            state.artifact = candidate.artifact
+            state.rendered = True
+            state.reviewed = True
+            state.failed = False
+            state.give_up = False
+            state.failure_reason = ""
+            state.failure_category = ""
+            state.rewrite_feedback = ""
+            state.exported_elements_code = candidate.exported_elements_code
+            state.exported_elements = list(candidate.exported_elements)
+            state.visual_status = "passed" if candidate.passed else "warning"
+            state.visual_score = candidate.score
+            state.visual_report_file = candidate.report_file
+            state.visual_report_sha256 = candidate.report_sha256
+            state.visual_artifact_sha256 = candidate.artifact.video_sha256
+            state.visual_feedback = ""
         return code_changed
 
     def _visual_gate(
@@ -4814,8 +4958,9 @@ class Orchestrator:
 
         profile = ctx.visual_eval_profile
         if not profile.enabled:
-            for state in ctx.scene_states.values():
-                state.visual_status = "skipped"
+            with self._state_lock:
+                for state in ctx.scene_states.values():
+                    state.visual_status = "skipped"
             return False
 
         # 若视觉修复链路自身失败，恢复此前得分最高且可验证的候选，避免丢掉
@@ -4823,16 +4968,22 @@ class Orchestrator:
         for scene_id, state in sorted(ctx.scene_states.items()):
             if scene_ids is not None and scene_id not in scene_ids:
                 continue
-            candidate = state.visual_best_candidate
-            if state.rendered or candidate is None or not (state.failed or state.give_up):
+            with self._state_lock:
+                candidate = state.visual_best_candidate
+                rendered = state.rendered
+                failed = state.failed
+                give_up = state.give_up
+                inherited_code = state.inherited_elements_code
+                current_code = state.code
+            if rendered or candidate is None or not (failed or give_up):
                 continue
-            if candidate.inherited_elements_sha256 != sha256_text(state.inherited_elements_code):
+            if candidate.inherited_elements_sha256 != sha256_text(inherited_code):
                 continue
-            current_code = state.code
             self._artifact_video_path(ctx, candidate.artifact)
             changed = self._restore_visual_candidate_into_state(ctx, scene_id, state, candidate)
-            state.visual_status = "warning"
-            state.visual_feedback = "视觉修复链路失败，已恢复最佳可用版本"
+            with self._state_lock:
+                state.visual_status = "warning"
+                state.visual_feedback = "视觉修复链路失败，已恢复最佳可用版本"
             self._emit(
                 "scene_visual_warning",
                 scene_id=scene_id,
@@ -4848,19 +4999,21 @@ class Orchestrator:
                     include_failed=True,
                 )
             self._checkpoint(ctx, State.VISUAL_EVALUATING)
-            return bool(ctx.continuity_rebuild_required)
+            with self._state_lock:
+                return bool(ctx.continuity_rebuild_required)
 
         targets: list[tuple[int, SceneState, SceneArtifact]] = []
         for scene_id, state in sorted(ctx.scene_states.items()):
             if scene_ids is not None and scene_id not in scene_ids:
                 continue
-            artifact = state.artifact
-            if not state.rendered or artifact is None:
-                continue
-            terminal = state.visual_status in {"passed", "warning", "unknown"}
-            if terminal and state.visual_artifact_sha256 == artifact.video_sha256:
-                continue
-            state.visual_status = "evaluating"
+            with self._state_lock:
+                artifact = state.artifact
+                if not state.rendered or artifact is None:
+                    continue
+                terminal = state.visual_status in {"passed", "warning", "unknown"}
+                if terminal and state.visual_artifact_sha256 == artifact.video_sha256:
+                    continue
+                state.visual_status = "evaluating"
             targets.append((scene_id, state, artifact))
             self._emit("scene_visual_evaluating", scene_id=scene_id)
 
@@ -4884,11 +5037,13 @@ class Orchestrator:
                 visual_eval_model=profile.model,
                 output_dir=ctx.paths.root / "eval_reports",
             )
+            with self._state_lock:
+                scene_context = self._scene_visual_context(ctx, state)
             with self._visual_llm_slot():
                 result, samples = evaluator.evaluate_scene_video(
                     video,
                     description=ctx.original_prompt or ctx.user_prompt,
-                    scene_context=self._scene_visual_context(ctx, state),
+                    scene_context=scene_context,
                     output_dir=frame_dir,
                     frame_count=profile.frame_count,
                 )
@@ -4912,11 +5067,19 @@ class Orchestrator:
         first_fix_feedback = ""
         for scene_id, state, artifact in targets:
             result, samples, error = outcomes[scene_id]
+            with self._state_lock:
+                visual_fix_attempt = state.visual_fix_attempts
+                inherited_code = state.inherited_elements_code
+                code_snapshot = state.code
+                class_name_snapshot = state.class_name
+                job_snapshot = state.slurm_job
+                exported_code_snapshot = state.exported_elements_code
+                exported_elements_snapshot = list(state.exported_elements)
             report_dir = ctx.paths.root / "eval_reports" / f"scene_{scene_id}"
             report_dir.mkdir(parents=True, exist_ok=True)
             report_dir.chmod(0o700)
             report_path = report_dir / (
-                f"attempt_{state.visual_fix_attempts:02d}_{artifact.video_sha256[:12]}.json"
+                f"attempt_{visual_fix_attempt:02d}_{artifact.video_sha256[:12]}.json"
             )
             report: dict = {
                 "schema_version": 1,
@@ -4924,10 +5087,10 @@ class Orchestrator:
                 "scene_id": scene_id,
                 "model": profile.model,
                 "visual_profile_sha256": profile.digest(),
-                "attempt": state.visual_fix_attempts,
+                "attempt": visual_fix_attempt,
                 "artifact_sha256": artifact.video_sha256,
                 "code_sha256": artifact.code_sha256,
-                "inherited_elements_sha256": sha256_text(state.inherited_elements_code),
+                "inherited_elements_sha256": sha256_text(inherited_code),
                 "frames": [
                     {
                         "frame_id": sample.frame_id,
@@ -4948,77 +5111,90 @@ class Orchestrator:
             report_relative = report_path.relative_to(ctx.paths.root).as_posix()
             report_hash = sha256_file(report_path)
 
-            state.visual_report_file = report_relative
-            state.visual_report_sha256 = report_hash
-            state.visual_artifact_sha256 = artifact.video_sha256
             if result is None:
-                state.visual_status = "unknown"
-                state.visual_score = None
-                state.visual_feedback = error
+                with self._state_lock:
+                    state.visual_report_file = report_relative
+                    state.visual_report_sha256 = report_hash
+                    state.visual_artifact_sha256 = artifact.video_sha256
+                    state.visual_status = "unknown"
+                    state.visual_score = None
+                    state.visual_feedback = error
                 self._emit("scene_visual_unknown", scene_id=scene_id, reason=error)
                 continue
 
-            state.visual_score = result.overall_score
-            state.visual_feedback = result.feedback()
+            score = result.overall_score
+            feedback = result.feedback()
+            passed = not result.needs_fix(profile.threshold)
             candidate = VisualCandidate(
-                score=result.overall_score,
+                score=score,
                 has_major_issue=result.has_major_issue,
-                passed=not result.needs_fix(profile.threshold),
-                inherited_elements_sha256=sha256_text(state.inherited_elements_code),
-                code=state.code,
-                class_name=state.class_name,
-                slurm_job=state.slurm_job,
+                passed=passed,
+                inherited_elements_sha256=sha256_text(inherited_code),
+                code=code_snapshot,
+                class_name=class_name_snapshot,
+                slurm_job=job_snapshot,
                 artifact=artifact,
-                exported_elements_code=state.exported_elements_code,
-                exported_elements=list(state.exported_elements),
+                exported_elements_code=exported_code_snapshot,
+                exported_elements=exported_elements_snapshot,
                 report_file=report_relative,
                 report_sha256=report_hash,
             )
-            previous = state.visual_best_candidate
-            candidate_rank = (
-                candidate.passed,
-                not candidate.has_major_issue,
-                candidate.score,
-            )
-            previous_rank = (
-                (previous.passed, not previous.has_major_issue, previous.score)
-                if previous is not None
-                else (False, False, 0.0)
-            )
-            if previous is None or candidate_rank > previous_rank:
-                state.visual_best_candidate = candidate
+            with self._state_lock:
+                state.visual_report_file = report_relative
+                state.visual_report_sha256 = report_hash
+                state.visual_artifact_sha256 = artifact.video_sha256
+                state.visual_score = score
+                state.visual_feedback = feedback
+                previous = state.visual_best_candidate
+                candidate_rank = (
+                    candidate.passed,
+                    not candidate.has_major_issue,
+                    candidate.score,
+                )
+                previous_rank = (
+                    (previous.passed, not previous.has_major_issue, previous.score)
+                    if previous is not None
+                    else (False, False, 0.0)
+                )
+                if previous is None or candidate_rank > previous_rank:
+                    state.visual_best_candidate = candidate
 
-            if not result.needs_fix(profile.threshold):
-                state.visual_status = "passed"
-                state.visual_feedback = ""
+            if passed:
+                with self._state_lock:
+                    state.visual_status = "passed"
+                    state.visual_feedback = ""
                 self._emit(
                     "scene_visual_pass",
                     scene_id=scene_id,
-                    score=result.overall_score,
+                    score=score,
                 )
                 continue
 
-            can_fix = ctx.auto_fix and state.visual_fix_attempts < profile.max_fix_attempts
+            with self._state_lock:
+                can_fix = ctx.auto_fix and state.visual_fix_attempts < profile.max_fix_attempts
             if can_fix:
-                state.visual_status = "needs_fix"
+                with self._state_lock:
+                    state.visual_status = "needs_fix"
                 if first_fix_scene is None:
                     # 一次只修改最早失败场景。它的导出元素会影响所有后继场景；
                     # 先修后重建可避免并行修复基于即将过期的连续性上下文。
                     first_fix_scene = scene_id
-                    first_fix_feedback = result.feedback()
+                    first_fix_feedback = feedback
                 continue
 
             # 主观质量问题不应使已经成功渲染的视频消失。达到上限时选择
             # 历次得分最高候选，并将未解决问题明确记录为 warning。
-            best = state.visual_best_candidate
+            with self._state_lock:
+                best = state.visual_best_candidate
             if (
                 best is not None
                 and best.artifact.video_sha256 != artifact.video_sha256
-                and best.inherited_elements_sha256 == sha256_text(state.inherited_elements_code)
+                and best.inherited_elements_sha256 == sha256_text(inherited_code)
             ):
                 changed = self._restore_visual_candidate_into_state(ctx, scene_id, state, best)
-                state.visual_status = "warning"
-                state.visual_feedback = "视觉修复耗尽后已恢复最高分候选"
+                with self._state_lock:
+                    state.visual_status = "warning"
+                    state.visual_feedback = "视觉修复耗尽后已恢复最高分候选"
                 if changed:
                     self._request_continuity_rebuild(
                         ctx,
@@ -5028,37 +5204,40 @@ class Orchestrator:
                         include_failed=True,
                     )
             else:
-                state.visual_status = "warning"
-                if not state.visual_feedback:
-                    state.visual_feedback = (
-                        "已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"
-                    )
+                with self._state_lock:
+                    state.visual_status = "warning"
+                    if not state.visual_feedback:
+                        state.visual_feedback = (
+                            "已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"
+                        )
             self._emit(
                 "scene_visual_warning",
                 scene_id=scene_id,
-                score=state.visual_score,
+                score=score,
                 reason=("已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"),
             )
 
         if first_fix_scene is not None:
             state = ctx.scene_states[first_fix_scene]
-            state.visual_fix_attempts += 1
-            state.rewrite_feedback = (
-                "## Visual Evaluation Feedback\n"
-                f"{first_fix_feedback}\n\n"
-                "请使用原有全局视觉配置修复这些可见问题，不要改变正确的数学内容或"
-                "跨场景元素合同。"
-            )
-            state.reviewed = False
-            state.rendered = False
-            state.artifact = None
-            state.slurm_job = None
-            ctx.final_video = None
-            ctx.final_video_sha256 = ""
+            with self._state_lock:
+                state.visual_fix_attempts += 1
+                state.rewrite_feedback = (
+                    "## Visual Evaluation Feedback\n"
+                    f"{first_fix_feedback}\n\n"
+                    "请使用原有全局视觉配置修复这些可见问题，不要改变正确的数学内容或"
+                    "跨场景元素合同。"
+                )
+                state.reviewed = False
+                state.rendered = False
+                state.artifact = None
+                state.slurm_job = None
+                ctx.final_video = None
+                ctx.final_video_sha256 = ""
+                visual_fix_attempt = state.visual_fix_attempts
             self._emit(
                 "scene_visual_fixing",
                 scene_id=first_fix_scene,
-                attempt=state.visual_fix_attempts,
+                attempt=visual_fix_attempt,
                 max_attempts=profile.max_fix_attempts,
             )
             self._request_continuity_rebuild(
@@ -5071,7 +5250,8 @@ class Orchestrator:
             return True
 
         self._checkpoint(ctx, State.VISUAL_EVALUATING)
-        return bool(ctx.continuity_rebuild_required)
+        with self._state_lock:
+            return bool(ctx.continuity_rebuild_required)
 
     def _final_visual_report(self, ctx: PipelineContext) -> None:
         """对合并成片生成报告；不据此执行无法可靠归因的代码重写。"""
@@ -5274,11 +5454,24 @@ class Orchestrator:
                 enable_visual_eval=False,
                 output_dir=ctx.paths.root / "eval_reports",
             )
-            scene_eval_results = {
-                scene_id: evaluator.evaluate_code(state.code)
-                for scene_id, state in ctx.scene_states.items()
-                if state.code
-            }
+            evaluate_code = evaluator.evaluate_code
+            if self._supports_keyword(evaluate_code, "renderer"):
+                scene_eval_results = {
+                    scene_id: evaluate_code(
+                        state.code,
+                        renderer=ctx.render_profile.renderer,
+                    )
+                    for scene_id, state in ctx.scene_states.items()
+                    if state.code
+                }
+            else:
+                # 兼容旧的评估器替身/外部集成；正式 Evaluator 会按当前
+                # run 的 RenderProfile 验证 OpenGL/Cairo 规则。
+                scene_eval_results = {
+                    scene_id: evaluate_code(state.code)
+                    for scene_id, state in ctx.scene_states.items()
+                    if state.code
+                }
             eval_result = evaluator.evaluate_run(
                 ctx.paths.run_id,
                 ctx.paths.root,
@@ -5373,6 +5566,12 @@ class Orchestrator:
                 state.inherited_elements_code = ""
                 state.exported_elements_code = ""
                 state.exported_elements = []
+                state.local_smoke_status = "pending"
+                # 代码和交接上下文同时失效；否则后续场景会从旧的
+                # ElementManifest 读取已经被评估淘汰的定义，TechnicalSpec
+                # 也可能在下一轮被误认为仍然与输入匹配。
+                self._reset_technical_spec(state)
+                self._remove_element_manifest_scene(ctx, scene_id)
                 state.visual_status = "pending" if ctx.visual_eval_profile.enabled else "skipped"
                 state.visual_fix_attempts = 0
                 state.visual_score = None

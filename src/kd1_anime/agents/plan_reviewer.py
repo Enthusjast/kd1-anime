@@ -145,6 +145,8 @@ def filter_verified_plan_issues(
     new_ids = {item.element_id for item in plan.new_elements}
     removed_ids = {item.element_id for item in plan.elements_to_remove}
     declared_ids = inherited_ids | new_ids | removed_ids
+    handoff_ids = {item.element_id for item in plan.handoff}
+    required_new_ids = {item.element_id for item in plan.new_elements if item.required}
     role_lists_are_unique = all(
         len(elements) == len({item.element_id for item in elements})
         for elements in (
@@ -155,9 +157,11 @@ def filter_verified_plan_issues(
     )
     handoff_contract_valid = (
         role_lists_are_unique
+        and len(handoff_ids) == len(plan.handoff)
         and not inherited_ids & new_ids
         and not removed_ids & new_ids
         and removed_ids <= inherited_ids
+        and required_new_ids <= handoff_ids
         and all(
             item.element_id in declared_ids
             and item.action
@@ -173,8 +177,17 @@ def filter_verified_plan_issues(
     )
     filtered: list[PlanReviewIssue] = []
     for issue in issues:
+        issue_text = f"{issue.message}\n{issue.fix_instruction}"
+        # 模型有时会把“检查通过、无需修改”的说明误包装成一个默认
+        # severity=major 的 issue。它没有提出阻断事实，若照单处理会让
+        # Planner 在同一份合法计划上反复重规划。仅在文本同时明确表示
+        # 合规/无需修改时丢弃，不放宽真正带否定结论的数学或合同问题。
+        explicitly_non_blocking = ("无需修改" in issue_text or "无需修正" in issue_text) and any(
+            marker in issue_text for marker in ("合理", "符合要求", "不需要调整")
+        )
+        if explicitly_non_blocking:
+            continue
         if issue.category == "math" and issue.field.startswith("math_claims["):
-            issue_text = f"{issue.message}\n{issue.fix_instruction}"
             claim_id = issue.field.removeprefix("math_claims[").removesuffix("]")
             claim = claims.get(claim_id)
             if (
@@ -205,6 +218,43 @@ def filter_verified_plan_issues(
                 continue
         filtered.append(issue)
     return filtered
+
+
+def dedupe_plan_review_issues(
+    issues: list[PlanReviewIssue],
+) -> list[PlanReviewIssue]:
+    """按类别、字段和消息合并确定性检查与模型检查的重复结果。"""
+
+    unique: list[PlanReviewIssue] = []
+    seen: set[tuple[str, str, str]] = set()
+    for issue in issues:
+        key = (issue.category, issue.field, issue.message)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique
+
+
+def classify_plan_review_issues(
+    plan: ScenePlan,
+    *,
+    deterministic_issues: list[PlanReviewIssue],
+    result: PlanReviewResult,
+) -> tuple[list[PlanReviewIssue], list[PlanReviewIssue], list[PlanReviewIssue]]:
+    """统一执行计划审查结果的去重、误报过滤和阻断分级。
+
+    返回 ``(全部问题, 阻断问题, 非阻断提示)``。CLI 预览和正式流水线必须
+    共用这套策略，避免同一份计划在两个入口得到不同结论。
+    """
+
+    all_issues = dedupe_plan_review_issues(
+        [*deterministic_issues, *(result.issues if not result.is_valid else [])]
+    )
+    all_issues = filter_verified_plan_issues(plan, all_issues)
+    blocking = [issue for issue in all_issues if issue.severity == "major"]
+    non_blocking = [issue for issue in all_issues if issue.severity != "major"]
+    return all_issues, blocking, non_blocking
 
 
 PLAN_REVIEW_BATCH_PROMPT = (

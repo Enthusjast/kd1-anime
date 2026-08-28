@@ -50,9 +50,14 @@ class Evaluator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.chmod(0o700)
 
-    def evaluate_code(self, code: str) -> EvalResult:
+    def evaluate_code(
+        self,
+        code: str,
+        *,
+        renderer: str | None = None,
+    ) -> EvalResult:
         result = EvalResult(run_id=f"code_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        for score in self.code_evaluator.evaluate(code):
+        for score in self.code_evaluator.evaluate(code, renderer=renderer):
             result.add_score(score)
         result.summary = self._generate_summary(result)
         return result
@@ -330,7 +335,10 @@ class Evaluator:
             code_files = sorted(run_dir.glob("scene_*.py"))
         for code_file in code_files:
             try:
-                for score in self.code_evaluator.evaluate(code_file.read_text(encoding="utf-8")):
+                for score in self.code_evaluator.evaluate(
+                    code_file.read_text(encoding="utf-8"),
+                    renderer=manifest.render_profile.renderer if manifest is not None else None,
+                ):
                     score.details["file"] = str(code_file)
                     result.add_score(score)
             except (OSError, UnicodeError, ValueError) as exc:

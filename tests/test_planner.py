@@ -275,6 +275,28 @@ class TestPlannerAgent:
         assert len(outlines) == 2
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_outline_fits_explicit_total_duration(self, mock_call_llm, planner):
+        mock_call_llm.return_value = """{"items": [
+            {"scene_id": 1, "title": "第一段", "duration_seconds": 60, "purpose": "A", "math_concept": "A"},
+            {"scene_id": 2, "title": "第二段", "duration_seconds": 60, "purpose": "B", "math_concept": "B"}
+        ]}"""
+
+        outlines = planner.plan_outline("视频总时长控制在 1 分钟以内，分成 2 个场景。")
+
+        assert sum(item.duration_seconds for item in outlines) <= 60.05
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_outline_uses_upper_bound_for_duration_range(self, mock_call_llm, planner):
+        mock_call_llm.return_value = """{"items": [
+            {"scene_id": 1, "title": "第一段", "duration_seconds": 200, "purpose": "A", "math_concept": "A"},
+            {"scene_id": 2, "title": "第二段", "duration_seconds": 200, "purpose": "B", "math_concept": "B"}
+        ]}"""
+
+        outlines = planner.plan_outline("视频总时长控制在 3-5 分钟以内，分成 2 个场景。")
+
+        assert sum(item.duration_seconds for item in outlines) == pytest.approx(300)
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_outline_rejects_too_many_scenes(self, mock_call_llm, planner):
         """测试拒绝过多场景。"""
         from kd1_anime.config import settings

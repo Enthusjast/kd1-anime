@@ -359,3 +359,19 @@ def test_show_banner_displays_main_and_visual_models(monkeypatch):
     assert "embedding-model" in rendered
     assert "Reranker 模型:" in rendered
     assert "reranker-model" in rendered
+
+
+def test_non_tty_pipeline_callback_displays_technical_and_smoke_stages(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(tui_module, "console", Console(file=output, force_terminal=False))
+
+    ChatSession._pipeline_callback("stage_start", {"stage": "technical"})
+    ChatSession._pipeline_callback("scene_technical_planning", {"scene_id": 1})
+    ChatSession._pipeline_callback("scene_technical_ready", {"scene_id": 1})
+    ChatSession._pipeline_callback("scene_smoke_rendering", {"scene_id": 1})
+    ChatSession._pipeline_callback("scene_smoke_rendered", {"scene_id": 1})
+
+    rendered = output.getvalue()
+    assert "技术实现设计" in rendered
+    assert "技术合同完成" in rendered
+    assert "Smoke Render 通过" in rendered

@@ -365,6 +365,20 @@ class PlanCompiler:
                         )
                     )
                 cursor = max(cursor, event.end_seconds)
+            for event in events:
+                if event.end_seconds > plan.duration_seconds + 0.05:
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="timing",
+                            field="timeline",
+                            scene_ids=scene_ids,
+                            message=(
+                                f"时间线事件 {event.event_id} 结束于 {event.end_seconds:.2f}s，"
+                                f"超出场景时长 {plan.duration_seconds:.2f}s。"
+                            ),
+                            fix_instruction="将事件结束时间调整到场景时长以内，或增加场景总时长。",
+                        )
+                    )
             if cursor < plan.duration_seconds - 0.05:
                 issues.append(
                     PlanCompilerIssue(
@@ -446,6 +460,32 @@ class PlanCompiler:
         for geometry in plan.geometry_specs:
             if not geometry.vertices:
                 continue
+            if geometry.shape == "circle":
+                # GeometrySpec 没有圆心/半径字段，不能把圆的离散辅助点
+                # 当作多边形用鞋带公式计算面积；圆的语义审查交给 LLM。
+                continue
+            if geometry.shape == "line":
+                if len(geometry.vertices) < 2:
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="geometry",
+                            field=f"geometry_specs[{geometry.geometry_id}].vertices",
+                            scene_ids=scene_ids,
+                            message="线段至少需要两个顶点。",
+                            fix_instruction="补充线段的起点和终点，或不要声明该几何对象。",
+                        )
+                    )
+                if any(len(point) < 2 for point in geometry.vertices):
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="geometry",
+                            field=f"geometry_specs[{geometry.geometry_id}].vertices",
+                            scene_ids=scene_ids,
+                            message="几何顶点必须至少包含 x、y 坐标。",
+                            fix_instruction="为每个顶点提供二维坐标。",
+                        )
+                    )
+                continue
             if len(geometry.vertices) < 3:
                 issues.append(
                     PlanCompilerIssue(
@@ -510,11 +550,13 @@ class PlanCompiler:
                     )
                 )
 
-        declared_ids = {
-            item.element_id
-            for item in [*plan.inherited_elements, *plan.new_elements]
-            if item.element_id not in {removed.element_id for removed in plan.elements_to_remove}
-        }
+        inherited_ids = {item.element_id for item in plan.inherited_elements}
+        new_ids = {item.element_id for item in plan.new_elements}
+        removed_ids = {item.element_id for item in plan.elements_to_remove}
+        # removed 元素仍然是本场景的合法声明，因为 handoff 需要用
+        # ``action=remove`` 显式描述它的退出。最终导出区是否包含它会由
+        # validate_export_contract() 单独拒绝。
+        declared_ids = inherited_ids | new_ids | removed_ids
         handoff_ids = {item.element_id for item in plan.handoff}
         if len(handoff_ids) != len(plan.handoff):
             issues.append(
@@ -537,9 +579,36 @@ class PlanCompiler:
                     fix_instruction="让 handoff 与 inherited_elements/new_elements 使用相同的 element_id。",
                 )
             )
-        inherited_ids = {item.element_id for item in plan.inherited_elements}
-        new_ids = {item.element_id for item in plan.new_elements}
-        removed_ids = {item.element_id for item in plan.elements_to_remove}
+        missing_required_handoff = {
+            item.element_id for item in plan.new_elements if item.required
+        } - handoff_ids
+        if missing_required_handoff:
+            issues.append(
+                PlanCompilerIssue(
+                    category="contract",
+                    field="handoff",
+                    scene_ids=scene_ids,
+                    message=(
+                        "required=true 的 new_elements 未列入 handoff: "
+                        + ", ".join(sorted(missing_required_handoff))
+                    ),
+                    fix_instruction="为每个需要交给下一场景的 new_element 增加 handoff 条目，并使用 create 或 keep。",
+                )
+            )
+        invalid_removed = removed_ids - inherited_ids
+        if invalid_removed:
+            issues.append(
+                PlanCompilerIssue(
+                    category="contract",
+                    field="elements_to_remove",
+                    scene_ids=scene_ids,
+                    message=(
+                        "elements_to_remove 只能引用 inherited_elements 中的元素: "
+                        + ", ".join(sorted(invalid_removed))
+                    ),
+                    fix_instruction="只移除本场景真实继承的元素，或先加入 inherited_elements。",
+                )
+            )
         for item in plan.handoff:
             expected_actions = (
                 {"remove"}
@@ -580,7 +649,8 @@ class PlanCompiler:
         previous_available = {
             item.element_id
             for item in [*previous.inherited_elements, *previous.new_elements]
-            if item.element_id
+            if item.required
+            and item.element_id
             not in {removed.element_id for removed in previous.elements_to_remove}
         }
         current_inherited = {item.element_id for item in current.inherited_elements}

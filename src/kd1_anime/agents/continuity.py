@@ -494,10 +494,14 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
             raise ValueError("连续性导出区必须位于 Scene.construct() 内")
     if marker_lines:
         lines = code.splitlines()
-        begin_index = next(
+        begin_indices = [
             index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line
-        )
-        end_index = next(index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line)
+        ]
+        end_indices = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line]
+        if len(begin_indices) != 1 or len(end_indices) != 1:
+            raise ValueError("连续性导出区标记不成对或重复")
+        begin_index = begin_indices[0]
+        end_index = end_indices[0]
         block_text = textwrap.dedent("\n".join(lines[begin_index + 1 : end_index])).strip()
         prefix_code = _safe_alias_prefix(code, begin_index + 1, block_text)
         marked_code, marked_elements = _parse_export_block(code, prefix_code=prefix_code)
@@ -643,40 +647,39 @@ def normalize_scene_plan_contract(
         previous_available_by_id = {
             item.element_id: item
             for item in [*previous_plan.inherited_elements, *previous_plan.new_elements]
-            if item.element_id not in previous_removed
+            if item.required and item.element_id not in previous_removed
         }
         previous_available = set(previous_available_by_id)
-        if previous_available:
-            kept = [item for item in inherited if item.element_id in previous_available]
-            dropped = [
-                item.element_id for item in inherited if item.element_id not in previous_available
-            ]
-            if dropped:
-                repairs.append("删除上一场景未声明导出的继承元素: " + ", ".join(sorted(dropped)))
-            inherited = kept
+        kept = [item for item in inherited if item.element_id in previous_available]
+        dropped = [
+            item.element_id for item in inherited if item.element_id not in previous_available
+        ]
+        if dropped:
+            repairs.append("删除上一场景未声明导出的继承元素: " + ", ".join(sorted(dropped)))
+        inherited = kept
 
-            # element_id 是语义身份，variable_name 是代码级身份。Planner
-            # 经常会在相邻场景里把同一个对象从 ``triangle`` 改名为
-            # ``right_triangle``；如果不在这里固定为上一场景的变量名，
-            # Coder 会收到互相矛盾的继承代码和结构化合同，最终生成重复
-            # 或无法导出的连续性区。
-            aligned_inherited: list[VisualElementState] = []
-            for current_item in inherited:
-                previous_item = previous_available_by_id[current_item.element_id]
-                aligned_item = current_item
-                if (
-                    previous_item.variable_name
-                    and current_item.variable_name != previous_item.variable_name
-                ):
-                    repairs.append(
-                        f"元素 {current_item.element_id} 的变量名固定为上一场景的 "
-                        f"{previous_item.variable_name}"
-                    )
-                    aligned_item = current_item.model_copy(
-                        update={"variable_name": previous_item.variable_name}
-                    )
-                aligned_inherited.append(aligned_item)
-            inherited = aligned_inherited
+        # element_id 是语义身份，variable_name 是代码级身份。Planner
+        # 经常会在相邻场景里把同一个对象从 ``triangle`` 改名为
+        # ``right_triangle``；如果不在这里固定为上一场景的变量名，
+        # Coder 会收到互相矛盾的继承代码和结构化合同，最终生成重复
+        # 或无法导出的连续性区。
+        aligned_inherited: list[VisualElementState] = []
+        for current_item in inherited:
+            previous_item = previous_available_by_id[current_item.element_id]
+            aligned_item = current_item
+            if (
+                previous_item.variable_name
+                and current_item.variable_name != previous_item.variable_name
+            ):
+                repairs.append(
+                    f"元素 {current_item.element_id} 的变量名固定为上一场景的 "
+                    f"{previous_item.variable_name}"
+                )
+                aligned_item = current_item.model_copy(
+                    update={"variable_name": previous_item.variable_name}
+                )
+            aligned_inherited.append(aligned_item)
+        inherited = aligned_inherited
 
     inherited_ids = {item.element_id for item in inherited}
     valid_removals: list[VisualElementState] = []
@@ -957,7 +960,9 @@ def _state_tokens(values: list[str]) -> set[str]:
     return {
         token
         for token in re.findall(r"[a-z][a-z0-9_]*|\d+|[\u4e00-\u9fff]{2,}", text)
-        if len(token) > 1 or token.isdigit()
+        # 单字母变量（a、b、x 等）是数学状态的重要组成部分；中文单字
+        # 仍然忽略，避免普通语句因一个常见虚词产生误匹配。
+        if len(token) > 1 or token.isdigit() or (len(token) == 1 and token.isascii())
     }
 
 
@@ -1152,7 +1157,7 @@ def deterministic_continuity_issues(
         previous_variable_by_id = {
             item.element_id: item.variable_name
             for item in (*plan.inherited_elements, *plan.new_elements)
-            if item.element_id not in removal_ids and item.variable_name
+            if item.required and item.element_id not in removal_ids and item.variable_name
         }
         variable_drifts = [
             f"{item.element_id}: {previous_variable_by_id[item.element_id]} -> {item.variable_name}"

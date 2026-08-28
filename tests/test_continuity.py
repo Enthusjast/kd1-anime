@@ -246,6 +246,19 @@ class Demo(Scene):
     assert [item.element_id for item in elements] == ["formula"]
 
 
+def test_extract_continuity_elements_reports_unpaired_markers_cleanly():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        formula = Circle()
+"""
+
+    with pytest.raises(ValueError, match="标记不成对"):
+        extract_continuity_elements(code)
+
+
 def test_extract_continuity_elements_without_marker_uses_safe_fallback():
     code = """
 from manim import *
@@ -542,6 +555,67 @@ def test_normalize_scene_plan_contract_drops_unexported_previous_elements():
 
     assert [item.element_id for item in normalized.inherited_elements] == ["kept"]
     assert any("未声明导出" in repair for repair in repairs)
+
+
+def test_normalize_scene_plan_contract_drops_all_inherited_when_previous_exports_none():
+    previous = make_plan(1)
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [
+                VisualElementState(element_id="missing", variable_name="missing")
+            ]
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(
+        current,
+        ContinuityBible(),
+        previous_plan=previous,
+    )
+
+    assert normalized.inherited_elements == []
+    assert any("未声明导出" in repair for repair in repairs)
+
+
+def test_normalize_scene_plan_contract_drops_optional_previous_elements():
+    previous = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary",
+                    variable_name="temporary",
+                    required=False,
+                )
+            ]
+        }
+    )
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [
+                VisualElementState(element_id="temporary", variable_name="temporary")
+            ]
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(
+        current,
+        ContinuityBible(),
+        previous_plan=previous,
+    )
+
+    assert normalized.inherited_elements == []
+    assert any("未声明导出" in repair for repair in repairs)
+
+
+def test_continuity_state_matching_keeps_single_letter_math_variables():
+    plans = [
+        make_plan(1, closing=["保留变量 a"]),
+        make_plan(2, opening=["接管变量 a"], closing=["结论"]),
+    ]
+
+    issues = deterministic_continuity_issues(plans, ContinuityBible())
+
+    assert not any(issue.category == "state" for issue in issues)
 
 
 def test_normalize_scene_plan_contract_keeps_previous_variable_name():

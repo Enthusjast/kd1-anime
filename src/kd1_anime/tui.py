@@ -622,6 +622,8 @@ class ChatSession:
                         console.print(Rule("[bold magenta]场景概要[/]", style="magenta"))
                     case "detailing":
                         console.print(Rule("[bold magenta]导演分镜[/]", style="magenta"))
+                    case "technical":
+                        console.print(Rule("[bold magenta]技术实现设计[/]", style="magenta"))
                     case "coding":
                         console.print(Rule("[bold magenta]代码生成[/]", style="magenta"))
                     case "reviewing":
@@ -682,6 +684,20 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]分镜完成 ✓[/]")
 
+            case "scene_technical_planning":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]技术实现设计中[/]")
+
+            case "scene_technical_ready":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]技术合同完成 ✓[/]")
+
+            case "scene_technical_failed":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]技术合同失败 ✗[/]{suffix}")
+
             case "scene_plan_reviewing":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]计划正确性审查中[/]")
@@ -738,10 +754,26 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]需修正[/]")
 
+            case "scene_smoke_rendering":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]Smoke Render 检查中[/]")
+
+            case "scene_smoke_rendered":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]Smoke Render 通过 ✓[/]")
+
             case "scene_submitted":
                 scene_id = data.get("scene_id", "?")
                 job_id = data.get("job_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id} → Job {job_id}")
+
+            case "scene_artifact_invalid":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]渲染产物不可用，将重新处理[/]{suffix}"
+                )
 
             case "scene_rendered":
                 scene_id = data.get("scene_id", "?")

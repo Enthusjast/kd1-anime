@@ -257,6 +257,23 @@ class InvalidScene(Scene):
         assert syntax_score.score == 1
         assert evaluator.analyze_code(code).validation_errors
 
+    def test_submission_validation_uses_explicit_renderer(self):
+        evaluator = CodeEvaluator()
+        code = """
+from manim import *
+
+class Shape(VMobject):
+    pass
+
+class Demo(Scene):
+    def construct(self):
+        self.add(Shape())
+"""
+
+        analysis = evaluator.analyze_code(code, renderer="opengl")
+
+        assert any("自定义 mobject 子类" in error for error in analysis.validation_errors)
+
     def test_get_scene_complexity(self):
         """测试场景复杂度评估"""
         evaluator = CodeEvaluator()

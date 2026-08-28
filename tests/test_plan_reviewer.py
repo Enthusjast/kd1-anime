@@ -8,6 +8,7 @@ from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
     PlanReviewResult,
+    classify_plan_review_issues,
     deterministic_plan_issues,
     filter_verified_plan_issues,
 )
@@ -138,6 +139,72 @@ def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():
     )
 
     assert filtered == []
+
+
+def test_plan_review_only_major_issues_block():
+    plan = make_plan()
+    result = PlanReviewResult(
+        is_valid=False,
+        severity="minor",
+        summary="建议调整停顿",
+        issues=[
+            {
+                "category": "timing",
+                "severity": "minor",
+                "field": "key_moments",
+                "message": "停顿略短",
+                "fix_instruction": "可选地增加停顿",
+            }
+        ],
+    )
+
+    all_issues, blocking, warnings = classify_plan_review_issues(
+        plan,
+        deterministic_issues=[],
+        result=result,
+    )
+
+    assert len(all_issues) == 1
+    assert blocking == []
+    assert len(warnings) == 1
+
+
+def test_plan_review_drops_model_issue_that_explicitly_says_no_change_needed():
+    plan = make_plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_step",
+                    variable_name="temporary_step",
+                    required=False,
+                )
+            ]
+        }
+    )
+    result = PlanReviewResult(
+        is_valid=False,
+        severity="major",
+        summary="计划符合要求",
+        issues=[
+            {
+                "category": "contract",
+                "field": "new_elements",
+                "message": (
+                    "temporary_step 的 required=false 符合要求，作为中间步骤不应标记为 required=true。"
+                ),
+                "fix_instruction": "无需修改；确保结束时淡出。",
+            }
+        ],
+    )
+
+    _, blocking, warnings = classify_plan_review_issues(
+        plan,
+        deterministic_issues=[],
+        result=result,
+    )
+
+    assert blocking == []
+    assert warnings == []
 
 
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")

@@ -457,6 +457,10 @@ class SceneDashboard:
             if status:
                 self._mark_running(status, "渲染", f"Job {data.get('job_id', '?')}")
 
+        elif event == "scene_artifact_invalid":
+            if status:
+                self._mark_running(status, "渲染", "渲染产物不可用，准备重新处理")
+
         elif event in ("scene_rendered", "scene_reused"):
             if status:
                 # 启用视觉门时，渲染完成只是中间态；只有视觉评估已接受

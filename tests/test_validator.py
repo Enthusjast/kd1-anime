@@ -15,6 +15,32 @@ def test_valid_manim_scene():
     assert result.scene_classes == ["Demo"]
 
 
+def test_allows_scene_remove_for_mobject_lifecycle():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        circle = Circle()\n"
+        "        self.add(circle)\n"
+        "        self.remove(circle)\n"
+    )
+
+    assert result.is_valid, result.feedback
+
+
+def test_still_rejects_remove_on_arbitrary_object():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        value = VGroup()\n"
+        "        value.remove(Circle())\n"
+    )
+
+    assert not result.is_valid
+    assert "remove" in result.feedback
+
+
 def test_allows_common_local_names_that_shadow_manim_internals():
     result = validate_manim_code(
         "from manim import *\n"

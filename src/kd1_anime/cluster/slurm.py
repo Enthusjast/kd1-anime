@@ -978,20 +978,19 @@ class SlurmDispatcher:
         # stdout 常包含正常的启动/进度/完成前日志，不能仅凭“有日志”就
         # 把作业判为失败；只有出现 traceback/异常/非零退出等明确证据时
         # 才进入 AutoFix，否则继续等待产物传播或 sacct 记录。
+        # 不能使用裸的 ``error ``/``failed`` 子串：正常输出、课程文字或
+        # 警告中出现这些词时，作业也可能只是短暂地从队列中消失。只匹配
+        # traceback、异常类型、退出码和明确的作业终态证据。
         failure_markers = (
-            "traceback (most recent call last)",
-            "exception:",
-            "error:",
-            "error ",
-            "fatal",
-            "failed",
-            "non-zero",
-            "exit code",
-            "killed",
-            "cancelled",
-            "time limit",
+            re.compile(r"traceback\s*\(most recent call last\)", re.IGNORECASE),
+            re.compile(r"\b(?:[a-z_][a-z0-9_]*(?:error|exception))\s*:", re.IGNORECASE),
+            re.compile(r"\bfatal(?:\s+error)?\b", re.IGNORECASE),
+            re.compile(r"\bnon[- ]zero(?:\s+exit)?\b", re.IGNORECASE),
+            re.compile(r"\bexit(?:ed)?\s+(?:with\s+)?(?:code|status)\b", re.IGNORECASE),
+            re.compile(r"\b(?:killed|cancelled|time limit)\b", re.IGNORECASE),
+            re.compile(r"\b(?:render|job|process)\s+(?:failed|failure)\b", re.IGNORECASE),
         )
-        if log_tail and any(marker in log_tail.lower() for marker in failure_markers):
+        if log_tail and any(marker.search(log_tail) for marker in failure_markers):
             job.failure_reason = f"作业已从集群消失，依据日志判定为失败:\n{log_tail}"
             return "FAILED"
         return None

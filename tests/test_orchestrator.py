@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,256 @@ def test_valid_review_after_rewrite_exits_review_loop(tmp_path):
     Orchestrator()._apply_review_result(ctx, 1, ctx.scene_states[1], ReviewResult(is_valid=True))
     assert ctx.scene_states[1].reviewed is True
     assert ctx.scene_states[1].review_round == 0
+
+
+def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    ctx = PipelineContext(
+        "direct",
+        paths=run_paths,
+        direct_render=True,
+        scenes=[state.plan],
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_technical_spec",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("direct render called LLM")),
+    )
+
+    orchestrator._run_code_review_barrier(ctx)
+
+
+def test_direct_render_flag_round_trips_in_manifest(tmp_path):
+    run_paths = paths(tmp_path)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    run_paths.scenes.mkdir(parents=True)
+    (run_paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    ctx = PipelineContext(
+        "direct",
+        paths=run_paths,
+        direct_render=True,
+        scenes=[state.plan],
+        scene_states={1: state},
+    )
+
+    orchestrator = Orchestrator()
+    orchestrator._checkpoint(ctx, State.DISPATCHING)
+
+    manifest = RunManifest.model_validate_json(
+        (run_paths.root / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest.direct_render is True
+    restored = orchestrator._context_from_manifest(manifest, run_paths.root)
+    assert restored.direct_render is True
+
+
+def test_direct_render_wait_does_not_call_any_generation_agent(monkeypatch, tmp_path):
+    from kd1_anime.cluster.slurm import SlurmJob
+    from kd1_anime.config import settings
+    from kd1_anime.rendering import VideoMetadata
+
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+
+    class FakeSlurm:
+        def submit_scene(self, scene_id, python_file, scene_class_name, **kwargs):
+            run_root = python_file.parent.parent
+            return SlurmJob(
+                job_id="123",
+                scene_id=scene_id,
+                script_path=python_file.parent / "render.sh",
+                log_out=run_root / "logs" / "scene.out",
+                log_err=run_root / "logs" / "scene.err",
+                media_dir=run_root / "videos" / f"scene_{scene_id}",
+                scene_class_name=scene_class_name,
+                submitted_at=1.0,
+                code_sha256=kwargs["code_sha256"],
+                render_profile=kwargs["render_profile"],
+            )
+
+        def poll_all_statuses(self, job_ids):
+            return {job_id: "COMPLETED" for job_id in job_ids}
+
+        def validate_completed_job(self, job):
+            job.output_path = job.media_dir / f"{job.scene_class_name}.mp4"
+            job.output_path.parent.mkdir(parents=True, exist_ok=True)
+            job.output_path.write_bytes(b"video")
+            job.output_metadata = VideoMetadata(
+                size_bytes=5,
+                duration_seconds=1,
+                width=job.render_profile.pixel_width,
+                height=job.render_profile.pixel_height,
+                frame_rate=job.render_profile.frame_rate,
+            )
+            job.output_sha256 = sha256_file(job.output_path)
+            return True
+
+        def _forward_log(self, job, positions):
+            return None
+
+        def cancel_job(self, job_id):
+            return True
+
+    class FakeMerger:
+        def merge(self, video_paths, output_path, **kwargs):
+            output_path = Path(output_path)
+            output_path.write_bytes(b"merged")
+            return output_path
+
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path / "workspace")
+    monkeypatch.setattr(settings, "ENABLE_AUTO_EVAL", False)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_preflight_environment",
+        staticmethod(lambda profile=None: None),
+    )
+    orchestrator = Orchestrator()
+    orchestrator.slurm = FakeSlurm()
+    orchestrator.merger = FakeMerger()
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_technical_spec",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("direct render must not call TechnicalPlanner")
+        ),
+    )
+
+    _, final_video, _ = orchestrator.submit_existing_scene(code, "Demo", wait=True)
+
+    assert final_video is not None
+    assert final_video.read_bytes() == b"merged"
+
+
+def test_resume_requeues_rendered_scene_when_video_was_deleted(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    profile = PipelineContext("prompt", paths=run_paths).render_profile
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    code_path = run_paths.scenes / "scene_1.py"
+    code_path.parent.mkdir(parents=True)
+    code_path.write_text(code, encoding="utf-8")
+    artifact = SceneArtifact(
+        origin="rendered",
+        source_run_id=run_paths.run_id,
+        job_id="123",
+        scene_id=1,
+        scene_class_name="Demo",
+        code_sha256=sha256_text(code),
+        render_profile_sha256=profile.digest(),
+        video_path="videos/scene_1/Demo.mp4",
+        video_sha256="a" * 64,
+        metadata=VideoMetadata(
+            size_bytes=1,
+            duration_seconds=1,
+            width=profile.pixel_width,
+            height=profile.pixel_height,
+            frame_rate=profile.frame_rate,
+        ),
+    )
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        reviewed=True,
+        rendered=True,
+        artifact=artifact,
+    )
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    orchestrator._reconcile_rendered_artifacts(ctx)
+
+    assert state.rendered is False
+    assert state.artifact is None
+    assert ctx.final_video is None
+    assert "重新处理" in state.failure_reason
+
+
+def test_local_smoke_status_is_persisted_and_failed_smoke_is_not_passed(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext("prompt", paths=run_paths)
+    state = SceneState(plan=plan())
+    monkeypatch.setattr(settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_local_smoke_render_impl", lambda *args: None)
+
+    orchestrator._local_smoke_render(ctx, state)
+
+    assert state.local_smoke_status == "passed"
+
+    def fail(*args):
+        raise RuntimeError("smoke failed")
+
+    monkeypatch.setattr(orchestrator, "_local_smoke_render_impl", fail)
+    with pytest.raises(RuntimeError, match="smoke failed"):
+        orchestrator._local_smoke_render(ctx, state)
+    assert state.local_smoke_status == "failed"
+
+
+def test_failed_scene_phase_does_not_remain_visual_evaluating():
+    state = SceneState(plan=plan(), failed=True, visual_status="evaluating")
+
+    assert Orchestrator._scene_phase(state) == "failed"
+
+
+def test_scene_worker_clears_rendered_state_when_post_render_step_fails(monkeypatch, tmp_path):
+    from kd1_anime.cluster.slurm import SlurmJob
+
+    run_paths = paths(tmp_path)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+        class_name="Demo",
+        reviewed=True,
+        slurm_job=SlurmJob(
+            job_id="123",
+            scene_id=1,
+            script_path=run_paths.scenes / "render.sh",
+            log_out=run_paths.logs / "out",
+            log_err=run_paths.logs / "err",
+            media_dir=run_paths.videos / "scene_1",
+            scene_class_name="Demo",
+            submitted_at=1.0,
+        ),
+    )
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    orchestrator._slot_lock = threading.Lock()
+    orchestrator._in_flight = 1
+    orchestrator._reserved_existing_scenes = {1}
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    def fail_after_marking_rendered(_ctx, current_state):
+        current_state.rendered = True
+        raise RuntimeError("post-render failure")
+
+    monkeypatch.setattr(orchestrator, "_scene_wait_render", fail_after_marking_rendered)
+
+    orchestrator._scene_worker(ctx, 1, state)
+
+    assert state.failed is True
+    assert state.rendered is False
+    assert state.artifact is None
 
 
 def test_disabled_rag_retrieval_is_recorded_without_network(tmp_path):

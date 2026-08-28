@@ -7,6 +7,8 @@ from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
     PlanReviewResult,
+    classify_plan_review_issues,
+    dedupe_plan_review_issues,
     deterministic_plan_issues,
     filter_verified_plan_issues,
 )
@@ -48,7 +50,9 @@ __all__ = [
     "TechnicalSpec",
     "TechnicalValidationResult",
     "build_bounded_prompt",
+    "classify_plan_review_issues",
     "compile_technical_spec",
+    "dedupe_plan_review_issues",
     "deterministic_plan_issues",
     "filter_verified_plan_issues",
     "validate_animation_lifecycle",

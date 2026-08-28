@@ -92,6 +92,7 @@ VisualStatus = Literal[
     "skipped",
 ]
 TechnicalStatus = Literal["pending", "generating", "passed", "failed"]
+LocalSmokeStatus = Literal["pending", "running", "passed", "failed", "skipped"]
 
 
 def utc_now() -> datetime:
@@ -188,6 +189,7 @@ class StoredSceneState(BaseModel):
     technical_input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     technical_status: TechnicalStatus = "pending"
     technical_error: str = Field(default="", max_length=50_000)
+    local_smoke_status: LocalSmokeStatus = "pending"
     rewrite_feedback: str = Field(default="", max_length=50_000)
     review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
     identical_review_count: int = Field(default=0, ge=0)
@@ -244,6 +246,9 @@ class RunManifest(BaseModel):
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    # Direct ``render`` runs contain user-supplied code and intentionally skip
+    # every generation/review LLM stage, including on resume.
+    direct_render: bool = False
     approve_plan: bool = False
     plan_approved: bool = False
     output_path: str
@@ -327,6 +332,8 @@ class RunManifest(BaseModel):
                 artifact = scene.artifact
                 if not scene.rendered:
                     errors.append(f"Scene {scene_id} 存在 artifact 但 rendered=false")
+                if scene.rendered and not artifact.verified:
+                    errors.append(f"Scene {scene_id} 标记为 rendered 但 artifact 未验证")
                 if artifact.scene_id != scene_id:
                     errors.append(f"Scene {scene_id} 的 artifact.scene_id 不一致")
                 if artifact.scene_class_name != scene.class_name:
@@ -353,6 +360,8 @@ class RunManifest(BaseModel):
                     errors.append(f"Scene {scene_id} 的视觉评估记录与当前视频哈希不一致")
             candidate = scene.visual_best_candidate
             if candidate is not None:
+                if not candidate.artifact.verified:
+                    errors.append(f"Scene {scene_id} 的最佳视觉候选产物未经验证")
                 if candidate.artifact.scene_id != scene_id:
                     errors.append(f"Scene {scene_id} 的最佳视觉候选场景 ID 不一致")
                 if candidate.artifact.code_sha256 != candidate.code_sha256:
@@ -391,6 +400,17 @@ class RunManifest(BaseModel):
         if self.status == "completed" and not self.final_video:
             errors.append("运行标记为 completed 但缺少 final_video")
         return errors
+
+    def validate_for_resume(self) -> None:
+        """在恢复/增量复用前拒绝语义损坏的清单。
+
+        ``status`` 命令仍允许读取并展示损坏清单，便于诊断；真正复用其中
+        的代码、Job 或元素交接时必须 fail-closed，不能只依赖字段类型校验。
+        """
+
+        errors = self.integrity_errors()
+        if errors:
+            raise ValueError("运行清单完整性校验失败: " + "; ".join(errors))
 
 
 def _run_relative(root: Path, path: Path) -> str:

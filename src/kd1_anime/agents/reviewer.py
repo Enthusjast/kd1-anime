@@ -198,12 +198,9 @@ class ReviewResult(BaseModel):
             self.findings = []
             return self
         if self.severity == "info":
-            # info 级别视为通过
-            self.is_valid = True
-            self.feedback = ""
-            self.fixes = []
-            self.findings = []
-            return self
+            # 失败结果不能因为错误的 severity 而绕过代码审查；与
+            # PlanReviewResult 一样采取 fail-closed 策略。
+            self.severity = "major"
         if self.severity == "minor" and not self.fixes:
             # 没有 fixes 的 minor 升级为 major
             self.severity = "major"

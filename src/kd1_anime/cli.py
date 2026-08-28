@@ -86,7 +86,7 @@ def cache_clear(
 def rag_index(
     docs_dir: Path | None = typer.Option(None, "--docs-dir", help="Manim 文档目录"),
     examples_dir: Path | None = typer.Option(None, "--examples-dir", help="Manim 示例目录"),
-    rebuild: bool = typer.Option(False, "--rebuild", help="显式重建整个索引"),
+    rebuild: bool = typer.Option(False, "--rebuild", help="忽略已有索引，强制重新计算 Embedding"),
 ):
     """索引 Manim 文档和示例。"""
 
@@ -100,7 +100,11 @@ def rag_index(
         raise typer.Exit(1)
     try:
         service = RagService()
-        result = service.build_index(docs_dir=docs_dir, examples_dir=examples_dir)
+        result = service.build_index(
+            docs_dir=docs_dir,
+            examples_dir=examples_dir,
+            rebuild=rebuild,
+        )
     except Exception as exc:
         console.print(f"[red]RAG 索引失败:[/] {exc}", markup=False)
         raise typer.Exit(1) from exc
@@ -134,7 +138,7 @@ def rag_status():
             f"分块: {index['chunk_count']}，维度: {index['embedding_dimension']}，"
             f"索引 SHA-256: {index['index_sha256']}"
         )
-    elif data["index_error"]:
+    if data["index_error"]:
         console.print(f"[yellow]索引错误:[/] {data['index_error']}", markup=False)
 
 
@@ -204,17 +208,21 @@ def _ensure_visual_llm_api_available(
 
 
 def _ensure_rag_apis_available() -> None:
-    """在启用 RAG 的生成入口前验证 Embedding 与 Reranker。"""
+    """在启用 RAG 的生成入口前验证索引、Embedding 与 Reranker。"""
 
     if not settings.RAG_ENABLED:
         return
     from kd1_anime.rag.service import RagService
 
     try:
-        RagService().probe()
+        service = RagService()
+        require_index = getattr(service, "require_index", None)
+        if callable(require_index):
+            require_index()
+        service.probe()
     except Exception as exc:
         console.print(
-            f"Embedding/Reranker API 不可用: {exc}",
+            f"RAG 不可用: {exc}",
             style="bold red",
             markup=False,
         )
@@ -486,7 +494,12 @@ def plan(
     try:
         from kd1_anime.agents.continuity import normalize_scene_plan_contract
         from kd1_anime.agents.plan_compiler import PlanCompiler
-        from kd1_anime.agents.plan_reviewer import PlanReviewerAgent, deterministic_plan_issues
+        from kd1_anime.agents.plan_reviewer import (
+            PlanReviewerAgent,
+            PlanReviewIssue,
+            classify_plan_review_issues,
+            deterministic_plan_issues,
+        )
 
         planner = PlannerAgent()
         rag_service = None
@@ -558,20 +571,24 @@ def plan(
                     contract_repairs.extend(f"Scene {scene.scene_id}: {'；'.join(repairs)}")
             scenes = normalized_scenes
             compiler_result = PlanCompiler().compile(outlines, scenes, review_bible)
+            compile_issues_by_scene: dict[int, list[PlanReviewIssue]] = {}
             for issue in compiler_result.issues:
                 target_ids = issue.scene_ids or [scene.scene_id for scene in scenes]
                 for target_id in target_ids:
-                    plan_review_failures.append(
-                        (
-                            target_id,
-                            [
-                                f"[{issue.category}] {issue.message}",
-                                f"修正要求: {issue.fix_instruction}",
-                            ],
+                    compile_issues_by_scene.setdefault(target_id, []).append(
+                        PlanReviewIssue(
+                            category=issue.category,
+                            severity=issue.severity,
+                            field=issue.field,
+                            message=issue.message,
+                            fix_instruction=issue.fix_instruction,
                         )
                     )
             for scene in scenes:
-                deterministic = deterministic_plan_issues(scene, review_bible)
+                deterministic = [
+                    *deterministic_plan_issues(scene, review_bible),
+                    *compile_issues_by_scene.get(scene.scene_id, []),
+                ]
                 result = PlanReviewerAgent().review(
                     scene,
                     user_prompt=prompt,
@@ -580,12 +597,27 @@ def plan(
                     deterministic_issues=deterministic,
                     renderer=settings.MANIM_RENDERER,
                 )
-                issues = [*deterministic]
-                if not result.is_valid:
-                    issues.extend(result.issues)
-                unique_messages = list(dict.fromkeys(issue.message for issue in issues))
-                if unique_messages:
-                    plan_review_failures.append((scene.scene_id, unique_messages))
+                _, blocking_issues, non_blocking_issues = classify_plan_review_issues(
+                    scene,
+                    deterministic_issues=deterministic,
+                    result=result,
+                )
+                if blocking_issues:
+                    plan_review_failures.append(
+                        (
+                            scene.scene_id,
+                            [
+                                f"[{issue.category}] {issue.message}\n"
+                                f"修正要求: {issue.fix_instruction}"
+                                for issue in blocking_issues
+                            ],
+                        )
+                    )
+                for issue in non_blocking_issues:
+                    console.print(
+                        f"[yellow]Scene {scene.scene_id} 计划审查提示:[/] {issue.message}",
+                        markup=False,
+                    )
     except KeyboardInterrupt as e:
         console.print("\n[yellow]用户中断[/]")
         raise typer.Exit(130) from e
@@ -677,13 +709,13 @@ def render(
 
 
 def _scene_status(scene) -> str:
-    if scene.rendered:
-        visual_status = getattr(scene, "visual_status", "skipped")
-        return "rendered" if visual_status == "skipped" else f"rendered/{visual_status}"
     if scene.failed:
         return "failed"
     if scene.give_up:
         return "give_up"
+    if scene.rendered:
+        visual_status = getattr(scene, "visual_status", "skipped")
+        return "rendered" if visual_status == "skipped" else f"rendered/{visual_status}"
     if scene.slurm_job:
         return scene.slurm_job.status.lower()
     if scene.code_file:
@@ -976,6 +1008,7 @@ def clean(
                 # 候选列表生成与真正删除之间可能有很长的用户确认窗口；
                 # 加锁后重新读取，避免误删刚恢复/刚更新的运行。
                 current = repository.load(manifest.run_id)
+                current.validate_for_resume()
                 if current.updated_at > cutoff or (
                     not include_running and current.status == "running"
                 ):
@@ -1065,12 +1098,12 @@ def batch(
 @app.command(name="version")
 def version_cmd():
     """显示版本信息"""
-    try:
-        from importlib.metadata import version
+    # 使用源码包自己的版本常量，避免直接运行 ``python main.py`` 时被
+    # 环境中遗留的旧 editable-install 元数据误导；发布 wheel 时该常量
+    # 与 pyproject.toml 同步更新。
+    from kd1_anime import __version__
 
-        current_version = version("kd1-anime")
-    except Exception:
-        current_version = "0.4.0-dev"
+    current_version = __version__
     console.print(f"kd1-anime v{current_version}")
     console.print("AI Agent 驱动的 Manim 数学动画自动渲染流水线")
 
@@ -1198,8 +1231,14 @@ def doctor(
 
     # 检查 LLM 配置；默认只做本地配置检查，避免 doctor 在离线环境意外
     # 产生 API 请求。需要真实验证时显式使用 --probe-llm。
-    llm_ok = bool(settings.LLM_API_KEY and settings.LLM_MODEL)
-    llm_info = "已配置" if llm_ok else "未配置 (需要 LLM_API_KEY 和 LLM_MODEL)"
+    try:
+        settings.main_llm_profile().require()
+    except ValueError as exc:
+        llm_ok = False
+        llm_info = str(exc)
+    else:
+        llm_ok = True
+        llm_info = f"已配置模型 {settings.LLM_MODEL}"
     checks.append(("LLM 配置", llm_ok, llm_info))
     if probe_llm:
         if not llm_ok:
@@ -1257,17 +1296,21 @@ def doctor(
         rag_status["embedding_configured"]
         and rag_status["reranker_configured"]
         and (not settings.RAG_ENABLED or rag_status["index"] is not None)
+        and not rag_status["index_error"]
     )
+    rag_detail = (
+        f"{rag_status['status']}，Embedding={rag_status['embedding_model'] or '未配置'}，"
+        f"Reranker={rag_status['reranker_model'] or '未配置'}"
+        if rag_required
+        else "未启用（独立配置可留空）"
+    )
+    if rag_required and rag_status["index_error"]:
+        rag_detail += f"；{rag_status['index_error']}"
     checks.append(
         (
             "RAG 配置",
             rag_config_ok if rag_required else True,
-            (
-                f"{rag_status['status']}，Embedding={rag_status['embedding_model'] or '未配置'}，"
-                f"Reranker={rag_status['reranker_model'] or '未配置'}"
-                if rag_required
-                else "未启用（独立配置可留空）"
-            ),
+            rag_detail,
         )
     )
     if probe_rag:
@@ -1295,16 +1338,25 @@ def doctor(
                 ),
             )
         )
-    elif security_strict and not settings.SLURM_REQUIRE_CONTAINER:
+    else:
+        container_path = Path(settings.SLURM_CONTAINER_IMAGE).expanduser()
+        image_ok = container_path.is_file()
+        fail_closed_ok = not security_strict or settings.SLURM_REQUIRE_CONTAINER
+        isolation_ok = image_ok and apptainer_ok and fail_closed_ok
+        details: list[str] = []
+        if not image_ok:
+            details.append(f"镜像不存在: {container_path}")
+        if not apptainer_ok:
+            details.append("未找到 apptainer")
+        if not fail_closed_ok:
+            details.append("严格模式要求 SLURM_REQUIRE_CONTAINER=true")
         checks.append(
             (
                 "生成代码隔离",
-                False,
-                "已配置容器但 SLURM_REQUIRE_CONTAINER=false，严格模式要求 fail-closed",
+                isolation_ok,
+                "; ".join(details) if details else "Apptainer 镜像和命令均可用",
             )
         )
-    elif container_configured:
-        checks.append(("生成代码隔离", True, "Apptainer 镜像已配置"))
 
     # 显示结果
     table = Table(title="环境检查结果")

@@ -173,6 +173,58 @@ def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():
     assert any("未通过计划审查" in error for error in manifest.integrity_errors())
 
 
+def test_manifest_validate_for_resume_rejects_semantic_corruption():
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        plan_review_status="passed",
+        scenes={1: StoredSceneState(plan=make_plan(), plan_ready=True)},
+    )
+
+    with pytest.raises(ValueError, match="完整性校验失败"):
+        manifest.validate_for_resume()
+
+
+def test_manifest_integrity_rejects_unverified_rendered_artifact():
+    profile = PipelineContext("prompt", paths=make_paths(Path("/tmp"))).render_profile
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    scene = StoredSceneState(
+        plan=make_plan(),
+        code_file="scenes/scene_1.py",
+        code_sha256=sha256_text(code),
+        class_name="Demo",
+        rendered=True,
+        artifact={
+            "origin": "rendered",
+            "source_run_id": RUN_ID,
+            "job_id": "123",
+            "scene_id": 1,
+            "scene_class_name": "Demo",
+            "code_sha256": sha256_text(code),
+            "render_profile_sha256": profile.digest(),
+            "video_path": "videos/scene_1/Demo.mp4",
+            "video_sha256": "a" * 64,
+            "metadata": {
+                "size_bytes": 1,
+                "duration_seconds": 1,
+                "width": profile.pixel_width,
+                "height": profile.pixel_height,
+                "frame_rate": profile.frame_rate,
+            },
+            "verified": False,
+        },
+    )
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        scenes={1: scene},
+    )
+
+    assert any("artifact 未验证" in error for error in manifest.integrity_errors())
+
+
 def test_resume_completed_run_rejects_tampered_final_video(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     paths = make_paths(workspace)

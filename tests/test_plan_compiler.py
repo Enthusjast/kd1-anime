@@ -4,9 +4,11 @@ from kd1_anime.agents.planner import (
     ExtractedElement,
     GeometrySpec,
     MathClaim,
+    SceneHandoff,
     SceneOutline,
     ScenePlan,
     TimelineEvent,
+    VisualElementState,
 )
 from kd1_anime.run_store import RunManifest, StoredSceneState
 
@@ -82,6 +84,16 @@ def test_compiler_rejects_timeline_gap_and_bad_math_claim():
     assert {issue.category for issue in result.issues} >= {"timing", "math"}
 
 
+def test_compiler_rejects_timeline_past_scene_duration():
+    plan = make_plan(
+        timeline=[TimelineEvent(event_id="late", start_seconds=0, end_seconds=11, action="结论")]
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert any("超出场景时长" in issue.message for issue in result)
+
+
 def test_compiler_checks_polygon_area_and_accepts_valid_timeline():
     plan = make_plan(
         timeline=[
@@ -102,6 +114,48 @@ def test_compiler_checks_polygon_area_and_accepts_valid_timeline():
     result = PlanCompiler().compile([make_outline()], [plan])
 
     assert result.is_valid is True
+
+
+def test_compiler_does_not_treat_line_as_polygon():
+    plan = make_plan(
+        geometry_specs=[
+            GeometrySpec(
+                geometry_id="axis",
+                shape="line",
+                vertices=[[0, 0], [2, 0]],
+            )
+        ]
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert result == []
+
+
+def test_compiler_accepts_remove_handoff_for_inherited_element():
+    element = VisualElementState(element_id="old", variable_name="old")
+    plan = make_plan(
+        scene_id=2,
+        inherited_elements=[element],
+        elements_to_remove=[element],
+        handoff=[SceneHandoff(element_id="old", variable_name="old", action="remove")],
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any(issue.field == "handoff" for issue in result)
+
+
+def test_compiler_requires_required_new_elements_in_handoff():
+    plan = make_plan(
+        new_elements=[
+            VisualElementState(element_id="result", variable_name="result", required=True)
+        ]
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert any(issue.field == "handoff" and "required=true" in issue.message for issue in result)
 
 
 def test_element_manifest_keeps_latest_export_and_dependencies():

@@ -13,6 +13,7 @@ import re
 import time
 from contextlib import suppress
 from typing import ClassVar, Literal, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 from openai import (
     APIConnectionError,
@@ -125,8 +126,21 @@ class BaseAgent:
             detail = detail.replace(self.profile.api_key, "<redacted>")
         return (
             f"{self.profile.label}API 不可用"
-            f"（{self.profile.base_url}，模型 {self.model}）：{detail}"
+            f"（{self._safe_endpoint(self.profile.base_url)}，模型 {self.model}）：{detail}"
         )
+
+    @staticmethod
+    def _safe_endpoint(base_url: str) -> str:
+        """只显示 scheme/host/path，避免 URL 查询参数或密码泄露。"""
+
+        try:
+            parsed = urlsplit(base_url)
+            host = parsed.hostname or "<invalid-host>"
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+        except ValueError:
+            return "<invalid-endpoint>"
 
     @staticmethod
     def _extract_usage(usage: object) -> dict[str, int]:
@@ -980,6 +994,31 @@ class BaseAgent:
 
     # 合法但会被误认为 LaTeX 命令前缀的 JSON 转义 (如 \not 中的 \n, \text 中的 \t)
     _AMBIGUOUS_JSON_ESCAPE: ClassVar[frozenset[str]] = frozenset("ntfrb")
+    _KNOWN_LATEX_COMMANDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "not",
+            "nabla",
+            "nu",
+            "newcommand",
+            "text",
+            "theta",
+            "times",
+            "forall",
+            "beta",
+            "neq",
+            "neg",
+            "bar",
+            "begin",
+            "boxed",
+            "binom",
+            "frac",
+            "big",
+            "bigg",
+            "rho",
+            "mathrm",
+            "mathbf",
+        }
+    )
 
     @staticmethod
     def _fix_latex_escapes_in_json(json_str: str) -> str:
@@ -993,7 +1032,7 @@ class BaseAgent:
 
         策略: 扫描 JSON, 在字符串内部:
         - \\x 且 x 不在合法转义集中 → 必然修复
-        - \\x 且 x 在 {n,t,f,r,b} 且后一个字符是字母 → LaTeX, 修复
+        - \\x 且 x 在 {n,t,f,r,b} 且后续明确组成常见 LaTeX 命令 → 修复
         """
         result: list[str] = []
         in_string = False
@@ -1013,9 +1052,16 @@ class BaseAgent:
                     elif (
                         ch in BaseAgent._AMBIGUOUS_JSON_ESCAPE
                         and i + 1 < n
-                        and json_str[i + 1].isalpha()
+                        and any(
+                            (ch + re.match(r"[A-Za-z]*", json_str[i + 1 :]).group(0))
+                            .lower()
+                            .startswith(command)
+                            for command in BaseAgent._KNOWN_LATEX_COMMANDS
+                        )
                     ):
-                        # 合法转义但后跟字母 → LaTeX 命令 (如 \not, \text, \forall)
+                        # 只有明确匹配常见 LaTeX 命令才修复；普通 JSON 的
+                        # ``\n中文``/``\nnext`` 必须保留为换行，不能仅因
+                        # 后面紧跟字母就被误改成字面反斜杠。
                         result.insert(-1, "\\")
                     escape = False
                 elif ch == "\\":
@@ -1105,8 +1151,15 @@ class BaseAgent:
             closes_string = next_char in {"", ":", "}", "]"}
             if next_char == ",":
                 after_comma = json_str[next_index + 1 :].lstrip()
+                # 逗号后既可能是对象的下一个 key，也可能是数组的下一个
+                # 字符串/对象/数字。不能只识别 ``"key":``，否则当数组
+                # 中某个 LaTeX 字符串需要修复时，会把合法的 ``"a","b"``
+                # 误判成一个未闭合字符串。
                 closes_string = bool(
-                    after_comma.startswith("}") or re.match(r'"(?:\\.|[^"\\])*"\s*:', after_comma)
+                    after_comma.startswith(("}", "]", "{", "["))
+                    or re.match(r"(?:true|false|null)(?:\s*[,}\]])", after_comma)
+                    or re.match(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", after_comma)
+                    or re.match(r'"(?:\\.|[^"\\])*"\s*(?::|[,}\]])', after_comma)
                 )
             if closes_string:
                 result.append(ch)

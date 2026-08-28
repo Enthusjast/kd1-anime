@@ -242,6 +242,7 @@ class VideoMerger:
         height = profile.pixel_height
         fps = profile.frame_rate
         video_filter = (
+            "setpts=PTS-STARTPTS,"
             f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
             "settb=AVTB,format=yuv420p"
