@@ -112,8 +112,7 @@ def _validate_export_statement(
         # 用户自己的坐标变量误认为 Manim 类，否则提取出的交接代码会在
         # 下一场景中因缺少外部定义而触发 NameError。
         is_call_target = any(
-            isinstance(parent, ast.Call) and parent.func is node
-            for parent in ast.walk(statement)
+            isinstance(parent, ast.Call) and parent.func is node for parent in ast.walk(statement)
         )
         if (
             isinstance(node, ast.Name)
@@ -236,19 +235,14 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
                 )
             continue
 
-        matching_variables = [
-            variable_name for variable_name in group_variables if variable_name == annotated_id
-        ]
         if len(group_statements) == 1:
             exported_variable = group_variables[0]
-        elif matching_variables:
-            # 复合对象的最终赋值就是标记的语义对象；helper 语句保留在
-            # exported_elements_code 中，但不参加 element_id 合同。
-            exported_variable = matching_variables[-1]
         else:
-            raise ValueError(
-                f"元素 {annotated_id} 的导出分组必须以变量 {annotated_id} 赋值结束"
-            )
+            # 复合对象的最后一条赋值就是标记的语义对象；element_id
+            # 可以和 variable_name 不同（例如 ``main_triangle`` 对应
+            # ``triangle``）。helper 语句保留在 exported_elements_code
+            # 中，但不参加 element_id 合同。
+            exported_variable = group_variables[-1]
         group_source = "\n\n".join(
             ast.get_source_segment(block, statement).strip() for statement in group_statements
         )
@@ -913,8 +907,7 @@ def deterministic_continuity_issues(
             if item.element_id not in removal_ids and item.variable_name
         }
         variable_drifts = [
-            f"{item.element_id}: {previous_variable_by_id[item.element_id]} -> "
-            f"{item.variable_name}"
+            f"{item.element_id}: {previous_variable_by_id[item.element_id]} -> {item.variable_name}"
             for item in next_plan.inherited_elements
             if item.element_id in previous_variable_by_id
             and item.variable_name
@@ -925,10 +918,7 @@ def deterministic_continuity_issues(
                 ContinuityIssue(
                     scene_ids=[plan.scene_id, next_plan.scene_id],
                     category="element_handoff",
-                    message=(
-                        "相邻场景的继承元素变量名发生漂移："
-                        + ", ".join(variable_drifts)
-                    ),
+                    message=("相邻场景的继承元素变量名发生漂移：" + ", ".join(variable_drifts)),
                     fix_instruction=(
                         "保持 element_id 不变，并将后一场景 inherited_elements 的 "
                         "variable_name 固定为前一场景最终导出的变量名。"

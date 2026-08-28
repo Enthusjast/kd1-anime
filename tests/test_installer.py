@@ -66,6 +66,22 @@ def test_installer_can_be_sourced_without_running_main(tmp_path):
     assert result.stdout.strip() == "sourced"
 
 
+def test_installer_pins_documented_manim_version(tmp_path):
+    script = f"source {shlex.quote(str(INSTALLER))}; printf '%s\\n' \"$MANIM_SPEC\""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "manim==0.20.1"
+
+
 def test_remote_archive_checksum_is_verified_before_pip(tmp_path):
     result = run_install_function(tmp_path, ref="v0.3.0", checksum=ARCHIVE_SHA256)
 
@@ -307,6 +323,9 @@ def test_installer_uses_private_application_home_for_user_storage(tmp_path):
     assert "RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs" in content
     assert "RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples" in content
     assert "WORKSPACE_DIR=~/.kd1-anime/workspace" in content
+    assert "MAX_PLAN_REVIEW_ROUNDS=2" in content
+    assert "SAFE_FALLBACK_ENABLED=true" in content
+    assert "MAX_IDENTICAL_REVIEW_ATTEMPTS=2" in content
     assert (config_dir / "knowledge" / "docs").is_dir()
     assert (config_dir / "knowledge" / "examples").is_dir()
     assert not (tmp_path / ".config" / "kd1-anime").exists()

@@ -252,7 +252,7 @@ class Demo(Scene):
     def construct(self):
         # KD1_CONTINUITY_EXPORT_BEGIN
         origin = np.array([0, 0, 0])
-        # element_id: triangle
+        # element_id: main_triangle
         side_a = Line(origin, RIGHT)
         side_b = Line(origin, UP)
         triangle = VGroup(side_a, side_b)
@@ -266,7 +266,7 @@ class Demo(Scene):
 
     assert "origin = np.array" in exported_code
     assert [(item.element_id, item.variable_name) for item in elements] == [
-        ("triangle", "triangle"),
+        ("main_triangle", "triangle"),
         ("label", "label"),
     ]
 

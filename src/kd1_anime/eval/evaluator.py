@@ -331,7 +331,35 @@ class Evaluator:
             if final_video:
                 try:
                     frames = self.extract_video_frames(final_video, run_dir / "eval_frames")
-                    for score in self.visual_evaluator.evaluate_frames(frames, description):
+                    visual_description = description or (manifest.user_prompt if manifest else "")
+                    scene_context = (
+                        json.dumps(
+                            [
+                                scene.plan.model_dump(mode="json")
+                                for scene in manifest.scenes.values()
+                            ],
+                            ensure_ascii=False,
+                        )
+                        if manifest
+                        else ""
+                    )
+                    evaluate_frames = getattr(self.visual_evaluator, "evaluate_video_frames", None)
+                    if callable(evaluate_frames):
+                        analysis = evaluate_frames(
+                            frames,
+                            visual_description,
+                            scene_context=scene_context,
+                            scope="complete video",
+                        )
+                        scores = analysis.to_quality_scores()
+                    else:
+                        # 兼容旧的视觉评估器实现；新实现优先使用带完整
+                        # 视频 scope 和场景上下文的 evaluate_video_frames。
+                        scores = self.visual_evaluator.evaluate_frames(
+                            frames,
+                            visual_description,
+                        )
+                    for score in scores:
                         result.add_score(score)
                 except Exception as exc:
                     result.add_error("visual", str(exc))

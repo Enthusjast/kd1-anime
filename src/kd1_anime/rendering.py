@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -25,9 +27,46 @@ class RenderProfile(BaseModel):
     pixel_height: int = Field(gt=0)
     frame_rate: int = Field(gt=0)
     opengl_platform: Literal["egl", "glx"] = "egl"
+    # 运行环境也会影响 TeX、OpenGL 和视频编码结果。旧 manifest 没有这些
+    # 字段时默认为空，读取仍兼容；新运行会把探测到的版本纳入产物身份。
+    manim_version: str = Field(default="", max_length=200)
+    ffmpeg_version: str = Field(default="", max_length=300)
+    xelatex_version: str = Field(default="", max_length=300)
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _environment_versions() -> tuple[str, str, str]:
+        try:
+            manim_version = importlib.metadata.version("manim")
+        except (importlib.metadata.PackageNotFoundError, ValueError):
+            manim_version = ""
+
+        def command_version(command: str, flag: str) -> str:
+            executable = shutil.which(command)
+            if not executable:
+                return ""
+            try:
+                result = subprocess.run(
+                    [executable, flag],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return ""
+            output = (result.stdout or result.stderr).splitlines()
+            return output[0].strip()[:300] if result.returncode == 0 and output else ""
+
+        return (
+            str(manim_version)[:200],
+            command_version("ffmpeg", "-version"),
+            command_version("xelatex", "--version"),
+        )
 
     @classmethod
     def current(cls) -> RenderProfile:
+        manim_version, ffmpeg_version, xelatex_version = cls._environment_versions()
         return cls(
             renderer=settings.MANIM_RENDERER,
             quality=settings.MANIM_QUALITY,
@@ -35,6 +74,9 @@ class RenderProfile(BaseModel):
             pixel_height=settings.MANIM_PIXEL_HEIGHT,
             frame_rate=settings.MANIM_FRAME_RATE,
             opengl_platform=settings.MANIM_OPENGL_PLATFORM,
+            manim_version=manim_version,
+            ffmpeg_version=ffmpeg_version,
+            xelatex_version=xelatex_version,
         )
 
     def digest(self) -> str:

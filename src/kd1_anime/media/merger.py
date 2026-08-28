@@ -19,6 +19,22 @@ from kd1_anime.rendering import RenderProfile, VideoMetadata, sha256_file, verif
 console = Console()
 
 
+def _dashboard_quiet() -> bool:
+    """Rich Live 仪表盘运行时抑制合并器的普通输出。"""
+
+    try:
+        from kd1_anime.dashboard import quiet
+
+        return quiet()
+    except Exception:
+        return False
+
+
+def _print(*args, **kwargs) -> None:
+    if not _dashboard_quiet():
+        console.print(*args, **kwargs)
+
+
 class VideoMerger:
     @staticmethod
     @contextmanager
@@ -115,7 +131,7 @@ class VideoMerger:
                 if metadata != job.output_metadata:
                     raise RuntimeError(f"Scene {job.scene_id} 的视频元数据与 Slurm 检查点不一致")
             videos.append(video)
-            console.print(f"[dim][Merger][/] Scene {job.scene_id}: {video}")
+            _print(f"[dim][Merger][/] Scene {job.scene_id}: {video}")
         return videos
 
     def merge(
@@ -325,25 +341,23 @@ class VideoMerger:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, check=False)
         except subprocess.TimeoutExpired:
-            console.print(f"[red][Merger][/] ffmpeg {label} 超时")
+            _print(f"[red][Merger][/] ffmpeg {label} 超时")
             return False
         except OSError as exc:
-            console.print(f"[red][Merger][/] ffmpeg {label} 无法启动: {exc}", markup=False)
+            _print(f"[red][Merger][/] ffmpeg {label} 无法启动: {exc}", markup=False)
             return False
         try:
             output_size = output.stat().st_size if output.is_file() else 0
         except OSError as exc:
-            console.print(f"[red][Merger][/] ffmpeg {label} 产物无法读取: {exc}", markup=False)
+            _print(f"[red][Merger][/] ffmpeg {label} 产物无法读取: {exc}", markup=False)
             return False
         if result.returncode != 0 or output_size == 0:
-            console.print(
+            _print(
                 f"[red][Merger][/] ffmpeg {label} 失败: {result.stderr[-1000:]}",
                 markup=False,
             )
             return False
-        console.print(
-            f"[bold green][Merger][/] 拼接完成 ({label}): {output_size / (1024 * 1024):.1f} MB"
-        )
+        _print(f"[bold green][Merger][/] 拼接完成 ({label}): {output_size / (1024 * 1024):.1f} MB")
         return True
 
     @staticmethod
@@ -368,7 +382,7 @@ class VideoMerger:
                     f"{expected_duration:.3f}"
                 )
         except (OSError, RuntimeError, ValueError) as exc:
-            console.print(
+            _print(
                 f"[red][Merger][/] ffmpeg {label} 产物验证失败: {exc}",
                 markup=False,
             )
@@ -382,6 +396,9 @@ class VideoMerger:
         output_path: Path,
         render_profile: RenderProfile | None = None,
     ) -> Path:
+        scene_ids = [job.scene_id for job in jobs]
+        if len(set(scene_ids)) != len(scene_ids):
+            raise ValueError("合并任务包含重复的 scene_id")
         return self.merge(
             self.collect_job_videos(jobs, render_profile=render_profile),
             output_path,

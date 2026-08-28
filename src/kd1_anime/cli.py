@@ -186,9 +186,60 @@ def _manifest_requires_generation_apis(manifest: RunManifest) -> bool:
 
     if manifest.state in RESUME_LLM_STATES:
         return True
-    return manifest.status == "dry_run_complete" and any(
+    if manifest.status == "dry_run_complete" and any(
         not scene.reviewed or scene.failed or scene.give_up for scene in manifest.scenes.values()
-    )
+    ):
+        return True
+
+    # MONITORING/DISPATCHING 本身通常只轮询 Slurm，但 AutoFix 会在作业
+    # 失败后重新调用主模型。恢复时无法预知作业下一次的终态，因此只要
+    # 仍有未完成场景且允许自动修复，就提前做 API 预检，避免运行数分钟
+    # 后才因缺少凭据失败。
+    if manifest.auto_fix and manifest.state in {"DISPATCHING", "MONITORING"}:
+        return any(not scene.rendered and not scene.give_up for scene in manifest.scenes.values())
+    return False
+
+
+def _cancel_jobs_before_clean(manifest: RunManifest) -> None:
+    """删除陈旧 run 前取消其已知远端 Job，避免留下孤儿任务。"""
+    from kd1_anime.cluster.slurm import FAILURE_STATES, SlurmDispatcher
+
+    terminal_statuses = {"COMPLETED", "CANCELLED", *FAILURE_STATES}
+    jobs = [
+        scene.slurm_job
+        for scene in manifest.scenes.values()
+        if scene.slurm_job
+        and not scene.slurm_job.cancelled
+        and scene.slurm_job.status not in terminal_statuses
+    ]
+    if not jobs:
+        return
+    dispatcher = SlurmDispatcher()
+    try:
+        statuses = dispatcher.poll_all_statuses([job.job_id for job in jobs])
+    except Exception as exc:
+        raise RuntimeError(f"无法确认运行中的 Slurm Job，拒绝删除运行目录: {exc}") from exc
+    failed: list[str] = []
+    uncertain: list[str] = []
+    for job in jobs:
+        status = statuses.get(job.job_id, "UNKNOWN")
+        if status == "GONE" or status == "COMPLETED" or status == "CANCELLED":
+            continue
+        if status in FAILURE_STATES:
+            continue
+        if status == "UNKNOWN":
+            uncertain.append(job.job_id)
+            continue
+        if not dispatcher.cancel_job(job.job_id):
+            failed.append(job.job_id)
+    if uncertain:
+        raise RuntimeError(
+            "无法确认以下 Slurm Job 是否仍在运行，拒绝删除运行目录: " + ", ".join(uncertain)
+        )
+    if failed:
+        raise RuntimeError(
+            "检测到仍在运行的 Slurm Job，且取消失败，拒绝删除运行目录: " + ", ".join(failed)
+        )
 
 
 def _ensure_generation_apis(*, dry_run: bool) -> None:
@@ -302,6 +353,9 @@ def generate(
         requires_llm = not resume
         if resume:
             manifest = RunRepository(settings.WORKSPACE_DIR).load(resume)
+            # 恢复任务的 dry-run 属性以 manifest 为准；不能因为用户省略
+            # --dry-run 就把 dry-run 运行误报为普通视频生成成功。
+            dry_run = manifest.dry_run
             requires_llm = _manifest_requires_generation_apis(manifest)
         if requires_llm:
             _ensure_llm_api_available()
@@ -360,8 +414,13 @@ def plan(
         dir_okay=False,
         readable=True,
     ),
+    review: bool = typer.Option(
+        True,
+        "--review/--no-review",
+        help="生成计划后执行数学、可实现性和连续性合同审查（默认启用）",
+    ),
 ):
-    """只生成场景规划,不执行渲染"""
+    """只生成场景规划，不执行渲染；默认同时审查计划。"""
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
     if not prompt:
@@ -371,9 +430,15 @@ def plan(
         raise typer.Exit(1)
     _ensure_generation_apis(dry_run=True)
 
-    from kd1_anime.agents.planner import PlannerAgent
+    from kd1_anime.agents.planner import ContinuityBible, PlannerAgent
+
+    plan_review_failures: list[tuple[int, list[str]]] = []
+    contract_repairs: list[str] = []
 
     try:
+        from kd1_anime.agents.continuity import normalize_scene_plan_contract
+        from kd1_anime.agents.plan_reviewer import PlanReviewerAgent, deterministic_plan_issues
+
         planner = PlannerAgent()
         rag_service = None
         rag_context = ""
@@ -429,6 +494,36 @@ def plan(
                     rag_context=detail_context,
                 )
             )
+        if review:
+            review_bible = bible or ContinuityBible()
+            normalized_scenes = []
+            for scene in scenes:
+                previous_plan = normalized_scenes[-1] if normalized_scenes else None
+                normalized, repairs = normalize_scene_plan_contract(
+                    scene,
+                    review_bible,
+                    previous_plan=previous_plan,
+                )
+                normalized_scenes.append(normalized)
+                if repairs:
+                    contract_repairs.extend(f"Scene {scene.scene_id}: {'；'.join(repairs)}")
+            scenes = normalized_scenes
+            for scene in scenes:
+                deterministic = deterministic_plan_issues(scene, review_bible)
+                result = PlanReviewerAgent().review(
+                    scene,
+                    user_prompt=prompt,
+                    all_plans=scenes,
+                    continuity_bible=review_bible,
+                    deterministic_issues=deterministic,
+                    renderer=settings.MANIM_RENDERER,
+                )
+                issues = [*deterministic]
+                if not result.is_valid:
+                    issues.extend(result.issues)
+                unique_messages = list(dict.fromkeys(issue.message for issue in issues))
+                if unique_messages:
+                    plan_review_failures.append((scene.scene_id, unique_messages))
     except KeyboardInterrupt as e:
         console.print("\n[yellow]用户中断[/]")
         raise typer.Exit(130) from e
@@ -436,12 +531,25 @@ def plan(
         console.print(f"[bold red]规划失败:[/] {e}", markup=False)
         raise typer.Exit(1) from e
 
-    console.print("\n[bold]场景规划结果:[/]")
+    console.print(
+        "\n[bold]场景规划结果[/]"
+        + ("（已完成计划审查）" if review else "（预览模式，未执行计划审查）")
+        + ":"
+    )
     for scene in scenes:
         console.print(f"\n[cyan]Scene {scene.scene_id}:[/] {scene.title}")
         console.print(f"  数学概念: {scene.math_concept}")
         console.print(f"  时长: {scene.duration_seconds}s")
         console.print(f"  目的: {scene.purpose}")
+    for repair in contract_repairs:
+        console.print("连续性合同自动修复:", repair, style="yellow", markup=False)
+    if plan_review_failures:
+        console.print("\n[bold red]计划审查未通过:[/]")
+        for scene_id, issues in plan_review_failures:
+            console.print(f"Scene {scene_id}:", markup=False)
+            for issue in issues:
+                console.print(f"  - {issue}", markup=False)
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -709,6 +817,7 @@ def clean(
                 ):
                     skipped += 1
                     continue
+                _cancel_jobs_before_clean(current)
                 shutil.rmtree(root)
             removed += 1
         except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:

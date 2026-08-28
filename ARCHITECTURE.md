@@ -155,11 +155,13 @@ v1 清单读取时会迁移。旧复用占位 Job、缺失 Job 或无法验证�
 - 已完成、失败、在途场景的事件快照会补发给 TUI；
 - 两个进程不能同时恢复同一 run。
 
-`status` 只读清单；`clean` 使用同一把锁跳过活跃运行。
+`status` 只读清单；`clean` 使用同一把锁跳过活跃运行。只有显式使用
+`--include-running` 时才会处理陈旧的 running 清单，并且删除前会先取消其中已知的
+Slurm Job；任一 Job 取消失败都会保留运行目录。
 
 ### 3.6 MERGING 与增量复用
 
-VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifact` 解析精确路径，再核对 scene ID、类名、代码哈希、配置哈希和视频哈希。
+VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifact` 解析精确路径，再核对 scene ID、类名、代码哈希、渲染配置（含 Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
 
 按 scene ID 合并：
 

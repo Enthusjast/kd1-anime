@@ -80,6 +80,7 @@ from kd1_anime.run_store import (
     StoredVisualCandidate,
     VisualEvalProfile,
     atomic_write_json,
+    atomic_write_text,
     get_reusable_video_path,
     lock_run,
     restore_run_path,
@@ -474,10 +475,7 @@ class Orchestrator:
 
     @staticmethod
     def _write_private(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.parent.chmod(0o700)
-        path.write_text(content, encoding="utf-8")
-        path.chmod(0o600)
+        atomic_write_text(path, content, mode=0o600)
 
     def _store_visual_candidate(
         self,

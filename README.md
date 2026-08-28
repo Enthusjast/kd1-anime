@@ -54,7 +54,7 @@ bash /tmp/kd1-anime-install.sh
 
 1. 加载 `python3.12/3.12` 和 `miniconda/py312` module（若系统提供 module）。
 2. 创建或复用 `manim_env` conda 环境。
-3. 安装 Manim CE、FFmpeg 和 Noto CJK 字体。
+3. 安装 Manim Community Edition 0.20.1、FFmpeg 和 Noto CJK 字体。
 4. 依次检查 PATH、`/usr/local/texlive` 和 `~/texlive` 中已有的 XeLaTeX；完整环境直接复用且不调用 `tlmgr`。
 5. 仅当现有 TeX Live 缺失或无法无 sudo 补齐依赖时，才从 USTC CTAN 镜像安装最小用户目录版到 `~/texlive/<release>/`。
 6. 只安装 Manim/XeLaTeX 所需包及 `ctex`、`xeCJK`、`fontspec`，不安装完整 TeX Live scheme/collection。
@@ -181,7 +181,8 @@ kd1-anime doctor --probe-rag
 
 RAG 运行时服务暂时不可用时会降级继续：Embedding 失败则跳过检索，Reranker
 失败则使用 Embedding 初排结果。索引只读取 `.md`/`.rst`/`.py`，并排除运行目录和疑似
-密钥行。
+密钥行；知识库源文件发生变化后，旧索引会被标记为过期，需重新执行
+`kd1-anime rag index`。
 
 完整示例见 `.env.example`。安装脚本也会生成：
 
@@ -205,6 +206,8 @@ kd1-anime generate "解释特征值的几何意义" --dry-run
 
 # 仅查看场景规划
 kd1-anime plan "解释傅里叶级数"
+# 仅查看未经审查的模型原始规划
+kd1-anime plan "解释傅里叶级数" --no-review
 
 # 对已有的单 Scene Manim 文件做安全检查并提交渲染
 kd1-anime render scene.py --class MyScene --wait

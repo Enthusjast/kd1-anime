@@ -99,3 +99,7 @@ class RagIndexInfo(BaseModel):
     embedding_model: str = Field(min_length=1, max_length=500)
     embedding_dimension: int = Field(gt=0)
     chunk_count: int = Field(ge=0)
+    # 索引命令允许临时指定源目录；保存根目录后，运行时才能判断当前
+    # 配置是否仍然指向生成该索引的那组文件。
+    source_docs_dir: str = Field(default="", max_length=4_000)
+    source_examples_dir: str = Field(default="", max_length=4_000)
