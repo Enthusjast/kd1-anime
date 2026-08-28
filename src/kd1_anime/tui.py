@@ -227,7 +227,8 @@ class Clarifier:
         except json.JSONDecodeError:
             # LLM 常在长中文 JSON 里输出未转义的原始换行 (Invalid control character),
             # 先修复再解析一次, 否则 READY 会被误判为普通提问而卡在澄清循环。
-            repaired = self.agent._escape_control_chars_in_json(json_str)
+            repaired = self.agent._escape_unescaped_quotes_in_json(json_str)
+            repaired = self.agent._escape_control_chars_in_json(repaired)
             repaired = self.agent._fix_latex_escapes_in_json(repaired)
             repaired = self.agent._close_truncated_json(repaired)
             try:

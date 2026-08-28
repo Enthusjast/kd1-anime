@@ -9,6 +9,7 @@ BaseAgent 基类
 
 import json
 import random
+import re
 import time
 from contextlib import suppress
 from typing import ClassVar, Literal, TypeVar
@@ -610,7 +611,8 @@ class BaseAgent:
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError as first_error:
-                repaired = self._escape_control_chars_in_json(json_str)
+                repaired = self._escape_unescaped_quotes_in_json(json_str)
+                repaired = self._escape_control_chars_in_json(repaired)
                 repaired = self._fix_latex_escapes_in_json(repaired)
                 repaired = self._close_truncated_json(repaired)
                 try:
@@ -704,7 +706,8 @@ class BaseAgent:
             try:
                 data = json.loads(json_str)
             except json.JSONDecodeError as first_error:
-                repaired = self._escape_control_chars_in_json(json_str)
+                repaired = self._escape_unescaped_quotes_in_json(json_str)
+                repaired = self._escape_control_chars_in_json(repaired)
                 repaired = self._fix_latex_escapes_in_json(repaired)
                 repaired = self._close_truncated_json(repaired)
                 try:
@@ -940,6 +943,54 @@ class BaseAgent:
             if ch == '"':
                 in_string = True
             result.append(ch)
+        return "".join(result)
+
+    @staticmethod
+    def _escape_unescaped_quotes_in_json(json_str: str) -> str:
+        """修复 LLM 在 JSON 字符串中直接写入的引号。
+
+        澄清结果中的 Markdown 经常包含 ``"展开"`` 这样的说明。模型虽然
+        正确返回了对象结构，却忘记转义字符串内部的引号；根据引号后的
+        下一个非空字符判断对象/数组分隔符，可以在不改动合法 ``\\"`` 的
+        前提下恢复这类常见响应。
+        """
+
+        result: list[str] = []
+        in_string = False
+        escape = False
+        length = len(json_str)
+        for index, ch in enumerate(json_str):
+            if not in_string:
+                result.append(ch)
+                if ch == '"':
+                    in_string = True
+                continue
+            if escape:
+                result.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                result.append(ch)
+                escape = True
+                continue
+            if ch != '"':
+                result.append(ch)
+                continue
+            next_index = index + 1
+            while next_index < length and json_str[next_index].isspace():
+                next_index += 1
+            next_char = json_str[next_index] if next_index < length else ""
+            closes_string = next_char in {"", ":", "}", "]"}
+            if next_char == ",":
+                after_comma = json_str[next_index + 1 :].lstrip()
+                closes_string = bool(
+                    after_comma.startswith("}") or re.match(r'"(?:\\.|[^"\\])*"\s*:', after_comma)
+                )
+            if closes_string:
+                result.append(ch)
+                in_string = False
+            else:
+                result.extend(("\\", ch))
         return "".join(result)
 
     @staticmethod

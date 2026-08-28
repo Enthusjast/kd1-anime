@@ -136,6 +136,19 @@ def test_clarifier_accepts_ready_payload_with_raw_newlines():
     assert "### 公式一" in refined
 
 
+def test_clarifier_accepts_ready_markdown_with_unescaped_inner_quotes():
+    clarifier = Clarifier()
+    response = """{"READY": true, "prompt": "## 推导步骤
+1. 展示"展开成四项",然后合并
+2. 使用"交叉划线"突出抵消关系"}"""
+
+    refined = clarifier.extract_ready(response)
+
+    assert refined is not None
+    assert '展示"展开成四项",然后合并' in refined
+    assert '使用"交叉划线"突出抵消关系' in refined
+
+
 def test_clarifier_ignores_math_brackets_before_ready_payload():
     """前置散文中的坐标区间不能遮蔽后面的 READY JSON 对象。"""
     clarifier = Clarifier()
