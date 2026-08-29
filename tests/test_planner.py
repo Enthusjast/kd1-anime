@@ -22,6 +22,7 @@ from kd1_anime.agents.planner import (
     SceneOutline,
     ScenePlan,
     compact_lesson_spec,
+    normalize_transition_claim_assignments,
 )
 
 
@@ -388,6 +389,64 @@ class TestPlannerAgent:
             (edge.prerequisite_claim_id, edge.dependent_claim_id)
             for edge in draft.teaching_graph.edges
         ] == [("base", "result")]
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_draft_moves_claims_out_of_transition_outline(self, mock_call_llm, planner):
+        mock_call_llm.return_value = """{
+            "lesson_spec": {
+                "claims": [
+                    {"claim_id": "claim_1", "statement": "基础", "relation": "definition"},
+                    {"claim_id": "claim_2", "statement": "结论", "relation": "definition"}
+                ]
+            },
+            "teaching_graph": {
+                "claim_order": ["claim_1", "claim_2"],
+                "scene_claims": {"1": ["claim_1"], "2": ["claim_2"], "3": ["claim_2"]}
+            },
+            "items": [
+                {"scene_id": 1, "title": "建立基础", "duration_seconds": 20, "purpose": "建立", "math_concept": "基础", "claim_ids": ["claim_1"]},
+                {"scene_id": 2, "title": "章节过渡", "duration_seconds": 10, "purpose": "分隔并提示观众切换", "math_concept": "无", "claim_ids": ["claim_2"]},
+                {"scene_id": 3, "title": "完成推导", "duration_seconds": 20, "purpose": "展示结论", "math_concept": "结论", "claim_ids": ["claim_2"]}
+            ]
+        }"""
+
+        draft = planner.plan_draft("解释一个分为过渡和推导的公式")
+
+        assert [item.claim_ids for item in draft.items] == [["claim_1"], [], ["claim_2"]]
+        assert draft.teaching_graph.scene_claims == {1: ["claim_1"], 2: [], 3: ["claim_2"]}
+
+    def test_normalize_transition_claim_assignments_prefers_next_teaching_scene(self):
+        outlines = [
+            SceneOutline(
+                scene_id=1,
+                title="建立",
+                duration_seconds=10,
+                purpose="建立基础",
+                math_concept="基础",
+                claim_ids=["claim_1"],
+            ),
+            SceneOutline(
+                scene_id=2,
+                title="章节过渡",
+                duration_seconds=5,
+                purpose="分隔并提示观众切换",
+                math_concept="无",
+                claim_ids=["claim_2"],
+            ),
+            SceneOutline(
+                scene_id=3,
+                title="推导",
+                duration_seconds=10,
+                purpose="展示结论",
+                math_concept="结论",
+                claim_ids=[],
+            ),
+        ]
+
+        normalized, assignments = normalize_transition_claim_assignments(outlines)
+
+        assert [item.claim_ids for item in normalized] == [["claim_1"], [], ["claim_2"]]
+        assert assignments == {1: ["claim_1"], 2: [], 3: ["claim_2"]}
 
     def test_planning_draft_accepts_legacy_outline_alias(self):
         outline = {

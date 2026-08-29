@@ -813,6 +813,7 @@ OUTLINE_PROMPT = r"""你是一个数学动画导演, 风格参考 3Blue1Brown.
 - 不要按“一个函数一个场景”“一个公式一步一个场景”机械拆分；清单中的项目通常是同一场景内的连续动画事件。
 - 场景数量控制在 1-6 个；如果需求明确要求更多，仍不得超过系统配置上限。
 - 每个场景只承载一个核心数学概念, 场景之间按叙事顺序推进, 构成完整的推导弧线
+- 章节过渡/转场场景只负责切换画面，不承担核心数学断言；如果保留这类场景，claim_ids 必须为空，断言归属真正展示推导的场景
 - 场景标题用简洁中文, 一句话概括该场景的叙事任务
 - scene_id 从 1 开始连续编号 (1, 2, 3, ...), 不要跳号, 不要从 0 开始
 - 每个场景时长 15-60 秒, 全片总时长控制在 60-240 秒
@@ -846,6 +847,7 @@ OUTLINE_DRAFT_PROMPT = r"""你是数学动画的课程设计师和总导演。
 - 同一画布、同一坐标系、同一视觉状态中的逐步添加、叠加、比较和保持，默认属于同一个 visual_unit。
 - 只有独立的学习目标、镜头/布局或叙事弧线需要不同视觉状态时才拆分场景。
 - 每个核心数学断言必须有稳定 claim_id；场景只通过 claim_ids 引用断言，不能自行创造未声明的核心结论。
+- 章节过渡/转场场景只负责切换画面，不承担核心数学断言；如果保留这类场景，claim_ids 必须为空，断言归属下一个真正展示推导的场景。
 - 涉及除法、根号、对数、不等式或几何面积时，必须写明 domain/assumptions；无法验证的几何拼接不要声称为证明。
 - 场景数量取最小必要值，通常 1-6 个，绝对不能超过系统限制。
 
@@ -1250,6 +1252,88 @@ def _scene_granularity_guidance(user_prompt: str) -> str:
     )
 
 
+def _is_transition_outline(outline: SceneOutline) -> bool:
+    """识别只负责章节切换、没有独立教学目标的概要。"""
+
+    title = outline.title.lower()
+    purpose = outline.purpose.lower()
+    concept = outline.math_concept.lower()
+    explicit_marker = any(
+        marker in title or marker in purpose
+        for marker in ("过渡", "转场", "章节切换", "interlude", "transition")
+    )
+    if not explicit_marker:
+        return False
+    return (
+        not concept.strip()
+        or concept.strip() in {"无", "无核心数学概念", "none", "n/a", "transition"}
+        or any(marker in purpose for marker in ("分隔", "切换", "提示观众", "承上启下"))
+    )
+
+
+def normalize_transition_claim_assignments(
+    outlines: list[SceneOutline],
+    scene_claims: dict[int, list[str]] | None = None,
+) -> tuple[list[SceneOutline], dict[int, list[str]]]:
+    """把误分配给过渡场景的核心断言移到真正的教学场景。
+
+    ``SceneOutline.claim_ids`` 在 Detail 阶段是锁定字段，因此计划审查
+    无法通过重写 ScenePlan 来修正概要阶段的错误分配。这里在概要边界
+    统一修复：优先把断言交给后面第一个非过渡场景；若过渡场景位于片尾，
+    则交给前一个非过渡场景。不存在目标时保留原分配并交给审查器处理。
+    """
+
+    normalized = list(outlines)
+    provided_assignments = bool(scene_claims)
+    assignments: dict[int, list[str]] = {
+        int(scene_id): list(dict.fromkeys(claim_ids))
+        for scene_id, claim_ids in (scene_claims or {}).items()
+    }
+    for outline in normalized:
+        if outline.claim_ids:
+            # SceneOutline 是概要阶段的实际执行合同；当它已经填写
+            # claim_ids 时，不用图谱中的过时/冲突副本反向污染概要。
+            assignments[outline.scene_id] = list(dict.fromkeys(outline.claim_ids))
+        elif provided_assignments:
+            assignments.setdefault(outline.scene_id, [])
+
+    transition_indices = {
+        index for index, outline in enumerate(normalized) if _is_transition_outline(outline)
+    }
+    for index in sorted(transition_indices):
+        outline = normalized[index]
+        owned_claims = assignments.get(outline.scene_id, [])
+        if not owned_claims:
+            continue
+        target_index = next(
+            (
+                candidate
+                for candidate in range(index + 1, len(normalized))
+                if candidate not in transition_indices
+            ),
+            None,
+        )
+        if target_index is None:
+            target_index = next(
+                (
+                    candidate
+                    for candidate in range(index - 1, -1, -1)
+                    if candidate not in transition_indices
+                ),
+                None,
+            )
+        if target_index is None:
+            continue
+        target = normalized[target_index]
+        target_claims = list(dict.fromkeys([*assignments.get(target.scene_id, []), *owned_claims]))
+        assignments[target.scene_id] = target_claims
+        assignments[outline.scene_id] = []
+        normalized[target_index] = target.model_copy(update={"claim_ids": target_claims})
+        normalized[index] = outline.model_copy(update={"claim_ids": []})
+
+    return normalized, assignments
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -1317,6 +1401,10 @@ class PlannerAgent(BaseAgent):
             else outline
             for outline in outlines
         ]
+        outlines, scene_claims = normalize_transition_claim_assignments(
+            outlines,
+            scene_claims,
+        )
         unknown = sorted(graph_ids - claims)
         if unknown:
             raise ValueError("TeachingGraph/数学断言引用了未声明的 claim_id: " + ", ".join(unknown))
@@ -1504,6 +1592,7 @@ class PlannerAgent(BaseAgent):
         # LLM 可能产生重复、跳号或从 0 开始的 ID。内部文件和状态机必须使用
         # 稳定、连续的 1..N ID，因此按叙事顺序统一规范化。
         normalized = self._normalize_outlines(outlines, user_prompt)
+        normalized, _ = normalize_transition_claim_assignments(normalized)
         if _requests_single_visual_unit(user_prompt) and len(outlines) > 1:
             self._log(f"检测到连续同屏需求，将 {len(outlines)} 个过细概要合并为 1 个场景")
         if any(

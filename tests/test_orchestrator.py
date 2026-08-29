@@ -217,6 +217,91 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
     assert "达到最大次数" in ctx.scene_states[1].failure_reason
 
 
+def test_resume_migrates_claims_out_of_transition_scene(monkeypatch, tmp_path):
+    outlines = [
+        SceneOutline(
+            scene_id=1,
+            title="建立",
+            duration_seconds=10,
+            purpose="建立基础",
+            math_concept="基础",
+            claim_ids=["claim_1"],
+        ),
+        SceneOutline(
+            scene_id=2,
+            title="章节过渡",
+            duration_seconds=5,
+            purpose="分隔并提示观众切换",
+            math_concept="无",
+            claim_ids=["claim_2"],
+        ),
+        SceneOutline(
+            scene_id=3,
+            title="推导",
+            duration_seconds=10,
+            purpose="展示结论",
+            math_concept="结论",
+            claim_ids=["claim_2"],
+        ),
+    ]
+    states = {
+        index: SceneState(
+            plan=plan().model_copy(
+                update={"scene_id": index, "claim_ids": list(outline.claim_ids)}
+            ),
+            plan_ready=True,
+        )
+        for index, outline in enumerate(outlines, 1)
+    }
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        outlines=outlines,
+        teaching_graph=TeachingGraph(scene_claims={1: ["claim_1"], 2: ["claim_2"], 3: ["claim_2"]}),
+        scene_states=states,
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    assert orchestrator._normalize_transition_claim_contracts(ctx) is True
+    assert ctx.scene_states[2].plan.claim_ids == []
+    assert ctx.scene_states[3].plan.claim_ids == ["claim_2"]
+    assert ctx.teaching_graph.scene_claims == {1: ["claim_1"], 2: [], 3: ["claim_2"]}
+
+
+def test_plan_compile_drops_new_handoff_without_next_scene_consumer(tmp_path):
+    transition = VisualElementState(
+        element_id="transition_title",
+        variable_name="transition_title",
+        required=True,
+    )
+    first_plan = plan().model_copy(
+        update={
+            "new_elements": [transition],
+            "handoff": [
+                SceneHandoff(
+                    element_id="transition_title",
+                    variable_name="transition_title",
+                    action="keep",
+                )
+            ],
+        }
+    )
+    second_plan = plan().model_copy(update={"scene_id": 2})
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=first_plan, plan_ready=True),
+            2: SceneState(plan=second_plan, plan_ready=True),
+        },
+    )
+
+    assert Orchestrator()._normalize_dangling_handoffs(ctx) is True
+    assert ctx.scene_states[1].plan.handoff == []
+    assert ctx.scene_states[1].plan.new_elements[0].required is False
+
+
 def test_direct_render_flag_round_trips_in_manifest(tmp_path):
     run_paths = paths(tmp_path)
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"

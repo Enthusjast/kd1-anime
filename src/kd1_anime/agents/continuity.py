@@ -20,6 +20,7 @@ from kd1_anime.agents.planner import (
     SceneOutline,
     ScenePlan,
     TeachingGraph,
+    TimelineEvent,
     VisualElementState,
     compact_lesson_spec,
     compact_teaching_graph,
@@ -609,6 +610,27 @@ def validate_export_contract(
             )
 
 
+def _is_terminal_exit_action(action: str) -> bool:
+    text = str(action or "").lower()
+    return any(
+        token in text for token in ("淡出", "消失", "清空", "收束", "结束", "fade out", "fadeout")
+    )
+
+
+def _terminal_exit_element_ids(plan: ScenePlan) -> set[str]:
+    if not plan.timeline:
+        return set()
+    event = max(
+        plan.timeline,
+        key=lambda item: (item.end_seconds, item.start_seconds, item.event_id),
+    )
+    if event.end_seconds < plan.duration_seconds - 0.05 or not _is_terminal_exit_action(
+        event.action
+    ):
+        return set()
+    return set(event.element_ids)
+
+
 def normalize_scene_plan_contract(
     plan: ScenePlan,
     bible: ContinuityBible,
@@ -805,6 +827,109 @@ def normalize_scene_plan_contract(
             repaired_new.append(repaired_item)
         new_elements = repaired_new
 
+    # ``remove`` 不是 new element 的边界动作：它表示对象在当前场景内
+    # 已经退出，不应继续出现在 handoff 中。模型经常把“淡出中间步骤”
+    # 直接写成 handoff.remove，导致 PlanCompiler 将其误当成 required
+    # 交接元素并阻断整个场景。
+    new_ids = {item.element_id for item in new_elements}
+    new_remove_handoff_ids = {
+        item.element_id
+        for item in normalized_handoff
+        if item.element_id in new_ids and item.action == "remove"
+    }
+    if new_remove_handoff_ids:
+        normalized_handoff = [
+            item for item in normalized_handoff if item.element_id not in new_remove_handoff_ids
+        ]
+        new_elements = [
+            (
+                item.model_copy(update={"required": False})
+                if item.element_id in new_remove_handoff_ids and item.required
+                else item
+            )
+            for item in new_elements
+        ]
+        repairs.append(
+            "已将场景内退出的 new_elements 移出 handoff: "
+            + ", ".join(sorted(new_remove_handoff_ids))
+        )
+
+    inherited_remove_handoff_ids = {
+        item.element_id
+        for item in normalized_handoff
+        if item.element_id in inherited_ids and item.action == "remove"
+    }
+    if inherited_remove_handoff_ids:
+        removal_ids = {item.element_id for item in removals}
+        for item in inherited:
+            if (
+                item.element_id not in inherited_remove_handoff_ids
+                or item.element_id in removal_ids
+            ):
+                continue
+            removals.append(
+                item.model_copy(
+                    update={
+                        "required": True,
+                        "reason": item.reason or "handoff 明确要求在本场景退出",
+                    }
+                )
+            )
+            removal_ids.add(item.element_id)
+        repairs.append(
+            "handoff.remove 的继承元素已补入移除合同: "
+            + ", ".join(sorted(inherited_remove_handoff_ids))
+        )
+
+    # 最后一个场景的终态事件若明确淡出某个对象，该对象不可能继续作为
+    # required/handoff 元素存在。只在调用方确认“没有下一场景”时启用，
+    # 避免把可交给下一场景处理的延迟淡出误判成当前冲突。
+    terminal_exit_ids = _terminal_exit_element_ids(plan) if has_next_scene is False else set()
+    if terminal_exit_ids:
+        terminal_new_ids = terminal_exit_ids & new_ids
+        terminal_inherited_ids = terminal_exit_ids & inherited_ids
+        if terminal_new_ids:
+            new_elements = [
+                (
+                    item.model_copy(update={"required": False})
+                    if item.element_id in terminal_new_ids and item.required
+                    else item
+                )
+                for item in new_elements
+            ]
+            normalized_handoff = [
+                item for item in normalized_handoff if item.element_id not in terminal_new_ids
+            ]
+            repairs.append(
+                "场景末尾淡出的 new_elements 已标记为 optional: "
+                + ", ".join(sorted(terminal_new_ids))
+            )
+        if terminal_inherited_ids:
+            removal_ids = {item.element_id for item in removals}
+            for item in inherited:
+                if item.element_id not in terminal_inherited_ids or item.element_id in removal_ids:
+                    continue
+                removals.append(
+                    item.model_copy(
+                        update={
+                            "required": True,
+                            "reason": item.reason or "场景末尾淡出",
+                        }
+                    )
+                )
+                removal_ids.add(item.element_id)
+            normalized_handoff = [
+                (
+                    item.model_copy(update={"action": "remove"})
+                    if item.element_id in terminal_inherited_ids
+                    else item
+                )
+                for item in normalized_handoff
+            ]
+            repairs.append(
+                "场景末尾淡出的继承元素已列入移除合同: " + ", ".join(sorted(terminal_inherited_ids))
+            )
+
     # 如果当前场景明确声明在边界处整体退出，required 元素就不可能同时
     # 作为交接对象保留。模型常把“下一场景开始时再淡出”写进
     # transition_out；这种延后退出不属于当前 closing_state 冲突，应保留
@@ -876,6 +1001,25 @@ def normalize_scene_plan_contract(
                 normalized_item = item.model_copy(update={"required": False})
             normalized_new.append(normalized_item)
         new_elements = normalized_new
+
+    declared_ids = {item.element_id for item in [*inherited, *removals, *new_elements]}
+    normalized_timeline: list[TimelineEvent] = []
+    for event in plan.timeline:
+        unknown_ids = set(event.element_ids) - declared_ids
+        if unknown_ids:
+            repairs.append(
+                f"事件 {event.event_id} 删除未声明的元素引用: " + ", ".join(sorted(unknown_ids))
+            )
+            normalized_event = event.model_copy(
+                update={
+                    "element_ids": [
+                        element_id for element_id in event.element_ids if element_id in declared_ids
+                    ]
+                }
+            )
+        else:
+            normalized_event = event
+        normalized_timeline.append(normalized_event)
 
     allowed_colors = set(bible.global_visual_state.colors)
     normalized_color_names = {key.lower().replace("-", "_"): key for key in allowed_colors}
@@ -971,6 +1115,8 @@ def normalize_scene_plan_contract(
         updates["new_elements"] = new_elements
     if normalized_handoff != plan.handoff:
         updates["handoff"] = normalized_handoff
+    if normalized_timeline != plan.timeline:
+        updates["timeline"] = normalized_timeline
 
     return (plan.model_copy(update=updates) if updates else plan), repairs
 

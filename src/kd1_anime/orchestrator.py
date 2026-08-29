@@ -55,6 +55,7 @@ from kd1_anime.agents.planner import (
     ScenePlan,
     TeachingGraph,
     VisualElementState,
+    normalize_transition_claim_assignments,
 )
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewResult
 from kd1_anime.agents.safe_fallback import (
@@ -3270,6 +3271,8 @@ class Orchestrator:
     def _compile_scene_plans(self, ctx: PipelineContext) -> None:
         """在 LLM 计划审查前执行一次确定性计划编译。"""
 
+        transition_claims_changed = self._normalize_transition_claim_contracts(ctx)
+        dangling_handoffs_changed = self._normalize_dangling_handoffs(ctx)
         timeline_changed = False
         for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id):
             # 已经有代码/视频的场景不能在恢复时静默改写时间线；它们
@@ -3302,7 +3305,7 @@ class Orchestrator:
                 scene_id=state.plan.scene_id,
                 repairs=repairs,
             )
-        if timeline_changed:
+        if transition_claims_changed or dangling_handoffs_changed or timeline_changed:
             ctx.plan_review_status = "pending"
             ctx.scenes = [
                 state.plan
@@ -3366,6 +3369,149 @@ class Orchestrator:
             "issues": [issue.model_dump(mode="json") for issue in result.issues],
         }
         self._write_stage_artifact(ctx, "plan_compile.json", payload)
+
+    def _normalize_dangling_handoffs(self, ctx: PipelineContext) -> bool:
+        """删除下一场景没有声明接管的临时 handoff 对象。
+
+        handoff 是当前场景到下一场景的边界合同。模型常把章节标题、
+        预览公式或过渡箭头标成 keep/create，却没有在下一场景的
+        inherited_elements 中声明它们；若继续保留，Coder 会被迫导出
+        没有消费者的对象，并触发连续性审查往返。对本场景新增对象，
+        这种情况可以确定地降级为 optional 并移出 handoff。
+        """
+
+        ordered_states = [
+            state
+            for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            if state.plan_ready
+        ]
+        changed = False
+        for index, state in enumerate(ordered_states[:-1]):
+            next_state = ordered_states[index + 1]
+            if state.code or state.rendered or next_state.code or next_state.rendered:
+                continue
+            next_inherited_ids = {item.element_id for item in next_state.plan.inherited_elements}
+            persistent_handoff_ids = {
+                item.element_id
+                for item in state.plan.handoff
+                if item.action in {"inherit", "keep", "create"}
+            }
+            dangling_ids = persistent_handoff_ids - next_inherited_ids
+            if not dangling_ids:
+                continue
+
+            new_ids = {item.element_id for item in state.plan.new_elements}
+            dangling_new_ids = dangling_ids & new_ids
+            if not dangling_new_ids:
+                # 继承对象的去留涉及真实边界状态，交给 Plan Reviewer，
+                # 不在这里擅自改变上一场景的收场语义。
+                continue
+
+            new_elements = [
+                (
+                    item.model_copy(update={"required": False})
+                    if item.element_id in dangling_new_ids and item.required
+                    else item
+                )
+                for item in state.plan.new_elements
+            ]
+            handoff = [
+                item for item in state.plan.handoff if item.element_id not in dangling_new_ids
+            ]
+            state.plan = state.plan.model_copy(
+                update={"new_elements": new_elements, "handoff": handoff}
+            )
+            state.plan_reviewed = False
+            state.plan_review_round = 0
+            state.plan_review_feedback = ""
+            state.plan_review_signature = ""
+            state.identical_plan_review_count = 0
+            self._reset_technical_spec(state)
+            changed = True
+            repair = (
+                f"Scene {state.plan.scene_id} 的 handoff 对象未被 Scene "
+                f"{next_state.plan.scene_id} 接管，已改为场景内临时对象: "
+                + ", ".join(sorted(dangling_new_ids))
+            )
+            ctx.continuity_warnings.append(repair)
+            self._emit(
+                "continuity_contract_repaired",
+                scene_id=state.plan.scene_id,
+                repairs=[repair],
+            )
+        if changed:
+            ctx.scenes = [
+                state.plan
+                for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            ]
+            ctx.continuity_review_status = "pending"
+            ctx.continuity_review_round = 0
+        return changed
+
+    def _normalize_transition_claim_contracts(self, ctx: PipelineContext) -> bool:
+        """在 Detail 后修正过渡场景误占用教学断言的概要合同。
+
+        断言归属在概要阶段锁定，Detail/Plan Review 只能补充该场景的
+        证据，不能把过渡场景变成数学推导场景。恢复旧运行时也需要执行
+        同一迁移，否则旧 manifest 会继续把相同 claim_ids 传给错误场景。
+        """
+
+        original_outlines = list(ctx.outlines)
+        normalized_outlines, assignments = normalize_transition_claim_assignments(
+            ctx.outlines,
+            ctx.teaching_graph.scene_claims,
+        )
+        outlines_changed = normalized_outlines != ctx.outlines
+        graph_changed = assignments != ctx.teaching_graph.scene_claims
+        if not outlines_changed and not graph_changed:
+            return False
+
+        outline_by_id = {outline.scene_id: outline for outline in normalized_outlines}
+        changed = outlines_changed or graph_changed
+        for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id):
+            outline = outline_by_id.get(state.plan.scene_id)
+            if outline is None or state.code or state.rendered:
+                continue
+            next_claim_ids = list(outline.claim_ids)
+            if state.plan.claim_ids == next_claim_ids:
+                continue
+            update: dict[str, object] = {"claim_ids": next_claim_ids}
+            if not next_claim_ids:
+                update["math_claims"] = []
+                update["timeline"] = [
+                    event.model_copy(update={"math_claim_ids": []}) for event in state.plan.timeline
+                ]
+            state.plan = state.plan.model_copy(update=update)
+            state.plan_reviewed = False
+            state.plan_review_round = 0
+            state.plan_review_feedback = ""
+            state.plan_review_signature = ""
+            state.identical_plan_review_count = 0
+            self._reset_technical_spec(state)
+
+        ctx.outlines = normalized_outlines
+        ctx.teaching_graph = ctx.teaching_graph.model_copy(update={"scene_claims": assignments})
+        ctx.scenes = [
+            state.plan
+            for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+        ]
+        ctx.plan_review_status = "pending"
+        ctx.continuity_review_status = "pending"
+        ctx.continuity_review_round = 0
+        moved = [
+            outline.scene_id
+            for before, outline in zip(original_outlines, normalized_outlines, strict=True)
+            if before.claim_ids != outline.claim_ids
+        ]
+        if moved:
+            ctx.continuity_warnings.append(
+                "已将过渡场景的数学断言重新分配到教学场景: " + ", ".join(map(str, moved))
+            )
+        self._emit(
+            "continuity_contract_repaired",
+            repairs=["过渡场景不再承担核心数学断言"],
+        )
+        return changed
 
     @staticmethod
     def _plan_review_feedback(issues: list[PlanReviewIssue]) -> str:
