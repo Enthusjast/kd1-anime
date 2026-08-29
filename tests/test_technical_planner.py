@@ -9,6 +9,7 @@ from kd1_anime.agents.technical_planner import (
     TechnicalObject,
     TechnicalSpec,
     compile_technical_spec,
+    normalize_technical_spec_contract,
 )
 
 
@@ -165,6 +166,22 @@ def test_compile_technical_spec_requires_xelatex_contract_for_mathtex():
 
     assert result.is_valid is False
     assert any("latex.required" in error for error in result.errors)
+
+
+def test_normalize_technical_spec_copies_scene_removals_and_inherited_activity():
+    inherited = VisualElementState(element_id="old", variable_name="old")
+    plan = make_plan(inherited=[inherited], removed=[inherited])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="old", variable_name="old")],
+        removed_element_ids=[],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+
+    assert normalized.removed_element_ids == ["old"]
+    assert normalized.objects[0].initially_active is True
+    assert repairs
 
 
 def test_technical_spec_is_closed():

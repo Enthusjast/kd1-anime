@@ -162,6 +162,48 @@ def _duplicate_values(values: list[str]) -> list[str]:
     return sorted({value for value in values if values.count(value) > 1})
 
 
+def normalize_technical_spec_contract(
+    plan: ScenePlan,
+    spec: TechnicalSpec,
+    *,
+    renderer: Literal["cairo", "opengl"] | None = None,
+) -> tuple[TechnicalSpec, tuple[str, ...]]:
+    """修正 TechnicalSpec 中可以从 ScenePlan 直接确定的字段。
+
+    ``removed_element_ids`` 和继承对象的 ``initially_active`` 不应由模型
+    自由发挥；它们是边界合同的机械投影。其余动画/导出错误仍交给编译器
+    和有限反馈重生成，避免用“自动修复”掩盖真正的技术设计错误。
+    """
+
+    repairs: list[str] = []
+    updates: dict[str, object] = {}
+    expected_removed = list(dict.fromkeys(item.element_id for item in plan.elements_to_remove))
+    if spec.removed_element_ids != expected_removed:
+        updates["removed_element_ids"] = expected_removed
+        repairs.append("removed_element_ids 已与 ScenePlan.elements_to_remove 对齐")
+
+    inherited_ids = {item.element_id for item in plan.inherited_elements}
+    normalized_objects = []
+    object_changed = False
+    for item in spec.objects:
+        expected_active = item.element_id in inherited_ids
+        if item.initially_active != expected_active:
+            normalized_item = item.model_copy(update={"initially_active": expected_active})
+            object_changed = True
+        else:
+            normalized_item = item
+        normalized_objects.append(normalized_item)
+    if object_changed:
+        updates["objects"] = normalized_objects
+        repairs.append("继承对象的 initially_active 已与场景开场合同对齐")
+    if renderer is not None and spec.renderer != renderer:
+        updates["renderer"] = renderer
+        repairs.append(f"TechnicalSpec.renderer 已固定为 {renderer}")
+    if not updates:
+        return spec, ()
+    return spec.model_copy(update=updates), tuple(repairs)
+
+
 def compile_technical_spec(
     plan: ScenePlan,
     spec: TechnicalSpec,
@@ -416,11 +458,13 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
    临时步骤也要列入 objects，但 exported=false。
    同时填写 visual_role、z_index 和可估算的宽高，供布局审查使用。
 2. export_element_ids 只能包含场景结束时仍存在、且 ScenePlan 合同要求交接的对象。
+   removed_element_ids 必须逐项对应 ScenePlan.elements_to_remove；不能自行推断、遗漏或新增。
 3. 每个动画事件必须明确 source_element_ids、target_element_ids、create_element_ids 和
    remove_element_ids；Transform/ReplacementTransform 不能引用不存在或尚未出现的对象。
 4. 已经 FadeOut、Uncreate 或 ReplacementTransform 移除的对象不能在后续事件中继续使用。
    Transform 是原地变换：source 仍然是 active 对象，target 只是目标快照；只有
-   ReplacementTransform 才会让 target 成为后续可操作对象。
+   ReplacementTransform 才会让 target 成为后续可操作对象。不得在同一事件或后续事件中
+   移除 export_element_ids；若最后的 visual_flow 写“淡出”，只能淡出非导出临时对象。
 5. 仅使用当前 renderer 支持的相机 API。OpenGL 禁止 camera.frame 和 MovingCameraScene。
 6. 使用 Tex/MathTex 时必须说明 xelatex、.xdv、ctex 和子对象分段策略；不要凭空假设
    MathTex 一定包含某个下标，必须提供 substrings_to_isolate 或 expected_part_counts。

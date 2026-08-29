@@ -273,6 +273,21 @@ def test_compiler_requires_required_new_elements_in_handoff():
     assert any(issue.field == "handoff" and "required=true" in issue.message for issue in result)
 
 
+def test_compiler_rejects_global_fade_out_of_required_boundary_elements():
+    plan = make_plan(
+        transition_out="场景结束时所有元素整体淡出",
+        closing_state=["所有元素整体淡出"],
+        new_elements=[
+            VisualElementState(element_id="formula", variable_name="formula", required=True)
+        ],
+        handoff=[SceneHandoff(element_id="formula", variable_name="formula", action="keep")],
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert any(issue.field == "transition_out|closing_state" for issue in result)
+
+
 def test_element_manifest_keeps_latest_export_and_dependencies():
     plan = make_plan(
         new_elements=[

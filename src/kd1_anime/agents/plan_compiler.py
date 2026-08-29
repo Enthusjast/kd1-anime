@@ -739,6 +739,29 @@ class PlanCompiler:
                         fix_instruction="按 inherited/new/elements_to_remove 的生命周期修正 handoff.action。",
                     )
                 )
+        required_boundary_ids = {
+            item.element_id
+            for item in [*plan.inherited_elements, *plan.new_elements]
+            if item.required and item.element_id not in removed_ids
+        }
+        exit_text = " ".join([plan.transition_out, *plan.closing_state]).lower()
+        broad_exit = bool(
+            re.search(r"(?:所有|全部|整体|全片).{0,16}(?:淡出|消失|清空|移除)", exit_text)
+            or "self.clear" in exit_text
+        )
+        if required_boundary_ids and broad_exit:
+            issues.append(
+                PlanCompilerIssue(
+                    category="contract",
+                    field="transition_out|closing_state",
+                    scene_ids=scene_ids,
+                    message=(
+                        "场景声明了必须交接的元素，但 transition_out/closing_state 又要求整体退出: "
+                        + ", ".join(sorted(required_boundary_ids))
+                    ),
+                    fix_instruction="保留 required 元素到场景边界并在 handoff 中 keep/create，或将只退出的元素标为 optional/明确列入移除合同。",
+                )
+            )
         if bible is not None and plan.global_visual_state != bible.global_visual_state:
             issues.append(
                 PlanCompilerIssue(

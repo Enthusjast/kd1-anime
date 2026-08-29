@@ -66,6 +66,7 @@ from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
     TechnicalSpec,
     compile_technical_spec,
+    normalize_technical_spec_contract,
 )
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
 from kd1_anime.cluster.slurm import (
@@ -3067,6 +3068,16 @@ class Orchestrator:
                     planner_kwargs["feedback"] = feedback
                 with self._llm_slot():
                     spec = technical_planner.plan(state.plan, **planner_kwargs)
+                spec, contract_repairs = normalize_technical_spec_contract(
+                    state.plan,
+                    spec,
+                    renderer=ctx.render_profile.renderer,
+                )
+                if contract_repairs:
+                    ctx.continuity_warnings.extend(
+                        f"Scene {scene_id} TechnicalSpec 自动对齐：{repair}"
+                        for repair in contract_repairs
+                    )
                 result = compile_technical_spec(
                     state.plan,
                     spec,
@@ -3232,6 +3243,24 @@ class Orchestrator:
             for scene_id in target_ids:
                 by_scene.setdefault(scene_id, []).append(converted)
         ctx.plan_compile_issues = by_scene
+        if result.issues and ctx.plan_review_status != "skipped":
+            # 旧运行可能已经把计划标记为 passed，但新版本的确定性编译器
+            # 发现了此前未检查的错误。不能直接进入 TechnicalSpec/Coder，
+            # 否则 resume 会重复失败在同一个下游阶段。
+            affected_ids = {
+                scene_id
+                for issue in result.issues
+                for scene_id in (issue.scene_ids or [item.scene_id for item in plans])
+            }
+            for state in ctx.scene_states.values():
+                if state.plan.scene_id not in affected_ids or state.failed or state.give_up:
+                    continue
+                state.plan_reviewed = False
+                state.plan_review_round = 0
+                state.plan_review_feedback = ""
+                state.plan_review_signature = ""
+                state.identical_plan_review_count = 0
+            ctx.plan_review_status = "pending"
         payload = {
             "schema_version": 1,
             "is_valid": result.is_valid,

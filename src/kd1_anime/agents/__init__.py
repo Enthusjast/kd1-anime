@@ -35,6 +35,7 @@ from kd1_anime.agents.technical_planner import (
     TechnicalSpec,
     TechnicalValidationResult,
     compile_technical_spec,
+    normalize_technical_spec_contract,
 )
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
 
@@ -74,6 +75,7 @@ __all__ = [
     "dedupe_plan_review_issues",
     "deterministic_plan_issues",
     "filter_verified_plan_issues",
+    "normalize_technical_spec_contract",
     "validate_animation_lifecycle",
     "validate_manim_code",
     "validate_review_evidence",

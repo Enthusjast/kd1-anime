@@ -10,6 +10,7 @@ from kd1_anime.agents.planner import (
     LessonSpec,
     MathClaim,
     PlanningDraft,
+    SceneHandoff,
     SceneOutline,
     ScenePlan,
     TeachingGraph,
@@ -515,6 +516,45 @@ def test_continuity_replan_snapshot_stays_within_prompt_section_budget(tmp_path)
     snapshot = Orchestrator._continuity_plan_context(ctx, 2)
 
     assert len(snapshot) <= 22_000
+
+
+def test_resume_reopens_plan_review_when_new_compiler_finds_old_plan_error(tmp_path):
+    run_paths = paths(tmp_path)
+    bad_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="formula", variable_name="formula", required=True)
+            ],
+            "handoff": [
+                SceneHandoff(element_id="formula", variable_name="formula", action="remove")
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title="公式",
+                duration_seconds=10,
+                purpose="展示",
+                math_concept="公式",
+            )
+        ],
+        scene_states={
+            1: SceneState(
+                plan=bad_plan,
+                plan_ready=True,
+                plan_reviewed=True,
+            )
+        },
+        plan_review_status="passed",
+    )
+    Orchestrator()._compile_scene_plans(ctx)
+
+    assert ctx.plan_review_status == "pending"
+    assert ctx.scene_states[1].plan_reviewed is False
 
 
 def test_scheduler_stops_when_checkpoint_persistence_fails(monkeypatch, tmp_path):
