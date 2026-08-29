@@ -3629,7 +3629,123 @@ class Orchestrator:
 
     @staticmethod
     def _continuity_plan_context(ctx: PipelineContext, scene_id: int) -> str:
-        """构造当前场景及相邻场景的最新交接快照。"""
+        """构造有界的当前场景及相邻场景交接快照。
+
+        这里不能直接序列化完整 ScenePlan：连续性重规划通常在计划已经
+        包含长 computation、timeline 和多组元素时触发，完整快照会超过
+        ``plan_detail`` 的必需区块预算，反而阻止修复请求发出。当前场景
+        保留数学/交接字段；相邻场景只保留决定边界的摘要。
+        """
+
+        def compact_plan(plan: ScenePlan, *, boundary_only: bool) -> dict:
+            data = plan.model_dump(mode="json")
+            if boundary_only:
+                keys = (
+                    "scene_id",
+                    "title",
+                    "claim_ids",
+                    "visual_unit_id",
+                    "teaching_role",
+                    "opening_state",
+                    "closing_state",
+                    "transition_in",
+                    "transition_out",
+                    "inherited_elements",
+                    "elements_to_remove",
+                    "new_elements",
+                    "handoff",
+                )
+            else:
+                keys = (
+                    "scene_id",
+                    "title",
+                    "purpose",
+                    "math_concept",
+                    "claim_ids",
+                    "visual_unit_id",
+                    "teaching_role",
+                    "visual_design",
+                    "camera_movement",
+                    "visual_flow",
+                    "key_moments",
+                    "computation",
+                    "opening_state",
+                    "closing_state",
+                    "transition_in",
+                    "transition_out",
+                    "continuity_references",
+                    "inherited_elements",
+                    "elements_to_remove",
+                    "new_elements",
+                    "timeline",
+                    "math_claims",
+                    "handoff",
+                )
+            compact = {key: data.get(key) for key in keys}
+            for key in (
+                "purpose",
+                "math_concept",
+                "visual_design",
+                "camera_movement",
+                "computation",
+                "transition_in",
+                "transition_out",
+            ):
+                if isinstance(compact.get(key), str):
+                    compact[key] = compact[key][:2_000]
+            for key in (
+                "visual_flow",
+                "key_moments",
+                "opening_state",
+                "closing_state",
+                "continuity_references",
+            ):
+                if isinstance(compact.get(key), list):
+                    compact[key] = [str(item)[:800] for item in compact[key][:12]]
+            for key in ("inherited_elements", "elements_to_remove", "new_elements"):
+                if isinstance(compact.get(key), list):
+                    compact[key] = [
+                        {
+                            field: item.get(field, "")
+                            for field in (
+                                "element_id",
+                                "variable_name",
+                                "role",
+                                "kind",
+                                "semantic_state",
+                                "color_key",
+                                "anchor",
+                                "required",
+                                "reason",
+                            )
+                        }
+                        for item in compact[key][:20]
+                    ]
+            if not boundary_only:
+                for key in ("timeline", "math_claims"):
+                    if isinstance(compact.get(key), list):
+                        compact[key] = [
+                            {
+                                field: str(item.get(field, ""))[:1_200]
+                                for field in (
+                                    "event_id",
+                                    "start_seconds",
+                                    "end_seconds",
+                                    "action",
+                                    "element_ids",
+                                    "math_claim_ids",
+                                    "claim_id",
+                                    "statement",
+                                    "expression_before",
+                                    "expression_after",
+                                    "relation",
+                                    "justification",
+                                )
+                                if field in item
+                            }
+                            for item in compact[key][:30]
+                        ]
+            return compact
 
         snapshot = []
         for current_id, state in sorted(ctx.scene_states.items()):
@@ -3645,10 +3761,10 @@ class Orchestrator:
                         else "current"
                     ),
                     "scene_id": current_id,
-                    "plan": state.plan.model_dump(mode="json"),
+                    "plan": compact_plan(state.plan, boundary_only=current_id != scene_id),
                 }
             )
-        return json.dumps(snapshot, ensure_ascii=False, indent=2)
+        return json.dumps(snapshot, ensure_ascii=False, indent=2)[:22_000]
 
     @staticmethod
     def _supports_continuity_context(planner: object) -> bool:

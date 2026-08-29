@@ -108,6 +108,9 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
   也不要要求 Coder 把已经淡出的中间对象导出到下一场景。
 - LessonSpec 是全片数学事实的唯一来源；ScenePlan 只能引用其中的 claim_id，不能在
   computation 或 math_claims 中静默增加新的核心结论。
+- SceneOutline 中的 claim_ids 已经锁定当前场景负责的教学断言。若时间线没有证据，必须
+  要求补充 math_claims/timeline，而不能建议删除 claim_ids 来绕过教学合同；重新分配断言
+  只能回到全片概要阶段完成。
 - 没有阻断问题时返回 is_valid=true、severity=info、issues=[]。
 
 如果收到 `<safe_fallback_mode>true</safe_fallback_mode>`，说明该计划已经主动放弃

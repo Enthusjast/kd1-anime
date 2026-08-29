@@ -909,6 +909,9 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
 - 绘制阶段使用 stroke_widths.default；只有明确的高亮阶段才能使用 stroke_widths.highlight，不得把高亮线宽写成普通绘制线宽。
 - timeline 的事件必须按时间排序、不能有空区间，并覆盖 [0, duration_seconds]；每个核心数学断言
   都必须关联到 math_claims，复杂几何必须填 geometry_specs。
+- 当前场景概要中的 claim_ids 是锁定的教学合同字段；每个 claim_id 必须同时出现在
+  math_claims 和至少一个 timeline.math_claim_ids 中。不能通过删除 claim_ids、只显示
+  “公式预览”或把断言留在自然语言里来规避数学证据要求。
 
 ## 不要做的事
 - 不要指定 Manim 类名 (Axes, Dot, MathTex 等) — 那是动画师的决策
@@ -1009,6 +1012,8 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
    reassembled 等必需交接元素；使用面积标签或等式关系替代
 9. timeline 覆盖整个场景，math_claims 能解释所有核心公式；geometry_specs 中的顶点和面积
    必须与 computation 相同，不能用文字声称“显然相等”
+10. 当前场景 claim_ids 不得被 Detail 阶段删除或新增；每个 claim_id 都要在时间线中绑定
+    可观察的数学画面证据。
 
 ## 示例 — 场景"一元二次方程的配方法"(30s)
 
@@ -1648,7 +1653,7 @@ class PlannerAgent(BaseAgent):
             "下面给出了当前场景及相邻场景的最新规划。只复用其中已经确认的 "
             "element_id、变量名、opening_state 和 closing_state；不要复制其中的叙事性文字。"
             "如果快照与连续性圣经或修正反馈冲突，以连续性圣经和修正反馈为准。\n"
-            f"<continuity_snapshot>\n{continuity_context[:30_000]}\n"
+            f"<continuity_snapshot>\n{continuity_context[:22_000]}\n"
             "</continuity_snapshot>\n"
             if continuity_context
             else ""
@@ -1725,7 +1730,7 @@ class PlannerAgent(BaseAgent):
                     snapshot_context,
                     required=True,
                     priority=100,
-                    max_chars=30_000,
+                    max_chars=24_000,
                 )
             )
         if feedback_context:

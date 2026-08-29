@@ -573,6 +573,7 @@ class TestPlannerAgent:
         assert "opening_state" in DETAIL_PROMPT
         assert "closing_state" in DETAIL_PROMPT
         assert "persistent_elements" in DETAIL_PROMPT
+        assert "claim_ids 不得被 Detail 阶段删除或新增" in DETAIL_PROMPT
 
     def test_continuity_bible_prompt_structure(self):
         assert "palette" in CONTINUITY_BIBLE_PROMPT

@@ -115,6 +115,10 @@ def test_plan_reviewer_prompt_includes_readonly_teaching_graph(monkeypatch):
     assert "teaching_graph" in captured["kwargs"]["user_message"]
 
 
+def test_plan_review_prompt_does_not_use_claim_removal_to_bypass_evidence():
+    assert "不能建议删除 claim_ids" in PLAN_REVIEW_PROMPT
+
+
 def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():
     result_formula = VisualElementState(
         element_id="result_formula",

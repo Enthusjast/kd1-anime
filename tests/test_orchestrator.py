@@ -496,6 +496,27 @@ def test_plan_only_runs_new_teaching_contract_path(monkeypatch, tmp_path):
     assert scenes[0].claim_ids == ["claim_1"]
 
 
+def test_continuity_replan_snapshot_stays_within_prompt_section_budget(tmp_path):
+    run_paths = paths(tmp_path)
+    long_text = "连续性状态 " + "x" * 19_000
+    states = {}
+    for scene_id in (1, 2, 3):
+        scene_plan = plan().model_copy(
+            update={
+                "scene_id": scene_id,
+                "visual_design": long_text,
+                "computation": long_text,
+                "visual_flow": [long_text[:2_000]] * 10,
+            }
+        )
+        states[scene_id] = SceneState(plan=scene_plan, plan_ready=True)
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states=states)
+
+    snapshot = Orchestrator._continuity_plan_context(ctx, 2)
+
+    assert len(snapshot) <= 22_000
+
+
 def test_scheduler_stops_when_checkpoint_persistence_fails(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     ctx = PipelineContext(
