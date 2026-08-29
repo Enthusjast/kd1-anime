@@ -20,9 +20,12 @@ from kd1_anime.agents.planner import (
     ContinuityBible,
     ElementManifest,
     ExtractedElement,
+    LessonSpec,
     SceneOutline,
     ScenePlan,
+    TeachingGraph,
 )
+from kd1_anime.agents.state_ledger import StateLedger
 from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
@@ -34,7 +37,8 @@ from kd1_anime.rendering import (
 )
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
+READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5})
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -235,7 +239,7 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[4] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[4, 5] = MANIFEST_SCHEMA_VERSION
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -255,7 +259,13 @@ class RunManifest(BaseModel):
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     outlines: list[SceneOutline] = Field(default_factory=list)
     scenes: dict[int, StoredSceneState] = Field(default_factory=dict)
-    # 每个 v4 运行在分镜生成前固定全片规范；恢复时必须存在同一份结构化数据。
+    # v5 在概要阶段固定全片教学合同和断言依赖；v4 读取时使用空默认值，
+    # 但 validate_for_resume 会拒绝继续修改旧清单。
+    lesson_spec: LessonSpec = Field(default_factory=LessonSpec)
+    teaching_graph: TeachingGraph = Field(default_factory=TeachingGraph)
+    state_ledger: StateLedger = Field(default_factory=StateLedger)
+    expected_final_duration: float | None = Field(default=None, ge=0, le=3_600)
+    # v4/v5 运行都会固定全片连续性规范；v5 另外持久化教学合同与状态账本。
     continuity_bible: ContinuityBible | None = None
     element_manifest: ElementManifest = Field(default_factory=ElementManifest)
     plan_review_status: Literal["pending", "reviewing", "passed", "failed", "skipped"] = "skipped"
@@ -300,6 +310,8 @@ class RunManifest(BaseModel):
         """
 
         errors: list[str] = []
+        if self.schema_version not in READABLE_MANIFEST_SCHEMA_VERSIONS:
+            errors.append(f"不支持的 manifest schema_version: {self.schema_version}")
         for scene_id, scene in self.scenes.items():
             if scene.plan.scene_id != scene_id:
                 errors.append(f"Scene key {scene_id} 与 plan.scene_id {scene.plan.scene_id} 不一致")
@@ -397,6 +409,34 @@ class RunManifest(BaseModel):
                 errors.append(f"element_manifest.scene_exports 引用了不存在的 Scene {scene_id}")
             if len(exported_ids) != len(set(exported_ids)):
                 errors.append(f"Scene {scene_id} 的 element_manifest 导出 ID 重复")
+        for scene_id, boundary in self.state_ledger.boundaries.items():
+            if scene_id not in self.scenes:
+                errors.append(f"StateLedger 引用了不存在的 Scene {scene_id}")
+            if boundary.scene_id != scene_id:
+                errors.append(f"StateLedger 边界 key {scene_id} 与 scene_id 不一致")
+            scene = self.scenes.get(scene_id)
+            if scene is not None:
+                if (
+                    boundary.exported_code_sha256
+                    and scene.exported_elements_code
+                    and boundary.exported_code_sha256 != sha256_text(scene.exported_elements_code)
+                ):
+                    errors.append(f"StateLedger Scene {scene_id} 的导出代码哈希不一致")
+                if (
+                    boundary.artifact_video_sha256
+                    and scene.artifact is not None
+                    and boundary.artifact_video_sha256 != scene.artifact.video_sha256
+                ):
+                    errors.append(f"StateLedger Scene {scene_id} 的视频哈希不一致")
+        ledger_ids = [item.element_id for item in self.state_ledger.elements]
+        if len(ledger_ids) != len(set(ledger_ids)):
+            errors.append("StateLedger 包含重复 element_id")
+        for element in self.state_ledger.elements:
+            if element.source_scene_id not in self.scenes:
+                errors.append(
+                    f"StateLedger 元素 {element.element_id} 引用了不存在的 Scene "
+                    f"{element.source_scene_id}"
+                )
         if self.status == "completed" and not self.final_video:
             errors.append("运行标记为 completed 但缺少 final_video")
         return errors
@@ -408,6 +448,11 @@ class RunManifest(BaseModel):
         的代码、Job 或元素交接时必须 fail-closed，不能只依赖字段类型校验。
         """
 
+        if self.schema_version != MANIFEST_SCHEMA_VERSION:
+            raise ValueError(
+                f"manifest schema_version={self.schema_version} 仅支持只读查看；"
+                f"恢复需要 v{MANIFEST_SCHEMA_VERSION}，请重新生成运行。"
+            )
         errors = self.integrity_errors()
         if errors:
             raise ValueError("运行清单完整性校验失败: " + "; ".join(errors))
@@ -525,6 +570,11 @@ def atomic_write_json(path: Path, payload: Any, *, mode: int = 0o600) -> None:
 def write_manifest(path: Path, manifest: RunManifest) -> None:
     """以同目录临时文件 + os.replace 原子更新清单。"""
 
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"只允许写入 v{MANIFEST_SCHEMA_VERSION} manifest，"
+            f"不能修改 v{manifest.schema_version} 旧清单"
+        )
     manifest.updated_at = utc_now()
     atomic_write_text(path, manifest.model_dump_json(indent=2) + "\n")
 
@@ -560,6 +610,13 @@ class RunRepository:
         manifest = RunManifest.model_validate(migrated)
         if manifest.run_id != run_id:
             raise ValueError("运行目录与 manifest.run_id 不一致")
+        return manifest
+
+    def load_for_resume(self, run_id: str) -> RunManifest:
+        """读取并验证可修改恢复的 v5 清单。"""
+
+        manifest = self.load(run_id)
+        manifest.validate_for_resume()
         return manifest
 
     def list(self) -> list[RunManifest]:
@@ -677,12 +734,17 @@ def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
 
 
 def migrate_manifest_data(raw: dict, root: Path) -> dict:
-    """只接受当前清单格式；旧格式不再猜测迁移。"""
+    """读取 v4/v5 清单；v4 只允许查看，不进行猜测迁移。"""
 
     version = raw.get("schema_version", 1)
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
-    if version == MANIFEST_SCHEMA_VERSION:
+    if version in READABLE_MANIFEST_SCHEMA_VERSIONS:
+        if version == MANIFEST_SCHEMA_VERSION:
+            required_fields = {"lesson_spec", "teaching_graph", "state_ledger"}
+            missing_fields = sorted(required_fields - raw.keys())
+            if missing_fields:
+                raise ValueError("v5 manifest 缺少必需字段: " + ", ".join(missing_fields))
         return raw
     if version < MANIFEST_SCHEMA_VERSION:
         raise ValueError(

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +110,7 @@ class Evaluator:
             6: [
                 "opening",
                 "first_math_state",
-                "transition_boundary",
+                "middle",
                 "middle",
                 "conclusion",
                 "ending",
@@ -117,26 +118,27 @@ class Evaluator:
             7: [
                 "opening",
                 "first_math_state",
-                "transition_boundary",
                 "middle",
-                "transition_boundary",
+                "middle",
+                "middle",
                 "conclusion",
                 "ending",
             ],
             8: [
                 "opening",
                 "first_math_state",
-                "transition_boundary",
                 "middle",
-                "transition_boundary",
+                "middle",
+                "middle",
                 "conclusion",
-                "transition_boundary",
+                "middle",
                 "ending",
             ],
         }[frame_count]
         for index in range(frame_count):
             timestamp = metadata.duration_seconds * positions[index]
             output = output_dir / f"frame_{index + 1:02d}.jpg"
+            output.unlink(missing_ok=True)
             try:
                 result = subprocess.run(
                     [
@@ -201,6 +203,94 @@ class Evaluator:
                 frame_count=frame_count,
             )
         ]
+
+    @staticmethod
+    def extract_boundary_samples(
+        scene_videos: list[tuple[int, Path]],
+        output_dir: Path,
+        *,
+        max_boundaries: int = 4,
+    ) -> list[FrameSample]:
+        """抽取相邻 Scene 的真实首尾边界帧。"""
+
+        if len(scene_videos) < 2:
+            return []
+        if not 1 <= max_boundaries <= 4:
+            raise ValueError("max_boundaries 必须在 1..4 之间")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise EvaluationError("未找到 ffmpeg，无法抽取场景边界关键帧")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.chmod(0o700)
+        samples: list[FrameSample] = []
+        ordered_videos = sorted(scene_videos, key=lambda item: item[0])
+        scene_ids = [scene_id for scene_id, _ in ordered_videos]
+        if len(scene_ids) != len(set(scene_ids)):
+            raise ValueError("场景边界抽帧输入包含重复 scene_id")
+        # 只比较真正相邻的场景。部分输出模式下可能只渲染了 Scene 1
+        # 和 Scene 3，不能把它们误当成一个可审查的边界。
+        pairs = [pair for pair in pairwise(ordered_videos) if pair[1][0] == pair[0][0] + 1][
+            :max_boundaries
+        ]
+        for boundary_index, (
+            (previous_id, previous_video),
+            (current_id, current_video),
+        ) in enumerate(pairs, start=1):
+            boundary_id = f"B{boundary_index:02d}"
+            for role, scene_id, video, timestamp, suffix in (
+                ("boundary_end", previous_id, previous_video, None, "end"),
+                ("boundary_start", current_id, current_video, 0.05, "start"),
+            ):
+                output = output_dir / f"boundary_{boundary_index:02d}_{suffix}.jpg"
+                output.unlink(missing_ok=True)
+                command = [ffmpeg, "-y"]
+                if timestamp is None:
+                    command.extend(["-sseof", "-0.08"])
+                else:
+                    command.extend(["-ss", f"{timestamp:.3f}"])
+                command.extend(
+                    [
+                        "-i",
+                        str(video),
+                        "-vf",
+                        "scale=1024:1024:force_original_aspect_ratio=decrease",
+                        "-frames:v",
+                        "1",
+                        "-c:v",
+                        "mjpeg",
+                        "-q:v",
+                        "5",
+                        str(output),
+                    ]
+                )
+                try:
+                    result = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise EvaluationError(f"场景边界帧抽取超时: {boundary_id}/{role}") from exc
+                if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+                    raise EvaluationError(
+                        f"场景边界帧抽取失败: {boundary_id}/{role}: {result.stderr[-500:]}"
+                    )
+                if output.stat().st_size > MAX_VISUAL_FRAME_BYTES:
+                    raise EvaluationError(f"场景边界帧过大: {output}")
+                output.chmod(0o600)
+                samples.append(
+                    FrameSample(
+                        frame_id=f"F{len(samples) + 1:02d}",
+                        path=output,
+                        scene_id=scene_id,
+                        boundary_id=boundary_id,
+                        role=role,
+                        image_sha256=sha256_file(output),
+                    )
+                )
+        return samples
 
     def evaluate_scene_video(
         self,

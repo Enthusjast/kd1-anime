@@ -167,3 +167,21 @@ class Demo(Scene):
 
     assert result.is_valid is False  # step is required but never created
     assert any("必须导出" in error for error in result.errors)
+
+
+def test_lifecycle_rejects_scene_side_effect_hidden_in_helper():
+    code = """
+from manim import *
+class Demo(Scene):
+    def show_formula(self, formula):
+        self.play(FadeIn(formula))
+
+    def construct(self):
+        formula = MathTex(r"x")
+        self.show_formula(formula)
+"""
+
+    result = validate_animation_lifecycle(code, spec())
+
+    assert result.is_valid is False
+    assert any("辅助函数" in error and "self.play" in error for error in result.errors)

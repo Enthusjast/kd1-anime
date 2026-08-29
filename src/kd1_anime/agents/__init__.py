@@ -12,7 +12,16 @@ from kd1_anime.agents.plan_reviewer import (
     deterministic_plan_issues,
     filter_verified_plan_issues,
 )
-from kd1_anime.agents.planner import ContinuityBible, PlannerAgent
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    LearningObjective,
+    LessonSpec,
+    MathEntity,
+    PlannerAgent,
+    PlanningDraft,
+    TeachingEdge,
+    TeachingGraph,
+)
 from kd1_anime.agents.prompt_context import (
     PromptBudgetError,
     PromptContextBuilder,
@@ -20,6 +29,7 @@ from kd1_anime.agents.prompt_context import (
     build_bounded_prompt,
 )
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, validate_review_evidence
+from kd1_anime.agents.state_ledger import LedgerElement, SceneBoundaryState, StateLedger
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
     TechnicalSpec,
@@ -36,16 +46,25 @@ __all__ = [
     "ContinuityBible",
     "ContinuityReviewResult",
     "ContinuityReviewerAgent",
+    "LearningObjective",
+    "LedgerElement",
+    "LessonSpec",
     "LifecycleValidationResult",
+    "MathEntity",
     "PlanReviewIssue",
     "PlanReviewResult",
     "PlanReviewerAgent",
     "PlannerAgent",
+    "PlanningDraft",
     "PromptBudgetError",
     "PromptContextBuilder",
     "PromptSection",
     "ReviewFinding",
     "ReviewerAgent",
+    "SceneBoundaryState",
+    "StateLedger",
+    "TeachingEdge",
+    "TeachingGraph",
     "TechnicalPlannerAgent",
     "TechnicalSpec",
     "TechnicalValidationResult",

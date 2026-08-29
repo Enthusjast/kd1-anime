@@ -10,7 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.plan_compiler import expressions_are_equivalent
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    LessonSpec,
+    ScenePlan,
+    TeachingGraph,
+    compact_lesson_spec,
+    compact_teaching_graph,
+)
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
 from kd1_anime.config import settings
@@ -87,6 +94,8 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
    特别是 required=true 的 new_elements 未列入 handoff，或 handoff 的 create/keep 元素没有
    对应的结构化声明。
 6. 计划中的对象越界、明显重叠，或时间线无法覆盖场景时长并完成核心教学目标。
+7. 场景引用了未声明的数学断言、跳过断言前置依赖，或没有覆盖全片教学合同中的核心断言。
+8. 场景数量与 visual_unit/scene_policy 不一致，或扣除转场重叠后违反用户的总时长约束。
 
 ## 审查原则
 - 不因个人审美、命名风格或实现方式偏好打回计划。
@@ -97,6 +106,8 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
 - 每个问题必须定位字段，并给出可直接交给 Planner 的修改指令。
 - 以 handoff 作为场景边界的唯一对象清单：场景内临时步骤不要标记为 required=true，
   也不要要求 Coder 把已经淡出的中间对象导出到下一场景。
+- LessonSpec 是全片数学事实的唯一来源；ScenePlan 只能引用其中的 claim_id，不能在
+  computation 或 math_claims 中静默增加新的核心结论。
 - 没有阻断问题时返回 is_valid=true、severity=info、issues=[]。
 
 如果收到 `<safe_fallback_mode>true</safe_fallback_mode>`，说明该计划已经主动放弃
@@ -275,6 +286,7 @@ def deterministic_plan_issues(
     bible: ContinuityBible | None = None,
     *,
     safe_fallback: bool = False,
+    lesson_spec: LessonSpec | None = None,
 ) -> list[PlanReviewIssue]:
     """先拦截无需 LLM 判断的计划错误和未验证几何声明。"""
 
@@ -401,7 +413,22 @@ def deterministic_plan_issues(
     # 检查由 Orchestrator 的 compile() 调用负责。
     from kd1_anime.agents.plan_compiler import PlanCompiler
 
-    for compiler_issue in PlanCompiler().compile_scene(plan, bible):
+    if lesson_spec is not None and lesson_spec.claims:
+        known_claim_ids = {claim.claim_id for claim in lesson_spec.claims}
+        unknown_claim_ids = (
+            set(plan.claim_ids) | {claim.claim_id for claim in plan.math_claims}
+        ) - known_claim_ids
+        if unknown_claim_ids:
+            issues.append(
+                PlanReviewIssue(
+                    category="math",
+                    field="claim_ids|math_claims",
+                    message="场景使用了教学合同中不存在的数学断言: "
+                    + ", ".join(sorted(unknown_claim_ids)),
+                    fix_instruction="删除未声明的 claim_id，或先更新全片 LessonSpec。",
+                )
+            )
+    for compiler_issue in PlanCompiler().compile_scene(plan, bible, lesson_spec):
         issues.append(
             PlanReviewIssue(
                 category=compiler_issue.category,
@@ -502,6 +529,8 @@ class PlanReviewerAgent(BaseAgent):
         deterministic_issues: list[PlanReviewIssue] | None = None,
         renderer: Literal["cairo", "opengl"] | None = None,
         safe_fallback: bool = False,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> PlanReviewResult:
         neighbors = []
         for item in sorted(all_plans or [plan], key=lambda item: item.scene_id):
@@ -563,6 +592,20 @@ class PlanReviewerAgent(BaseAgent):
                 max_chars=30_000,
             ),
             PromptSection(
+                "lesson_spec",
+                f"<lesson_spec>\n{compact_lesson_spec(lesson_spec, max_chars=18_000)}\n</lesson_spec>",
+                required=True,
+                priority=100,
+                max_chars=30_000,
+            ),
+            PromptSection(
+                "teaching_graph",
+                f"<teaching_graph>\n{compact_teaching_graph(teaching_graph, scene_id=plan.scene_id, max_chars=8_000)}\n</teaching_graph>",
+                required=True,
+                priority=100,
+                max_chars=20_000,
+            ),
+            PromptSection(
                 "deterministic_findings",
                 f"<deterministic_findings>\n{json.dumps(deterministic, ensure_ascii=False, indent=2)}\n"
                 "</deterministic_findings>",
@@ -596,6 +639,8 @@ class PlanReviewerAgent(BaseAgent):
         deterministic_by_scene: dict[int, list[PlanReviewIssue]] | None = None,
         renderer: Literal["cairo", "opengl"] | None = None,
         safe_fallback_scene_ids: set[int] | None = None,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> dict[int, PlanReviewResult]:
         """一次请求审查一批尚未编码的计划。
 
@@ -641,6 +686,20 @@ class PlanReviewerAgent(BaseAgent):
                 required=True,
                 priority=110,
                 max_chars=70_000,
+            ),
+            PromptSection(
+                "lesson_spec",
+                f"<lesson_spec>\n{compact_lesson_spec(lesson_spec, max_chars=18_000)}\n</lesson_spec>",
+                required=True,
+                priority=100,
+                max_chars=30_000,
+            ),
+            PromptSection(
+                "teaching_graph",
+                f"<teaching_graph>\n{compact_teaching_graph(teaching_graph, max_chars=8_000)}\n</teaching_graph>",
+                required=True,
+                priority=100,
+                max_chars=20_000,
             ),
             PromptSection(
                 "deterministic_findings",

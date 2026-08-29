@@ -799,6 +799,36 @@ class ChatSession:
                     f"  [dim]▸[/] Scene {scene_id}: [yellow]安排视觉修复 {attempt}/{maximum}[/]"
                 )
 
+            case "scene_visual_plan_fixing":
+                scene_id = data.get("scene_id", "?")
+                target = esc(data.get("target", "计划"))
+                attempt = data.get("attempt", 0)
+                maximum = data.get("max_attempts", 0)
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]视觉反馈回到{target}层 "
+                    f"{attempt}/{maximum}[/]"
+                )
+
+            case "scene_plan_repair_requested":
+                scene_id = data.get("scene_id", "?")
+                target = esc(data.get("target", "计划"))
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]代码审查反馈回到{target}层[/]"
+                )
+
+            case "boundary_visual_pass":
+                score = data.get("score")
+                suffix = f" ({score:.2f}/5)" if isinstance(score, (int, float)) else ""
+                console.print(f"  [dim]▸[/] [green]场景边界视觉审查通过 ✓[/]{suffix}")
+
+            case "boundary_visual_warning":
+                target = esc(data.get("target", "unknown"))
+                console.print(f"  [dim]▸[/] [yellow]场景边界视觉提示，路由: {target}[/]")
+
+            case "boundary_visual_unknown":
+                reason = esc(data.get("reason", "视觉端点不可用"))
+                console.print(f"  [dim]▸[/] [yellow]场景边界视觉结果 unknown: {reason}[/]")
+
             case "scene_visual_warning":
                 scene_id = data.get("scene_id", "?")
                 reason = esc(data.get("reason", "视觉问题已记录"))

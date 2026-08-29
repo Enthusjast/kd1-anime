@@ -375,12 +375,26 @@ def generate(
         dir_okay=False,
         readable=True,
     ),
+    plan_file: Path = typer.Option(
+        None,
+        "--plan",
+        help="从结构化计划 JSON 继续生成（不能与 prompt、--file、--resume、--incremental 混用）",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
 ):
     """直接生成模式 (无需求澄清)"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
-    if not prompt and not resume:
+    if plan_file and (prompt or file or resume or incremental):
+        console.print(
+            "[bold red]错误:[/] --plan 不能与 prompt、--file、--resume 或 --incremental 混用"
+        )
+        raise typer.Exit(1)
+    if not prompt and not resume and not plan_file:
         console.print(
             "[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助"
         )
@@ -436,6 +450,14 @@ def generate(
         if resume:
             console.print(f"[cyan]恢复运行[/] {resume}")
             final_video = orchestrator.resume(resume, interactive=True)
+        elif plan_file:
+            console.print(f"[cyan]从计划文件继续[/] {plan_file}")
+            final_video = orchestrator.run_from_plan(
+                plan_file,
+                dry_run=dry_run,
+                output_path=output,
+                approve_plan=approve_plan,
+            )
         elif incremental:
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
             final_video = orchestrator.run_incremental(prompt, incremental, dry_run=dry_run)
@@ -475,6 +497,12 @@ def plan(
         "--review/--no-review",
         help="生成计划后执行数学、可实现性和连续性合同审查（默认启用）",
     ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="额外导出结构化计划 JSON（运行清单始终写入 ~/.kd1-anime/workspace）",
+    ),
 ):
     """只生成场景规划，不执行渲染；默认同时审查计划。"""
     if file:
@@ -486,138 +514,35 @@ def plan(
         raise typer.Exit(1)
     _ensure_generation_apis(dry_run=True)
 
-    from kd1_anime.agents.planner import ContinuityBible, PlannerAgent
-
-    plan_review_failures: list[tuple[int, list[str]]] = []
-    contract_repairs: list[str] = []
-
     try:
-        from kd1_anime.agents.continuity import normalize_scene_plan_contract
-        from kd1_anime.agents.plan_compiler import PlanCompiler
-        from kd1_anime.agents.plan_reviewer import (
-            PlanReviewerAgent,
-            PlanReviewIssue,
-            classify_plan_review_issues,
-            deterministic_plan_issues,
+        from kd1_anime.orchestrator import Orchestrator
+
+        orchestrator = Orchestrator()
+        scenes = orchestrator.plan_only(
+            prompt,
+            interactive=False,
+            review=review,
+            preflight=False,
         )
+        context = orchestrator._ctx
+        if output is not None and context is not None:
+            from kd1_anime.run_store import atomic_write_json
 
-        planner = PlannerAgent()
-        rag_service = None
-        rag_context = ""
-        if settings.RAG_ENABLED:
-            from kd1_anime.rag.service import RagService
-
-            rag_service = RagService()
-            rag_result = rag_service.search(
-                prompt,
-                stage="outline",
-                source_kinds={"manim_doc", "example"},
-            )
-            rag_context = rag_result.context
-            if rag_result.receipt.warning:
-                console.print(
-                    f"[yellow]RAG 提示:[/] {rag_result.receipt.warning}",
-                    markup=False,
-                )
-        outlines = planner.plan_outline(prompt, rag_context=rag_context)
-        bible_context = ""
-        bible = None
-        if callable(getattr(planner, "plan_continuity_bible", None)):
-            if rag_service is not None:
-                bible_result = rag_service.search(
-                    prompt + "\n" + "\n".join(item.math_concept for item in outlines),
-                    stage="continuity",
-                    source_kinds={"manim_doc", "example"},
-                )
-                bible_context = bible_result.context
-            bible = planner.plan_continuity_bible(
-                prompt,
-                outlines,
-                stream=False,
-                rag_context=bible_context,
-            )
-        scenes = []
-        for outline in outlines:
-            detail_context = ""
-            if rag_service is not None:
-                detail_result = rag_service.search(
-                    f"{outline.title}\n{outline.purpose}\n{outline.math_concept}",
-                    stage="detail",
-                    source_kinds={"manim_doc", "example"},
-                )
-                detail_context = detail_result.context
-            scenes.append(
-                planner.plan_detail(
-                    outline,
-                    outlines,
-                    prompt,
-                    stream=False,
-                    continuity_bible=bible,
-                    rag_context=detail_context,
-                )
-            )
-        if review:
-            review_bible = bible or ContinuityBible()
-            normalized_scenes = []
-            for scene in scenes:
-                previous_plan = normalized_scenes[-1] if normalized_scenes else None
-                normalized, repairs = normalize_scene_plan_contract(
-                    scene,
-                    review_bible,
-                    previous_plan=previous_plan,
-                )
-                normalized_scenes.append(normalized)
-                if repairs:
-                    contract_repairs.extend(f"Scene {scene.scene_id}: {'；'.join(repairs)}")
-            scenes = normalized_scenes
-            compiler_result = PlanCompiler().compile(outlines, scenes, review_bible)
-            compile_issues_by_scene: dict[int, list[PlanReviewIssue]] = {}
-            for issue in compiler_result.issues:
-                target_ids = issue.scene_ids or [scene.scene_id for scene in scenes]
-                for target_id in target_ids:
-                    compile_issues_by_scene.setdefault(target_id, []).append(
-                        PlanReviewIssue(
-                            category=issue.category,
-                            severity=issue.severity,
-                            field=issue.field,
-                            message=issue.message,
-                            fix_instruction=issue.fix_instruction,
-                        )
-                    )
-            for scene in scenes:
-                deterministic = [
-                    *deterministic_plan_issues(scene, review_bible),
-                    *compile_issues_by_scene.get(scene.scene_id, []),
-                ]
-                result = PlanReviewerAgent().review(
-                    scene,
-                    user_prompt=prompt,
-                    all_plans=scenes,
-                    continuity_bible=review_bible,
-                    deterministic_issues=deterministic,
-                    renderer=settings.MANIM_RENDERER,
-                )
-                _, blocking_issues, non_blocking_issues = classify_plan_review_issues(
-                    scene,
-                    deterministic_issues=deterministic,
-                    result=result,
-                )
-                if blocking_issues:
-                    plan_review_failures.append(
-                        (
-                            scene.scene_id,
-                            [
-                                f"[{issue.category}] {issue.message}\n"
-                                f"修正要求: {issue.fix_instruction}"
-                                for issue in blocking_issues
-                            ],
-                        )
-                    )
-                for issue in non_blocking_issues:
-                    console.print(
-                        f"[yellow]Scene {scene.scene_id} 计划审查提示:[/] {issue.message}",
-                        markup=False,
-                    )
+            payload = {
+                "schema_version": 1,
+                "run_id": context.paths.run_id,
+                "user_prompt": context.user_prompt,
+                "lesson_spec": context.lesson_spec.model_dump(mode="json"),
+                "teaching_graph": context.teaching_graph.model_dump(mode="json"),
+                "continuity_bible": (
+                    context.continuity_bible.model_dump(mode="json")
+                    if context.continuity_bible is not None
+                    else None
+                ),
+                "items": [scene.model_dump(mode="json") for scene in scenes],
+            }
+            atomic_write_json(output.expanduser().resolve(), payload)
+            console.print(f"结构化计划已导出: {output.expanduser().resolve()}", markup=False)
     except KeyboardInterrupt as e:
         console.print("\n[yellow]用户中断[/]")
         raise typer.Exit(130) from e
@@ -635,15 +560,6 @@ def plan(
         console.print(f"  数学概念: {scene.math_concept}")
         console.print(f"  时长: {scene.duration_seconds}s")
         console.print(f"  目的: {scene.purpose}")
-    for repair in contract_repairs:
-        console.print("连续性合同自动修复:", repair, style="yellow", markup=False)
-    if plan_review_failures:
-        console.print("\n[bold red]计划审查未通过:[/]")
-        for scene_id, issues in plan_review_failures:
-            console.print(f"Scene {scene_id}:", markup=False)
-            for issue in issues:
-                console.print(f"  - {issue}", markup=False)
-        raise typer.Exit(1)
 
 
 @app.command()

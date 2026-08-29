@@ -3,10 +3,13 @@ from kd1_anime.agents.planner import (
     ElementManifest,
     ExtractedElement,
     GeometrySpec,
+    LessonSpec,
     MathClaim,
     SceneHandoff,
     SceneOutline,
     ScenePlan,
+    TeachingEdge,
+    TeachingGraph,
     TimelineEvent,
     VisualElementState,
 )
@@ -144,6 +147,118 @@ def test_compiler_accepts_remove_handoff_for_inherited_element():
     result = PlanCompiler().compile_scene(plan)
 
     assert not any(issue.field == "handoff" for issue in result)
+
+
+def _claim_plan(scene_id: int, claim_id: str) -> ScenePlan:
+    return make_plan(
+        scene_id=scene_id,
+        claim_ids=[claim_id],
+        timeline=[
+            TimelineEvent(
+                event_id=f"show_{claim_id}",
+                start_seconds=0,
+                end_seconds=10,
+                action="展示数学关系",
+                math_claim_ids=[claim_id],
+            )
+        ],
+        math_claims=[
+            MathClaim(
+                claim_id=claim_id,
+                statement="a=a",
+                expression_before="a",
+                expression_after="a",
+                relation="equivalent",
+            )
+        ],
+    )
+
+
+def test_compiler_rejects_inherited_element_not_offered_by_previous_scene():
+    previous = make_plan(
+        scene_id=1,
+        new_elements=[VisualElementState(element_id="temporary", variable_name="temporary")],
+    )
+    current = make_plan(
+        scene_id=2,
+        inherited_elements=[VisualElementState(element_id="missing", variable_name="missing")],
+    )
+
+    result = PlanCompiler().compile([make_outline(1), make_outline(2)], [previous, current])
+
+    assert any(issue.category == "continuity" for issue in result.issues)
+
+
+def test_compiler_rejects_missing_detail_for_an_outline():
+    result = PlanCompiler().compile(
+        [make_outline(1), make_outline(2)],
+        [make_plan(scene_id=1)],
+    )
+
+    assert any(issue.field == "scene_id" for issue in result.issues)
+
+
+def test_compiler_validates_teaching_graph_and_scene_claim_assignments():
+    lesson = LessonSpec(
+        claims=[
+            MathClaim(claim_id="claim_1", statement="基础", relation="definition"),
+            MathClaim(
+                claim_id="claim_2",
+                statement="结论",
+                relation="definition",
+                prerequisite_claim_ids=["claim_1"],
+            ),
+        ]
+    )
+    graph = TeachingGraph(
+        claim_order=["claim_2", "claim_1"],
+        edges=[TeachingEdge(prerequisite_claim_id="claim_1", dependent_claim_id="claim_2")],
+        scene_claims={1: ["claim_1"], 2: ["claim_2"]},
+    )
+    result = PlanCompiler().compile(
+        [make_outline(1), make_outline(2)],
+        [_claim_plan(1, "claim_1"), _claim_plan(2, "claim_2")],
+        lesson_spec=lesson,
+        teaching_graph=graph,
+    )
+
+    assert any(issue.field == "teaching_graph.claim_order" for issue in result.issues)
+
+
+def test_compiler_accepts_consistent_teaching_graph():
+    lesson = LessonSpec(
+        claims=[
+            MathClaim(claim_id="claim_1", statement="基础", relation="definition"),
+            MathClaim(
+                claim_id="claim_2",
+                statement="结论",
+                relation="definition",
+                prerequisite_claim_ids=["claim_1"],
+            ),
+        ]
+    )
+    graph = TeachingGraph(
+        claim_order=["claim_1", "claim_2"],
+        edges=[TeachingEdge(prerequisite_claim_id="claim_1", dependent_claim_id="claim_2")],
+        scene_claims={1: ["claim_1"], 2: ["claim_2"]},
+    )
+
+    result = PlanCompiler().compile(
+        [make_outline(1), make_outline(2)],
+        [_claim_plan(1, "claim_1"), _claim_plan(2, "claim_2")],
+        lesson_spec=lesson,
+        teaching_graph=graph,
+    )
+
+    assert result.is_valid is True
+
+
+def test_compiler_requires_each_scene_claim_to_have_detail_and_timeline_evidence():
+    plan = make_plan(claim_ids=["claim_1"])
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert any(issue.field == "math_claims" for issue in result)
 
 
 def test_compiler_requires_required_new_elements_in_handoff():

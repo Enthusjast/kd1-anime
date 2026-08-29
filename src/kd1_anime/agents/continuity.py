@@ -15,9 +15,13 @@ from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
+    LessonSpec,
     SceneOutline,
     ScenePlan,
+    TeachingGraph,
     VisualElementState,
+    compact_lesson_spec,
+    compact_teaching_graph,
 )
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
@@ -927,6 +931,8 @@ CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查�
 9. 所有场景的 global_visual_state 是否完全服从同一份全局颜色、字体、字号、线宽和布局配置。
 10. 涉及切割、碎片、旋转或拼接时，computation 是否给出了足以核验顶点、面积和覆盖关系的
     数值；如果没有，要求改为面积标签或等式演示，不要继续规划“示意性无缝拼接”。
+11. ScenePlan 是否只引用 LessonSpec 已声明的数学断言，且所有断言都遵守教学图谱中的
+    前置依赖顺序；不能在不同场景中重新定义同一个符号或结论。
 
 ## 判定原则
 - 只报告会破坏观众理解或造成明显视觉跳变的问题。
@@ -967,7 +973,10 @@ def _state_tokens(values: list[str]) -> set[str]:
 
 
 def deterministic_continuity_issues(
-    plans: list[ScenePlan], bible: ContinuityBible
+    plans: list[ScenePlan],
+    bible: ContinuityBible,
+    lesson_spec: LessonSpec | None = None,
+    teaching_graph: TeachingGraph | None = None,
 ) -> list[ContinuityIssue]:
     """执行不依赖 LLM 的结构检查，先拦截明显的断接和空合同。"""
 
@@ -994,6 +1003,61 @@ def deterministic_continuity_issues(
                 fix_instruction="补齐全片级视觉规范后再生成场景分镜。",
             )
         )
+
+    if lesson_spec is not None and lesson_spec.claims:
+        known_claim_ids = {claim.claim_id for claim in lesson_spec.claims}
+        for plan in ordered:
+            unknown = set(plan.claim_ids) - known_claim_ids
+            if unknown:
+                issues.append(
+                    ContinuityIssue(
+                        scene_ids=[plan.scene_id],
+                        category="math",
+                        message="场景引用了教学合同中不存在的断言: " + ", ".join(sorted(unknown)),
+                        fix_instruction="只保留 LessonSpec 已声明的 claim_id。",
+                        target_fields=["claim_ids"],
+                    )
+                )
+        first_scene_by_claim: dict[str, int] = {}
+        for plan in ordered:
+            for claim_id in plan.claim_ids:
+                first_scene_by_claim.setdefault(claim_id, plan.scene_id)
+        for claim in lesson_spec.claims:
+            dependent_scene = first_scene_by_claim.get(claim.claim_id)
+            if dependent_scene is None:
+                continue
+            for prerequisite_id in claim.prerequisite_claim_ids:
+                prerequisite_scene = first_scene_by_claim.get(prerequisite_id)
+                if prerequisite_scene is not None and prerequisite_scene > dependent_scene:
+                    issues.append(
+                        ContinuityIssue(
+                            scene_ids=[prerequisite_scene, dependent_scene],
+                            category="math",
+                            message=(
+                                f"断言 {claim.claim_id} 的前置断言 {prerequisite_id} 出现在后面，"
+                                "教学顺序不连续。"
+                            ),
+                            fix_instruction="先分配并展示前置断言，再展示依赖断言。",
+                            target_fields=["claim_ids"],
+                        )
+                    )
+    if teaching_graph is not None:
+        graph_claim_ids = set(teaching_graph.claim_order)
+        graph_claim_ids.update(
+            claim_id for claim_ids in teaching_graph.scene_claims.values() for claim_id in claim_ids
+        )
+        if lesson_spec is not None and lesson_spec.claims:
+            unknown_graph = graph_claim_ids - {claim.claim_id for claim in lesson_spec.claims}
+            if unknown_graph:
+                issues.append(
+                    ContinuityIssue(
+                        scene_ids=actual_ids or [1],
+                        category="math",
+                        message="教学图谱包含未声明的断言: " + ", ".join(sorted(unknown_graph)),
+                        fix_instruction="删除未知图谱节点，或重新生成全片教学合同。",
+                        target_fields=["claim_ids"],
+                    )
+                )
 
     for index, plan in enumerate(ordered):
         if plan.global_visual_state != bible.global_visual_state:
@@ -1311,6 +1375,8 @@ class ContinuityReviewerAgent(BaseAgent):
         deterministic_issues: list[ContinuityIssue] | None = None,
         renderer: Literal["cairo", "opengl"] | None = None,
         stream: bool = False,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> ContinuityReviewResult:
         outline_context = [outline.model_dump(mode="json") for outline in outlines]
         plan_context = [
@@ -1346,6 +1412,24 @@ class ContinuityReviewerAgent(BaseAgent):
                 required=True,
                 priority=110,
                 max_chars=70_000,
+            ),
+            PromptSection(
+                "lesson_spec",
+                "<lesson_spec>\n"
+                f"{compact_lesson_spec(lesson_spec, max_chars=18_000)}\n"
+                "</lesson_spec>",
+                required=True,
+                priority=100,
+                max_chars=30_000,
+            ),
+            PromptSection(
+                "teaching_graph",
+                "<teaching_graph>\n"
+                f"{compact_teaching_graph(teaching_graph, max_chars=8_000)}\n"
+                "</teaching_graph>",
+                required=True,
+                priority=100,
+                max_chars=20_000,
             ),
             PromptSection(
                 "deterministic_findings",

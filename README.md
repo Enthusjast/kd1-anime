@@ -6,11 +6,13 @@
 
 - **对话式终端交互**：先追问受众、时长、内容重点和视觉风格，再开始生成。
 - **分层规划与计划审查**：先生成全片概要，再为每个场景生成详细导演分镜，并在写代码前审查数学正确性与可实现性。
+- **全片教学合同**：概要阶段同时固定 LessonSpec、数学断言依赖图和最小视觉单元；后续分镜、技术计划与代码只能实现已声明的断言。
 - **确定性计划编译**：对场景编号、时间线覆盖、可解析等式、多边形面积、画布边界和元素生命周期先做本地检查，再调用计划审查模型。
 - **最小场景粒度**：同一画布中的逐步绘制、叠加和对比默认合并为一个场景，避免按函数或清单条目机械拆分。
 - **全片视觉状态**：Planner 固定全局颜色、字体、字号、线宽与布局，并为每个场景声明继承、移除和新增元素。
 - **代码级场景交接**：计划审查通过后才进入编码；编码/代码审查按顺序执行，上一场景的最终 Mobject 定义会安全注入下一场景。
 - **最小连续性清单**：运行中维护带元素身份、变量名、依赖、语义状态、源代码和哈希的 ElementManifest，只把当前场景需要的交接定义注入 Coder。
+- **状态账本**：额外记录每个场景的开场/收场元素、数学状态、代码哈希、视频哈希和相邻边界帧，恢复与视觉审查都绑定到同一份状态证据。
 - **技术实现合同**：每个新场景在 Coder 前先生成结构化 TechnicalSpec，明确对象、生命周期、动画源/目标、布局、LaTeX 和最终导出清单；确定性编译失败会阻断编码。
 - **生命周期校验**：不执行生成代码即可用 AST 检查 Create/FadeOut/Transform、`self.add/remove/clear`、OpenGL 相机 API 和最终交接对象，修复后仍必须复审。
 - **多 Agent 流水线**：Planner → 计划审查 → Technical Planner → Coder → 代码审查 → AutoFixer，不依赖 LangChain 等重型框架。
@@ -221,6 +223,10 @@ kd1-anime generate "解释特征值的几何意义" --dry-run
 kd1-anime plan "解释傅里叶级数"
 # 仅查看未经审查的模型原始规划
 kd1-anime plan "解释傅里叶级数" --no-review
+# 导出结构化计划（可交给 generate --plan）
+kd1-anime plan "解释傅里叶级数" --output fourier-plan.json
+# 从结构化计划继续生成；仍会执行计划/连续性审查
+kd1-anime generate --plan fourier-plan.json --dry-run
 
 # 对已有的单 Scene Manim 文件做安全检查并提交渲染
 kd1-anime render scene.py --class MyScene --wait
@@ -285,19 +291,19 @@ Planner、Coder 或 Reviewer。
 ```text
 ~/.kd1-anime/workspace/runs/<timestamp>-<uuid>/
 ├── prompt.md
-├── manifest.json         # schema v4：阶段、Job、渲染/视觉配置与产物凭据
+├── manifest.json         # schema v5：教学合同、状态账本、阶段、Job 与产物凭据
 ├── scenes/              # 生成的 Python 和 sbatch 脚本
 ├── logs/                # Slurm stdout/stderr
 ├── videos/              # 当前 run 的 Manim 媒体目录
 ├── eval_frames/         # 场景/成片关键帧（启用视觉评估时）
 ├── eval_reports/        # 严格结构化的场景与成片视觉报告
 ├── visual_candidates/   # 视觉修复失败时可恢复的候选代码
-├── artifacts/           # 计划编译、TechnicalSpec、审查、ElementManifest、Smoke 结果等阶段快照
+├── artifacts/           # 教学合同、计划编译、TechnicalSpec、审查、状态账本等阶段快照
 └── output_final.mp4
 ```
 
 如设置 `OUTPUT_FILE=/path/to/final.mp4`，最终视频写到该路径；其余中间产物仍保留在独立 run 目录中。
-`manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。由于 v4 引入了结构化计划和 ElementManifest，旧版清单不会猜测迁移；恢复旧版时会给出明确错误，请重新生成。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
+`manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。当前清单为 v5，包含全片教学合同和 StateLedger；v4 仅可查看，不能猜测迁移或继续修改，恢复时会给出明确错误，请重新生成。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
 增量运行复用的场景视频会复制到新 run 的私有目录，因此清理基准 run 不会破坏新 run 的恢复或重新拼接。
 
 ## 关键配置
@@ -370,13 +376,15 @@ Planner、Coder 或 Reviewer。
 | `SLURM_CONTAINER_DISABLE_NETWORK` | `false` | 容器支持时通过独立网络命名空间禁用网络；需先在目标集群验证 |
 | `ENABLE_AUTO_EVAL` | `false` | 合并后执行确定性代码/效率评估改进循环 |
 | `ENABLE_VISUAL_EVAL` | `false` | 合并前执行逐场景视觉质量门，并在合并后生成成片视觉报告 |
-| `VISUAL_EVAL_FRAME_COUNT` | `6` | 每个场景/成片抽取的语义关键帧数（1–8，含开场/结论/结束） |
+| `VISUAL_EVAL_FRAME_COUNT` | `6` | 每个场景/成片抽取的语义关键帧数（1–8，成片预算优先保留真实相邻场景边界） |
 | `VISUAL_EVAL_THRESHOLD` | `3.5` | 场景视觉通过阈值（1–5）；重大问题无论均分都会触发修复 |
 | `MAX_VISUAL_FIX_ATTEMPTS` | `2` | 每个场景最多由视觉诊断触发的 Coder 修复次数 |
 
 ### 并行与 GPU 说明
 
 - **场景级并行**：编码阶段按 Scene ID 顺序传递连续性上下文；编码完成后，每个 Scene 是一个独立 Slurm job，调度器可将多个场景分配到不同节点或 CPU 核心并行渲染。这通常是最有效、最稳定的 Manim 并行方式。
+- **计划级屏障**：所有 Detail 完成后先经过确定性计划编译、Plan Review 和全片连续性 Review；数学断言、定义域、教学依赖或视觉单元冲突会回到 Planner，不会让 Coder 反复修补错误计划。
+- **边界视觉审查**：启用视觉评估且场景数不少于 2 时，合并前会抽取选定相邻场景的真实结尾帧和下一场景开头帧。数学/故事问题回到 Planner，交接问题回到 Continuity，布局问题才回到 Coder。
 - **并发限流**：共享集群可设置 `SLURM_MAX_IN_FLIGHT=4` 等值，程序会分批提交并在完成后继续下一批。
 - **单场景内部**：本项目不把单个 Scene 的动画帧拆成多个进程；ManimCE 本身也没有通用的单 Scene 多进程渲染开关。
 - **GPU**：只有 `MANIM_RENDERER=opengl` 时才申请 GPU。Cairo 是 CPU 渲染，配置了 `SLURM_GPU_TYPE` 也不会浪费 GPU 配额。

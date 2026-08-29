@@ -14,7 +14,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    LessonSpec,
+    SceneOutline,
+    ScenePlan,
+    TeachingGraph,
+)
+from kd1_anime.rendering import effective_transition_duration
 
 
 class PlanCompilerIssue(BaseModel):
@@ -280,16 +287,19 @@ class PlanCompiler:
         self,
         plan: ScenePlan,
         bible: ContinuityBible | None = None,
+        lesson_spec: LessonSpec | None = None,
     ) -> list[PlanCompilerIssue]:
         """只检查一个场景，不检查整片编号和相邻边界。"""
 
-        return self._compile_scene(plan, bible)
+        return self._compile_scene(plan, bible, lesson_spec)
 
     def compile(
         self,
         outlines: list[SceneOutline],
         plans: list[ScenePlan],
         bible: ContinuityBible | None = None,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> PlanCompileResult:
         issues: list[PlanCompilerIssue] = []
         ordered_plans = sorted(plans, key=lambda item: item.scene_id)
@@ -304,14 +314,15 @@ class PlanCompiler:
                     fix_instruction="按叙事顺序重新编号为 1,2,...,N。",
                 )
             )
-        if plan_ids != list(range(1, len(ordered_plans) + 1)):
+        expected_plan_ids = list(range(1, len(outlines) + 1))
+        if plan_ids != expected_plan_ids or plan_ids != outline_ids:
             issues.append(
                 PlanCompilerIssue(
                     category="contract",
                     field="scene_id",
                     message="详细分镜 ID 与场景数量/顺序不一致。",
                     fix_instruction="为每个概要提供一个同 ID 的详细分镜，并按 1..N 排序。",
-                    scene_ids=plan_ids,
+                    scene_ids=plan_ids or outline_ids,
                 )
             )
         if len({item.scene_id for item in plans}) != len(plans):
@@ -327,16 +338,25 @@ class PlanCompiler:
 
         previous: ScenePlan | None = None
         for plan in ordered_plans:
-            issues.extend(self._compile_scene(plan, bible))
+            issues.extend(self._compile_scene(plan, bible, lesson_spec))
             if previous is not None:
                 issues.extend(self._compile_boundary(previous, plan))
             previous = plan
+        if lesson_spec is not None:
+            issues.extend(
+                self._compile_lesson_contract(
+                    ordered_plans,
+                    lesson_spec,
+                    teaching_graph=teaching_graph,
+                )
+            )
         return PlanCompileResult(is_valid=not issues, issues=issues)
 
     def _compile_scene(
         self,
         plan: ScenePlan,
         bible: ContinuityBible | None,
+        lesson_spec: LessonSpec | None = None,
     ) -> list[PlanCompilerIssue]:
         issues: list[PlanCompilerIssue] = []
         scene_ids = [plan.scene_id]
@@ -444,6 +464,78 @@ class PlanCompiler:
                         fix_instruction="修正表达式或将 relation 改为真实的非等价关系，并说明推导依据。",
                     )
                 )
+            if (
+                claim.relation in {"equivalent", "equals", "inequality"}
+                and not claim.domain.strip()
+                and not claim.assumptions
+                and any(
+                    token in (left + right).lower()
+                    for token in ("/", "\\frac", "sqrt", "log", "ln", "根号")
+                )
+            ):
+                issues.append(
+                    PlanCompilerIssue(
+                        category="math",
+                        field=f"math_claims[{claim.claim_id}].domain",
+                        scene_ids=scene_ids,
+                        message="含除法、根式或对数的等价断言没有声明定义域或前提条件。",
+                        fix_instruction="补充 domain 或 assumptions，说明断言成立的条件。",
+                    )
+                )
+
+        if plan.claim_ids:
+            declared_claim_ids = set(plan.claim_ids)
+            detail_claim_ids = {claim.claim_id for claim in plan.math_claims}
+            timeline_claim_ids = {
+                claim_id for event in plan.timeline for claim_id in event.math_claim_ids
+            }
+            missing_detail_claims = declared_claim_ids - detail_claim_ids
+            extra_detail_claims = detail_claim_ids - declared_claim_ids
+            if missing_detail_claims:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="math",
+                        field="math_claims",
+                        scene_ids=scene_ids,
+                        message="场景概要声明的断言没有对应的详细数学断言: "
+                        + ", ".join(sorted(missing_detail_claims)),
+                        fix_instruction="为每个 claim_id 填写可核验的 math_claims，并在时间线中展示其依据。",
+                    )
+                )
+            if extra_detail_claims:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="math",
+                        field="math_claims",
+                        scene_ids=scene_ids,
+                        message="详细分镜增加了概要未声明的数学断言: "
+                        + ", ".join(sorted(extra_detail_claims)),
+                        fix_instruction="删除额外断言，或先把它纳入全片 LessonSpec 和当前场景 claim_ids。",
+                    )
+                )
+            if not plan.timeline:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="timing",
+                        field="timeline",
+                        scene_ids=scene_ids,
+                        message="场景声明了数学断言，但没有时间线画面证据。",
+                        fix_instruction="为每个 claim_id 添加覆盖场景时长的 timeline 事件，并绑定 math_claim_ids。",
+                    )
+                )
+            if plan.timeline:
+                missing_timeline_claims = declared_claim_ids - timeline_claim_ids
+                if missing_timeline_claims:
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="math",
+                            field="timeline.math_claim_ids",
+                            scene_ids=scene_ids,
+                            message="时间线没有为场景断言提供画面证据: "
+                            + ", ".join(sorted(missing_timeline_claims)),
+                            fix_instruction="将每个场景 claim_id 绑定到至少一个时间线事件。",
+                        )
+                    )
 
         for index, (left, right) in enumerate(_simple_equations(plan.computation), start=1):
             if expressions_are_equivalent(left, right) is False:
@@ -558,6 +650,21 @@ class PlanCompiler:
         # validate_export_contract() 单独拒绝。
         declared_ids = inherited_ids | new_ids | removed_ids
         handoff_ids = {item.element_id for item in plan.handoff}
+        timeline_element_ids = {
+            element_id for event in plan.timeline for element_id in event.element_ids
+        }
+        unknown_timeline_elements = timeline_element_ids - declared_ids
+        if unknown_timeline_elements:
+            issues.append(
+                PlanCompilerIssue(
+                    category="contract",
+                    field="timeline.element_ids",
+                    scene_ids=scene_ids,
+                    message="时间线引用了未声明的元素: "
+                    + ", ".join(sorted(unknown_timeline_elements)),
+                    fix_instruction="让 timeline.element_ids 与 inherited_elements、new_elements 或 elements_to_remove 对齐。",
+                )
+            )
         if len(handoff_ids) != len(plan.handoff):
             issues.append(
                 PlanCompilerIssue(
@@ -642,6 +749,355 @@ class PlanCompiler:
                     fix_instruction="完整复制连续性圣经的颜色、字体、字号和线宽配置。",
                 )
             )
+        if lesson_spec is not None and lesson_spec.claims:
+            known_claim_ids = {claim.claim_id for claim in lesson_spec.claims}
+            unknown_outline_claims = set(plan.claim_ids) - known_claim_ids
+            unknown_detail_claims = {claim.claim_id for claim in plan.math_claims} - known_claim_ids
+            unknown_claims = unknown_outline_claims | unknown_detail_claims
+            if unknown_claims:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="math",
+                        field="claim_ids|math_claims",
+                        scene_ids=scene_ids,
+                        message="场景引用或新增了教学合同未声明的数学断言: "
+                        + ", ".join(sorted(unknown_claims)),
+                        fix_instruction="只引用 LessonSpec 中已有的 claim_id；若确需新增断言，先修改全片教学合同。",
+                    )
+                )
+        return issues
+
+    @staticmethod
+    def _compile_lesson_contract(
+        plans: list[ScenePlan],
+        lesson_spec: LessonSpec,
+        *,
+        teaching_graph: TeachingGraph | None = None,
+    ) -> list[PlanCompilerIssue]:
+        """检查全片断言覆盖、依赖顺序和最终成片时长。"""
+
+        if not plans:
+            return (
+                [
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="scene_claims",
+                        scene_ids=[1],
+                        message="LessonSpec 已存在，但没有可执行的场景计划。",
+                        fix_instruction="至少提供一个 ScenePlan，并为其分配教学断言。",
+                    )
+                ]
+                if lesson_spec.claims
+                else []
+            )
+        issues: list[PlanCompilerIssue] = []
+        covered = {claim_id for plan in plans for claim_id in plan.claim_ids}
+        missing_core = {
+            claim.claim_id for claim in lesson_spec.claims if claim.claim_id not in covered
+        }
+        if missing_core:
+            issues.append(
+                PlanCompilerIssue(
+                    category="math",
+                    field="claim_ids",
+                    scene_ids=[plan.scene_id for plan in plans],
+                    message="全片概要没有覆盖教学合同中的数学断言: "
+                    + ", ".join(sorted(missing_core)),
+                    fix_instruction="为负责讲解这些断言的场景补充对应 claim_ids，不能只在自然语言中提及。",
+                )
+            )
+
+        known_claim_ids = set(
+            lesson_spec_claim.claim_id for lesson_spec_claim in lesson_spec.claims
+        )
+        for claim in lesson_spec.claims:
+            unknown_prerequisites = set(claim.prerequisite_claim_ids) - known_claim_ids
+            if unknown_prerequisites:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="math",
+                        field=f"claims[{claim.claim_id}].prerequisite_claim_ids",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message=(
+                            f"断言 {claim.claim_id} 引用了不存在的前置断言: "
+                            + ", ".join(sorted(unknown_prerequisites))
+                        ),
+                        fix_instruction="删除未知前置断言，或先在 LessonSpec 中声明它。",
+                    )
+                )
+
+        # Kahn 算法检测教学依赖环；有环时无法得到稳定的讲解顺序。
+        indegree = {claim_id: 0 for claim_id in known_claim_ids}
+        adjacency: dict[str, set[str]] = {claim_id: set() for claim_id in known_claim_ids}
+        for claim in lesson_spec.claims:
+            for prerequisite in claim.prerequisite_claim_ids:
+                if (
+                    prerequisite in known_claim_ids
+                    and claim.claim_id not in adjacency[prerequisite]
+                ):
+                    adjacency[prerequisite].add(claim.claim_id)
+                    indegree[claim.claim_id] += 1
+        queue = [claim_id for claim_id, degree in indegree.items() if degree == 0]
+        visited = 0
+        while queue:
+            current = queue.pop()
+            visited += 1
+            for dependent in adjacency[current]:
+                indegree[dependent] -= 1
+                if indegree[dependent] == 0:
+                    queue.append(dependent)
+        if visited != len(indegree):
+            issues.append(
+                PlanCompilerIssue(
+                    category="math",
+                    field="claims.prerequisite_claim_ids",
+                    scene_ids=[plan.scene_id for plan in plans],
+                    message="LessonSpec 的数学断言依赖存在环，无法安排教学顺序。",
+                    fix_instruction="删除循环依赖，建立从前置知识到结论的有向无环顺序。",
+                )
+            )
+
+        if teaching_graph is not None:
+            graph_order = list(teaching_graph.claim_order)
+            graph_order_set = set(graph_order)
+            if known_claim_ids and not graph_order:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="teaching_graph.claim_order",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message="LessonSpec 已声明数学断言，但教学图谱没有 claim_order。",
+                        fix_instruction="按前置依赖顺序补充所有 LessonSpec.claim_id。",
+                    )
+                )
+            duplicate_graph_nodes = {
+                claim_id for claim_id in graph_order if graph_order.count(claim_id) > 1
+            }
+            if duplicate_graph_nodes:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="teaching_graph.claim_order",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message="教学图谱 claim_order 包含重复断言: "
+                        + ", ".join(sorted(duplicate_graph_nodes)),
+                        fix_instruction="每个 claim_id 在 claim_order 中只出现一次。",
+                    )
+                )
+            unknown_graph_nodes = graph_order_set - known_claim_ids
+            missing_graph_nodes = known_claim_ids - graph_order_set if graph_order else set()
+            if unknown_graph_nodes:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="teaching_graph.claim_order",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message="教学图谱 claim_order 引用了未声明的断言: "
+                        + ", ".join(sorted(unknown_graph_nodes)),
+                        fix_instruction="只保留 LessonSpec 中声明的 claim_id。",
+                    )
+                )
+            if missing_graph_nodes:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="teaching_graph.claim_order",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message="教学图谱 claim_order 缺少 LessonSpec 断言: "
+                        + ", ".join(sorted(missing_graph_nodes)),
+                        fix_instruction="把所有教学断言按前置依赖顺序放入 claim_order。",
+                    )
+                )
+
+            plan_by_scene = {plan.scene_id: set(plan.claim_ids) for plan in plans}
+            graph_scene_ids = set(teaching_graph.scene_claims)
+            if known_claim_ids and any(plan_by_scene.values()) and not graph_scene_ids:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="teaching_graph.scene_claims",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message="ScenePlan 已声明数学断言，但教学图谱没有场景分配。",
+                        fix_instruction="为每个场景登记与 ScenePlan.claim_ids 一致的 scene_claims。",
+                    )
+                )
+            unknown_graph_scenes = graph_scene_ids - set(plan_by_scene)
+            if unknown_graph_scenes:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="teaching_graph.scene_claims",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message="教学图谱 scene_claims 引用了不存在的场景: "
+                        + ", ".join(map(str, sorted(unknown_graph_scenes))),
+                        fix_instruction="只为实际存在的 Scene 分配断言。",
+                    )
+                )
+            for scene_id, claim_ids in teaching_graph.scene_claims.items():
+                graph_claim_set = set(claim_ids)
+                unknown = graph_claim_set - known_claim_ids
+                missing_from_plan = graph_claim_set - plan_by_scene.get(scene_id, set())
+                absent_from_graph = plan_by_scene.get(scene_id, set()) - graph_claim_set
+                if unknown:
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="math",
+                            field=f"teaching_graph.scene_claims[{scene_id}]",
+                            scene_ids=[scene_id]
+                            if scene_id in plan_by_scene
+                            else [plan.scene_id for plan in plans],
+                            message="场景图谱引用了未声明的断言: " + ", ".join(sorted(unknown)),
+                            fix_instruction="只引用 LessonSpec 中已有的 claim_id。",
+                        )
+                    )
+                if missing_from_plan or absent_from_graph:
+                    mismatch = sorted(missing_from_plan | absent_from_graph)
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="contract",
+                            field=f"teaching_graph.scene_claims[{scene_id}]",
+                            scene_ids=[scene_id]
+                            if scene_id in plan_by_scene
+                            else [plan.scene_id for plan in plans],
+                            message="教学图谱与 ScenePlan.claim_ids 不一致: " + ", ".join(mismatch),
+                            fix_instruction="让 scene_claims 与对应 ScenePlan 的 claim_ids 完全一致。",
+                        )
+                    )
+
+            for scene_id, plan_claim_ids in plan_by_scene.items():
+                if not plan_claim_ids or scene_id in teaching_graph.scene_claims:
+                    continue
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field=f"teaching_graph.scene_claims[{scene_id}]",
+                        scene_ids=[scene_id],
+                        message="ScenePlan 声明了数学断言，但教学图谱没有为该场景分配: "
+                        + ", ".join(sorted(plan_claim_ids)),
+                        fix_instruction="在 TeachingGraph.scene_claims 中为该场景登记相同的 claim_ids。",
+                    )
+                )
+
+            if graph_order:
+                graph_position = {claim_id: index for index, claim_id in enumerate(graph_order)}
+                for claim in lesson_spec.claims:
+                    if claim.claim_id not in graph_position:
+                        continue
+                    for prerequisite in claim.prerequisite_claim_ids:
+                        if (
+                            prerequisite in graph_position
+                            and graph_position[prerequisite] >= graph_position[claim.claim_id]
+                        ):
+                            issues.append(
+                                PlanCompilerIssue(
+                                    category="math",
+                                    field="teaching_graph.claim_order",
+                                    scene_ids=[plan.scene_id for plan in plans],
+                                    message=(
+                                        f"claim_order 中前置断言 {prerequisite} 未排在依赖断言 "
+                                        f"{claim.claim_id} 之前。"
+                                    ),
+                                    fix_instruction="按从前置知识到结论的顺序重排 claim_order。",
+                                )
+                            )
+                graph_edges = {
+                    (edge.prerequisite_claim_id, edge.dependent_claim_id)
+                    for edge in teaching_graph.edges
+                }
+                for claim in lesson_spec.claims:
+                    for prerequisite in claim.prerequisite_claim_ids:
+                        if (
+                            prerequisite in known_claim_ids
+                            and (prerequisite, claim.claim_id) not in graph_edges
+                        ):
+                            issues.append(
+                                PlanCompilerIssue(
+                                    category="contract",
+                                    field="teaching_graph.edges",
+                                    scene_ids=[plan.scene_id for plan in plans],
+                                    message=(
+                                        f"教学图谱缺少 LessonSpec 中的依赖边 {prerequisite} -> "
+                                        f"{claim.claim_id}。"
+                                    ),
+                                    fix_instruction="为每个 prerequisite_claim_ids 补充对应的 TeachingEdge。",
+                                )
+                            )
+            unknown_edges = {
+                endpoint
+                for edge in teaching_graph.edges
+                for endpoint in (edge.prerequisite_claim_id, edge.dependent_claim_id)
+                if endpoint not in known_claim_ids
+            }
+            if unknown_edges:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="contract",
+                        field="teaching_graph.edges",
+                        scene_ids=[plan.scene_id for plan in plans],
+                        message="教学图谱边引用了未声明的断言: " + ", ".join(sorted(unknown_edges)),
+                        fix_instruction="删除未知边，或先把对应断言加入 LessonSpec。",
+                    )
+                )
+
+        first_scene_by_claim: dict[str, int] = {}
+        for plan in plans:
+            for claim_id in plan.claim_ids:
+                first_scene_by_claim.setdefault(claim_id, plan.scene_id)
+        for claim in lesson_spec.claims:
+            dependent_scene = first_scene_by_claim.get(claim.claim_id)
+            if dependent_scene is None:
+                continue
+            for prerequisite_id in claim.prerequisite_claim_ids:
+                prerequisite_scene = first_scene_by_claim.get(prerequisite_id)
+                if prerequisite_scene is not None and prerequisite_scene > dependent_scene:
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="math",
+                            field=f"claims[{claim.claim_id}].prerequisite_claim_ids",
+                            scene_ids=[prerequisite_scene, dependent_scene],
+                            message=(
+                                f"断言 {claim.claim_id} 在 Scene {dependent_scene} 先于其前置断言 "
+                                f"{prerequisite_id}（Scene {prerequisite_scene}）出现。"
+                            ),
+                            fix_instruction="调整 Scene 分配顺序，先展示所有前置断言再展示依赖断言。",
+                        )
+                    )
+
+        transition = effective_transition_duration(plan.duration_seconds for plan in plans)
+        planned_duration = sum(plan.duration_seconds for plan in plans)
+        final_duration = planned_duration - transition * (len(plans) - 1)
+        minimum = lesson_spec.requested_duration_min_seconds
+        maximum = lesson_spec.requested_duration_max_seconds
+        if minimum is not None and final_duration < minimum - 0.05:
+            issues.append(
+                PlanCompilerIssue(
+                    category="timing",
+                    field="duration_seconds",
+                    scene_ids=[plan.scene_id for plan in plans],
+                    message=f"考虑转场后的预计成片时长 {final_duration:.2f}s 小于要求下限 {minimum:.2f}s。",
+                    fix_instruction="增加场景定格/吸收停顿，使扣除转场后的成片时长达到要求下限。",
+                )
+            )
+        if maximum is not None and final_duration > maximum + 0.05:
+            issues.append(
+                PlanCompilerIssue(
+                    category="timing",
+                    field="duration_seconds",
+                    scene_ids=[plan.scene_id for plan in plans],
+                    message=f"考虑转场后的预计成片时长 {final_duration:.2f}s 超过要求上限 {maximum:.2f}s。",
+                    fix_instruction="压缩场景时长或减少不必要场景，确保扣除转场后的成片不超时。",
+                )
+            )
+        if lesson_spec.scene_policy == "single_visual_unit" and len(plans) > 1:
+            issues.append(
+                PlanCompilerIssue(
+                    category="contract",
+                    field="scene_policy",
+                    scene_ids=[plan.scene_id for plan in plans],
+                    message="教学合同要求单一视觉单元，但概要仍包含多个场景。",
+                    fix_instruction="将同一画布中的连续动作合并为一个 Scene。",
+                )
+            )
         return issues
 
     @staticmethod
@@ -654,7 +1110,7 @@ class PlanCompiler:
             not in {removed.element_id for removed in previous.elements_to_remove}
         }
         current_inherited = {item.element_id for item in current.inherited_elements}
-        if not previous_available or not current_inherited:
+        if not current_inherited:
             return []
         missing = current_inherited - previous_available
         if not missing:

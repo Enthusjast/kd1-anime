@@ -16,8 +16,12 @@ from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.planner import (
     ContinuityBible,
     ElementManifest,
+    LessonSpec,
     ScenePlan,
+    TeachingGraph,
     VisualElementState,
+    compact_lesson_spec,
+    compact_teaching_graph,
 )
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
@@ -66,6 +70,10 @@ class TechnicalObject(BaseModel):
     dependencies: list[str] = Field(default_factory=list, max_length=100)
     initial_state: str = Field(default="", max_length=2_000)
     final_state: str = Field(default="", max_length=2_000)
+    visual_role: str = Field(default="", max_length=1_000)
+    z_index: int = Field(default=0, ge=-10_000, le=10_000)
+    estimated_width: float | None = Field(default=None, gt=0, le=100)
+    estimated_height: float | None = Field(default=None, gt=0, le=100)
     lifecycle: list[LifecycleAction] = Field(default_factory=list, max_length=30)
     initially_active: bool = False
     exported: bool = False
@@ -84,6 +92,7 @@ class TechnicalAnimation(BaseModel):
     target_element_ids: list[str] = Field(default_factory=list, max_length=50)
     create_element_ids: list[str] = Field(default_factory=list, max_length=50)
     remove_element_ids: list[str] = Field(default_factory=list, max_length=50)
+    claim_ids: list[str] = Field(default_factory=list, max_length=50)
     api_notes: str = Field(default="", max_length=2_000)
 
     @model_validator(mode="after")
@@ -264,16 +273,31 @@ def compile_technical_spec(
             errors.append("TechnicalSpec.latex.preamble_packages 必须包含 ctex")
 
     referenced_ids: set[str] = set()
+    referenced_claim_ids: set[str] = set()
     for event in spec.animations:
         referenced_ids.update(event.source_element_ids)
         referenced_ids.update(event.target_element_ids)
         referenced_ids.update(event.create_element_ids)
         referenced_ids.update(event.remove_element_ids)
+        referenced_claim_ids.update(event.claim_ids)
     unknown_references = referenced_ids - object_id_set
     if unknown_references:
         errors.append(
             "TechnicalSpec 动画引用了未定义对象: " + ", ".join(sorted(unknown_references))
         )
+    if plan.claim_ids:
+        unknown_claim_references = referenced_claim_ids - set(plan.claim_ids)
+        missing_claim_references = set(plan.claim_ids) - referenced_claim_ids
+        if unknown_claim_references:
+            errors.append(
+                "TechnicalSpec 动画引用了当前场景未声明的数学断言: "
+                + ", ".join(sorted(unknown_claim_references))
+            )
+        if missing_claim_references:
+            errors.append(
+                "TechnicalSpec 未覆盖当前场景的数学断言: "
+                + ", ".join(sorted(missing_claim_references))
+            )
 
     if effective_renderer == "opengl":
         camera_text = " ".join(
@@ -390,6 +414,7 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
 ## 必须遵守
 1. 所有对象使用稳定的 element_id 和 variable_name；继承对象设置 initially_active=true；
    临时步骤也要列入 objects，但 exported=false。
+   同时填写 visual_role、z_index 和可估算的宽高，供布局审查使用。
 2. export_element_ids 只能包含场景结束时仍存在、且 ScenePlan 合同要求交接的对象。
 3. 每个动画事件必须明确 source_element_ids、target_element_ids、create_element_ids 和
    remove_element_ids；Transform/ReplacementTransform 不能引用不存在或尚未出现的对象。
@@ -401,6 +426,8 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
    MathTex 一定包含某个下标，必须提供 substrings_to_isolate 或 expected_part_counts。
 7. 时间线必须覆盖从 0 到场景结束的完整区间；末尾没有交接的临时对象必须退出或标记为非导出。
 8. 不要把 ScenePlan 中没有要求的章节、音频、插件或动画效果加入技术合同。
+9. 如果 ScenePlan 声明了 claim_ids，每个断言至少要绑定一个动画事件的 claim_ids；
+   不得让数学结论只存在于文字描述而没有对应画面事件。
 
 ## 输出字段
 {
@@ -426,6 +453,7 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
     "target_element_ids": ["formula"],
     "create_element_ids": ["formula"],
     "remove_element_ids": [],
+    "claim_ids": ["claim_1"],
     "api_notes": "使用 FadeIn，run_time=1"
   }],
   "layout": {
@@ -468,6 +496,8 @@ class TechnicalPlannerAgent(BaseAgent):
         rag_context: str = "",
         feedback: str = "",
         stream: bool = False,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> TechnicalSpec:
         plan_json = scene_plan.model_dump_json(indent=2)
         bible_json = (
@@ -513,6 +543,18 @@ class TechnicalPlannerAgent(BaseAgent):
                 f"<element_manifest>\n{manifest_json}\n</element_manifest>",
                 priority=50,
                 max_chars=20_000,
+            ),
+            PromptSection(
+                "lesson_spec",
+                "<lesson_spec>\n"
+                f"{compact_lesson_spec(lesson_spec, claim_ids=set(scene_plan.claim_ids), max_chars=16_000)}\n"
+                "</lesson_spec>\n<teaching_graph>\n"
+                f"{compact_teaching_graph(teaching_graph, scene_id=scene_plan.scene_id, max_chars=8_000)}\n"
+                "</teaching_graph>\n"
+                f"当前场景 claim_ids: {scene_plan.claim_ids}",
+                required=True,
+                priority=70,
+                max_chars=30_000,
             ),
             PromptSection(
                 "RAG Reference Context",

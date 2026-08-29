@@ -181,6 +181,7 @@ class TestSceneDashboard:
         assert "分镜✓" in pipeline
         assert "编码⟳" in pipeline
         assert "渲染·" in pipeline
+        assert "审查·" in pipeline
 
     def test_regeneration_clears_stale_downstream_checkmarks(self):
         dash = SceneDashboard()
@@ -198,8 +199,34 @@ class TestSceneDashboard:
         assert dash.scenes[1].done == ["分镜"]
         pipeline = str(dash.scenes[1].render_row()[2])
         assert "编码⟳" in pipeline
-        assert "审查·" in pipeline
-        assert "渲染·" in pipeline
+
+    def test_visual_plan_repair_is_shown_as_plan_review_not_code_repair(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event(
+            "plan_complete",
+            {"scenes": [MagicMock(scene_id=1, title="S1")], "visual_enabled": True},
+        )
+        dash.on_event("scene_detailed", {"scene_id": 1})
+        dash.on_event("scene_plan_review_pass", {"scene_id": 1})
+        dash.on_event("scene_technical_ready", {"scene_id": 1})
+        dash.on_event("scene_coded", {"scene_id": 1})
+        dash.on_event("scene_review_pass", {"scene_id": 1})
+        dash.on_event("scene_rendered", {"scene_id": 1})
+        dash.on_event("scene_visual_evaluating", {"scene_id": 1})
+
+        dash.on_event(
+            "scene_visual_plan_fixing",
+            {"scene_id": 1, "target": "Planner", "attempt": 1, "max_attempts": 2},
+        )
+
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].stage == "计划审查"
+        assert dash.scenes[1].done == ["分镜"]
+        assert "计划审查⟳" in str(dash.scenes[1].render_row()[2])
+
+        dash.on_event("scene_plan_repair_requested", {"scene_id": 1, "target": "planner"})
+        assert dash.scenes[1].stage == "计划审查"
 
     def test_failed_and_give_up(self):
         dash = SceneDashboard()

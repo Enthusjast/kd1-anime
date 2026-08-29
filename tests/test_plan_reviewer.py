@@ -14,9 +14,11 @@ from kd1_anime.agents.plan_reviewer import (
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    LessonSpec,
     MathClaim,
     SceneHandoff,
     ScenePlan,
+    TeachingGraph,
     VisualElementState,
 )
 
@@ -89,6 +91,28 @@ def test_deterministic_plan_review_does_not_reject_explicit_safe_fallback():
     issues = deterministic_plan_issues(plan, ContinuityBible(), safe_fallback=True)
 
     assert not any(issue.category == "geometry" for issue in issues)
+
+
+def test_plan_reviewer_prompt_includes_readonly_teaching_graph(monkeypatch):
+    reviewer = PlanReviewerAgent()
+    captured = {}
+
+    def fake_call_llm_json(**kwargs):
+        captured["kwargs"] = kwargs
+        return PlanReviewResult(is_valid=True, severity="info")
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call_llm_json)
+    reviewer.review(
+        make_plan(),
+        user_prompt="解释公式",
+        continuity_bible=ContinuityBible(),
+        lesson_spec=LessonSpec(
+            claims=[MathClaim(claim_id="claim_1", statement="a=a", relation="definition")]
+        ),
+        teaching_graph=TeachingGraph(claim_order=["claim_1"], scene_claims={2: ["claim_1"]}),
+    )
+
+    assert "teaching_graph" in captured["kwargs"]["user_message"]
 
 
 def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():

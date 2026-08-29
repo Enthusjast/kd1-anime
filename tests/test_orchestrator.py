@@ -5,9 +5,20 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    LessonSpec,
+    MathClaim,
+    PlanningDraft,
+    SceneOutline,
+    ScenePlan,
+    TeachingGraph,
+    VisualElementState,
+)
 from kd1_anime.agents.reviewer import ReviewResult
 from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.config import settings
+from kd1_anime.eval.visual_eval import VisualAnalysisResult, VisualIssue
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import SceneArtifact, VideoMetadata, sha256_file
 from kd1_anime.run_store import RunManifest, StoredSceneState, sha256_text, write_manifest
@@ -318,6 +329,171 @@ def test_disabled_rag_retrieval_is_recorded_without_network(tmp_path):
 
     assert context == ""
     assert ctx.rag_receipts["scene:1:code"].status == "disabled"
+
+
+def test_visual_math_issue_routes_back_to_planner():
+    result = VisualAnalysisResult(
+        overall_analysis="公式不正确",
+        mathematical_accuracy={"score": 2, "comprehensive_evaluation": "公式错误"},
+        visual_relevance={"score": 4, "comprehensive_evaluation": "相关"},
+        visual_quality={"score": 4, "comprehensive_evaluation": "清晰"},
+        visual_consistency={"score": 4, "comprehensive_evaluation": "一致"},
+        element_layout={"score": 4, "comprehensive_evaluation": "整齐"},
+        issues=[
+            VisualIssue(
+                category="mathematics",
+                severity="major",
+                frame_ids=["F01"],
+                evidence="画面等式前后不等价",
+                recommendation="回到计划修正数学断言",
+            )
+        ],
+    )
+
+    assert Orchestrator._visual_repair_target(result) == "planner"
+
+
+def test_visual_boundary_issue_uses_boundary_start_scene_for_repair():
+    result = VisualAnalysisResult(
+        overall_analysis="边界突变",
+        mathematical_accuracy={"score": 4, "comprehensive_evaluation": "正确"},
+        visual_relevance={"score": 4, "comprehensive_evaluation": "相关"},
+        visual_quality={"score": 4, "comprehensive_evaluation": "清晰"},
+        visual_consistency={"score": 2, "comprehensive_evaluation": "突变"},
+        element_layout={"score": 4, "comprehensive_evaluation": "整齐"},
+        issues=[
+            VisualIssue(
+                category="consistency",
+                severity="major",
+                repair_target="continuity",
+                frame_ids=["F01", "F02"],
+                boundary_ids=["B02"],
+                evidence="Scene 2 开头丢失对象",
+                recommendation="恢复边界交接",
+            )
+        ],
+    )
+
+    assert Orchestrator._visual_repair_target(result) == "continuity"
+
+
+def test_visual_plan_feedback_survives_plan_compile(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    current_plan = plan()
+    state = SceneState(plan=current_plan, plan_ready=True)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title="demo",
+                duration_seconds=10,
+                purpose="test",
+                math_concept="circle",
+            )
+        ],
+        scenes=[current_plan],
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_request_continuity_rebuild", lambda *args, **kwargs: None)
+
+    orchestrator._schedule_visual_plan_repair(
+        ctx,
+        1,
+        state,
+        "画面中的数学关系不成立",
+        "planner",
+    )
+    orchestrator._compile_scene_plans(ctx)
+
+    assert any(issue.field == "visual_evaluation" for issue in ctx.plan_compile_issues[1])
+
+
+def test_plan_only_runs_new_teaching_contract_path(monkeypatch, tmp_path):
+    outline = SceneOutline(
+        scene_id=1,
+        title="公式",
+        duration_seconds=10,
+        purpose="展示公式",
+        math_concept="恒等式",
+        claim_ids=["claim_1"],
+    )
+    plan = ScenePlan(
+        **outline.model_dump(),
+        visual_design="固定画面",
+        camera_movement="固定",
+        visual_flow=["展示公式"],
+        key_moments=["结论定格"],
+        computation="a=a",
+        opening_state=["画面为空"],
+        closing_state=["公式保留"],
+        transition_in="从空画面建立公式",
+        transition_out="保留公式并收束",
+        timeline=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 10,
+                "action": "展示公式",
+                "math_claim_ids": ["claim_1"],
+            }
+        ],
+        math_claims=[
+            MathClaim(
+                claim_id="claim_1",
+                statement="a=a",
+                expression_before="a",
+                expression_after="a",
+                relation="equivalent",
+            )
+        ],
+    )
+
+    class FakePlanner:
+        def plan_draft(self, prompt, **kwargs):
+            return PlanningDraft(
+                lesson_spec=LessonSpec(
+                    topic="公式",
+                    claims=[MathClaim(claim_id="claim_1", statement="a=a", relation="definition")],
+                ),
+                teaching_graph=TeachingGraph(
+                    claim_order=["claim_1"],
+                    scene_claims={1: ["claim_1"]},
+                ),
+                items=[outline],
+            )
+
+        def plan_continuity_bible(self, prompt, outlines, **kwargs):
+            return ContinuityBible()
+
+        def plan_detail(self, *args, **kwargs):
+            return plan
+
+    class FakePlanReviewer:
+        def review(self, *args, **kwargs):
+            from kd1_anime.agents.plan_reviewer import PlanReviewResult
+
+            return PlanReviewResult(is_valid=True, severity="info", summary="通过")
+
+    class FakeContinuityReviewer:
+        def review(self, *args, **kwargs):
+            from kd1_anime.agents.continuity import ContinuityReviewResult
+
+            return ContinuityReviewResult(is_valid=True, summary="通过")
+
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(module, "PlannerAgent", FakePlanner)
+    monkeypatch.setattr(module, "PlanReviewerAgent", FakePlanReviewer)
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", FakeContinuityReviewer)
+
+    scenes = Orchestrator().plan_only("解释公式", preflight=False)
+
+    assert [scene.scene_id for scene in scenes] == [1]
+    assert scenes[0].claim_ids == ["claim_1"]
 
 
 def test_scheduler_stops_when_checkpoint_persistence_fails(monkeypatch, tmp_path):

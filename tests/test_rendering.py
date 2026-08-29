@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 
 from kd1_anime.config import settings
-from kd1_anime.rendering import RenderProfile, probe_video, verify_video
+from kd1_anime.rendering import (
+    RenderProfile,
+    effective_transition_duration,
+    probe_video,
+    verify_video,
+)
 
 
 def test_render_profile_digest_changes_with_output_settings(monkeypatch):
@@ -29,6 +34,14 @@ def test_render_profile_digest_includes_tool_versions():
     changed = profile.model_copy(update={"manim_version": "0.20.2"})
 
     assert profile.digest() != changed.digest()
+
+
+def test_effective_transition_duration_matches_short_video_guard(monkeypatch):
+    monkeypatch.setattr(settings, "TRANSITION_DURATION", 0.5)
+
+    assert effective_transition_duration([10, 10]) == 0.5
+    assert effective_transition_duration([0.2, 10]) == 0.1
+    assert effective_transition_duration([10]) == 0.0
 
 
 def test_render_profile_rejects_unsafe_script_values():

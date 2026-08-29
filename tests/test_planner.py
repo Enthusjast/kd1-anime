@@ -11,12 +11,17 @@ from pydantic import ValidationError
 from kd1_anime.agents.planner import (
     CONTINUITY_BIBLE_PROMPT,
     DETAIL_PROMPT,
+    OUTLINE_DRAFT_PROMPT,
     OUTLINE_PROMPT,
     ContinuityBible,
+    LessonSpec,
+    MathClaim,
     PlannerAgent,
+    PlanningDraft,
     SceneDetail,
     SceneOutline,
     ScenePlan,
+    compact_lesson_spec,
 )
 
 
@@ -94,6 +99,17 @@ class TestSceneOutline:
                 duration_seconds=601,
                 purpose="Test",
                 math_concept="Test",
+            )
+
+    def test_outline_rejects_duplicate_claim_ids(self):
+        with pytest.raises(ValidationError, match="claim_ids"):
+            SceneOutline(
+                scene_id=1,
+                title="Test",
+                duration_seconds=30,
+                purpose="Test",
+                math_concept="Test",
+                claim_ids=["claim_1", "claim_1"],
             )
 
 
@@ -297,6 +313,118 @@ class TestPlannerAgent:
         assert sum(item.duration_seconds for item in outlines) == pytest.approx(300)
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_draft_expands_short_output_to_requested_minimum(self, mock_call_llm, planner):
+        mock_call_llm.return_value = """{
+            "lesson_spec": {
+                "requested_duration_min_seconds": 30,
+                "requested_duration_max_seconds": 60
+            },
+            "items": [
+                {"scene_id": 1, "title": "概念", "duration_seconds": 10, "purpose": "建立", "math_concept": "定义"}
+            ]
+        }"""
+
+        draft = planner.plan_draft("制作一个 30-60 秒的数学动画")
+
+        assert sum(item.duration_seconds for item in draft.items) == pytest.approx(30)
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_draft_returns_teaching_contract_and_coalesces_single_unit(
+        self, mock_call_llm, planner
+    ):
+        mock_call_llm.return_value = """{
+            "lesson_spec": {
+                "topic": "幂函数",
+                "scene_policy": "minimum_visual_units",
+                "claims": [
+                    {"claim_id": "claim_1", "statement": "y=x", "relation": "definition"},
+                    {"claim_id": "claim_2", "statement": "y=x^2", "relation": "definition", "prerequisite_claim_ids": ["claim_1"]}
+                ]
+            },
+            "teaching_graph": {
+                "claim_order": ["claim_1", "claim_2"],
+                "edges": [{"prerequisite_claim_id": "claim_1", "dependent_claim_id": "claim_2"}],
+                "scene_claims": {"1": ["claim_1"], "2": ["claim_2"]}
+            },
+            "items": [
+                {"scene_id": 1, "title": "直线", "duration_seconds": 20, "purpose": "显示", "math_concept": "y=x", "claim_ids": ["claim_1"]},
+                {"scene_id": 2, "title": "抛物线", "duration_seconds": 20, "purpose": "显示", "math_concept": "y=x^2", "claim_ids": ["claim_2"]}
+            ]
+        }"""
+
+        draft = planner.plan_draft("在同一坐标系中同时展示两个幂函数，并保持显示")
+
+        assert isinstance(draft, PlanningDraft)
+        assert len(draft.items) == 1
+        assert draft.lesson_spec.scene_policy == "single_visual_unit"
+        assert draft.items[0].claim_ids == ["claim_1", "claim_2"]
+        assert "全片的教学事实合同" in mock_call_llm.call_args.kwargs["system_prompt"]
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_draft_repairs_dependency_order_without_replanning_details(
+        self, mock_call_llm, planner
+    ):
+        mock_call_llm.return_value = """{
+            "lesson_spec": {
+                "claims": [
+                    {"claim_id": "base", "statement": "基础", "relation": "definition"},
+                    {"claim_id": "result", "statement": "结论", "relation": "definition", "prerequisite_claim_ids": ["base"]}
+                ]
+            },
+            "teaching_graph": {
+                "claim_order": ["result", "base"],
+                "scene_claims": {"1": ["base"], "2": ["result"]}
+            },
+            "items": [
+                {"scene_id": 1, "title": "基础", "duration_seconds": 10, "purpose": "建立", "math_concept": "基础", "claim_ids": ["base"]},
+                {"scene_id": 2, "title": "结论", "duration_seconds": 10, "purpose": "得出", "math_concept": "结论", "claim_ids": ["result"]}
+            ]
+        }"""
+
+        draft = planner.plan_draft("解释一个需要前置知识的公式")
+
+        assert draft.teaching_graph.claim_order == ["base", "result"]
+        assert [
+            (edge.prerequisite_claim_id, edge.dependent_claim_id)
+            for edge in draft.teaching_graph.edges
+        ] == [("base", "result")]
+
+    def test_planning_draft_accepts_legacy_outline_alias(self):
+        outline = {
+            "scene_id": 1,
+            "title": "概念",
+            "duration_seconds": 10,
+            "purpose": "建立概念",
+            "math_concept": "定义",
+        }
+        draft = PlanningDraft.model_validate({"outlines": [outline]})
+
+        assert draft.items[0].title == "概念"
+
+    def test_compact_lesson_spec_includes_recursive_prerequisites(self):
+        spec = LessonSpec(
+            claims=[
+                MathClaim(claim_id="base", statement="基础", relation="definition"),
+                MathClaim(
+                    claim_id="middle",
+                    statement="中间",
+                    relation="definition",
+                    prerequisite_claim_ids=["base"],
+                ),
+                MathClaim(
+                    claim_id="result",
+                    statement="结论",
+                    relation="definition",
+                    prerequisite_claim_ids=["middle"],
+                ),
+            ]
+        )
+
+        payload = compact_lesson_spec(spec, claim_ids={"result"})
+
+        assert all(claim_id in payload for claim_id in ("base", "middle", "result"))
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_outline_rejects_too_many_scenes(self, mock_call_llm, planner):
         """测试拒绝过多场景。"""
         from kd1_anime.config import settings
@@ -426,6 +554,11 @@ class TestPlannerAgent:
         assert "math_concept" in OUTLINE_PROMPT
         assert "连续编号" in OUTLINE_PROMPT
         assert "不可信数据" in OUTLINE_PROMPT
+
+    def test_outline_draft_prompt_structure(self):
+        assert "lesson_spec" in OUTLINE_DRAFT_PROMPT
+        assert "teaching_graph" in OUTLINE_DRAFT_PROMPT
+        assert "最小必要场景" in OUTLINE_DRAFT_PROMPT
 
     def test_detail_prompt_structure(self):
         """测试细节提示结构。"""

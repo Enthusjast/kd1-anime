@@ -517,6 +517,36 @@ class SceneDashboard:
                     f"安排视觉修复 #{data.get('attempt', 0)}",
                 )
 
+        elif event == "scene_visual_plan_fixing":
+            self.stage = "plan_reviewing"
+            self.stage_label = "视觉反馈计划修正"
+            if status:
+                # 视觉评估发现的是数学/故事或交接问题，不能继续显示为
+                # “代码修复”；清除计划审查之后的完成标记，明确回退层级。
+                status.invalidate_from("计划审查", self.stages)
+                target = data.get("target", "计划")
+                self._mark_running(status, "计划审查", f"视觉反馈回到{target}层")
+
+        elif event == "scene_plan_repair_requested":
+            self.stage = "plan_reviewing"
+            self.stage_label = "代码审查反馈计划修正"
+            if status:
+                status.invalidate_from("计划审查", self.stages)
+                target = data.get("target", "计划")
+                self._mark_running(status, "计划审查", f"代码审查反馈回到{target}层")
+
+        elif event == "boundary_visual_pass":
+            self.stage = "visual_evaluating"
+            self.stage_label = "场景边界视觉通过"
+
+        elif event == "boundary_visual_warning":
+            self.stage = "visual_evaluating"
+            self.stage_label = "场景边界视觉提示"
+
+        elif event == "boundary_visual_unknown":
+            self.stage = "visual_evaluating"
+            self.stage_label = "场景边界视觉不可用"
+
         elif event == "scene_failed":
             if status:
                 status.state = "failed"

@@ -444,11 +444,50 @@ def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_current_manifest_uses_v4_schema():
+def test_current_manifest_uses_v5_schema():
     assert (
         RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
-        == 4
+        == 5
     )
+
+
+def test_v4_manifest_is_readable_but_read_only(tmp_path):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    raw = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="legacy",
+        output_path=str((root / "output.mp4").resolve()),
+    ).model_dump(mode="json")
+    raw["schema_version"] = 4
+    path = root / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = RunRepository(workspace).load(RUN_ID)
+
+    assert loaded.schema_version == 4
+    with pytest.raises(ValueError, match="仅支持只读查看"):
+        loaded.validate_for_resume()
+    with pytest.raises(ValueError, match="只允许写入 v5"):
+        write_manifest(path, loaded)
+
+
+def test_v5_manifest_must_persist_teaching_contract_fields(tmp_path):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    raw = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str((root / "output.mp4").resolve()),
+    ).model_dump(mode="json")
+    for field_name in ("lesson_spec", "teaching_graph", "state_ledger"):
+        raw.pop(field_name)
+    (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="v5 manifest 缺少必需字段"):
+        RunRepository(workspace).load(RUN_ID)
 
 
 def _write_v1_manifest(workspace: Path, *, reused_job: bool = False) -> Path:
