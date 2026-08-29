@@ -35,12 +35,13 @@ from kd1_anime.agents.continuity import (
     validate_export_contract,
 )
 from kd1_anime.agents.lifecycle import validate_animation_lifecycle
-from kd1_anime.agents.plan_compiler import PlanCompiler
+from kd1_anime.agents.plan_compiler import PlanCompiler, normalize_scene_timeline_contract
 from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
     PlanReviewResult,
     classify_plan_review_issues,
+    dedupe_plan_review_issues,
     deterministic_plan_issues,
 )
 from kd1_anime.agents.planner import (
@@ -3259,6 +3260,46 @@ class Orchestrator:
     def _compile_scene_plans(self, ctx: PipelineContext) -> None:
         """在 LLM 计划审查前执行一次确定性计划编译。"""
 
+        timeline_changed = False
+        for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id):
+            # 已经有代码/视频的场景不能在恢复时静默改写时间线；它们
+            # 必须沿用原合同或由显式重规划流程处理。尚未编码的计划则
+            # 可以安全吸收模型遗漏的末尾定格时间。
+            if (
+                state.failed
+                or state.give_up
+                or not state.plan_ready
+                or state.code
+                or state.rendered
+            ):
+                continue
+            normalized_plan, repairs = normalize_scene_timeline_contract(state.plan)
+            if not repairs:
+                continue
+            state.plan = normalized_plan
+            self._reset_technical_spec(state)
+            state.plan_reviewed = False
+            state.plan_review_round = 0
+            state.plan_review_feedback = ""
+            state.plan_review_signature = ""
+            state.identical_plan_review_count = 0
+            timeline_changed = True
+            ctx.continuity_warnings.append(
+                f"Scene {state.plan.scene_id} 已自动补齐时间线：" + "；".join(repairs)
+            )
+            self._emit(
+                "continuity_contract_repaired",
+                scene_id=state.plan.scene_id,
+                repairs=repairs,
+            )
+        if timeline_changed:
+            ctx.plan_review_status = "pending"
+            ctx.scenes = [
+                state.plan
+                for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            ]
+            self._checkpoint(ctx, State.PLAN_REVIEWING)
+
         plans = [
             state.plan
             for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
@@ -3353,15 +3394,17 @@ class Orchestrator:
         if not callable(review_batch):
             return {}
         deterministic_by_scene = {
-            state.plan.scene_id: [
-                *deterministic_plan_issues(
-                    state.plan,
-                    ctx.continuity_bible,
-                    safe_fallback=state.safe_fallback_used,
-                    lesson_spec=ctx.lesson_spec,
-                ),
-                *ctx.plan_compile_issues.get(state.plan.scene_id, []),
-            ]
+            state.plan.scene_id: dedupe_plan_review_issues(
+                [
+                    *deterministic_plan_issues(
+                        state.plan,
+                        ctx.continuity_bible,
+                        safe_fallback=state.safe_fallback_used,
+                        lesson_spec=ctx.lesson_spec,
+                    ),
+                    *ctx.plan_compile_issues.get(state.plan.scene_id, []),
+                ]
+            )
             for state in active_states
         }
         try:
@@ -3436,10 +3479,9 @@ class Orchestrator:
                     safe_fallback=state.safe_fallback_used,
                     lesson_spec=ctx.lesson_spec,
                 )
-                deterministic = [
-                    *deterministic,
-                    *ctx.plan_compile_issues.get(scene_id, []),
-                ]
+                deterministic = dedupe_plan_review_issues(
+                    [*deterministic, *ctx.plan_compile_issues.get(scene_id, [])]
+                )
                 result = batch_results.pop(scene_id, None)
                 if result is None:
                     try:

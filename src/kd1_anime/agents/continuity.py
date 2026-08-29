@@ -783,6 +783,74 @@ def normalize_scene_plan_contract(
             repaired_new.append(repaired_item)
         new_elements = repaired_new
 
+    # 如果当前场景明确声明在边界处整体退出，required 元素就不可能同时
+    # 作为交接对象保留。模型常把“下一场景开始时再淡出”写进
+    # transition_out；这种延后退出不属于当前 closing_state 冲突，应保留
+    # 原合同。除此之外，按退出描述机械地把 inherited 元素列入移除，
+    # 并把本场景 new_elements 还原为临时对象，避免 Coder 被要求导出已
+    # 淡出的中间公式。
+    closing_text = " ".join(plan.closing_state).lower()
+    transition_text = plan.transition_out.lower()
+    broad_exit_pattern = r"(?:所有|全部|整体|全片).{0,16}(?:淡出|消失|清空|移除)"
+    closing_broad_exit = bool(
+        re.search(broad_exit_pattern, closing_text) or "self.clear" in closing_text
+    )
+    transition_broad_exit = bool(
+        re.search(broad_exit_pattern, transition_text) or "self.clear" in transition_text
+    )
+    deferred_transition_exit = transition_broad_exit and any(
+        marker in transition_text
+        for marker in (
+            "下一场景",
+            "下一个场景",
+            "后续场景",
+            "进入下一",
+            "场景切换",
+            "next scene",
+            "following scene",
+        )
+    )
+    if closing_broad_exit or (transition_broad_exit and not deferred_transition_exit):
+        removal_ids = {item.element_id for item in removals}
+        added_removals: list[str] = []
+        for item in inherited:
+            if item.element_id in removal_ids:
+                continue
+            removals.append(
+                item.model_copy(
+                    update={
+                        "required": True,
+                        "reason": item.reason or "场景边界整体退出",
+                    }
+                )
+            )
+            removal_ids.add(item.element_id)
+            added_removals.append(item.element_id)
+        if added_removals:
+            repairs.append(
+                "场景边界整体退出，已将继承元素列入移除合同: " + ", ".join(sorted(added_removals))
+            )
+
+        new_ids = {item.element_id for item in new_elements}
+        normalized_handoff = [item for item in normalized_handoff if item.element_id not in new_ids]
+        normalized_handoff = [
+            (
+                item.model_copy(update={"action": "remove"})
+                if item.element_id in {element.element_id for element in inherited}
+                and item.action != "remove"
+                else item
+            )
+            for item in normalized_handoff
+        ]
+        normalized_new: list[VisualElementState] = []
+        for item in new_elements:
+            normalized_item = item
+            if item.required:
+                repairs.append(f"整体退出场景中的元素 {item.element_id} 已标记为 optional")
+                normalized_item = item.model_copy(update={"required": False})
+            normalized_new.append(normalized_item)
+        new_elements = normalized_new
+
     allowed_colors = set(bible.global_visual_state.colors)
     normalized_color_names = {key.lower().replace("-", "_"): key for key in allowed_colors}
     color_aliases = {

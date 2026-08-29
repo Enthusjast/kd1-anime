@@ -1,4 +1,8 @@
-from kd1_anime.agents.plan_compiler import PlanCompiler, expressions_are_equivalent
+from kd1_anime.agents.plan_compiler import (
+    PlanCompiler,
+    expressions_are_equivalent,
+    normalize_scene_timeline_contract,
+)
 from kd1_anime.agents.planner import (
     ElementManifest,
     ExtractedElement,
@@ -286,6 +290,37 @@ def test_compiler_rejects_global_fade_out_of_required_boundary_elements():
     result = PlanCompiler().compile_scene(plan)
 
     assert any(issue.field == "transition_out|closing_state" for issue in result)
+
+
+def test_compiler_allows_exit_deferred_to_next_scene_transition():
+    plan = make_plan(
+        transition_out="场景结束时保留公式到边界；下一场景淡入时本场景元素整体淡出",
+        new_elements=[
+            VisualElementState(element_id="formula", variable_name="formula", required=True)
+        ],
+        handoff=[SceneHandoff(element_id="formula", variable_name="formula", action="keep")],
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any(issue.field == "transition_out|closing_state" for issue in result)
+
+
+def test_normalize_scene_timeline_contract_absorbs_trailing_pause_before_fade():
+    plan = make_plan(
+        duration_seconds=10,
+        timeline=[
+            TimelineEvent(event_id="content", start_seconds=0, end_seconds=5, action="展示结论"),
+            TimelineEvent(event_id="fade", start_seconds=5, end_seconds=6, action="整体淡出"),
+        ],
+    )
+
+    normalized, repairs = normalize_scene_timeline_contract(plan)
+
+    assert normalized.timeline[0].end_seconds == 9
+    assert normalized.timeline[1].start_seconds == 9
+    assert normalized.timeline[1].end_seconds == 10
+    assert repairs
 
 
 def test_element_manifest_keeps_latest_export_and_dependencies():

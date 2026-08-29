@@ -536,6 +536,25 @@ def test_normalize_scene_plan_contract_preserves_semantic_color_aliases():
     }
 
 
+def test_normalize_scene_plan_contract_handles_explicit_full_exit():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="result", variable_name="result", required=True)
+            ],
+            "handoff": [SceneHandoff(element_id="result", variable_name="result", action="keep")],
+            "closing_state": ["所有元素整体淡出，场景结束"],
+            "transition_out": "本场景结束时所有元素整体淡出",
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(plan, ContinuityBible())
+
+    assert normalized.new_elements[0].required is False
+    assert normalized.handoff == []
+    assert any("整体退出" in repair for repair in repairs)
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={

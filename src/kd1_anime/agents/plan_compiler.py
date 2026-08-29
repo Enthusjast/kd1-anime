@@ -53,6 +53,89 @@ class PlanCompileResult(BaseModel):
     issues: list[PlanCompilerIssue] = Field(default_factory=list, max_length=200)
 
 
+def _is_exit_timeline_action(action: str) -> bool:
+    text = str(action or "").lower()
+    return any(
+        token in text for token in ("淡出", "消失", "清空", "收束", "结束", "fade out", "fadeout")
+    )
+
+
+def _is_deferred_transition_exit(text: str) -> bool:
+    """判断转场中的退出是否发生在当前场景边界之后。"""
+
+    normalized = str(text or "").lower()
+    return (_is_exit_timeline_action(normalized) or "self.clear" in normalized) and any(
+        marker in normalized
+        for marker in (
+            "下一场景",
+            "下一个场景",
+            "后续场景",
+            "进入下一",
+            "场景切换",
+            "next scene",
+            "following scene",
+        )
+    )
+
+
+def normalize_scene_timeline_contract(
+    plan: ScenePlan,
+) -> tuple[ScenePlan, tuple[str, ...]]:
+    """吸收末尾未覆盖的时间到结论定格，避免模型遗漏长停顿。
+
+    Detail 常能正确写出 ``key_moments`` 的长时间定格，却把 timeline
+    只写到最后一个动画动作。若最后一个事件是淡出，应把淡出推迟到场景
+    末尾，并延长前一个内容事件；否则直接延长最后一个内容事件。这个
+    归一化只改变停顿分配，不改变对象、数学断言或动画顺序。
+    """
+
+    if not plan.timeline:
+        return plan, ()
+    ordered = sorted(
+        enumerate(plan.timeline),
+        key=lambda pair: (pair[1].start_seconds, pair[1].event_id, pair[0]),
+    )
+    last_index, last_event = ordered[-1]
+    gap = plan.duration_seconds - last_event.end_seconds
+    if gap <= 0.05:
+        return plan, ()
+
+    events = list(plan.timeline)
+    repairs: list[str] = []
+    if _is_exit_timeline_action(last_event.action) and len(ordered) >= 2:
+        previous_index, previous_event = ordered[-2]
+        if not _is_exit_timeline_action(previous_event.action):
+            shifted_start = last_event.start_seconds + gap
+            if shifted_start > previous_event.start_seconds + 0.05:
+                events[previous_index] = previous_event.model_copy(
+                    update={"end_seconds": shifted_start}
+                )
+                events[last_index] = last_event.model_copy(
+                    update={
+                        "start_seconds": shifted_start,
+                        "end_seconds": plan.duration_seconds,
+                    }
+                )
+                repairs.append(
+                    f"将收束事件 {last_event.event_id} 延后至场景末尾，并补足 {gap:.2f}s 结论定格"
+                )
+            else:
+                events[last_index] = last_event.model_copy(
+                    update={"end_seconds": plan.duration_seconds}
+                )
+                repairs.append(f"将时间线最后事件 {last_event.event_id} 延长至场景末尾")
+        else:
+            events[last_index] = last_event.model_copy(
+                update={"end_seconds": plan.duration_seconds}
+            )
+            repairs.append(f"将时间线最后事件 {last_event.event_id} 延长至场景末尾")
+    else:
+        events[last_index] = last_event.model_copy(update={"end_seconds": plan.duration_seconds})
+        repairs.append(f"将时间线最后事件 {last_event.event_id} 延长至场景末尾")
+
+    return plan.model_copy(update={"timeline": events}), tuple(repairs)
+
+
 _TOKEN_RE = re.compile(r"\*\*|[()+\-*/^]|(?:\d+(?:\.\d+)?)|[A-Za-z]+")
 
 
@@ -744,10 +827,19 @@ class PlanCompiler:
             for item in [*plan.inherited_elements, *plan.new_elements]
             if item.required and item.element_id not in removed_ids
         }
-        exit_text = " ".join([plan.transition_out, *plan.closing_state]).lower()
-        broad_exit = bool(
-            re.search(r"(?:所有|全部|整体|全片).{0,16}(?:淡出|消失|清空|移除)", exit_text)
-            or "self.clear" in exit_text
+        closing_text = " ".join(plan.closing_state).lower()
+        transition_text = plan.transition_out.lower()
+        broad_exit_pattern = r"(?:所有|全部|整体|全片).{0,16}(?:淡出|消失|清空|移除)"
+        closing_broad_exit = bool(
+            re.search(broad_exit_pattern, closing_text) or "self.clear" in closing_text
+        )
+        transition_broad_exit = bool(
+            re.search(broad_exit_pattern, transition_text) or "self.clear" in transition_text
+        )
+        # “下一场景淡入时，本场景元素淡出”表示先在当前边界保留，
+        # 再由下一场景处理退出，不能被误判为 closing_state 的冲突。
+        broad_exit = closing_broad_exit or (
+            transition_broad_exit and not _is_deferred_transition_exit(transition_text)
         )
         if required_boundary_ids and broad_exit:
             issues.append(
