@@ -348,8 +348,8 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
 
     pairs: list[tuple[str, str]] = []
     pattern = re.compile(
-        r"(?<![A-Za-z0-9_])([A-Za-z0-9_()+\-*/^²³.]{1,80})\s*(?:=|→|⟶)\s*"
-        r"([A-Za-z0-9_()+\-*/^²³.]{1,80})(?![A-Za-z0-9_])"
+        r"(?<![A-Za-z0-9_])([A-Za-z0-9_()+\-−*/^²³.·×⋅\\]{1,80})\s*(?:=|→|⟶)\s*"
+        r"([A-Za-z0-9_()+\-−*/^²³.·×⋅\\]{1,80})(?![A-Za-z0-9_])"
     )
     for match in pattern.finditer(str(text or "")):
         left, right = match.groups()
@@ -1234,7 +1234,10 @@ class PlanCompiler:
             PlanCompilerIssue(
                 category="continuity",
                 field="inherited_elements",
-                scene_ids=[previous.scene_id, current.scene_id],
+                # 该问题的可编辑字段只在当前场景；把 previous 也作为
+                # 目标会让计划屏障错误地要求前一场景修复后一场景的
+                # inherited_elements，随后反复返回同一份前场景计划。
+                scene_ids=[current.scene_id],
                 message=(
                     f"Scene {current.scene_id} 继承了 Scene {previous.scene_id} 未交接的元素: "
                     + ", ".join(sorted(missing))

@@ -16,6 +16,7 @@ from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
     LessonSpec,
+    SceneHandoff,
     SceneOutline,
     ScenePlan,
     TeachingGraph,
@@ -613,6 +614,7 @@ def normalize_scene_plan_contract(
     bible: ContinuityBible,
     *,
     previous_plan: ScenePlan | None = None,
+    has_next_scene: bool | None = None,
 ) -> tuple[ScenePlan, list[str]]:
     """确定性修复分镜交接合同中的机械性错误。
 
@@ -739,10 +741,27 @@ def normalize_scene_plan_contract(
     if normalized_handoff:
         handoff_ids = {item.element_id for item in normalized_handoff}
         declared_ids = {item.element_id for item in [*inherited, *removals, *new_elements]}
+        previous_declared_ids = {
+            item.element_id
+            for item in (
+                [*previous_plan.inherited_elements, *previous_plan.new_elements]
+                if previous_plan is not None
+                else []
+            )
+        }
+        valid_handoff: list[SceneHandoff] = []
         for handoff_item in normalized_handoff:
-            if handoff_item.element_id in declared_ids or handoff_item.action == "remove":
-                continue
             previous_item = previous_available_by_id.get(handoff_item.element_id)
+            if (
+                previous_plan is not None
+                and handoff_item.element_id in previous_declared_ids
+                and previous_item is None
+            ):
+                repairs.append(f"删除上一场景未导出的过期 handoff 元素: {handoff_item.element_id}")
+                continue
+            if handoff_item.element_id in declared_ids or handoff_item.action == "remove":
+                valid_handoff.append(handoff_item)
+                continue
             inferred = VisualElementState(
                 element_id=handoff_item.element_id,
                 role="",
@@ -768,6 +787,9 @@ def normalize_scene_plan_contract(
                 new_elements.append(inferred)
                 repairs.append(f"handoff 中的元素 {handoff_item.element_id} 已补入 new_elements")
             declared_ids.add(handoff_item.element_id)
+            valid_handoff.append(handoff_item)
+
+        normalized_handoff = valid_handoff
 
         handoff_ids = {item.element_id for item in normalized_handoff}
         repaired_new: list[VisualElementState] = []
@@ -798,16 +820,20 @@ def normalize_scene_plan_contract(
     transition_broad_exit = bool(
         re.search(broad_exit_pattern, transition_text) or "self.clear" in transition_text
     )
-    deferred_transition_exit = transition_broad_exit and any(
-        marker in transition_text
-        for marker in (
-            "下一场景",
-            "下一个场景",
-            "后续场景",
-            "进入下一",
-            "场景切换",
-            "next scene",
-            "following scene",
+    deferred_transition_exit = (
+        transition_broad_exit
+        and has_next_scene is not False
+        and any(
+            marker in transition_text
+            for marker in (
+                "下一场景",
+                "下一个场景",
+                "后续场景",
+                "进入下一",
+                "场景切换",
+                "next scene",
+                "following scene",
+            )
         )
     )
     if closing_broad_exit or (transition_broad_exit and not deferred_transition_exit):

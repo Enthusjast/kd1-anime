@@ -555,6 +555,58 @@ def test_normalize_scene_plan_contract_handles_explicit_full_exit():
     assert any("整体退出" in repair for repair in repairs)
 
 
+def test_normalize_scene_plan_contract_drops_stale_handoff_for_unexported_previous_element():
+    previous = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="transition",
+                    variable_name="transition",
+                    required=False,
+                )
+            ]
+        }
+    )
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [
+                VisualElementState(
+                    element_id="transition",
+                    variable_name="transition",
+                    required=True,
+                )
+            ],
+            "handoff": [
+                SceneHandoff(
+                    element_id="transition",
+                    variable_name="transition",
+                    action="keep",
+                )
+            ],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(
+        current,
+        ContinuityBible(),
+        previous_plan=previous,
+        has_next_scene=False,
+    )
+
+    all_ids = {
+        item.element_id
+        for group in (
+            normalized.inherited_elements,
+            normalized.elements_to_remove,
+            normalized.new_elements,
+        )
+        for item in group
+    }
+    assert "transition" not in all_ids
+    assert all(item.element_id != "transition" for item in normalized.handoff)
+    assert any("过期 handoff" in repair for repair in repairs)
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={

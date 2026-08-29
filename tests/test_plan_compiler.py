@@ -70,6 +70,14 @@ def test_compiler_does_not_treat_geometric_constraints_as_identities():
     assert not any(issue.category == "math" for issue in result.issues)
 
 
+def test_compiler_keeps_middle_dot_equations_intact():
+    plan = make_plan(computation="符号规则：a·(-b) = -ab，b·(-b) = -b²")
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any(issue.category == "math" for issue in result)
+
+
 def test_compiler_rejects_timeline_gap_and_bad_math_claim():
     plan = make_plan(
         timeline=[
@@ -190,7 +198,9 @@ def test_compiler_rejects_inherited_element_not_offered_by_previous_scene():
 
     result = PlanCompiler().compile([make_outline(1), make_outline(2)], [previous, current])
 
-    assert any(issue.category == "continuity" for issue in result.issues)
+    continuity_issues = [issue for issue in result.issues if issue.category == "continuity"]
+    assert continuity_issues
+    assert continuity_issues[0].scene_ids == [2]
 
 
 def test_compiler_rejects_missing_detail_for_an_outline():

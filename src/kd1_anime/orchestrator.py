@@ -2946,6 +2946,11 @@ class Orchestrator:
             state.plan,
             ctx.continuity_bible,
             previous_plan=previous_plan,
+            has_next_scene=any(
+                item.plan.scene_id > state.plan.scene_id
+                for item in ctx.scene_states.values()
+                if item.plan_ready
+            ),
         )
         if not repairs:
             return
@@ -3237,6 +3242,11 @@ class Orchestrator:
                 state.plan,
                 ctx.continuity_bible,
                 previous_plan=previous_plan,
+                has_next_scene=any(
+                    item.plan.scene_id > state.plan.scene_id
+                    for item in ctx.scene_states.values()
+                    if item.plan_ready
+                ),
             )
             if not repairs:
                 continue
@@ -3640,6 +3650,11 @@ class Orchestrator:
                     revised_plan,
                     ctx.continuity_bible or ContinuityBible(),
                     previous_plan=previous_plan,
+                    has_next_scene=any(
+                        item.plan.scene_id > scene_id
+                        for item in ctx.scene_states.values()
+                        if item.plan_ready
+                    ),
                 )
                 code_invalidated = bool(
                     state.code or state.reviewed or state.rendered or state.slurm_job
@@ -4097,6 +4112,7 @@ class Orchestrator:
                     revised_plan,
                     ctx.continuity_bible,
                     previous_plan=previous_plan,
+                    has_next_scene=outline_index + 1 < len(ctx.outlines),
                 )
                 with self._state_lock:
                     state.plan = revised_plan
@@ -4310,6 +4326,7 @@ class Orchestrator:
                 plan,
                 ctx.continuity_bible,
                 previous_plan=previous_plan,
+                has_next_scene=any(item.scene_id > scene_id for item in ctx.outlines),
             )
             if repairs:
                 reason = "；".join(repairs)
@@ -5239,6 +5256,11 @@ class Orchestrator:
                 fallback_plan,
                 ctx.continuity_bible,
                 previous_plan=previous_plan,
+                has_next_scene=any(
+                    item.plan.scene_id > scene_id
+                    for item in ctx.scene_states.values()
+                    if item.plan_ready
+                ),
             )
         else:
             contract_repairs = []
