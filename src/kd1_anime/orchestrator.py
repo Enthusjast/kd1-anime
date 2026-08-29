@@ -1888,9 +1888,15 @@ class Orchestrator:
                     or (ctx.plan_review_status != "skipped" and not scene.plan_reviewed)
                 ]
                 if unfinished:
+                    # 如果上游场景已经明确失败，下游只是被顺序屏障
+                    # 阻塞，不要把“缺少继承状态”再包装成第二个错误。
+                    root_failures = [
+                        item for item in unfinished if item[1].failed or item[1].give_up
+                    ]
+                    reported = root_failures or unfinished
                     details = "; ".join(
                         f"Scene {scene_id}: {scene.failure_reason or '未通过编码/审查'}"
-                        for scene_id, scene in unfinished
+                        for scene_id, scene in reported
                     )
                     message = f"Dry-run 未完成，存在失败场景: {details}"
                     self._checkpoint(ctx, State.ERROR, status="failed", error=message)
@@ -2718,6 +2724,14 @@ class Orchestrator:
             ) from self._checkpoint_error
         if ctx.continuity_rebuild_required or self._stop_event.is_set():
             return
+        # 代码屏障是渲染前的硬闸门。任何场景尚未完成编码/审查时，不能
+        # 让场景 worker 越过它直接提交 Slurm；尤其不能让下游在缺少上游
+        # 导出状态时自行生成一份“看似连续”的代码。
+        if any(state.failed or state.give_up for state in ctx.scene_states.values()) or any(
+            not state.reviewed and not state.failed and not state.give_up and state.plan_ready
+            for state in ctx.scene_states.values()
+        ):
+            return
 
         threads: list[threading.Thread] = []
         for scene_id, state in sorted(ctx.scene_states.items()):
@@ -2751,6 +2765,29 @@ class Orchestrator:
             if self._stop_event.is_set() or state.failed or state.give_up:
                 continue
             try:
+                # 场景代码按 ID 顺序生成，是因为后一场景可能要消费前一
+                # 场景刚刚审查通过的导出区。上游失败时继续处理下游只会
+                # 把“缺少状态账本/继承代码”制造成第二个假故障，既浪费
+                # LLM 调用，也让用户难以定位真正根因。下游保持 pending，
+                # 待用户 resume 后从最早失败场景重新建立交接。
+                if scene_id > 1:
+                    previous_state = ctx.scene_states.get(scene_id - 1)
+                    requires_inherited_state = bool(state.plan.inherited_elements)
+                    upstream_unavailable = previous_state is None or (
+                        previous_state.failed
+                        or previous_state.give_up
+                        or not previous_state.reviewed
+                        or not previous_state.code
+                    )
+                    if requires_inherited_state and upstream_unavailable:
+                        dependency_reason = f"等待 Scene {scene_id - 1} 编码/审查通过后建立继承状态"
+                        self._emit(
+                            "scene_waiting_for_dependency",
+                            scene_id=scene_id,
+                            dependency_scene_id=scene_id - 1,
+                            reason=dependency_reason,
+                        )
+                        break
                 if not state.rendered:
                     self._normalize_plan_contract_for_coding(ctx, state)
                 previous_context = state.inherited_elements_code
@@ -2871,6 +2908,17 @@ class Orchestrator:
                     except Exception as checkpoint_error:
                         self._record_checkpoint_failure(checkpoint_error)
                 self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+
+        # 顺序代码屏障没有完成全部可运行场景时，禁止后面的渲染 worker
+        # 在没有 TechnicalSpec/继承代码的状态下自行启动。失败场景本身
+        # 仍由外层收尾逻辑报告，pending 场景会在显式 resume 时重试。
+        if any(state.failed or state.give_up for state in ctx.scene_states.values()):
+            return
+        if any(
+            not state.reviewed and not state.failed and not state.give_up and state.plan_ready
+            for state in ctx.scene_states.values()
+        ):
+            return
 
     def _normalize_plan_contract_for_coding(
         self,

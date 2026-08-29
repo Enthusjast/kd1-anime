@@ -7,6 +7,7 @@ ScenePlan 中的对象、生命周期、时间线和导出边界显式化，供 
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -162,6 +163,199 @@ def _duplicate_values(values: list[str]) -> list[str]:
     return sorted({value for value in values if values.count(value) > 1})
 
 
+_CAMERA_API_TERMS = ("camera.frame", "movingcamerascene")
+_CAMERA_NEGATION_RE = re.compile(
+    r"(?:禁止|严禁|不得|不能|不要|不应|无需|避免|勿|免于|do\s+not|don't|never|without|not)"
+    r"(?:\s|使用|调用|要求|访问|依赖|通过|use|call|require|access|with)?",
+    re.IGNORECASE,
+)
+
+
+def _contains_positive_camera_api_reference(text: str) -> bool:
+    """判断技术说明是否真的要求调用 OpenGL 不支持的相机 API。
+
+    Technical Planner 往往会在 ``implementation_notes`` 中复述禁止项，
+    例如“OpenGL 渲染器，禁止使用 camera.frame”。简单的子串搜索会把
+    这类安全说明误判成违规要求，导致合法 TechnicalSpec 永远无法通过
+    编译。这里按句子检查每次命中的局部上下文，只把没有否定词的引用
+    视为实际使用。
+    """
+
+    normalized = str(text or "")
+    for term in _CAMERA_API_TERMS:
+        offset = 0
+        while True:
+            index = normalized.lower().find(term, offset)
+            if index < 0:
+                break
+            # 不按英文句号切分：``camera.frame`` 本身包含句点。
+            prefix = re.split(r"[\n。；，,、;!?]", normalized[:index])[-1]
+            if not _CAMERA_NEGATION_RE.search(prefix):
+                return True
+            offset = index + len(term)
+    return False
+
+
+def _append_api_repair_note(note: str, repair: str) -> str:
+    suffix = f"；{repair}" if note.strip() else repair
+    return (note + suffix)[:2_000]
+
+
+def _normalise_technical_lifecycle(
+    spec: TechnicalSpec,
+    *,
+    required_boundary_ids: set[str],
+) -> tuple[TechnicalSpec, tuple[str, ...]]:
+    """修复技术模型最常见的生命周期歧义。
+
+    模型经常把 ``Transform`` 的目标同时放进 ``create_element_ids``，并在
+    收尾事件里列出从未淡入的可选步骤标签。前者实际表达的是
+    ``ReplacementTransform``；后者是安全的空操作。两种情况都能由当前
+    TechnicalSpec 的状态合同确定，不应浪费有限的 LLM 重试次数。
+    """
+
+    active = {item.element_id for item in spec.objects if item.initially_active}
+    normalized_events: dict[int, TechnicalAnimation] = {}
+    repairs: list[str] = []
+    changed = False
+    ordered_events = sorted(
+        enumerate(spec.animations),
+        key=lambda pair: (pair[1].start_seconds, pair[1].event_id, pair[0]),
+    )
+    for index, original in ordered_events:
+        event = original
+        target_ids = set(event.target_element_ids)
+        create_ids = set(event.create_element_ids)
+
+        # ``create_element_ids`` 是 target 变成后续 active 对象的明确声明；
+        # 对 transform 来说，这等价于 ReplacementTransform，而不是原地
+        # Transform。修正 operation 并清除重复的 create 标记，避免状态
+        # 模拟把同一个 target 计入两次。
+        if (
+            event.operation == "transform"
+            and target_ids
+            and create_ids
+            and create_ids <= target_ids
+        ):
+            event = event.model_copy(
+                update={
+                    "operation": "replacement_transform",
+                    "create_element_ids": [],
+                    "api_notes": _append_api_repair_note(
+                        event.api_notes,
+                        "Technical Planner 已按 target 成为 active 的声明改用 ReplacementTransform",
+                    ),
+                }
+            )
+            repairs.append(f"事件 {event.event_id} 的 transform 已规范为 replacement_transform")
+            changed = True
+        elif event.operation == "replacement_transform" and create_ids:
+            event = event.model_copy(
+                update={
+                    "create_element_ids": [],
+                    "api_notes": _append_api_repair_note(
+                        event.api_notes,
+                        "ReplacementTransform 的 target 已由 operation 管理",
+                    ),
+                }
+            )
+            repairs.append(f"事件 {event.event_id} 删除了重复的 create_element_ids")
+            changed = True
+
+        if event.operation in {"fade_out", "uncreate", "remove"}:
+            source_ids = set(event.source_element_ids)
+            remove_ids = set(event.remove_element_ids)
+            referenced_exit_ids = source_ids | remove_ids
+            inactive = referenced_exit_ids - active
+            protected = referenced_exit_ids & required_boundary_ids
+            optional_inactive = inactive - required_boundary_ids
+            if optional_inactive or protected:
+                # 过滤从未 active 的临时对象，同时保护计划要求交接的
+                # 边界对象。required 对象若本来就未 active，则不在这里
+                # 静默修复，后续编译器仍会报告真正的缺失。
+                kept_sources = [
+                    item
+                    for item in event.source_element_ids
+                    if item in active and item not in required_boundary_ids
+                ]
+                kept_removes = [
+                    item
+                    for item in event.remove_element_ids
+                    if item in active and item not in required_boundary_ids
+                ]
+                if protected:
+                    repairs.append(
+                        f"事件 {event.event_id} 保留必需边界对象: " + ", ".join(sorted(protected))
+                    )
+                if not kept_sources and not kept_removes:
+                    event = event.model_copy(
+                        update={
+                            "operation": "wait",
+                            "source_element_ids": [],
+                            "target_element_ids": [],
+                            "create_element_ids": [],
+                            "remove_element_ids": [],
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "清理事件没有可退出的非边界对象，按空操作处理",
+                            ),
+                        }
+                    )
+                else:
+                    event = event.model_copy(
+                        update={
+                            "source_element_ids": kept_sources,
+                            "remove_element_ids": kept_removes,
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "已过滤无效或不可退出的对象引用",
+                            ),
+                        }
+                    )
+                repairs.append(
+                    f"事件 {event.event_id} 已规范化退出对象: "
+                    + ", ".join(sorted(optional_inactive | protected))
+                )
+                changed = True
+
+        if event.operation in {"fade_out", "uncreate", "remove"} and event.target_element_ids:
+            event = event.model_copy(
+                update={
+                    "target_element_ids": [],
+                    "api_notes": _append_api_repair_note(
+                        event.api_notes,
+                        "退出操作不使用 target_element_ids",
+                    ),
+                }
+            )
+            repairs.append(f"事件 {event.event_id} 清空了退出操作中的 target_element_ids")
+            changed = True
+
+        normalized_events[index] = event
+
+        # 与 compile_technical_spec 的生命周期语义保持完全一致。
+        if event.operation in {"create", "write", "fade_in", "add"}:
+            active.update(set(event.create_element_ids) | set(event.target_element_ids))
+            if not event.create_element_ids and not event.target_element_ids:
+                active.update(event.source_element_ids)
+        elif event.operation == "replacement_transform":
+            active.difference_update(event.source_element_ids)
+            active.update(event.target_element_ids)
+        elif event.operation in {"fade_out", "uncreate", "remove"}:
+            active.difference_update(set(event.source_element_ids) or set(event.remove_element_ids))
+        active.difference_update(event.remove_element_ids)
+
+    if not changed:
+        return spec, ()
+    # ``ordered_events`` 只影响状态模拟，不改变模型输出的原始事件顺序；
+    # 使用原始下标而不是 event_id，避免错误的重复 ID 被兼容层悄悄合并，
+    # 让后续确定性编译器仍能报告重复事件。
+    animations = [
+        normalized_events.get(index, event) for index, event in enumerate(spec.animations)
+    ]
+    return spec.model_copy(update={"animations": animations}), tuple(repairs)
+
+
 def normalize_technical_spec_contract(
     plan: ScenePlan,
     spec: TechnicalSpec,
@@ -170,9 +364,11 @@ def normalize_technical_spec_contract(
 ) -> tuple[TechnicalSpec, tuple[str, ...]]:
     """修正 TechnicalSpec 中可以从 ScenePlan 直接确定的字段。
 
-    ``removed_element_ids`` 和继承对象的 ``initially_active`` 不应由模型
-    自由发挥；它们是边界合同的机械投影。其余动画/导出错误仍交给编译器
-    和有限反馈重生成，避免用“自动修复”掩盖真正的技术设计错误。
+    ``removed_element_ids``、``export_element_ids`` 和继承对象的
+    ``initially_active`` 不应由模型自由发挥；它们是边界合同的机械投影。
+    同时修复明确的 renderer/生命周期歧义（例如把带 active target 的
+    transform 规范为 replacement_transform），其余动画/导出错误仍交给
+    编译器和有限反馈重生成，避免用“自动修复”掩盖真正的技术设计错误。
     """
 
     repairs: list[str] = []
@@ -185,23 +381,49 @@ def normalize_technical_spec_contract(
     inherited_ids = {item.element_id for item in plan.inherited_elements}
     normalized_objects = []
     object_changed = False
+    expected_exports = [
+        item.element_id
+        for item in [*plan.inherited_elements, *plan.new_elements]
+        if item.required and item.element_id not in set(expected_removed)
+    ]
+    if spec.export_element_ids != expected_exports:
+        updates["export_element_ids"] = expected_exports
+        repairs.append("export_element_ids 已与计划中的必需边界元素对齐")
     for item in spec.objects:
         expected_active = item.element_id in inherited_ids
+        expected_exported = item.element_id in expected_exports
+        item_updates: dict[str, object] = {}
         if item.initially_active != expected_active:
-            normalized_item = item.model_copy(update={"initially_active": expected_active})
+            item_updates["initially_active"] = expected_active
+        if item.exported != expected_exported:
+            item_updates["exported"] = expected_exported
+        if item_updates:
+            normalized_item = item.model_copy(update=item_updates)
             object_changed = True
         else:
             normalized_item = item
         normalized_objects.append(normalized_item)
     if object_changed:
         updates["objects"] = normalized_objects
-        repairs.append("继承对象的 initially_active 已与场景开场合同对齐")
+        repairs.append("对象的 initially_active/exported 已与场景边界合同对齐")
     if renderer is not None and spec.renderer != renderer:
         updates["renderer"] = renderer
         repairs.append(f"TechnicalSpec.renderer 已固定为 {renderer}")
-    if not updates:
+
+    normalized_spec = spec.model_copy(update=updates) if updates else spec
+    required_boundary_ids = {
+        item.element_id
+        for item in [*plan.inherited_elements, *plan.new_elements]
+        if item.required and item.element_id not in set(expected_removed)
+    }
+    normalized_spec, lifecycle_repairs = _normalise_technical_lifecycle(
+        normalized_spec,
+        required_boundary_ids=required_boundary_ids,
+    )
+    repairs.extend(lifecycle_repairs)
+    if normalized_spec is spec and not repairs:
         return spec, ()
-    return spec.model_copy(update=updates), tuple(repairs)
+    return normalized_spec, tuple(repairs)
 
 
 def compile_technical_spec(
@@ -345,7 +567,7 @@ def compile_technical_spec(
         camera_text = " ".join(
             [spec.layout.strategy, *spec.layout.constraints, *spec.implementation_notes]
         ).lower()
-        if "camera.frame" in camera_text or "movingcamerascene" in camera_text:
+        if _contains_positive_camera_api_reference(camera_text):
             errors.append("OpenGL TechnicalSpec 不能要求 camera.frame 或 MovingCameraScene")
 
     active: set[str] = {item.element_id for item in spec.objects if item.initially_active}
@@ -420,8 +642,10 @@ def compile_technical_spec(
                     f"事件 {event.event_id} 使用了尚未 active 的对象: "
                     + ", ".join(sorted(sources - active))
                 )
-        # wait 没有对象状态变化。
-        active.update(creates)
+        # wait 没有对象状态变化。create_element_ids 只对引入类操作生效；
+        # Transform 的 target 是快照，不能因为模型误填 create 字段而被
+        # 当成已经加入场景的对象（兼容修复会优先把这种事件改成
+        # replacement_transform）。
         active.difference_update(removes)
 
     missing_final = exports - active
@@ -463,14 +687,20 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
    remove_element_ids；Transform/ReplacementTransform 不能引用不存在或尚未出现的对象。
 4. 已经 FadeOut、Uncreate 或 ReplacementTransform 移除的对象不能在后续事件中继续使用。
    Transform 是原地变换：source 仍然是 active 对象，target 只是目标快照；只有
-   ReplacementTransform 才会让 target 成为后续可操作对象。不得在同一事件或后续事件中
-   移除 export_element_ids；若最后的 visual_flow 写“淡出”，只能淡出非导出临时对象。
-5. 仅使用当前 renderer 支持的相机 API。OpenGL 禁止 camera.frame 和 MovingCameraScene。
-6. 使用 Tex/MathTex 时必须说明 xelatex、.xdv、ctex 和子对象分段策略；不要凭空假设
+   ReplacementTransform 才会让 target 成为后续可操作对象。使用 ReplacementTransform
+   时 operation 必须写 replacement_transform，且不要把 target 重复放入 create_element_ids。
+   不得在同一事件或后续事件中移除 export_element_ids；若最后的 visual_flow 写“淡出”，
+   只能淡出非导出临时对象。
+5. fade_out/uncreate/remove 的 source/remove 列表只能包含该事件之前已经 active 的对象；
+   不要把没有淡入或已被替换移除的步骤标签列入收尾清理。退出事件不要填写
+   target_element_ids。
+6. 仅使用当前 renderer 支持的相机 API。OpenGL 禁止 camera.frame 和 MovingCameraScene。
+   在 implementation_notes 中复述这一禁止规则是允许的，不要把禁止语句当成使用要求。
+7. 使用 Tex/MathTex 时必须说明 xelatex、.xdv、ctex 和子对象分段策略；不要凭空假设
    MathTex 一定包含某个下标，必须提供 substrings_to_isolate 或 expected_part_counts。
-7. 时间线必须覆盖从 0 到场景结束的完整区间；末尾没有交接的临时对象必须退出或标记为非导出。
-8. 不要把 ScenePlan 中没有要求的章节、音频、插件或动画效果加入技术合同。
-9. 如果 ScenePlan 声明了 claim_ids，每个断言至少要绑定一个动画事件的 claim_ids；
+8. 时间线必须覆盖从 0 到场景结束的完整区间；末尾没有交接的临时对象必须退出或标记为非导出。
+9. 不要把 ScenePlan 中没有要求的章节、音频、插件或动画效果加入技术合同。
+10. 如果 ScenePlan 声明了 claim_ids，每个断言至少要绑定一个动画事件的 claim_ids；
    不得让数学结论只存在于文字描述而没有对应画面事件。
 
 ## 输出字段

@@ -388,6 +388,14 @@ class SceneDashboard:
                 status.started_at = 0.0
                 status.message = "技术实现合同失败"
 
+        elif event == "scene_waiting_for_dependency":
+            if status:
+                status.state = "pending"
+                status.stage = ""
+                status.started_at = 0.0
+                dependency = data.get("dependency_scene_id", "?")
+                status.message = f"等待 Scene {dependency} 完成"
+
         elif event in (
             "scene_detailing",
             "scene_coding",

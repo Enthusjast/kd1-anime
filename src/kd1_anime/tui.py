@@ -816,6 +816,13 @@ class ChatSession:
                     f"  [dim]▸[/] Scene {scene_id}: [yellow]代码审查反馈回到{target}层[/]"
                 )
 
+            case "scene_waiting_for_dependency":
+                scene_id = data.get("scene_id", "?")
+                dependency = data.get("dependency_scene_id", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]等待 Scene {dependency} 完成后继续[/]"
+                )
+
             case "boundary_visual_pass":
                 score = data.get("score")
                 suffix = f" ({score:.2f}/5)" if isinstance(score, (int, float)) else ""

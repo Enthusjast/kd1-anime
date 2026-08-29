@@ -481,6 +481,61 @@ def test_normalize_scene_plan_contract_repairs_mechanical_conflicts():
     assert normalized.global_visual_state == ContinuityBible().global_visual_state
 
 
+def test_normalize_scene_plan_contract_preserves_semantic_color_aliases():
+    bible = ContinuityBible(
+        global_visual_state=GlobalVisualState(
+            colors={
+                "primary_blue": "#1F77B4",
+                "secondary_red": "#D62728",
+                "highlight_green": "#2CA02C",
+                "neutral_black": "#2C3E50",
+                "neutral_gray": "#7F8C8D",
+                "background": "#F8F9FA",
+            }
+        )
+    )
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="title",
+                    variable_name="title",
+                    role="场景标题",
+                    color_key="neutral",
+                ),
+                VisualElementState(
+                    element_id="step",
+                    variable_name="step",
+                    role="步骤标签",
+                    color_key="gray",
+                ),
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    role="公式",
+                    color_key="primary",
+                ),
+                VisualElementState(
+                    element_id="result",
+                    variable_name="result",
+                    role="最终结论",
+                    color_key="highlight",
+                ),
+            ]
+        }
+    )
+
+    normalized, _ = normalize_scene_plan_contract(plan, bible)
+    colors = {item.element_id: item.color_key for item in normalized.new_elements}
+
+    assert colors == {
+        "title": "neutral_black",
+        "step": "neutral_gray",
+        "formula": "primary_blue",
+        "result": "highlight_green",
+    }
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={

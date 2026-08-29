@@ -94,6 +94,66 @@ def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
     orchestrator._run_code_review_barrier(ctx)
 
 
+def test_code_barrier_does_not_turn_downstream_missing_ledger_into_failure(monkeypatch, tmp_path):
+    """上游技术合同失败时，下游应等待而不是伪造继承状态错误。"""
+
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    inherited = VisualElementState(
+        element_id="previous_result",
+        variable_name="previous_result",
+        required=True,
+    )
+    first = plan().model_copy(
+        update={
+            "new_elements": [inherited],
+            "handoff": [
+                SceneHandoff(
+                    element_id="previous_result",
+                    variable_name="previous_result",
+                    action="keep",
+                )
+            ],
+        }
+    )
+    second = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [inherited],
+            "new_elements": [],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        plan_review_status="passed",
+        scene_states={
+            1: SceneState(plan=first, plan_ready=True),
+            2: SceneState(plan=second, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    events = []
+    orchestrator._callback = lambda event, data: events.append((event, data))
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    def fail_first(current_ctx, scene_state):
+        if scene_state.plan.scene_id == 1:
+            raise RuntimeError("TechnicalSpec invalid")
+
+    monkeypatch.setattr(orchestrator, "_ensure_technical_spec", fail_first)
+
+    orchestrator._run_code_review_barrier(ctx)
+
+    assert ctx.scene_states[1].failed is True
+    assert ctx.scene_states[2].failed is False
+    assert ctx.scene_states[2].give_up is False
+    assert any(
+        event == "scene_waiting_for_dependency" and data["scene_id"] == 2 for event, data in events
+    )
+
+
 def test_direct_render_flag_round_trips_in_manifest(tmp_path):
     run_paths = paths(tmp_path)
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"

@@ -784,14 +784,81 @@ def normalize_scene_plan_contract(
         new_elements = repaired_new
 
     allowed_colors = set(bible.global_visual_state.colors)
+    normalized_color_names = {key.lower().replace("-", "_"): key for key in allowed_colors}
+    color_aliases = {
+        "primary": ("primary", "primary_blue", "a_blue", "blue", "input"),
+        "secondary": ("secondary", "secondary_red", "b_red", "red", "support"),
+        "result": ("result", "highlight", "highlight_green", "green", "accent"),
+        "highlight": ("highlight", "highlight_green", "result", "green", "accent"),
+        "neutral": ("neutral", "neutral_black", "text_dark", "text", "black"),
+        "gray": ("gray", "neutral_gray", "cancel_gray", "text_light_gray"),
+        "cancel": ("cancel", "cancel_gray", "neutral_gray", "gray"),
+        "white": ("white", "text_light"),
+        "background": ("background",),
+    }
+    for alias_group in tuple(color_aliases.values()):
+        for alias in alias_group:
+            color_aliases.setdefault(alias, alias_group)
 
     def normalize_color(item: VisualElementState) -> VisualElementState:
-        if not item.color_key or item.color_key in allowed_colors:
-            return item
-        fallback = (
-            "primary" if "primary" in allowed_colors else next(iter(sorted(allowed_colors)), "")
+        role_text = f"{item.role} {item.semantic_state}".lower()
+        looks_like_recovered_background = (
+            item.color_key.lower().replace("-", "_") == "background"
+            and "背景" not in role_text
+            and "background" not in role_text
         )
-        repairs.append(f"元素 {item.element_id} 的未知颜色键 {item.color_key} 已映射为 {fallback}")
+        if not item.color_key or (
+            item.color_key in allowed_colors and not looks_like_recovered_background
+        ):
+            return item
+        original_key = item.color_key
+        normalized_key = original_key.lower().replace("-", "_")
+        if looks_like_recovered_background:
+            candidates = (
+                ("highlight", "highlight_green", "result", "green", "accent")
+                if any(token in role_text for token in ("结论", "结果", "result", "conclusion"))
+                else ("gray", "neutral_gray", "cancel_gray", "text_light_gray")
+                if any(token in role_text for token in ("步骤", "辅助", "说明", "step", "helper"))
+                else ("neutral", "neutral_black", "text_dark", "foreground", "primary")
+            )
+        else:
+            candidates = color_aliases.get(normalized_key, (normalized_key,))
+        fallback = next(
+            (
+                normalized_color_names[candidate]
+                for candidate in candidates
+                if candidate in normalized_color_names
+            ),
+            None,
+        )
+        if fallback is None:
+            # 不要把未知语义统一映射成 background：那会让标题、步骤和
+            # 公式在进入 Coder 前丢失颜色含义。按元素角色选择稳定的
+            # 中性色，只有连续性圣经没有中性色时才退回 background。
+            role_candidates = (
+                ("neutral_black", "text_dark", "neutral", "black")
+                if any(token in role_text for token in ("标题", "文本", "公式", "等式", "运算"))
+                else ("neutral_gray", "gray", "cancel_gray")
+                if any(token in role_text for token in ("步骤", "辅助", "说明", "抵消"))
+                else ("neutral_black", "text_dark", "neutral", "black")
+            )
+            fallback = next(
+                (
+                    normalized_color_names[candidate]
+                    for candidate in role_candidates
+                    if candidate in normalized_color_names
+                ),
+                normalized_color_names.get(
+                    "primary",
+                    normalized_color_names.get(
+                        "foreground",
+                        normalized_color_names.get(
+                            "background", next(iter(sorted(allowed_colors)), "")
+                        ),
+                    ),
+                ),
+            )
+        repairs.append(f"元素 {item.element_id} 的颜色键 {original_key} 已规范为 {fallback}")
         return item.model_copy(update={"color_key": fallback})
 
     inherited = [normalize_color(item) for item in inherited]
