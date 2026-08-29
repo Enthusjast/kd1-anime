@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
+from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
     ContinuityBible,
     LessonSpec,
@@ -152,6 +153,68 @@ def test_code_barrier_does_not_turn_downstream_missing_ledger_into_failure(monke
     assert any(
         event == "scene_waiting_for_dependency" and data["scene_id"] == 2 for event, data in events
     )
+
+
+def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp_path):
+    """重规划会重置单份计划的审查轮数，但不能重置总调用预算。"""
+
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    current_plan = plan()
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title=current_plan.title,
+                duration_seconds=current_plan.duration_seconds,
+                purpose=current_plan.purpose,
+                math_concept=current_plan.math_concept,
+            )
+        ],
+        scene_states={1: SceneState(plan=current_plan, plan_ready=True)},
+        plan_review_status="pending",
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+    monkeypatch.setattr(settings, "MAX_PLAN_REVIEW_ROUNDS", 2)
+    monkeypatch.setattr(settings, "MAX_PLAN_REPLAN_ATTEMPTS", 2)
+
+    class FakeReviewer:
+        def review(self, *args, **kwargs):
+            return PlanReviewResult(
+                is_valid=False,
+                severity="major",
+                issues=[
+                    PlanReviewIssue(
+                        category="feasibility",
+                        field="visual_flow",
+                        message="方案不可实现",
+                        fix_instruction="重新规划",
+                    )
+                ],
+            )
+
+    class FakePlanner:
+        calls = 0
+
+        def plan_detail(self, *args, **kwargs):
+            self.calls += 1
+            return current_plan
+
+    fake_planner = FakePlanner()
+    monkeypatch.setattr(module, "PlanReviewerAgent", FakeReviewer)
+    monkeypatch.setattr(module, "PlannerAgent", lambda: fake_planner)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert fake_planner.calls == 2
+    assert ctx.scene_states[1].failed is True
+    assert ctx.plan_review_status == "failed"
+    assert "达到最大次数" in ctx.scene_states[1].failure_reason
 
 
 def test_direct_render_flag_round_trips_in_manifest(tmp_path):

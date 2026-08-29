@@ -80,7 +80,7 @@ Planner 使用分层结构化输出：
 1. `plan_draft()` 一次性生成 `PlanningDraft`：LessonSpec 固定学习目标、实体、数学断言、定义域和时长；TeachingGraph 固定断言依赖与场景分配；`SceneOutline` 按最小必要视觉单元生成。概要按返回顺序规范化 scene ID 为 `1..N`。同一画布中逐个出现、保留并对比的对象属于同一个场景；当用户明确要求同屏/整体展示而模型仍按对象拆分时，Planner 会将概要确定性合并为一个场景。只有用户明确要求多场景，或镜头/布局/叙事弧线确实独立时才拆分。
 2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
 3. 每个 worker 的 `plan_detail()` 接收原始需求、教学合同、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state、结构化 `inherited_elements` / `elements_to_remove` / `new_elements` 和转场合同。
-4. 所有 Detail 完成后先运行 Plan Compiler，检查场景 ID、断言覆盖/依赖、时间线覆盖、可解析等式、多边形鞋带面积、画布边界和元素生命周期。随后逐场景执行 Plan Review，检查数学正确性、几何可实现性和交接合同；问题只回到 Planner 重规划，受 `MAX_PLAN_REVIEW_ROUNDS` 限制，未通过的计划不会进入 Coder。计划/问题指纹重复时冻结计划并停止空转。
+4. 所有 Detail 完成后先运行 Plan Compiler，检查场景 ID、断言覆盖/依赖、时间线覆盖、可解析等式、多边形鞋带面积、画布边界和元素生命周期。随后逐场景执行 Plan Review，检查数学正确性、几何可实现性和交接合同；问题只回到 Planner 重规划，单份计划的审查轮数受 `MAX_PLAN_REVIEW_ROUNDS` 限制，Planner 总重调用次数另受 `MAX_PLAN_REPLAN_ATTEMPTS` 限制，未通过的计划不会进入 Coder。计划/问题指纹重复时冻结计划并停止空转。
 5. Plan Review 通过后执行全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。高风险几何方案在计划审查或代码审查耗尽后，可切换为保守的面积/等式教学方案。
 
 Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。ScenePlan 还包含 timeline、math_claims、geometry_specs 和 handoff 四类结构化合同；无法确定的数学表达式不会被编译器擅自判定为正确。用户需求被明确标记为不可信数据，不能改变系统规则。

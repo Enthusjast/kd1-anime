@@ -3410,6 +3410,11 @@ class Orchestrator:
 
         self._emit("plan_reviewing", scene_count=len(active_states))
         max_rounds = max(1, settings.MAX_PLAN_REVIEW_ROUNDS)
+        max_replans = max(1, settings.MAX_PLAN_REPLAN_ATTEMPTS)
+        # ``plan_review_round`` 描述当前这份计划的审查轮数；每次重规划
+        # 后它会归零。因此必须另行累计 Planner 调用次数，否则模型在
+        # 同一冲突上反复返回等价计划时，内层 while 永远不会结束。
+        replan_attempts: dict[int, int] = {}
         batch_results = self._run_plan_review_batch(
             ctx,
             [
@@ -3535,6 +3540,20 @@ class Orchestrator:
                     )
                     break
 
+                replan_count = replan_attempts.get(scene_id, 0)
+                if replan_count >= max_replans:
+                    self._plan_review_failure(
+                        ctx,
+                        scene_id,
+                        state,
+                        f"Scene {scene_id} 计划重规划已达到最大次数 {max_replans}，"
+                        f"仍未解决以下问题：{feedback}",
+                    )
+                    break
+                replan_attempts[scene_id] = replan_count + 1
+                ctx.continuity_warnings.append(
+                    f"Scene {scene_id} 计划重规划尝试 {replan_count + 1}/{max_replans}"
+                )
                 outline = next(item for item in ctx.outlines if item.scene_id == scene_id)
                 planner = PlannerAgent()
                 replan_kwargs: dict[str, object] = {

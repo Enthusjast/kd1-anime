@@ -337,6 +337,7 @@ Planner、Coder 或 Reviewer。
 | `WORKSPACE_DIR` | `~/.kd1-anime/workspace` | 运行、场景、日志、视频和评估产物根目录 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
 | `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
+| `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 同一场景计划反馈后的 Planner 重调用总次数，防止无限重规划 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 全片连续性审查发现冲突后的局部分镜重规划轮数 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 复杂几何方案审查耗尽后是否自动切换为保守教学方案 |
 | `MAX_IDENTICAL_REVIEW_ATTEMPTS` | `2` | 相同代码与审查反馈重复出现后的提前终止次数 |
