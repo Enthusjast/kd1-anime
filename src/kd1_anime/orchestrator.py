@@ -3445,7 +3445,6 @@ class Orchestrator:
                 for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
             ]
             ctx.continuity_review_status = "pending"
-            ctx.continuity_review_round = 0
         return changed
 
     def _normalize_transition_claim_contracts(self, ctx: PipelineContext) -> bool:
@@ -3497,7 +3496,6 @@ class Orchestrator:
         ]
         ctx.plan_review_status = "pending"
         ctx.continuity_review_status = "pending"
-        ctx.continuity_review_round = 0
         moved = [
             outline.scene_id
             for before, outline in zip(original_outlines, normalized_outlines, strict=True)

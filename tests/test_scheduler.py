@@ -1070,6 +1070,56 @@ def test_continuity_replan_passes_latest_neighbor_snapshot(monkeypatch, tmp_path
     assert all('"scene_id": 2' in context for context in planner.continuity_contexts)
 
 
+def test_continuity_replan_round_is_not_reset_by_contract_normalization(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    planner = ContinuityPlanner()
+
+    class AlwaysRejectingContinuityReviewer:
+        calls = 0
+
+        def review(self, *args, **kwargs):
+            self.calls += 1
+            return ContinuityReviewResult(
+                is_valid=False,
+                summary="仍需修正",
+                issues=[
+                    {
+                        "scene_ids": [1, 2],
+                        "category": "transition",
+                        "severity": "major",
+                        "message": "交接对象仍不一致",
+                        "fix_instruction": "统一交接对象",
+                    }
+                ],
+            )
+
+    continuity_reviewer = AlwaysRejectingContinuityReviewer()
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, planner=planner)
+    orchestrator.planner = planner
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", lambda: continuity_reviewer)
+    monkeypatch.setattr(settings, "MAX_CONTINUITY_FIX_ROUNDS", 1)
+
+    outlines = [make_outline(1), make_outline(2)]
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=outlines,
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="pending",
+        scene_states={
+            sid: SceneState(plan=planner.plan_detail(outline, outlines, "prompt"), plan_ready=True)
+            for sid, outline in enumerate(outlines, 1)
+        },
+    )
+
+    orchestrator._run_scheduler(ctx)
+
+    assert continuity_reviewer.calls == 2
+    assert ctx.continuity_review_round == 2
+    assert ctx.continuity_review_status == "warning"
+
+
 # ---------------------------------------------------------------------------
 # 8) _execute 端到端: dry-run 完整流水线 (init→outline→detail→code→review→DONE)
 # ---------------------------------------------------------------------------
