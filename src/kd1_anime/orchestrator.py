@@ -51,6 +51,7 @@ from kd1_anime.agents.planner import (
     LessonSpec,
     PlannerAgent,
     PlanningDraft,
+    SceneHandoff,
     SceneOutline,
     ScenePlan,
     TeachingGraph,
@@ -3274,9 +3275,88 @@ class Orchestrator:
             ]
             self._checkpoint(ctx, State.DETAILING)
 
+    def _normalize_scene_claim_contracts(self, ctx: PipelineContext) -> bool:
+        """删除 Detail 阶段擅自增加的数学断言引用。
+
+        概要阶段已经锁定了每个场景的 ``claim_ids``。Detail 模型有时会把
+        前置推导拆成 ``claim_4_derive_1`` 等新 ID，随后计划编译器会在
+        每一轮重复报告同一个错误。额外断言不是可由视觉合同推断的内容，
+        因而可以确定地从 ``math_claims`` 和时间线引用中删除；真正缺少
+        概要断言的情况仍由 Plan Reviewer 处理。
+        """
+
+        changed = False
+        for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id):
+            if (
+                state.failed
+                or state.give_up
+                or not state.plan_ready
+                or state.code
+                or state.rendered
+            ):
+                continue
+            allowed = set(state.plan.claim_ids)
+            extra_claims = [
+                claim.claim_id for claim in state.plan.math_claims if claim.claim_id not in allowed
+            ]
+            normalized_claims = [
+                claim for claim in state.plan.math_claims if claim.claim_id in allowed
+            ]
+            normalized_timeline = [
+                event.model_copy(
+                    update={
+                        "math_claim_ids": [
+                            claim_id for claim_id in event.math_claim_ids if claim_id in allowed
+                        ]
+                    }
+                )
+                if any(claim_id not in allowed for claim_id in event.math_claim_ids)
+                else event
+                for event in state.plan.timeline
+            ]
+            if not extra_claims and normalized_timeline == state.plan.timeline:
+                continue
+            state.plan = state.plan.model_copy(
+                update={
+                    "math_claims": normalized_claims,
+                    "timeline": normalized_timeline,
+                }
+            )
+            state.plan_reviewed = False
+            state.plan_review_round = 0
+            state.plan_review_feedback = ""
+            state.plan_review_signature = ""
+            state.identical_plan_review_count = 0
+            self._reset_technical_spec(state)
+            changed = True
+            if extra_claims:
+                ctx.continuity_warnings.append(
+                    f"Scene {state.plan.scene_id} 已删除 Detail 擅自增加的数学断言: "
+                    + ", ".join(sorted(extra_claims))
+                )
+            self._emit(
+                "plan_claim_contract_repaired",
+                scene_id=state.plan.scene_id,
+                removed_claim_ids=extra_claims,
+            )
+            self._write_stage_artifact(
+                ctx,
+                f"scene_{state.plan.scene_id}_plan.json",
+                {"schema_version": 1, "plan": state.plan.model_dump(mode="json")},
+            )
+        if changed:
+            ctx.scenes = [
+                state.plan
+                for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            ]
+            ctx.plan_review_status = "pending"
+            ctx.continuity_review_status = "pending"
+        return changed
+
     def _compile_scene_plans(self, ctx: PipelineContext) -> None:
         """在 LLM 计划审查前执行一次确定性计划编译。"""
 
+        claim_contracts_changed = self._normalize_scene_claim_contracts(ctx)
         transition_claims_changed = self._normalize_transition_claim_contracts(ctx)
         dangling_handoffs_changed = self._normalize_dangling_handoffs(ctx)
         timeline_changed = False
@@ -3311,7 +3391,12 @@ class Orchestrator:
                 scene_id=state.plan.scene_id,
                 repairs=repairs,
             )
-        if transition_claims_changed or dangling_handoffs_changed or timeline_changed:
+        if (
+            claim_contracts_changed
+            or transition_claims_changed
+            or dangling_handoffs_changed
+            or timeline_changed
+        ):
             ctx.plan_review_status = "pending"
             ctx.scenes = [
                 state.plan
@@ -3525,6 +3610,289 @@ class Orchestrator:
             for issue in issues
         )
 
+    def _repair_plan_handoff_issues(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+        issues: list[PlanReviewIssue],
+    ) -> list[str]:
+        """机械修复计划审查中可由 element_id 直接确定的交接问题。
+
+        Plan Reviewer 经常能够准确指出“某个 new_element 应该进入
+        handoff”，但 Planner 重规划时又把同一对象改回 optional，形成
+        ``review -> replan -> review`` 的无效往返。对于带有明确 element_id
+        和 handoff/inherited_elements 字段的问题，可以直接同步前后场景的
+        边界合同；数学内容和没有明确对象身份的语义问题仍交给 Planner。
+        """
+
+        if (
+            state.failed
+            or state.give_up
+            or state.code
+            or state.rendered
+            or state.slurm_job is not None
+        ):
+            return []
+        contract_issues = [
+            issue
+            for issue in issues
+            if issue.category == "contract"
+            and issue.field in {"handoff", "inherited_elements", "new_elements"}
+        ]
+        if not contract_issues:
+            return []
+
+        ordered_states = sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+        state_by_id = {item.plan.scene_id: item for item in ordered_states}
+        known_element_ids = {
+            item.element_id
+            for candidate in ordered_states
+            for element_group in (
+                candidate.plan.inherited_elements,
+                candidate.plan.elements_to_remove,
+                candidate.plan.new_elements,
+            )
+            for item in element_group
+        }
+        issue_text = "\n".join(
+            f"{issue.message}\n{issue.fix_instruction}" for issue in contract_issues
+        )
+        element_ids = [
+            element_id
+            for element_id in sorted(known_element_ids, key=lambda item: (-len(item), item))
+            if re.search(
+                rf"(?<![A-Za-z0-9_.-]){re.escape(element_id)}(?![A-Za-z0-9_.-])",
+                issue_text,
+            )
+        ]
+        if not element_ids:
+            return []
+
+        mentioned_scene_ids = {
+            int(value)
+            for value in re.findall(r"(?:场景|scene)\s*([0-9]+)", issue_text, re.IGNORECASE)
+        }
+        next_state = next(
+            (candidate for candidate in ordered_states if candidate.plan.scene_id > scene_id),
+            None,
+        )
+        target_state = next(
+            (
+                state_by_id[target_id]
+                for target_id in sorted(mentioned_scene_ids)
+                if target_id > scene_id and target_id in state_by_id
+            ),
+            None,
+        )
+        if target_state is None and (
+            next_state is not None
+            and any(
+                marker in issue_text
+                for marker in ("下一场景", "后续场景", "传递", "交接", "handoff")
+            )
+        ):
+            target_state = next_state
+
+        previous_state = state_by_id.get(scene_id - 1)
+        changed_states: set[int] = set()
+        repairs: list[str] = []
+
+        def find_element(plan: ScenePlan, element_id: str) -> tuple[str, VisualElementState] | None:
+            for group_name, elements in (
+                ("inherited_elements", plan.inherited_elements),
+                ("elements_to_remove", plan.elements_to_remove),
+                ("new_elements", plan.new_elements),
+            ):
+                for element in elements:
+                    if element.element_id == element_id:
+                        return group_name, element
+            return None
+
+        def replace_element(
+            plan: ScenePlan,
+            group_name: str,
+            element_id: str,
+            replacement: VisualElementState,
+        ) -> ScenePlan:
+            elements = list(getattr(plan, group_name))
+            for index, element in enumerate(elements):
+                if element.element_id == element_id:
+                    elements[index] = replacement
+                    return plan.model_copy(update={group_name: elements})
+            return plan
+
+        def upsert_handoff(
+            plan: ScenePlan,
+            element: VisualElementState,
+            action: str,
+        ) -> ScenePlan:
+            handoff = list(plan.handoff)
+            transition = (
+                f"Scene {plan.scene_id} {element.element_id} 已建立/接管，"
+                "在下一场景保持同一变量名和视觉状态"
+            )
+            candidate = SceneHandoff(
+                element_id=element.element_id,
+                variable_name=element.variable_name,
+                action=action,
+                semantic_state=element.semantic_state,
+                transition=transition,
+            )
+            for index, existing in enumerate(handoff):
+                if existing.element_id == element.element_id:
+                    if existing != candidate:
+                        handoff[index] = existing.model_copy(
+                            update={
+                                "variable_name": element.variable_name or existing.variable_name,
+                                "action": action,
+                                "semantic_state": (
+                                    element.semantic_state or existing.semantic_state
+                                ),
+                                "transition": existing.transition or transition,
+                            }
+                        )
+                    return plan.model_copy(update={"handoff": handoff})
+            handoff.append(candidate)
+            return plan.model_copy(update={"handoff": handoff})
+
+        def add_inherited(plan: ScenePlan, element: VisualElementState) -> ScenePlan:
+            existing = find_element(plan, element.element_id)
+            inherited = element.model_copy(update={"required": True})
+            if existing is not None:
+                group_name, current = existing
+                if group_name == "inherited_elements":
+                    aligned = current.model_copy(
+                        update={
+                            "required": True,
+                            "variable_name": element.variable_name or current.variable_name,
+                        }
+                    )
+                    return replace_element(plan, group_name, element.element_id, aligned)
+                return plan
+            return plan.model_copy(
+                update={"inherited_elements": [*plan.inherited_elements, inherited]}
+            )
+
+        def mark_boundary(state_to_update: SceneState, plan: ScenePlan) -> None:
+            if plan == state_to_update.plan:
+                return
+            state_to_update.plan = plan
+            changed_states.add(plan.scene_id)
+
+        for element_id in element_ids:
+            current_declaration = find_element(state.plan, element_id)
+            previous_declaration = (
+                find_element(previous_state.plan, element_id)
+                if previous_state is not None
+                else None
+            )
+
+            # 当前场景新建的元素：提升为边界对象，并同步到下一场景。
+            if current_declaration is not None and current_declaration[0] == "new_elements":
+                _, element = current_declaration
+                promoted = element.model_copy(update={"required": True})
+                current_plan = replace_element(
+                    state.plan,
+                    "new_elements",
+                    element_id,
+                    promoted,
+                )
+                if target_state is not None:
+                    current_plan = upsert_handoff(current_plan, promoted, "create")
+                    target_plan = add_inherited(target_state.plan, promoted)
+                    target_plan = upsert_handoff(target_plan, promoted, "keep")
+                    mark_boundary(target_state, target_plan)
+                    repairs.append(
+                        f"Scene {scene_id} 的 {element_id} 已提升为 required，并交接给 "
+                        f"Scene {target_state.plan.scene_id}"
+                    )
+                mark_boundary(state, current_plan)
+                continue
+
+            # 当前场景缺少但上一场景存在的元素：补齐上一场景导出、当前
+            # inherited 以及当前到下一场景的交接。
+            if previous_state is not None and previous_declaration is not None:
+                previous_group, previous_element = previous_declaration
+                promoted_previous = previous_element.model_copy(update={"required": True})
+                previous_plan = replace_element(
+                    previous_state.plan,
+                    previous_group,
+                    element_id,
+                    promoted_previous,
+                )
+                previous_plan = upsert_handoff(
+                    previous_plan,
+                    promoted_previous,
+                    "create" if previous_group == "new_elements" else "keep",
+                )
+                mark_boundary(previous_state, previous_plan)
+
+                current_plan = add_inherited(state.plan, promoted_previous)
+                current_element = find_element(current_plan, element_id)
+                if current_element is not None:
+                    current_plan = upsert_handoff(current_plan, current_element[1], "keep")
+                if target_state is not None:
+                    target_plan = add_inherited(target_state.plan, promoted_previous)
+                    target_element = find_element(target_plan, element_id)
+                    if target_element is not None:
+                        target_plan = upsert_handoff(target_plan, target_element[1], "keep")
+                    mark_boundary(target_state, target_plan)
+                mark_boundary(state, current_plan)
+                repairs.append(
+                    f"已将上一场景的 {element_id} 补入 Scene {scene_id} 的 inherited_elements"
+                )
+
+        if not changed_states:
+            return []
+
+        # 让刚补齐的上一场景声明成为后继场景的唯一来源，并吸收
+        # required/handoff 的机械字段修复；不改写视觉和数学创作内容。
+        normalization_scope = {scene_id}
+        if target_state is not None:
+            normalization_scope.add(target_state.plan.scene_id)
+        for candidate in ordered_states:
+            if candidate.plan.scene_id not in changed_states | normalization_scope:
+                continue
+            previous = state_by_id.get(candidate.plan.scene_id - 1)
+            normalized, contract_repairs = normalize_scene_plan_contract(
+                candidate.plan,
+                ctx.continuity_bible or ContinuityBible(),
+                previous_plan=previous.plan if previous is not None else None,
+                has_next_scene=any(
+                    item.plan.scene_id > candidate.plan.scene_id for item in ordered_states
+                ),
+            )
+            if normalized != candidate.plan:
+                candidate.plan = normalized
+                changed_states.add(candidate.plan.scene_id)
+            repairs.extend(
+                f"Scene {candidate.plan.scene_id} 合同规范：{repair}" for repair in contract_repairs
+            )
+
+        with self._state_lock:
+            for changed_scene_id in changed_states:
+                changed_state = state_by_id[changed_scene_id]
+                changed_state.plan_reviewed = False
+                changed_state.plan_review_round = 0
+                changed_state.plan_review_feedback = ""
+                changed_state.plan_review_signature = ""
+                changed_state.identical_plan_review_count = 0
+                self._reset_technical_spec(changed_state)
+                self._write_stage_artifact(
+                    ctx,
+                    f"scene_{changed_scene_id}_plan.json",
+                    {
+                        "schema_version": 1,
+                        "plan": changed_state.plan.model_dump(mode="json"),
+                    },
+                )
+            ctx.scenes = [candidate.plan for candidate in ordered_states]
+            ctx.plan_review_status = "pending"
+            ctx.continuity_review_status = "pending"
+            self._checkpoint(ctx, State.PLAN_REVIEWING)
+        return repairs
+
     def _plan_review_failure(
         self,
         ctx: PipelineContext,
@@ -3599,7 +3967,12 @@ class Orchestrator:
             ctx.continuity_warnings.append(f"批量计划审查失败，已回退逐场景审查: {exc}")
             return {}
 
-    def _run_plan_review_barrier(self, ctx: PipelineContext) -> None:
+    def _run_plan_review_barrier(
+        self,
+        ctx: PipelineContext,
+        *,
+        _mechanical_restart_count: int = 0,
+    ) -> None:
         """在 Coder 前逐场景审查计划，阻断不可实现或数学错误的方案。"""
 
         active_states = [
@@ -3626,6 +3999,7 @@ class Orchestrator:
                 if state.plan_review_round == 0
             ],
         )
+        restart_required = False
         for scene_id, state in sorted(ctx.scene_states.items()):
             if state.failed or state.give_up or not state.plan_ready or state.plan_reviewed:
                 continue
@@ -3710,6 +4084,26 @@ class Orchestrator:
                     break
 
                 feedback = self._plan_review_feedback(issues)
+                mechanical_repairs = self._repair_plan_handoff_issues(
+                    ctx,
+                    scene_id,
+                    state,
+                    issues,
+                )
+                if mechanical_repairs:
+                    ctx.continuity_warnings.append(
+                        f"Scene {scene_id} 计划审查后自动修复交接合同："
+                        + "；".join(mechanical_repairs)
+                    )
+                    self._emit(
+                        "continuity_contract_repaired",
+                        scene_id=scene_id,
+                        repairs=mechanical_repairs,
+                    )
+                    self._compile_scene_plans(ctx)
+                    batch_results.clear()
+                    restart_required = True
+                    break
                 signature = sha256_text(
                     state.plan.model_dump_json() + "\n--- plan review ---\n" + feedback
                 )[:16]
@@ -3878,8 +4272,26 @@ class Orchestrator:
             if state.failed:
                 break
 
+            if restart_required:
+                break
+
         if self._stop_event.is_set() or ctx.continuity_rebuild_required:
             return
+        if restart_required:
+            # 机械交接修复可能同时修改上一场景或下一场景；不能让当前
+            # for 循环跳过这些已经被标记为 plan_reviewed=False 的计划，
+            # 否则代码屏障会在它们未经复审时继续执行。
+            if _mechanical_restart_count >= 3:
+                reason = "计划交接的机械修复未能在有限轮次内收敛"
+                with self._state_lock:
+                    ctx.plan_review_status = "failed"
+                    ctx.continuity_warnings.append(reason)
+                    self._checkpoint(ctx, State.PLAN_REVIEWING)
+                return
+            return self._run_plan_review_barrier(
+                ctx,
+                _mechanical_restart_count=_mechanical_restart_count + 1,
+            )
         failed = any(state.failed for state in ctx.scene_states.values() if state.plan_ready)
         with self._state_lock:
             ctx.plan_review_status = "failed" if failed else "passed"

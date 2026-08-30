@@ -15,6 +15,7 @@ from kd1_anime.agents.planner import (
     SceneOutline,
     ScenePlan,
     TeachingGraph,
+    TimelineEvent,
     VisualElementState,
 )
 from kd1_anime.agents.reviewer import ReviewResult
@@ -1406,6 +1407,213 @@ class Demo(Scene):
     assert generated == code
     assert class_name == "Demo"
     assert coder.calls == 1
+
+
+def test_plan_review_repairs_explicit_handoff_ids_across_neighboring_scenes(monkeypatch, tmp_path):
+    p1 = plan().model_copy(
+        update={
+            "scene_id": 1,
+            "new_elements": [
+                VisualElementState(
+                    element_id="function_label",
+                    variable_name="function_label",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p2 = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [],
+            "new_elements": [
+                VisualElementState(
+                    element_id="tangent_plane_surface",
+                    variable_name="tangent_plane_surface",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p3 = plan().model_copy(update={"scene_id": 3, "new_elements": []})
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=p1, plan_ready=True),
+            2: SceneState(plan=p2, plan_ready=True),
+            3: SceneState(plan=p3, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    issues = [
+        PlanReviewIssue(
+            category="contract",
+            field="handoff",
+            message=(
+                "tangent_plane_surface 未列入 handoff，应传递给场景3；"
+                "function_label 需要从场景1继承并传递给场景3。"
+            ),
+            fix_instruction="将两个元素标记为 required，并补充 handoff。",
+        )
+    ]
+
+    repairs = orchestrator._repair_plan_handoff_issues(
+        ctx,
+        2,
+        ctx.scene_states[2],
+        issues,
+    )
+
+    assert repairs
+    assert any(
+        item.element_id == "function_label" and item.required
+        for item in ctx.scene_states[1].plan.new_elements
+    )
+    assert any(
+        item.element_id == "function_label" and item.action == "create"
+        for item in ctx.scene_states[1].plan.handoff
+    )
+    assert any(
+        item.element_id == "tangent_plane_surface" and item.required
+        for item in ctx.scene_states[2].plan.new_elements
+    )
+    assert {item.element_id for item in ctx.scene_states[3].plan.inherited_elements} >= {
+        "function_label",
+        "tangent_plane_surface",
+    }
+
+
+def test_compile_scene_plans_removes_extra_detail_claims(monkeypatch, tmp_path):
+    scene_plan = plan().model_copy(
+        update={
+            "claim_ids": ["claim_1"],
+            "math_claims": [
+                MathClaim(claim_id="claim_1", statement="x=x"),
+                MathClaim(claim_id="claim_1_extra", statement="x+1=x+1"),
+            ],
+            "timeline": [
+                TimelineEvent(
+                    event_id="show",
+                    start_seconds=0,
+                    end_seconds=10,
+                    action="展示",
+                    math_claim_ids=["claim_1", "claim_1_extra"],
+                )
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        continuity_bible=ContinuityBible(),
+        scene_states={1: SceneState(plan=scene_plan, plan_ready=True)},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    assert orchestrator._normalize_scene_claim_contracts(ctx) is True
+    assert [claim.claim_id for claim in ctx.scene_states[1].plan.math_claims] == ["claim_1"]
+    assert ctx.scene_states[1].plan.timeline[0].math_claim_ids == ["claim_1"]
+
+
+def test_plan_review_revisits_neighbors_after_mechanical_handoff_repair(monkeypatch, tmp_path):
+    boundary = {
+        "opening_state": ["对象进入画面"],
+        "closing_state": ["对象保留到场景结束"],
+        "transition_in": "对象从上一状态接入",
+        "transition_out": "对象交给下一场景",
+    }
+    p1 = plan().model_copy(
+        update={
+            "scene_id": 1,
+            **boundary,
+            "new_elements": [
+                VisualElementState(
+                    element_id="function_label",
+                    variable_name="function_label",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p2 = plan().model_copy(
+        update={
+            "scene_id": 2,
+            **boundary,
+            "new_elements": [
+                VisualElementState(
+                    element_id="tangent_plane_surface",
+                    variable_name="tangent_plane_surface",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p3 = plan().model_copy(update={"scene_id": 3, **boundary, "new_elements": []})
+    outlines = [
+        SceneOutline(
+            scene_id=scene_id,
+            title=f"Scene {scene_id}",
+            duration_seconds=10,
+            purpose="test",
+            math_concept="test",
+        )
+        for scene_id in (1, 2, 3)
+    ]
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        outlines=outlines,
+        continuity_bible=ContinuityBible(),
+        plan_review_status="pending",
+        continuity_review_status="passed",
+        scene_states={
+            1: SceneState(plan=p1, plan_ready=True),
+            2: SceneState(plan=p2, plan_ready=True),
+            3: SceneState(plan=p3, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+
+    class Reviewer:
+        def __init__(self):
+            self.calls = []
+
+        def review(self, current_plan, **kwargs):
+            self.calls.append(current_plan.scene_id)
+            if current_plan.scene_id == 2 and self.calls.count(2) == 1:
+                return PlanReviewResult(
+                    is_valid=False,
+                    severity="major",
+                    issues=[
+                        {
+                            "category": "contract",
+                            "field": "handoff",
+                            "message": (
+                                "tangent_plane_surface 未列入 handoff，应传递给场景3；"
+                                "function_label 需要从场景1继承并传递给场景3。"
+                            ),
+                            "fix_instruction": "将两个元素标记为 required，并补充 handoff。",
+                        }
+                    ],
+                )
+            return PlanReviewResult(is_valid=True, severity="info")
+
+    reviewer = Reviewer()
+    monkeypatch.setattr(module, "PlanReviewerAgent", lambda: reviewer)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert reviewer.calls.count(1) == 2
+    assert reviewer.calls.count(2) == 2
+    assert reviewer.calls.count(3) == 1
+    assert ctx.plan_review_status == "passed"
+    assert all(state.plan_reviewed for state in ctx.scene_states.values())
 
 
 def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path):
