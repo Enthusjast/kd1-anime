@@ -406,6 +406,7 @@ class CoderAgent(BaseAgent):
         response = self.call_llm(
             system_prompt=build_coder_system_prompt(renderer),
             user_message=user_msg,
+            max_tokens=settings.LLM_CODE_MAX_TOKENS,
             stream=stream,
         )
         extracted = self._extract_code_block(response)

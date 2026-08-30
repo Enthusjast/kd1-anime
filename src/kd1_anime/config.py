@@ -221,6 +221,13 @@ class Settings(BaseSettings):
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int | None = Field(default=32768, ge=1, le=1_000_000)
+    # 不同阶段的输出复杂度差异很大。默认使用较小的阶段预算，避免计划
+    # 审查/连续性审查为极短 JSON 消耗与代码生成相同的长推理预算；用户
+    # 仍可按模型能力覆盖这些值，LLM_MAX_TOKENS 保留为总配置兼容项。
+    LLM_PLANNING_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
+    LLM_TECHNICAL_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
+    LLM_CODE_MAX_TOKENS: int = Field(default=24576, ge=4096, le=1_000_000)
+    LLM_REVIEW_MAX_TOKENS: int = Field(default=8192, ge=2048, le=1_000_000)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     # 单次 LLM 请求的连接/读取超时(秒)。读取超时对非流式是"等待完整响应"，
     # 对流式是"等待下一个 chunk"——静默流式下 600s 只是兜底，不会拖慢任何请求。

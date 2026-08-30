@@ -1669,6 +1669,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             response_model=PlanningDraft,
+            max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
             stream=False,
         )
         normalized = self._normalize_draft(draft, user_prompt)
@@ -1721,6 +1722,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             item_model=SceneOutline,
+            max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
         )
         # LLM 可能产生重复、跳号或从 0 开始的 ID。内部文件和状态机必须使用
         # 稳定、连续的 1..N ID，因此按叙事顺序统一规范化。
@@ -1813,6 +1815,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             response_model=ContinuityBible,
+            max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
             stream=stream,
         )
         return detail
@@ -1981,6 +1984,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             response_model=SceneDetail,
+            max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
             stream=stream,
         )
         plan = ScenePlan(

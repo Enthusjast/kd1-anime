@@ -949,6 +949,7 @@ class TechnicalPlannerAgent(BaseAgent):
             system_prompt=f"{TECHNICAL_PLANNER_SYSTEM_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,
             response_model=TechnicalSpec,
+            max_tokens=settings.LLM_TECHNICAL_MAX_TOKENS,
             stream=stream,
         )
         if renderer is not None and spec.renderer != renderer:

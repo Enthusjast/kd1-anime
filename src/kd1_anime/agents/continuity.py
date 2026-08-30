@@ -1976,6 +1976,7 @@ class ContinuityReviewerAgent(BaseAgent):
             system_prompt=f"{CONTINUITY_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,
             response_model=ContinuityReviewResult,
+            max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
             stream=stream,
             allow_truncated=True,
         )

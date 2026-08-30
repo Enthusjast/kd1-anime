@@ -94,6 +94,23 @@ def test_json_list_rejects_partially_invalid_output():
         StubListAgent().call_llm_json_list("system", "user", PositiveResult)
 
 
+def test_json_list_forwards_stage_token_budget():
+    class CaptureListAgent(BaseAgent):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def call_llm(self, **kwargs):
+            self.calls.append(kwargs)
+            return '{"items":[{"value":1}]}'
+
+    agent = CaptureListAgent()
+    result = agent.call_llm_json_list("system", "user", PositiveResult, max_tokens=1234)
+
+    assert result[0].value == 1
+    assert agent.calls[0]["max_tokens"] == 1234
+
+
 def test_stream_is_closed_when_iteration_fails():
     class BrokenStream:
         def __init__(self):

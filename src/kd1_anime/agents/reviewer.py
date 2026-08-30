@@ -476,6 +476,7 @@ class ReviewerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_message=user_message,
                 response_model=ReviewResult,
+                max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 allow_truncated=True,
             )
         except TruncatedResponseError:
@@ -495,6 +496,7 @@ class ReviewerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_message=user_message,
                 response_model=ReviewResult,
+                max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 allow_truncated=True,
             )
         protocol_errors = validate_review_evidence(result, code)
@@ -521,6 +523,7 @@ class ReviewerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_message=user_message,
                 response_model=ReviewResult,
+                max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 allow_truncated=True,
             )
             protocol_errors = validate_review_evidence(result, code)

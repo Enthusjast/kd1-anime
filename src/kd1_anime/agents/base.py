@@ -810,6 +810,7 @@ class BaseAgent:
         item_model: type[T],
         temperature: float | None = None,
         *,
+        max_tokens: int | None = None,
         allow_truncated: bool = False,
     ) -> list[T]:
         """
@@ -828,6 +829,7 @@ class BaseAgent:
                 "system_prompt": system_prompt,
                 "user_message": current_message,
                 "temperature": temp,
+                "max_tokens": max_tokens,
                 "json_mode": True,
             }
             if getattr(type(self), "call_llm", None) is BaseAgent.call_llm:

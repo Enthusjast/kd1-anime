@@ -324,6 +324,7 @@ class AutoFixerAgent(BaseAgent):
                 )
             ),
             user_message=user_msg,
+            max_tokens=settings.LLM_CODE_MAX_TOKENS,
             stream=False,
         )
 

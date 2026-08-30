@@ -168,6 +168,10 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_SILENT_STREAM is True
     assert config.LLM_HEALTHCHECK_TIMEOUT == 15.0
     assert config.LLM_MAX_TOKENS == 32768
+    assert config.LLM_PLANNING_MAX_TOKENS == 16384
+    assert config.LLM_TECHNICAL_MAX_TOKENS == 16384
+    assert config.LLM_CODE_MAX_TOKENS == 24576
+    assert config.LLM_REVIEW_MAX_TOKENS == 8192
     assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
     assert config.LLM_CACHE_ENABLED is True
     assert config.LLM_CACHE_MAX_ENTRIES == 512

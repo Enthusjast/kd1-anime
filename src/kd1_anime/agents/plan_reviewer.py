@@ -629,6 +629,7 @@ class PlanReviewerAgent(BaseAgent):
             system_prompt=f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,
             response_model=PlanReviewResult,
+            max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
             stream=False,
             allow_truncated=True,
         )
@@ -732,6 +733,7 @@ class PlanReviewerAgent(BaseAgent):
             system_prompt=f"{PLAN_REVIEW_BATCH_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,
             item_model=PlanReviewBatchItem,
+            max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
             allow_truncated=True,
         )
         expected = {plan.scene_id for plan in ordered}
