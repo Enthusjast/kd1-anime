@@ -87,6 +87,8 @@ _EXPORT_PURE_MOBJECT_METHODS = {
     "get_family",
     "get_height",
     "get_left",
+    "get_part_by_tex",
+    "get_parts_by_tex",
     "get_right",
     "get_start",
     "get_top",
@@ -125,6 +127,18 @@ _SAFE_EXPORT_CONTEXT_NAMES = {
     "list",
 }
 
+# 这些配置变量即使偶尔被模型误放进 marker，也不能被当作跨场景
+# Mobject 导出。它们属于每个场景都会重新建立的运行时上下文；导出区
+# 只应携带可交接的视觉对象和为其服务的局部 helper。
+_EXPORT_CONTEXT_ASSIGN_NAMES = {
+    "COLORS",
+    "FONTS",
+    "FONT_SIZES",
+    "STROKE_WIDTHS",
+    "LAYOUT_ANCHORS",
+    "tex_template",
+}
+
 
 def _call_name(node: ast.Call) -> str:
     function = node.func
@@ -136,12 +150,87 @@ def _call_name(node: ast.Call) -> str:
 
 
 def _receiver_name(node: ast.AST) -> str:
-    """返回 Mobject 链式调用最左侧的变量名。"""
+    """返回 Mobject 链式调用最左侧的变量名。
+
+    ``MathTex(...).get_part_by_tex(...).set_color(...)`` 是 Coder 为公式
+    子串着色时的常见写法。旧实现只沿着 ``Attribute``/``Subscript`` 向
+    左查找，遇到中间的 ``Call`` 就返回空字符串，误把一个已定义的
+    Mobject 判成“未定义 receiver”。调用链仍然必须最终落到一个已定义
+    的变量，不能借此放行独立构造器或任意函数。
+    """
 
     current = node
-    while isinstance(current, (ast.Attribute, ast.Subscript)):
-        current = current.value
+    while True:
+        if isinstance(current, (ast.Attribute, ast.Subscript)):
+            current = current.value
+            continue
+        if isinstance(current, ast.Call):
+            function = current.func
+            if isinstance(function, ast.Attribute):
+                current = function.value
+                continue
+            # ``factory().set_color()`` 的根对象不是一个已知变量；让
+            # 调用方按未定义 receiver 拒绝它。
+            return ""
+        break
     return current.id if isinstance(current, ast.Name) else ""
+
+
+def _is_static_export_literal(node: ast.AST) -> bool:
+    """判断配置赋值是否只包含静态字面量。"""
+
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        return all(_is_static_export_literal(item) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(key is not None and _is_static_export_literal(key) for key in node.keys) and all(
+            _is_static_export_literal(value) for value in node.values
+        )
+    return False
+
+
+def _is_export_context_assignment(statement: ast.stmt) -> bool:
+    """识别误放在导出区的安全视觉/LaTeX 上下文赋值。"""
+
+    if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+        return False
+    target = statement.targets[0]
+    if not isinstance(target, ast.Name) or target.id not in _EXPORT_CONTEXT_ASSIGN_NAMES:
+        return False
+    value = statement.value
+    if target.id == "tex_template":
+        if not isinstance(value, ast.Call) or _call_name(value) != "TexTemplate":
+            return False
+        try:
+            _validate_export_expression(
+                statement,
+                set(_SAFE_EXPORT_CONTEXT_NAMES),
+                "tex_template",
+            )
+        except ValueError:
+            return False
+        return True
+    return _is_static_export_literal(value)
+
+
+def _without_export_context_assignments(block: str) -> str:
+    """从 marker 代码中移除配置赋值，同时保留行号和其余源码。"""
+
+    try:
+        tree = ast.parse(block)
+    except SyntaxError:
+        return block
+    lines = block.splitlines()
+    for statement in tree.body:
+        if not _is_export_context_assignment(statement):
+            continue
+        start = statement.lineno - 1
+        end = statement.end_lineno or statement.lineno
+        for index in range(start, end):
+            if 0 <= index < len(lines):
+                lines[index] = ""
+    return "\n".join(lines).strip()
 
 
 def _validate_export_expression(statement: ast.AST, defined: set[str], label: str) -> None:
@@ -306,6 +395,12 @@ def _parse_export_block(
         raise ValueError("连续性导出区标记不成对或顺序错误")
     block_lines = lines[begin[0] + 1 : end[0]]
     block = textwrap.dedent("\n".join(block_lines)).strip()
+    if not block:
+        return prefix_code, []
+    # Coder 偶尔会把 TexTemplate/颜色字典初始化也包进 marker。它们是
+    # 当前场景的上下文而不是可交接对象：校验时允许其存在，但不把它们
+    # 作为元素，也不把配置源码复制到下一场景。
+    block = _without_export_context_assignments(block)
     if not block:
         return prefix_code, []
     full_block = "\n\n".join(item for item in (prefix_code, block) if item)
@@ -535,6 +630,9 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
             if len(targets) != 1 or not isinstance(targets[0], ast.Name):
                 continue
             variable_name = targets[0].id
+            if _is_export_context_assignment(statement):
+                bound_names.add(variable_name)
+                continue
             # 只把首字母大写的 Manim 构造器视为候选，避免把普通数值中间变量
             # 注入下一场景；完整安全性仍由 validate_manim_code 负责。
             if not constructor[0].isupper():
@@ -555,6 +653,52 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
     for item in candidates:
         unique[item.element_id] = item
     return "\n".join(item.code for item in unique.values()), list(unique.values())
+
+
+def extract_scene_continuity_elements(
+    code: str,
+    plan: ScenePlan,
+) -> tuple[str, list[ExtractedElement]]:
+    """按当前场景的边界合同提取可交接对象。
+
+    没有必需边界元素的结构化计划，表示本场景结束时不向下一场景交接
+    Mobject。对这类场景，未带 marker 的旧式代码不能再把 ``tex_template``、
+    中间公式等所有构造器误判为导出对象；它们都是场景内部实现，直接返回
+    空交接。若模型把已经声明为 optional 的对象误放进 marker，也将其视为
+    场景内部实现并丢弃导出结果；未知对象、已移除对象仍严格报错，避免
+    真正的合同冲突被静默传播。
+
+    没有任何结构化元素合同的旧计划继续使用原有 AST 降级路径，以保持
+    兼容性。
+    """
+
+    has_structured_contract = bool(
+        plan.inherited_elements or plan.new_elements or plan.elements_to_remove or plan.handoff
+    )
+    required_ids = {
+        item.element_id
+        for item in [*plan.inherited_elements, *plan.new_elements]
+        if item.required
+        and item.element_id not in {removed.element_id for removed in plan.elements_to_remove}
+    }
+    has_markers = CONTINUITY_EXPORT_BEGIN in code or CONTINUITY_EXPORT_END in code
+    if has_structured_contract and not required_ids and not has_markers:
+        return "", []
+
+    exported_code, elements = extract_continuity_elements(code)
+    if has_structured_contract and not required_ids:
+        declared_by_id = {
+            item.element_id: item
+            for item in [*plan.inherited_elements, *plan.new_elements]
+            if item.element_id not in {removed.element_id for removed in plan.elements_to_remove}
+        }
+        if all(
+            (declared := declared_by_id.get(item.element_id)) is not None and not declared.required
+            for item in elements
+        ):
+            return "", []
+    validate_export_contract(plan, elements)
+    return exported_code, elements
 
 
 def validate_export_contract(

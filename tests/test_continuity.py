@@ -13,6 +13,7 @@ from kd1_anime.agents.continuity import (
     apply_deterministic_continuity_repairs,
     deterministic_continuity_issues,
     extract_continuity_elements,
+    extract_scene_continuity_elements,
     normalize_scene_plan_contract,
     validate_export_contract,
 )
@@ -264,13 +265,15 @@ def test_extract_continuity_elements_without_marker_uses_safe_fallback():
 from manim import *
 class Demo(Scene):
     def construct(self):
-        formula = MathTex(r"x^2")
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        formula = MathTex(r"x^2", tex_template=tex_template)
         self.play(Write(formula))
 """
 
     exported_code, elements = extract_continuity_elements(code)
 
     assert "formula = MathTex" in exported_code
+    assert "tex_template =" not in exported_code
     assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
 
 
@@ -323,6 +326,114 @@ class Demo(Scene):
     assert 'A_BLUE = "#123456"' in exported_code
     assert elements[0].element_id == "title"
     assert "title.to_edge(UP)" in elements[0].code
+
+
+def test_extract_continuity_elements_accepts_tex_subpart_styling():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = MathTex(r"a+b")
+        formula.get_part_by_tex("a").set_color(BLUE)
+        formula.get_part_by_tex("b").set_color(RED)
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    exported_code, elements = extract_continuity_elements(code)
+
+    assert "get_part_by_tex" in exported_code
+    assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
+
+
+def test_extract_continuity_elements_drops_context_assignments_from_marker():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        COLORS = {"primary": "#123456"}
+        # element_id: formula
+        formula = MathTex(r"x^2", tex_template=tex_template, color=COLORS["primary"])
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    exported_code, elements = extract_continuity_elements(code)
+
+    assert "tex_template =" not in exported_code
+    assert "COLORS =" not in exported_code
+    assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
+
+
+def test_extract_scene_continuity_elements_ignores_unmarked_internal_objects_without_exports():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_formula",
+                    variable_name="temporary_formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        temporary_formula = MathTex(r"x^2", tex_template=tex_template)
+        self.play(Write(temporary_formula))
+"""
+
+    exported_code, elements = extract_scene_continuity_elements(code, plan)
+
+    assert exported_code == ""
+    assert elements == []
+
+
+def test_extract_scene_continuity_elements_drops_declared_optional_marker_objects():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_formula",
+                    variable_name="temporary_formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: temporary_formula
+        temporary_formula = MathTex(r"x^2")
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    exported_code, elements = extract_scene_continuity_elements(code, plan)
+
+    assert exported_code == ""
+    assert elements == []
+
+
+def test_extract_scene_continuity_elements_keeps_legacy_fallback_without_contract():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x^2")
+"""
+
+    exported_code, elements = extract_scene_continuity_elements(code, make_plan(1))
+
+    assert "formula = MathTex" in exported_code
+    assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
 
 
 def test_extract_continuity_elements_rejects_non_whitelisted_local_method():

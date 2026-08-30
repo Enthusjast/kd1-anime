@@ -30,9 +30,8 @@ from kd1_anime.agents.continuity import (
     ContinuityReviewerAgent,
     apply_deterministic_continuity_repairs,
     deterministic_continuity_issues,
-    extract_continuity_elements,
+    extract_scene_continuity_elements,
     normalize_scene_plan_contract,
-    validate_export_contract,
 )
 from kd1_anime.agents.lifecycle import validate_animation_lifecycle
 from kd1_anime.agents.plan_compiler import PlanCompiler, normalize_scene_timeline_contract
@@ -1111,8 +1110,7 @@ class Orchestrator:
             validation = self._validate(code, renderer=renderer)
             continuity_error = ""
             try:
-                _, exported_elements = extract_continuity_elements(code)
-                validate_export_contract(plan, exported_elements)
+                extract_scene_continuity_elements(code, plan)
             except ValueError as exc:
                 continuity_error = str(exc)
             lifecycle_error = ""
@@ -1134,6 +1132,12 @@ class Orchestrator:
             if continuity_error:
                 feedback_parts.append(
                     "\n连续性导出合同校验未通过，必须修复以下问题：\n- " + continuity_error
+                )
+                feedback_parts.append(
+                    "\n导出区修复规则：只允许导出 required=true 的边界元素；"
+                    "required=false 的对象只能作为场景内部对象，不能出现在 marker 内。"
+                    "如果没有 required=true 元素，保留空的导出区或删除 marker；"
+                    "tex_template/COLORS/FONTS 等场景上下文必须放在 marker 之前。\n"
                 )
             if lifecycle_error:
                 feedback_parts.append(
@@ -4524,7 +4528,10 @@ class Orchestrator:
             for item in previous.exported_elements
         )
         if previous.code and (not previous.exported_elements_code or not export_hashes_match):
-            exported_code, exported_elements = extract_continuity_elements(previous.code)
+            exported_code, exported_elements = extract_scene_continuity_elements(
+                previous.code,
+                previous.plan,
+            )
             previous.exported_elements_code = exported_code
             previous.exported_elements = [
                 item.model_copy(
@@ -4574,8 +4581,10 @@ class Orchestrator:
     def _refresh_scene_export(state: SceneState) -> None:
         """从审查通过的最终代码提取下一场景可复用的纯定义。"""
 
-        exported_code, exported_elements = extract_continuity_elements(state.code)
-        validate_export_contract(state.plan, exported_elements)
+        exported_code, exported_elements = extract_scene_continuity_elements(
+            state.code,
+            state.plan,
+        )
         state.exported_elements_code = exported_code
         code_hash = sha256_text(state.code)
         state.exported_elements = [
@@ -4805,8 +4814,7 @@ class Orchestrator:
             # 导出区是确定性的交接合同。先校验再调用 Reviewer，避免把重复
             # 导出标记、缺失元素等可直接修复的问题交给 LLM，尤其避免长上下文
             # 让 Reviewer 输出被截断。
-            _, exported_elements = extract_continuity_elements(state.code)
-            validate_export_contract(state.plan, exported_elements)
+            extract_scene_continuity_elements(state.code, state.plan)
             if state.technical_spec is not None:
                 lifecycle_result = validate_animation_lifecycle(
                     state.code,
@@ -5284,8 +5292,7 @@ class Orchestrator:
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             continuity_error = ""
             try:
-                _, exported_elements = extract_continuity_elements(candidate)
-                validate_export_contract(state.plan, exported_elements)
+                extract_scene_continuity_elements(candidate, state.plan)
             except ValueError as exc:
                 continuity_error = str(exc)
             lifecycle_error = ""

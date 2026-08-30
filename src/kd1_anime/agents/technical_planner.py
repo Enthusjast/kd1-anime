@@ -379,6 +379,82 @@ def normalize_technical_spec_contract(
         repairs.append("removed_element_ids 已与 ScenePlan.elements_to_remove 对齐")
 
     inherited_ids = {item.element_id for item in plan.inherited_elements}
+    declared_object_ids = (
+        inherited_ids | {item.element_id for item in plan.new_elements} | set(expected_removed)
+    )
+    has_structured_contract = bool(
+        plan.inherited_elements or plan.new_elements or plan.elements_to_remove or plan.handoff
+    )
+    unknown_object_ids = (
+        {item.element_id for item in spec.objects} - declared_object_ids
+        if has_structured_contract
+        else set()
+    )
+    normalized_objects = list(spec.objects)
+    if unknown_object_ids:
+        normalized_objects = []
+        dropped_dependencies = False
+        for item in spec.objects:
+            if item.element_id in unknown_object_ids:
+                continue
+            dependencies = [
+                dependency
+                for dependency in item.dependencies
+                if dependency not in unknown_object_ids
+            ]
+            normalized_item = item
+            if dependencies != item.dependencies:
+                normalized_item = item.model_copy(update={"dependencies": dependencies})
+                dropped_dependencies = True
+            normalized_objects.append(normalized_item)
+        updates["objects"] = normalized_objects
+        repairs.append(
+            "删除 TechnicalSpec 中未在 ScenePlan 声明的对象: "
+            + ", ".join(sorted(unknown_object_ids))
+        )
+        if dropped_dependencies:
+            repairs.append("删除对象依赖中的过期 element_id")
+
+        normalized_animations = []
+        for event in spec.animations:
+            event_updates: dict[str, object] = {}
+            for field_name in (
+                "source_element_ids",
+                "target_element_ids",
+                "create_element_ids",
+                "remove_element_ids",
+            ):
+                values = getattr(event, field_name)
+                filtered = [value for value in values if value not in unknown_object_ids]
+                if filtered != values:
+                    event_updates[field_name] = filtered
+            normalized_event = event.model_copy(update=event_updates) if event_updates else event
+            referenced_ids = {
+                element_id
+                for field_name in (
+                    "source_element_ids",
+                    "target_element_ids",
+                    "create_element_ids",
+                    "remove_element_ids",
+                )
+                for element_id in getattr(normalized_event, field_name)
+            }
+            if event_updates and not referenced_ids and normalized_event.operation != "wait":
+                normalized_event = normalized_event.model_copy(
+                    update={
+                        "operation": "wait",
+                        "api_notes": _append_api_repair_note(
+                            normalized_event.api_notes,
+                            "过期对象已移除，该事件按空操作处理",
+                        ),
+                    }
+                )
+            if event_updates:
+                repairs.append(f"事件 {event.event_id} 删除过期对象引用")
+            normalized_animations.append(normalized_event)
+        updates["animations"] = normalized_animations
+
+    objects_to_normalize = normalized_objects
     normalized_objects = []
     object_changed = False
     expected_exports = [
@@ -389,7 +465,7 @@ def normalize_technical_spec_contract(
     if spec.export_element_ids != expected_exports:
         updates["export_element_ids"] = expected_exports
         repairs.append("export_element_ids 已与计划中的必需边界元素对齐")
-    for item in spec.objects:
+    for item in objects_to_normalize:
         expected_active = item.element_id in inherited_ids
         expected_exported = item.element_id in expected_exports
         item_updates: dict[str, object] = {}
@@ -403,7 +479,7 @@ def normalize_technical_spec_contract(
         else:
             normalized_item = item
         normalized_objects.append(normalized_item)
-    if object_changed:
+    if object_changed or unknown_object_ids:
         updates["objects"] = normalized_objects
         repairs.append("对象的 initially_active/exported 已与场景边界合同对齐")
     if renderer is not None and spec.renderer != renderer:
@@ -472,6 +548,17 @@ def compile_technical_spec(
             + ", ".join(sorted(invalid_removed))
         )
     declared = (inherited | _ids(plan.new_elements)) - removed
+    has_structured_contract = bool(
+        plan.inherited_elements or plan.new_elements or plan.elements_to_remove or plan.handoff
+    )
+    unknown_object_declarations = (
+        object_id_set - (declared | removed) if has_structured_contract else set()
+    )
+    if unknown_object_declarations:
+        errors.append(
+            "TechnicalSpec.objects 包含未在 ScenePlan 声明的对象: "
+            + ", ".join(sorted(unknown_object_declarations))
+        )
     missing_object_declarations = (declared | removed) - object_id_set
     if missing_object_declarations:
         errors.append(
@@ -681,6 +768,8 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
 1. 所有对象使用稳定的 element_id 和 variable_name；继承对象设置 initially_active=true；
    临时步骤也要列入 objects，但 exported=false。
    同时填写 visual_role、z_index 和可估算的宽高，供布局审查使用。
+   `objects[].element_id` 必须严格来自当前 ScenePlan 的 inherited_elements、new_elements
+   或 elements_to_remove；计划重规划后不得保留上一版的旧标题、旧对象或其他过期 ID。
 2. export_element_ids 只能包含场景结束时仍存在、且 ScenePlan 合同要求交接的对象。
    removed_element_ids 必须逐项对应 ScenePlan.elements_to_remove；不能自行推断、遗漏或新增。
 3. 每个动画事件必须明确 source_element_ids、target_element_ids、create_element_ids 和

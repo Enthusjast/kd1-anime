@@ -109,9 +109,15 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   `variable_name`。helper 赋值只能服务于这个最终对象，不能添加动画或副作用。
 - 导出区只能导出 closing_state 中仍然存在、且在 `[Inherited Elements State]` 或 `[New Elements]`
   中声明的元素；不要导出临时碎片、辅助线、标题过渡对象或 `[Elements To Remove]` 中的元素。
+- 只有 `required=true` 的继承/新元素才是场景边界导出对象；`required=false` 明确表示
+  场景内部临时对象，必须留在 marker 之外并在场景内按计划退出。若当前场景没有任何
+  `required=true` 导出对象，两个 marker 之间必须为空（不导出任何对象）。
 - 导出区内所有 helper 依赖（坐标数组、子 Mobject、组合对象的局部变量）都必须在导出区内定义；
   不得引用导出区外的 `A_point`、`triangle_parts` 等业务变量。导出区外只允许使用全局配置
   和 Manim/NumPy 已导入的名称。
+- `tex_template`、`COLORS`、`FONTS`、`FONT_SIZES`、`STROKE_WIDTHS` 和
+  `LAYOUT_ANCHORS` 是每个场景都会初始化的上下文，不是交接元素；必须在 marker 之前配置，
+  不得放入 marker，也不得给它们添加 `element_id`。
 - 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
   面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；

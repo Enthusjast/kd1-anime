@@ -283,6 +283,59 @@ def test_normalize_technical_spec_copies_scene_removals_and_inherited_activity()
     assert repairs
 
 
+def test_normalize_technical_spec_drops_stale_objects_after_plan_rewrite():
+    plan = make_plan(
+        new=[VisualElementState(element_id="transition_title", variable_name="transition_title")]
+    )
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(element_id="old_title", variable_name="old_title"),
+            TechnicalObject(element_id="transition_title", variable_name="transition_title"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="fade_old_title",
+                start_seconds=0,
+                end_seconds=1,
+                operation="fade_out",
+                source_element_ids=["old_title"],
+            ),
+            TechnicalAnimation(
+                event_id="show_transition_title",
+                start_seconds=1,
+                end_seconds=2,
+                operation="fade_in",
+                target_element_ids=["transition_title"],
+                create_element_ids=["transition_title"],
+            ),
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    assert [item.element_id for item in normalized.objects] == ["transition_title"]
+    assert normalized.animations[0].operation == "wait"
+    assert not result.errors
+    assert any("old_title" in repair for repair in repairs)
+
+
+def test_compile_technical_spec_rejects_stale_object_declaration():
+    plan = make_plan()
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(element_id="formula", variable_name="formula"),
+            TechnicalObject(element_id="stale", variable_name="stale"),
+        ],
+    )
+
+    result = compile_technical_spec(plan, spec)
+
+    assert any("未在 ScenePlan 声明" in error for error in result.errors)
+
+
 def test_technical_spec_is_closed():
     with pytest.raises(ValueError):
         TechnicalSpec(scene_id=1, unknown_field=True)

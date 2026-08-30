@@ -1364,6 +1364,50 @@ class Demo(Scene):
     assert "连续性导出合同" in coder.calls[1]
 
 
+def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_formula",
+                    variable_name="temporary_formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        temporary_formula = MathTex(r"x^2", tex_template=tex_template)
+        self.play(Write(temporary_formula))
+"""
+
+    class FakeCoder:
+        calls = 0
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls += 1
+            return code
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda value, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    generated, class_name = Orchestrator()._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == code
+    assert class_name == "Demo"
+    assert coder.calls == 1
+
+
 def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     ctx = PipelineContext(
