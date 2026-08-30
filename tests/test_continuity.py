@@ -749,6 +749,26 @@ def test_normalize_scene_plan_contract_drops_stale_handoff_for_unexported_previo
     assert any("过期 handoff" in repair for repair in repairs)
 
 
+def test_normalize_scene_plan_contract_drops_unknown_remove_handoff():
+    current = make_plan(2).model_copy(
+        update={
+            "handoff": [
+                SceneHandoff(
+                    element_id="stale_element",
+                    variable_name="stale_element",
+                    action="remove",
+                )
+            ]
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(current, ContinuityBible())
+
+    assert normalized.handoff == []
+    assert normalized.new_elements == []
+    assert any("未声明的过期 handoff" in repair for repair in repairs)
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={

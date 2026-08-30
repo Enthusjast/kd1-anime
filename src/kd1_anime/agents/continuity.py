@@ -992,8 +992,11 @@ def normalize_scene_plan_contract(
             ):
                 repairs.append(f"删除上一场景未导出的过期 handoff 元素: {handoff_item.element_id}")
                 continue
-            if handoff_item.element_id in declared_ids or handoff_item.action == "remove":
+            if handoff_item.element_id in declared_ids:
                 valid_handoff.append(handoff_item)
+                continue
+            if handoff_item.action == "remove" and previous_item is None:
+                repairs.append(f"删除未声明的过期 handoff 元素: {handoff_item.element_id}")
                 continue
             inferred = VisualElementState(
                 element_id=handoff_item.element_id,
