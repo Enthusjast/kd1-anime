@@ -639,6 +639,57 @@ class PlanCompiler:
                 # GeometrySpec 没有圆心/半径字段，不能把圆的离散辅助点
                 # 当作多边形用鞋带公式计算面积；圆的语义审查交给 LLM。
                 continue
+            geometry_field = f"geometry_specs[{geometry.geometry_id}].vertices"
+            dimensions = {len(point) for point in geometry.vertices}
+            if any(dimension < 2 for dimension in dimensions):
+                issues.append(
+                    PlanCompilerIssue(
+                        category="geometry",
+                        field=geometry_field,
+                        scene_ids=scene_ids,
+                        message="几何顶点必须至少包含 x、y 坐标。",
+                        fix_instruction="为每个顶点提供二维或三维坐标。",
+                    )
+                )
+                continue
+            is_3d = any(dimension > 2 for dimension in dimensions)
+            if is_3d and any(dimension != 3 for dimension in dimensions):
+                issues.append(
+                    PlanCompilerIssue(
+                        category="geometry",
+                        field=geometry_field,
+                        scene_ids=scene_ids,
+                        message="三维几何的每个顶点都必须包含 x、y、z 三个坐标。",
+                        fix_instruction="补齐 z 坐标，或将该几何规格改为二维顶点。",
+                    )
+                )
+                continue
+            if geometry.shape == "point":
+                # 点不应被当作多边形计算面积。
+                continue
+            if is_3d or geometry.shape in {"surface", "plane"}:
+                if len(geometry.vertices) < 3 and geometry.shape != "surface":
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="geometry",
+                            field=geometry_field,
+                            scene_ids=scene_ids,
+                            message="平面或三维区域至少需要三个顶点。",
+                            fix_instruction="补充完整的三维顶点，或改用文字/公式描述不可核验的曲面。",
+                        )
+                    )
+                    continue
+                if any(abs(point[0]) > 7.2 or abs(point[1]) > 4.2 for point in geometry.vertices):
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="feasibility",
+                            field=geometry_field,
+                            scene_ids=scene_ids,
+                            message="几何顶点超出默认 16:9 安全画布范围。",
+                            fix_instruction="将顶点调整到约 x∈[-7,7]、y∈[-4,4] 的安全区，或明确镜头移动。",
+                        )
+                    )
+                continue
             if geometry.shape == "line":
                 if len(geometry.vertices) < 2:
                     issues.append(

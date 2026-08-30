@@ -221,9 +221,19 @@ class GeometrySpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     geometry_id: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,99}$")
-    shape: Literal["polygon", "rectangle", "square", "triangle", "circle", "line", "other"] = (
-        "other"
-    )
+    shape: Literal[
+        "polygon",
+        "rectangle",
+        "square",
+        "triangle",
+        "circle",
+        "line",
+        "point",
+        "surface",
+        "plane",
+        "region",
+        "other",
+    ] = "other"
     vertices: list[list[float]] = Field(default_factory=list, max_length=100)
     declared_area: float | None = Field(default=None, ge=0)
     target_area: float | None = Field(default=None, ge=0)
@@ -238,18 +248,129 @@ class GeometrySpec(BaseModel):
             return value
         data = dict(value)
         if "geometry_id" not in data:
-            data["geometry_id"] = data.get("id") or data.get("name") or "geometry_1"
-        if "vertices" not in data and "points" in data:
-            data["vertices"] = data["points"]
-        if "declared_area" not in data and "area" in data:
-            data["declared_area"] = data["area"]
+            data["geometry_id"] = (
+                data.get("element_id") or data.get("id") or data.get("name") or "geometry_1"
+            )
+        data["geometry_id"] = str(data["geometry_id"])
+
+        shape_aliases = {
+            "poly": "polygon",
+            "polygon": "polygon",
+            "rectangle": "rectangle",
+            "rect": "rectangle",
+            "square": "square",
+            "triangle": "triangle",
+            "circle": "circle",
+            "line": "line",
+            "segment": "line",
+            "point": "point",
+            "surface": "surface",
+            "plane": "plane",
+            "region": "region",
+            "area": "region",
+        }
+        raw_shape = data.get("shape", data.get("type", data.get("geometry_type")))
+        if raw_shape is not None:
+            normalized_shape = shape_aliases.get(str(raw_shape).strip().lower(), "other")
+            data["shape"] = normalized_shape
+
+        if "vertices" not in data or data.get("vertices") is None:
+            coordinates = data.get("points", data.get("coordinates"))
+            if isinstance(coordinates, (list, tuple)):
+                if coordinates and all(
+                    isinstance(point, (int, float)) and not isinstance(point, bool)
+                    for point in coordinates
+                ):
+                    data["vertices"] = [list(coordinates)]
+                else:
+                    data["vertices"] = coordinates
+        elif (
+            isinstance(data["vertices"], (list, tuple))
+            and data["vertices"]
+            and all(
+                isinstance(point, (int, float)) and not isinstance(point, bool)
+                for point in data["vertices"]
+            )
+        ):
+            data["vertices"] = [list(data["vertices"])]
+
+        area_note = ""
+        raw_area = data.get("declared_area")
+        if raw_area is None and "area" in data:
+            raw_area = data["area"]
+        if isinstance(raw_area, (int, float)) and not isinstance(raw_area, bool):
+            data["declared_area"] = raw_area
+        elif raw_area not in (None, ""):
+            area_note = f"原始面积描述：{raw_area}"
+            data["declared_area"] = None
         if (
             "target_area" not in data
             and "target" in data
             and isinstance(data["target"], (int, float))
+            and not isinstance(data["target"], bool)
         ):
             data["target_area"] = data["target"]
-        for alias in ("id", "name", "points", "area", "target"):
+        elif "target_area" in data and not isinstance(data["target_area"], (int, float)):
+            data["target_area"] = None
+
+        raw_rotation = data.get("rotation_degrees", data.get("rotation"))
+        if isinstance(raw_rotation, (int, float)) and not isinstance(raw_rotation, bool):
+            data["rotation_degrees"] = raw_rotation
+        elif isinstance(raw_rotation, str):
+            match = re.search(r"[-+]?\d+(?:\.\d+)?", raw_rotation)
+            data["rotation_degrees"] = float(match.group(0)) if match else 0.0
+
+        if "coordinate_system" not in data:
+            dimension = data.get("dimension")
+            vertices = data.get("vertices") or []
+            if isinstance(dimension, str) and dimension.strip():
+                data["coordinate_system"] = dimension.strip()
+            elif any(isinstance(point, (list, tuple)) and len(point) > 2 for point in vertices):
+                data["coordinate_system"] = "3d"
+
+        description_parts = [
+            str(data.get("target_description", "")).strip(),
+            str(data.get("description", "")).strip(),
+            str(data.get("target_region", "")).strip(),
+            area_note,
+        ]
+        description = "；".join(part for part in description_parts if part)
+        if description:
+            data["target_description"] = description[:1_000]
+
+        vertices = data.get("vertices") or []
+        is_3d = any(isinstance(point, (list, tuple)) and len(point) > 2 for point in vertices)
+        if is_3d:
+            # 现有鞋带公式只适用于二维多边形，不能把三维曲面/误差
+            # 区域的数值面积伪装成已验证结果；保留描述供 Reviewer
+            # 审查，但交给确定性编译器的面积字段必须为空。
+            declared_area = data.get("declared_area")
+            target_area = data.get("target_area")
+            if declared_area is not None or target_area is not None:
+                note = "三维几何面积未由二维鞋带公式自动核验"
+                existing = str(data.get("target_description", "")).strip()
+                data["target_description"] = "；".join(part for part in (existing, note) if part)[
+                    :1_000
+                ]
+            data["declared_area"] = None
+            data["target_area"] = None
+
+        for alias in (
+            "id",
+            "name",
+            "element_id",
+            "points",
+            "coordinates",
+            "area",
+            "target",
+            "type",
+            "geometry_type",
+            "kind",
+            "description",
+            "target_region",
+            "rotation",
+            "dimension",
+        ):
             data.pop(alias, None)
         return data
 
@@ -903,6 +1024,18 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
 - math_claims: 每一个公式、等式、面积或几何关系断言及其前后表达式
 - geometry_specs: 需要核验的多边形顶点、面积、旋转和目标区域
 - handoff: 每个跨场景元素在本场景边界的 inherit/keep/create/remove 动作
+
+## geometry_specs 的结构
+- 每项只使用 `geometry_id`、`shape`、`vertices`、`declared_area`、`target_area`、
+  `rotation_degrees`、`coordinate_system`、`target_description` 这些字段。
+- 二维多边形使用 `shape` 为 polygon/rectangle/square/triangle，`vertices` 为
+  `[[x,y], ...]`；只有顶点和面积可以用二维鞋带公式核对时才填写面积字段。
+- 三维点、曲面、平面或误差区域可使用 point/surface/plane/region，顶点写成
+  `[[x,y,z], ...]`，并填写 `coordinate_system: "3d"`。三维曲面面积不能用二维
+  鞋带公式代替；无法严格计算时不要填写 `declared_area`/`target_area`，把语义写进
+  `target_description`。
+- 不要使用 `element_id`、`type`、`description`、`area` 等旧式字段名；不要把
+  JSON 对象或字符串公式当作 `vertices`。
 
 ## 连续性修正优先级（只有在重规划时生效）
 - 连续性审查反馈高于当前场景旧分镜中的任何描述；反馈指出冲突的句子必须删除或改写，不能保留原句后再补一句“与连续性圣经一致”。
