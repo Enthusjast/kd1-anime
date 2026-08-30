@@ -118,6 +118,9 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - `tex_template`、`COLORS`、`FONTS`、`FONT_SIZES`、`STROKE_WIDTHS` 和
   `LAYOUT_ANCHORS` 是每个场景都会初始化的上下文，不是交接元素；必须在 marker 之前配置，
   不得放入 marker，也不得给它们添加 `element_id`。
+- 每个 Mobject 变量在 `construct()` 中只能定义一次；不要先在动画流程中定义对象，
+  又在 marker 内复制同名定义。marker 应紧邻唯一的对象定义；没有边界导出对象时保留空 marker
+  或省略 marker，不能在场景结尾再次重建已 active 的对象。
 - 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
   面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；

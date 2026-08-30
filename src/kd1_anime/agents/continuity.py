@@ -701,6 +701,73 @@ def extract_scene_continuity_elements(
     return exported_code, elements
 
 
+def strip_redundant_optional_export_block(code: str, plan: ScenePlan) -> str:
+    """删除不会产生边界交接、且重复定义对象的误放 marker。
+
+    当场景没有任何 ``required=true`` 元素时，导出区本应为空。模型有时
+    会先在正常动画流程中定义公式，随后又在 marker 内复制一遍同名定义，
+    这会被生命周期检查正确判定为 active 对象重定义。只在能够确定
+    marker 内的每个赋值变量已经在 marker 之前定义过时删除整段 marker；
+    其它情况仍交给严格合同校验和 Coder 重试，避免掩盖真正的缺失定义。
+    """
+
+    required_ids = {
+        item.element_id
+        for item in [*plan.inherited_elements, *plan.new_elements]
+        if item.required
+        and item.element_id not in {removed.element_id for removed in plan.elements_to_remove}
+    }
+    if required_ids:
+        return code
+    lines = code.splitlines()
+    begin_indices = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line]
+    end_indices = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line]
+    if len(begin_indices) != 1 or len(end_indices) != 1 or begin_indices[0] >= end_indices[0]:
+        return code
+    try:
+        tree = ast.parse(code)
+        block = textwrap.dedent("\n".join(lines[begin_indices[0] + 1 : end_indices[0]])).strip()
+        block_tree = ast.parse(block) if block else None
+    except SyntaxError:
+        return code
+    construct = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "construct"
+            and node.lineno < begin_indices[0] + 1 <= (node.end_lineno or node.lineno)
+        ),
+        None,
+    )
+    if construct is None:
+        return code
+    marker_lines = [begin_indices[0] + 1, end_indices[0] + 1]
+    if not all(_marker_is_inside_construct(lines, construct, line) for line in marker_lines):
+        return code
+    if block_tree is None:
+        return "\n".join(lines[: begin_indices[0]] + lines[end_indices[0] + 1 :]).rstrip() + "\n"
+    marker_assignments = {
+        target.id
+        for node in ast.walk(block_tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name)
+    }
+    prior_assignments = {
+        target.id
+        for node in ast.walk(construct)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and (node.end_lineno or node.lineno) < begin_indices[0] + 1
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name)
+    }
+    if marker_assignments and not marker_assignments <= prior_assignments:
+        return code
+    stripped = lines[: begin_indices[0]] + lines[end_indices[0] + 1 :]
+    return "\n".join(stripped).rstrip() + "\n"
+
+
 def validate_export_contract(
     plan: ScenePlan,
     elements: list[ExtractedElement],

@@ -15,6 +15,7 @@ from kd1_anime.agents.continuity import (
     extract_continuity_elements,
     extract_scene_continuity_elements,
     normalize_scene_plan_contract,
+    strip_redundant_optional_export_block,
     validate_export_contract,
 )
 from kd1_anime.agents.planner import (
@@ -434,6 +435,36 @@ class Demo(Scene):
 
     assert "formula = MathTex" in exported_code
     assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
+
+
+def test_strip_redundant_optional_export_block_removes_duplicate_definitions():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x^2")
+        self.play(Write(formula))
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = MathTex(r"x^2")
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    stripped = strip_redundant_optional_export_block(code, plan)
+
+    assert "KD1_CONTINUITY_EXPORT_BEGIN" not in stripped
+    assert stripped.count('formula = MathTex(r"x^2")') == 1
 
 
 def test_extract_continuity_elements_rejects_non_whitelisted_local_method():

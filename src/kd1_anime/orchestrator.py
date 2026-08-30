@@ -32,6 +32,7 @@ from kd1_anime.agents.continuity import (
     deterministic_continuity_issues,
     extract_scene_continuity_elements,
     normalize_scene_plan_contract,
+    strip_redundant_optional_export_block,
 )
 from kd1_anime.agents.lifecycle import validate_animation_lifecycle
 from kd1_anime.agents.plan_compiler import PlanCompiler, normalize_scene_timeline_contract
@@ -1106,6 +1107,7 @@ class Orchestrator:
                 plan,
                 **code_kwargs,
             )
+            code = strip_redundant_optional_export_block(code, plan)
 
             validation = self._validate(code, renderer=renderer)
             continuity_error = ""
