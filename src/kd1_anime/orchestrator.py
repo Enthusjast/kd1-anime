@@ -278,6 +278,8 @@ class PipelineContext:
     plan_review_status: str = "skipped"
     continuity_review_status: str = "passed"
     continuity_review_round: int = 0
+    # 连续性 warning 恢复时只自动重新检查一次，避免每次 resume 都重新进入死循环。
+    continuity_resume_recheck_used: bool = False
     continuity_warnings: list[str] = field(default_factory=list)
     # Plan Compiler 的确定性发现按场景缓存，交给 Plan Reviewer 一起处理，
     # 避免每个场景重复计算或把跨场景错误丢失。
@@ -738,6 +740,7 @@ class Orchestrator:
                 plan_review_cycle_count=ctx.plan_review_cycle_count,
                 continuity_review_status=ctx.continuity_review_status,
                 continuity_review_round=ctx.continuity_review_round,
+                continuity_resume_recheck_used=ctx.continuity_resume_recheck_used,
                 continuity_warnings=ctx.continuity_warnings[-100:],
                 final_video=str(ctx.final_video) if ctx.final_video else None,
                 final_video_sha256=ctx.final_video_sha256,
@@ -1007,6 +1010,9 @@ class Orchestrator:
             plan_review_cycle_count=getattr(manifest, "plan_review_cycle_count", 0),
             continuity_review_status=manifest.continuity_review_status,
             continuity_review_round=manifest.continuity_review_round,
+            continuity_resume_recheck_used=getattr(
+                manifest, "continuity_resume_recheck_used", False
+            ),
             continuity_warnings=list(manifest.continuity_warnings),
             final_video=final_video,
             final_video_sha256=manifest.final_video_sha256,
@@ -1602,21 +1608,30 @@ class Orchestrator:
             # 直接监控会得到连续 UNKNOWN → CANCEL_FAILED → 场景永久判死。
             self._reconcile_restored_jobs(ctx)
 
-            # 上一次运行可能在连续性重规划达到上限后被中断。warning 不是
-            # 已确认通过；显式 resume 应开启一轮新的有限修正，让新版的
-            # 字段级反馈和确定性合同修复有机会处理旧分镜，而不是直接带着
-            # 已知冲突进入编码阶段。
+            # 上一次运行可能在连续性重规划达到上限后被中断。按恢复策略，
+            # 第一次 resume 额外开启一轮有限修正；这次机会必须持久化，
+            # 否则用户每次 resume 都会重新进入同一个连续性循环。若本轮
+            # 再次耗尽预算，warning 将作为非阻断终态沿用已有计划。
             if (
                 ctx.continuity_bible is not None
                 and ctx.continuity_review_status == "warning"
+                and not ctx.continuity_resume_recheck_used
                 and any(
                     not scene.rendered and not scene.failed and not scene.give_up
                     for scene in ctx.scene_states.values()
                 )
             ):
-                ctx.continuity_review_status = "pending"
-                ctx.continuity_review_round = 0
-                ctx.continuity_warnings.append("恢复运行：重新开启连续性审查与有限修正")
+                with self._state_lock:
+                    ctx.continuity_review_status = "pending"
+                    ctx.continuity_review_round = 0
+                    ctx.continuity_resume_recheck_used = True
+                    ctx.continuity_warnings.append("恢复运行：重新开启连续性审查与有限修正")
+                    self._checkpoint(ctx, state)
+                self._emit(
+                    "continuity_review_resume_recheck",
+                    run_id=run_id,
+                    max_rechecks=1,
+                )
 
             # schema 2 的早期清单没有 continuity bible。恢复未完成运行时补建并
             # 持久化一份；已经渲染完成的旧场景不再触发连续性重规划。
@@ -2712,6 +2727,8 @@ class Orchestrator:
                     ) from self._checkpoint_error
                 if ctx.continuity_rebuild_required or self._stop_event.is_set():
                     return
+                # warning 是连续性 LLM 审查耗尽预算后的“接受并继续”终态，
+                # 只保留诊断信息，不再回到 pending，也不阻断后续编码。
             if ctx.plan_review_status in {"pending", "reviewing"}:
                 continue
             if ctx.continuity_bible is not None and ctx.continuity_review_status in {
@@ -4555,6 +4572,13 @@ class Orchestrator:
                     with self._state_lock:
                         ctx.continuity_review_status = "warning"
                         self._checkpoint(ctx, State.REVIEWING)
+                    self._emit(
+                        "continuity_review_accepted_with_warning",
+                        reason=warning,
+                        reason_type="llm_error",
+                        round=current_round,
+                        max_rounds=max_rounds,
+                    )
                     self._emit("continuity_warning", reason=warning)
                     return
                 self._emit("continuity_warning", reason=warning)
@@ -4595,6 +4619,18 @@ class Orchestrator:
                     ctx.continuity_warnings.append(warning)
                     self._checkpoint(ctx, State.REVIEWING)
                 self._emit("continuity_warning", reason=warning)
+                event_data = {
+                    "reason": warning,
+                    "reason_type": (
+                        "max_rounds" if current_round > max_rounds else "already_started"
+                    ),
+                    "scene_ids": affected_ids,
+                    "round": current_round,
+                    "max_rounds": max_rounds,
+                }
+                if current_round > max_rounds:
+                    self._emit("continuity_review_exhausted", **event_data)
+                self._emit("continuity_review_accepted_with_warning", **event_data)
                 return
 
             feedback_by_scene: dict[int, list[str]] = {scene_id: [] for scene_id in affected_ids}
@@ -4656,6 +4692,14 @@ class Orchestrator:
                         ctx.continuity_review_status = "warning"
                         ctx.continuity_warnings.append(warning)
                         self._checkpoint(ctx, State.REVIEWING)
+                    self._emit(
+                        "continuity_review_accepted_with_warning",
+                        reason=warning,
+                        reason_type="replan_error",
+                        scene_ids=[scene_id],
+                        round=current_round,
+                        max_rounds=max_rounds,
+                    )
                     self._emit("continuity_warning", reason=warning)
                     return
                 outline_index = next(

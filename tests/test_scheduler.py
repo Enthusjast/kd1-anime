@@ -1098,6 +1098,8 @@ def test_continuity_replan_round_is_not_reset_by_contract_normalization(monkeypa
     orchestrator.planner = planner
     monkeypatch.setattr(module, "ContinuityReviewerAgent", lambda: continuity_reviewer)
     monkeypatch.setattr(settings, "MAX_CONTINUITY_FIX_ROUNDS", 1)
+    events = []
+    orchestrator._callback = lambda event, data: events.append((event, data))
 
     outlines = [make_outline(1), make_outline(2)]
     ctx = PipelineContext(
@@ -1118,6 +1120,10 @@ def test_continuity_replan_round_is_not_reset_by_contract_normalization(monkeypa
     assert continuity_reviewer.calls == 2
     assert ctx.continuity_review_round == 2
     assert ctx.continuity_review_status == "warning"
+    assert all(state.reviewed for state in ctx.scene_states.values())
+    assert not orchestrator._stop_event.is_set()
+    assert any(event == "continuity_review_exhausted" for event, _ in events)
+    assert any(event == "continuity_review_accepted_with_warning" for event, _ in events)
 
 
 # ---------------------------------------------------------------------------

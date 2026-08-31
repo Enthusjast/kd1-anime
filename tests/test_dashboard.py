@@ -170,6 +170,40 @@ class TestSceneDashboard:
         assert dash.scenes[1].state == "running"
         assert "保守方案" in dash.scenes[1].render_row()[3].plain
 
+    def test_continuity_exhaustion_is_warning_and_does_not_fail_scene(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event(
+            "plan_complete",
+            {"scenes": [MagicMock(scene_id=1, title="S1"), MagicMock(scene_id=2, title="S2")]},
+        )
+        dash.on_event(
+            "continuity_review_exhausted",
+            {
+                "scene_ids": [1, 2],
+                "reason": "达到最大连续性修正轮数，已继续生成",
+                "round": 3,
+                "max_rounds": 2,
+            },
+        )
+
+        assert dash.stage_label == "连续性审查达到上限，继续生成"
+        assert all(scene.state == "warning" for scene in dash.scenes.values())
+        assert all(scene.icon == "⚠" for scene in dash.scenes.values())
+
+        dash.on_event("scene_coding", {"scene_id": 1})
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[2].state == "warning"
+
+    def test_continuity_resume_recheck_has_explicit_stage(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+
+        dash.on_event("continuity_review_resume_recheck", {"max_rechecks": 1})
+
+        assert dash.stage == "continuity"
+        assert dash.stage_label == "恢复：重新检查连续性"
+
     def test_pipeline_row_shows_done_and_current_stages(self):
         dash = SceneDashboard()
         dash.live = MagicMock()

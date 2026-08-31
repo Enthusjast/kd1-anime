@@ -97,6 +97,7 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
         plan_review_status="passed",
         continuity_review_status="pending",
         continuity_review_round=1,
+        continuity_resume_recheck_used=True,
         continuity_warnings=["warning"],
         scene_states={
             1: SceneState(
@@ -119,6 +120,7 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
     assert restored.continuity_bible == bible
     assert restored.continuity_review_status == "pending"
     assert restored.continuity_review_round == 1
+    assert restored.continuity_resume_recheck_used is True
     assert restored.continuity_warnings == ["warning"]
     assert restored.scene_states[1].safe_fallback_used is True
     assert restored.scene_states[1].safe_fallback_reason == "几何方案无法验证"

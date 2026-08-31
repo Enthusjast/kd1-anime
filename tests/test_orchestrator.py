@@ -986,8 +986,8 @@ def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_pa
     assert captured["context"].scene_states[1].failure_reason == ""
 
 
-def test_resume_reopens_continuity_warning_for_unfinished_scenes(monkeypatch, tmp_path):
-    """带已知连续性 warning 的中断运行应在 resume 时重新开启修正预算。"""
+def test_resume_rechecks_continuity_warning_once(monkeypatch, tmp_path):
+    """连续性 warning 的恢复只重新开启一次修正预算。"""
     from kd1_anime.config import settings
 
     run_id = "20260728-120000-1234abcd"
@@ -1019,6 +1019,42 @@ def test_resume_reopens_continuity_warning_for_unfinished_scenes(monkeypatch, tm
     assert Orchestrator().resume(run_id) is None
     assert captured["context"].continuity_review_status == "pending"
     assert captured["context"].continuity_review_round == 0
+    assert captured["context"].continuity_resume_recheck_used is True
+
+
+def test_resume_does_not_recheck_continuity_warning_twice(monkeypatch, tmp_path):
+    """已经用过恢复重检查机会时，resume 应直接沿用 warning 计划。"""
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / run_id
+    root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_id,
+        status="running",
+        state="CODING",
+        user_prompt="prompt",
+        output_path=str((root / "output.mp4").resolve()),
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="warning",
+        continuity_review_round=3,
+        continuity_resume_recheck_used=True,
+        continuity_warnings=["达到最大连续性修正轮数"],
+        scenes={1: StoredSceneState(plan=plan(), plan_ready=True)},
+    )
+    write_manifest(root / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    captured = {}
+
+    def fake_execute(self, context, state):
+        captured["context"] = context
+        return None
+
+    monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
+
+    assert Orchestrator().resume(run_id) is None
+    assert captured["context"].continuity_review_status == "warning"
+    assert captured["context"].continuity_review_round == 3
+    assert captured["context"].continuity_resume_recheck_used is True
 
 
 def test_context_derives_pending_plan_review_for_legacy_incomplete_run(tmp_path):

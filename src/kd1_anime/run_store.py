@@ -273,6 +273,8 @@ class RunManifest(BaseModel):
     plan_review_cycle_count: int = Field(default=0, ge=0)
     continuity_review_status: Literal["pending", "reviewing", "passed", "warning"] = "passed"
     continuity_review_round: int = Field(default=0, ge=0)
+    # 连续性审查耗尽后，resume 最多自动重查一次；默认值兼容已有清单。
+    continuity_resume_recheck_used: bool = False
     continuity_warnings: list[str] = Field(default_factory=list, max_length=100)
     final_video: str | None = None
     final_video_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
