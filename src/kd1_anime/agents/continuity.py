@@ -1027,6 +1027,32 @@ def normalize_scene_plan_contract(
 
         normalized_handoff = valid_handoff
 
+        removal_ids = {item.element_id for item in removals}
+        inherited_ids = {item.element_id for item in inherited}
+        new_ids = {item.element_id for item in new_elements}
+        aligned_handoff: list[SceneHandoff] = []
+        for handoff_item in normalized_handoff:
+            aligned_item = handoff_item
+            if handoff_item.element_id in removal_ids:
+                expected_action = "remove"
+            elif handoff_item.element_id in inherited_ids:
+                expected_action = (
+                    handoff_item.action if handoff_item.action in {"inherit", "keep"} else "keep"
+                )
+            elif handoff_item.element_id in new_ids:
+                expected_action = (
+                    handoff_item.action if handoff_item.action in {"create", "keep"} else "create"
+                )
+            else:
+                expected_action = handoff_item.action
+            if handoff_item.action != expected_action:
+                aligned_item = handoff_item.model_copy(update={"action": expected_action})
+                repairs.append(
+                    f"handoff 元素 {handoff_item.element_id} 的动作已规范为 {expected_action}"
+                )
+            aligned_handoff.append(aligned_item)
+        normalized_handoff = aligned_handoff
+
         handoff_ids = {item.element_id for item in normalized_handoff}
         repaired_new: list[VisualElementState] = []
         for item in new_elements:

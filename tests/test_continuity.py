@@ -769,6 +769,22 @@ def test_normalize_scene_plan_contract_drops_unknown_remove_handoff():
     assert any("未声明的过期 handoff" in repair for repair in repairs)
 
 
+def test_normalize_scene_plan_contract_aligns_handoff_action_with_removal():
+    inherited = VisualElementState(element_id="old", variable_name="old")
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [inherited],
+            "elements_to_remove": [inherited],
+            "handoff": [SceneHandoff(element_id="old", variable_name="old", action="keep")],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(current, ContinuityBible())
+
+    assert normalized.handoff[0].action == "remove"
+    assert any("动作已规范为 remove" in repair for repair in repairs)
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={
