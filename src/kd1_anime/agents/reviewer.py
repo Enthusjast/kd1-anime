@@ -107,6 +107,8 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 4. **避免过度审查**：如果代码能正确渲染出导演分镜要求的效果，即使实现方式与你的偏好不同，也应标记为 is_valid=true。不要为了风格、写法偏好或“如果是我会怎么写”而打回代码。
 5. **反馈必须可执行**：major 的 findings 要具体到出错的对象/行/调用，说明原因和改法，不要泛泛而谈（如“代码不够好”）。
 6. **fixes 必须可匹配**：fixes 中每个 find 必须是代码中实际存在的片段（精确匹配，含空格和缩进）；找不到精确匹配就不要给该 fix，改用 feedback 描述。
+7. **证据优先于行号**：evidence 必须从 `<manim_code>` 中逐字复制、连续且完整；行号以 `<manim_code>` 的第一行作为第 1 行。行号只是辅助定位，不要凭记忆猜测；如果无法确认行号可留空，但不能编造 evidence。
+8. **只报告确定的问题**：不要把“可能导致”“看起来可能”或个人实现偏好写成 major。Manim 的 Transform/Rotate 通常会就地更新源 Mobject；不能仅凭使用了副本、VGroup 或 Transform 就断言变量引用失效，必须指出代码中实际发生的后续错误或合同违例。
 
 ## 输出 JSON
 {
@@ -276,6 +278,73 @@ def validate_review_evidence(result: ReviewResult, code: str) -> list[str]:
     if result.severity == "major" and not result.findings:
         errors.append("major 审查结果必须提供 findings 证据")
     return errors
+
+
+def normalize_review_evidence(
+    result: ReviewResult,
+    code: str,
+) -> tuple[ReviewResult, list[str]]:
+    """校正模型给出的、但与精确证据不一致的行号。
+
+    LLM 经常能够准确复制代码片段，却会因为长代码上下文、Markdown
+    包裹或自己的行号计数偏移而给出错误的 ``line_start``/``line_end``。
+    行号不是证据本身；当一个 evidence 在当前代码中**恰好出现一次**时，
+    实际位置可以由程序确定，因此不应让这种机械偏移阻断整个流水线。
+
+    这里只修正唯一匹配证据的行号，不补造 evidence、不删除 finding，也不
+    处理重复或不存在的片段。后两类情况仍由 ``validate_review_evidence``
+    和一次协议重试严格处理。
+    """
+
+    if result.is_valid or not result.findings:
+        return result, []
+
+    corrected_findings: list[ReviewFinding] = []
+    corrections: list[str] = []
+    for index, finding in enumerate(result.findings, start=1):
+        corrected = finding
+        evidence = finding.evidence.strip()
+        if evidence:
+            positions: list[tuple[int, int]] = []
+            start = 0
+            while True:
+                position = code.find(evidence, start)
+                if position < 0:
+                    break
+                end = position + len(evidence)
+                positions.append(
+                    (
+                        code.count("\n", 0, position) + 1,
+                        code.count("\n", 0, end) + 1,
+                    )
+                )
+                start = position + 1
+
+            if len(positions) == 1 and (
+                finding.line_start is not None or finding.line_end is not None
+            ):
+                actual_start, actual_end = positions[0]
+                declared_end = finding.line_end or finding.line_start
+                contains_evidence = (
+                    finding.line_start is not None
+                    and declared_end is not None
+                    and actual_start >= finding.line_start
+                    and actual_end <= declared_end
+                )
+                if not contains_evidence:
+                    corrected = finding.model_copy(
+                        update={"line_start": actual_start, "line_end": actual_end}
+                    )
+                    corrections.append(
+                        f"finding[{index}] 行号已从 "
+                        f"{finding.line_start or '?'}-{declared_end or '?'} "
+                        f"校正为 {actual_start}-{actual_end}"
+                    )
+        corrected_findings.append(corrected)
+
+    if not corrections:
+        return result, []
+    return result.model_copy(update={"findings": corrected_findings}), corrections
 
 
 class ReviewerAgent(BaseAgent):
@@ -499,6 +568,12 @@ class ReviewerAgent(BaseAgent):
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 allow_truncated=True,
             )
+        result, evidence_corrections = normalize_review_evidence(result, code)
+        if evidence_corrections:
+            self._log(
+                "审查证据片段已匹配，自动校正模型行号：" + "；".join(evidence_corrections),
+                style="yellow",
+            )
         protocol_errors = validate_review_evidence(result, code)
         if protocol_errors:
             self._log("审查结果缺少可验证证据，带协议反馈重试", style="yellow")
@@ -526,6 +601,13 @@ class ReviewerAgent(BaseAgent):
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 allow_truncated=True,
             )
+            result, evidence_corrections = normalize_review_evidence(result, code)
+            if evidence_corrections:
+                self._log(
+                    "重试后的审查证据片段已匹配，自动校正模型行号："
+                    + "；".join(evidence_corrections),
+                    style="yellow",
+                )
             protocol_errors = validate_review_evidence(result, code)
             if protocol_errors:
                 raise RuntimeError("Reviewer 输出无法通过证据协议：" + "; ".join(protocol_errors))

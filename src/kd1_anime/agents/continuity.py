@@ -68,6 +68,7 @@ _EXPORT_MUTATION_METHODS = {
     "set_color_by_tex",
     "set_fill",
     "set_opacity",
+    "set_style",
     "set_stroke",
     "set_x",
     "set_y",

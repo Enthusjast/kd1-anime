@@ -345,6 +345,26 @@ class Demo(ThreeDScene):
     assert "def paraboloid" in elements[0].code
 
 
+def test_extract_continuity_elements_accepts_surface_style_mutation():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        def paraboloid(u, v):
+            return np.array([u, v, u**2 + v**2])
+        surface = Surface(paraboloid)
+        surface.set_style(fill_opacity=0.6, stroke_color=BLUE)
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("surface", "surface")]
+    assert "surface.set_style" in elements[0].code
+
+
 def test_extract_continuity_elements_accepts_local_styling_and_safe_aliases():
     code = """
 from manim import *

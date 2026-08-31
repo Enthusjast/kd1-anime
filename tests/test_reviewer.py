@@ -7,6 +7,7 @@ from kd1_anime.agents.reviewer import (
     FixSuggestion,
     ReviewFinding,
     ReviewResult,
+    normalize_review_evidence,
     validate_review_evidence,
 )
 
@@ -26,6 +27,8 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "面积守恒" in REVIEWER_SYSTEM_PROMPT
     assert "保守教学方案" in REVIEWER_SYSTEM_PROMPT
     assert "evidence" in REVIEWER_SYSTEM_PROMPT
+    assert "证据优先于行号" in REVIEWER_SYSTEM_PROMPT
+    assert "只报告确定的问题" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_severity_is_closed_enum():
@@ -128,6 +131,113 @@ def test_review_finding_line_range_must_contain_evidence():
     )
 
     assert any("行号与 evidence 不匹配" in error for error in errors)
+
+
+def test_normalize_review_evidence_repairs_unique_line_offset():
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                line_start=1,
+                line_end=1,
+                evidence="self.play(Create(circle))",
+                why="circle 未定义",
+                repair="先定义 circle",
+            )
+        ],
+    )
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self):\n        self.play(Create(circle))\n"
+
+    normalized, corrections = normalize_review_evidence(result, code)
+
+    assert corrections
+    assert normalized.findings[0].line_start == 4
+    assert normalized.findings[0].line_end == 4
+    assert validate_review_evidence(normalized, code) == []
+
+
+def test_normalize_review_evidence_does_not_guess_duplicate_or_missing_text():
+    duplicate = ReviewResult(
+        is_valid=False,
+        severity="major",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                line_start=1,
+                line_end=1,
+                evidence="self.wait()",
+                why="重复",
+                repair="删除一处",
+            )
+        ],
+    )
+    missing = duplicate.model_copy(
+        update={"findings": [duplicate.findings[0].model_copy(update={"evidence": "missing"})]}
+    )
+
+    normalized_duplicate, duplicate_corrections = normalize_review_evidence(
+        duplicate,
+        "self.wait()\nself.wait()\n",
+    )
+    normalized_missing, missing_corrections = normalize_review_evidence(missing, "self.wait()\n")
+
+    assert duplicate_corrections == []
+    assert normalized_duplicate == duplicate
+    assert missing_corrections == []
+    assert normalized_missing == missing
+
+
+def test_reviewer_accepts_unique_evidence_with_wrong_model_line_numbers(monkeypatch):
+    from kd1_anime.agents.planner import ScenePlan
+    from kd1_anime.agents.reviewer import ReviewerAgent
+
+    scene_plan = ScenePlan(
+        scene_id=1,
+        title="行号校正",
+        duration_seconds=10,
+        purpose="测试",
+        math_concept="x",
+        visual_design="固定",
+        camera_movement="固定",
+        visual_flow=["显示"],
+        key_moments=["停顿"],
+        computation="x=1",
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                line_start=1,
+                line_end=1,
+                evidence="self.play(FadeIn(circle))",
+                why="circle 未定义",
+                repair="先定义 circle",
+            )
+        ],
+    )
+    calls = []
+    reviewer = ReviewerAgent()
+
+    def fake_call(**kwargs):
+        calls.append(kwargs)
+        return result
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call)
+    reviewed = reviewer.review(
+        "from manim import *\nclass Demo(Scene):\n    def construct(self):\n        self.play(FadeIn(circle))",
+        scene_plan,
+    )
+
+    assert len(calls) == 1
+    assert reviewed.findings[0].line_start == 4
+    assert reviewed.findings[0].line_end == 4
 
 
 def test_reviewer_retries_when_model_finding_has_no_code_evidence(monkeypatch):
