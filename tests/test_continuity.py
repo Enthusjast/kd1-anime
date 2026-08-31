@@ -304,6 +304,47 @@ class Demo(Scene):
     ]
 
 
+def test_extract_continuity_elements_keeps_named_root_with_child_helpers():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: axes_3d
+        axes_3d = ThreeDAxes()
+        x_label = MathTex(r"x")
+        y_label = MathTex(r"y")
+        axes_3d.add(x_label, y_label)
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("axes_3d", "axes_3d")]
+
+
+def test_extract_continuity_elements_accepts_pure_surface_parameter_helper():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        def paraboloid(u, v):
+            x = u
+            y = v
+            z = x**2 + y**2
+            return np.array([x, y, z])
+        surface = Surface(paraboloid, u_range=[-1, 1], v_range=[-1, 1])
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("surface", "surface")]
+    assert "def paraboloid" in elements[0].code
+
+
 def test_extract_continuity_elements_accepts_local_styling_and_safe_aliases():
     code = """
 from manim import *

@@ -106,7 +106,9 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   `# KD1_CONTINUITY_EXPORT_BEGIN` 到 `# KD1_CONTINUITY_EXPORT_END`。
 - 复合 Mobject（例如由多条 Line 组成的 VGroup）需要的纯 helper 定义可以放在同一个导出区内；
   用 `# element_id: <最终元素 ID>` 标记该组，并让该组最后一条赋值把对象绑定到对应的
-  `variable_name`。helper 赋值只能服务于这个最终对象，不能添加动画或副作用。
+  `variable_name`。Surface 等对象所需的参数函数也可以放在导出区内，但只能是无装饰器、
+  无副作用、明确 `return` 的纯计算函数；不能调用 `self.play/add/remove/clear`，不能访问文件、网络或环境。
+  helper 只能服务于这个最终对象，不能添加动画或副作用。
 - 导出区只能导出 closing_state 中仍然存在、且在 `[Inherited Elements State]` 或 `[New Elements]`
   中声明的元素；不要导出临时碎片、辅助线、标题过渡对象或 `[Elements To Remove]` 中的元素。
 - 只有 `required=true` 的继承/新元素才是场景边界导出对象；`required=false` 明确表示

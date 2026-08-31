@@ -278,6 +278,48 @@ def _validate_export_statement(
     """校验导出定义及其安全的局部样式/布局调用。"""
 
     defined = bound_names or set()
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(statement, ast.AsyncFunctionDef):
+            raise ValueError("连续性导出区不允许异步 helper 函数")
+        if (
+            not statement.name.isidentifier()
+            or statement.name.startswith("__")
+            or statement.name in _BANNED_EXPORT_NAMES
+        ):
+            raise ValueError("连续性导出区的 helper 函数名不安全")
+        if statement.decorator_list:
+            raise ValueError("连续性导出区的 helper 函数不能包含装饰器")
+        if statement.args.vararg or statement.args.kwarg:
+            raise ValueError("连续性导出区的 helper 函数不能使用可变参数")
+        argument_names = {
+            argument.arg
+            for argument in (
+                [*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs]
+            )
+        }
+        if statement.args.defaults or any(
+            default is not None for default in statement.args.kw_defaults
+        ):
+            raise ValueError("连续性导出区的 helper 函数不能包含默认参数")
+        local_defined = defined | argument_names
+        has_return = False
+        for child in statement.body:
+            if isinstance(child, ast.Return):
+                if child.value is None:
+                    raise ValueError("连续性导出区的 helper 函数必须返回值")
+                _validate_export_expression(child, local_defined, statement.name)
+                has_return = True
+                continue
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                raise ValueError("连续性导出区不允许嵌套 helper/class 定义")
+            variable_name = _validate_export_helper_statement(child, local_defined)
+            if variable_name:
+                local_defined.add(variable_name)
+        if not has_return:
+            raise ValueError("连续性导出区的 helper 函数必须包含 return")
+        # 第一个返回值表示“可交接元素赋值”；helper 本身只作为后续
+        # Mobject 构造器的局部依赖，因此放到第二个返回值中绑定。
+        return "", statement.name
     if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
         call = statement.value
         if (
@@ -298,9 +340,10 @@ def _validate_export_statement(
         _validate_export_expression(statement.test, defined, "条件")
         local_defined = set(defined)
         for child in statement.body:
-            variable_name, _ = _validate_export_statement(child, local_defined)
-            if variable_name:
-                local_defined.add(variable_name)
+            variable_name, bound_name = _validate_export_statement(child, local_defined)
+            for name in (variable_name, bound_name):
+                if name:
+                    local_defined.add(name)
         return "", ""
     if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
         raise ValueError("连续性导出区只能包含变量赋值或白名单内的 Mobject 样式/布局调用")
@@ -315,6 +358,34 @@ def _validate_export_statement(
         raise ValueError(f"元素 {variable_name} 的构造器必须是明确的名称或属性")
     _validate_export_expression(statement, defined, variable_name)
     return variable_name, variable_name
+
+
+def _validate_export_helper_statement(statement: ast.stmt, defined: set[str]) -> str:
+    """校验纯 helper 函数中的标量赋值/条件/返回表达式。"""
+
+    if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            raise ValueError("连续性导出区 helper 的赋值目标必须是单个变量")
+        variable_name = targets[0].id
+        _validate_export_expression(statement, defined, variable_name)
+        return variable_name
+    if isinstance(statement, ast.If):
+        if statement.orelse:
+            raise ValueError("连续性导出区 helper 不允许 else/elif 分支")
+        _validate_export_expression(statement.test, defined, "helper 条件")
+        local_defined = set(defined)
+        for child in statement.body:
+            if isinstance(child, ast.Return):
+                if child.value is None:
+                    raise ValueError("连续性导出区 helper 的 return 必须有值")
+                _validate_export_expression(child, local_defined, "helper return")
+                continue
+            variable_name = _validate_export_helper_statement(child, local_defined)
+            if variable_name:
+                local_defined.add(variable_name)
+        return ""
+    raise ValueError("连续性导出区 helper 只能包含纯赋值、条件和 return")
 
 
 def _safe_alias_prefix(code: str, begin_line: int, block: str) -> str:
@@ -493,10 +564,11 @@ def _parse_export_block(
             source = ast.get_source_segment(block, statement)
             if not source:
                 raise ValueError("无法读取连续性导出语句")
-            variable_name, _ = _validate_export_statement(statement, bound_names)
+            variable_name, bound_name = _validate_export_statement(statement, bound_names)
             group_variables.append(variable_name)
-            if variable_name:
-                bound_names.add(variable_name)
+            for name in (variable_name, bound_name):
+                if name:
+                    bound_names.add(name)
 
         # 无标记 helper 组只负责为后续对象提供安全的本地依赖。
         if not annotated_id:
@@ -520,6 +592,11 @@ def _parse_export_block(
             raise ValueError(f"元素 {annotated_id} 缺少 Mobject 赋值")
         if len(group_statements) == 1:
             exported_variable = bound_group_variables[0]
+        elif annotated_id in bound_group_variables:
+            # 带子部件的对象可能在首次赋值后继续定义 x_label/y_label
+            # 等 helper，最后还通过 ``axes_3d.add(...)`` 修改主对象；
+            # 若 element_id 与主变量同名，应优先保留这个语义变量。
+            exported_variable = annotated_id
         else:
             # 复合对象的最后一条赋值就是标记的语义对象；element_id
             # 可以和 variable_name 不同（例如 ``main_triangle`` 对应
