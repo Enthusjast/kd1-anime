@@ -44,6 +44,9 @@ def test_coder_prompt_has_continuity_contract():
     assert "transition_out" in CODER_SYSTEM_PROMPT
     assert "RAG Reference Context" in CODER_SYSTEM_PROMPT
     assert "已移除元素绝不能出现在最终连续性导出区" in CODER_SYSTEM_PROMPT
+    assert "导出区只能有一个" in CODER_SYSTEM_PROMPT
+    assert "同时完成“接管”和“导出”" in CODER_SYSTEM_PROMPT
+    assert "仅仅写入导出区不等于对象已经 active" in CODER_SYSTEM_PROMPT
     assert "未经验证的碎片移动" in CODER_SYSTEM_PROMPT
 
 

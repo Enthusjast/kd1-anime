@@ -1077,7 +1077,8 @@ class Orchestrator:
                     + "\n".join(f"- {error}" for error in technical_result.errors),
                     hint="请重新生成 TechnicalSpec，不要直接修改代码绕过技术合同",
                 )
-        for _ in range(settings.CODE_VALIDATION_ATTEMPTS):
+        max_validation_attempts = settings.CODE_VALIDATION_ATTEMPTS
+        for attempt in range(1, max_validation_attempts + 1):
             code_kwargs = {
                 "feedback": current_feedback,
                 "previous_code": current_previous,
@@ -1137,7 +1138,17 @@ class Orchestrator:
             last_continuity_error = continuity_error
             last_lifecycle_error = lifecycle_error
             # 提供详细的修复指导
-            feedback_parts = [f"确定性校验未通过，必须修复以下问题：\n{validation.feedback}"]
+            feedback_parts = [
+                f"上一候选是第 {attempt}/{max_validation_attempts} 次尝试，未通过确定性校验；"
+                f"现在进行第 {min(attempt + 1, max_validation_attempts)}/{max_validation_attempts} "
+                "次修复。不得原样返回上一候选代码，必须针对下面的确定性错误做最小修改：\n"
+                f"{validation.feedback}"
+            ]
+            if current_previous and code == current_previous:
+                feedback_parts.append(
+                    "\n上一候选代码与本次输出完全相同，说明上一次修复没有生效；"
+                    "请改变实现结构，不要再次复制同一份代码。\n"
+                )
             if continuity_error:
                 feedback_parts.append(
                     "\n连续性导出合同校验未通过，必须修复以下问题：\n- " + continuity_error
@@ -1160,6 +1171,22 @@ class Orchestrator:
                 feedback_parts.append(
                     "\n动画生命周期校验未通过，必须修复以下问题：\n- " + lifecycle_error
                 )
+                if "重定义仍处于 active 的对象" in lifecycle_error:
+                    feedback_parts.append(
+                        "\n生命周期修复规则：导出区只能有一个；继承且需要继续交接的对象只能定义一次，"
+                        "并且应放在唯一的 KD1_CONTINUITY_EXPORT_BEGIN/END 区内；"
+                        "不要先在 marker 外复制继承代码，再在 marker 内重新定义，"
+                        "也不要在动画结束位置再次重建同名对象。需要淡出的继承元素"
+                        "才定义在 marker 外，并保留唯一的 FadeOut。\n"
+                    )
+                if "必须导出的对象不 active" in lifecycle_error:
+                    feedback_parts.append(
+                        "\n导出对象激活规则：required=true 的导出变量必须在动画流程中"
+                        "使用 Create、Write、FadeIn 等 introducer 实际引入，并在结尾"
+                        "保持 active；不要只定义该变量或只让带 _initial、_shrunk 等"
+                        "后缀的临时变量参与动画。若使用 Transform 阶段目标，需保证"
+                        "最终仍由合同中的 variable_name 对象承接。\n"
+                    )
 
             # 如果是 TexTemplate 相关错误，提供正确示例
             if any("TexTemplate" in err or "tex_template" in err for err in validation.errors):

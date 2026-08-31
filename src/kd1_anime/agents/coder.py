@@ -120,9 +120,17 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - `tex_template`、`COLORS`、`FONTS`、`FONT_SIZES`、`STROKE_WIDTHS` 和
   `LAYOUT_ANCHORS` 是每个场景都会初始化的上下文，不是交接元素；必须在 marker 之前配置，
   不得放入 marker，也不得给它们添加 `element_id`。
-- 每个 Mobject 变量在 `construct()` 中只能定义一次；不要先在动画流程中定义对象，
-  又在 marker 内复制同名定义。marker 应紧邻唯一的对象定义；没有边界导出对象时保留空 marker
-  或省略 marker，不能在场景结尾再次重建已 active 的对象。
+- 导出区只能有一个，并且必须紧邻全局配置之后，作为场景的唯一对象初始化区。
+  对于 `inherited_elements` 中同时需要继续保留并交接的元素，把它的定义只写在这个
+  marker 内；这一次定义同时完成“接管”和“导出”，不要先在 marker 外定义、再在
+  marker 末尾复制一遍。对于 `[Elements To Remove]` 中只需淡出的元素，才把它的唯一
+  定义放在 marker 外，并保留对应的 FadeOut。每个 Mobject 变量在 `construct()` 中只能
+  定义一次，绝不能在动画流程结束时再次重建 active 对象。
+- required 的新元素也只在同一个 marker 内定义，但必须在动画流程中用 `Create`、`Write`
+  或 `FadeIn` 等 introducer 实际引入；仅仅写入导出区不等于对象已经 active。若用分阶段
+  目标对象演示变化，优先对 required 变量本身使用 `Transform`，或确保最终 active 的
+  变量名就是合同中的 `variable_name`，不要只让带 `_initial`/`_shrunk` 后缀的临时变量
+  活跃而遗漏 required 对象。
 - 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
   面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；
@@ -295,7 +303,10 @@ class CoderAgent(BaseAgent):
                 ),
                 PromptSection(
                     "[Inherited Elements Code]",
-                    "以下是上一场景最终保留的纯 Mobject 定义。请在 construct() 开头重新定义并接管它们：\n"
+                    "以下是上一场景最终保留的纯 Mobject 定义。请在 construct() 开头重新定义并接管它们。"
+                    "其中仍需保留并交接的元素，直接放入唯一导出区并在动画中复用；"
+                    "[Elements To Remove] 中的元素只在导出区外定义一次并执行 FadeOut。"
+                    "不要把同一份继承代码同时放在 marker 外和 marker 内：\n"
                     f"```python\n{inherited_elements_code}\n```",
                     required=bool(inherited_elements_code),
                     priority=110,

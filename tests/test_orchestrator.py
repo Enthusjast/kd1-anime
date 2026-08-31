@@ -19,7 +19,7 @@ from kd1_anime.agents.planner import (
     VisualElementState,
 )
 from kd1_anime.agents.reviewer import ReviewResult
-from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.agents.technical_planner import TechnicalAnimation, TechnicalObject, TechnicalSpec
 from kd1_anime.config import settings
 from kd1_anime.eval.visual_eval import VisualAnalysisResult, VisualIssue
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
@@ -1399,6 +1399,142 @@ class Demo(Scene):
     assert class_name == "Demo"
     assert len(coder.calls) == 2
     assert "连续性导出合同" in coder.calls[1]
+    assert "第 2/3 次修复" in coder.calls[1]
+
+
+def test_code_generation_explains_single_export_definition_on_lifecycle_failure(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    required=True,
+                )
+            ]
+        }
+    )
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                constructor="Circle",
+                lifecycle=["define", "create", "keep"],
+                exported=True,
+            )
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=0,
+                end_seconds=1,
+                operation="create",
+                target_element_ids=["formula"],
+                create_element_ids=["formula"],
+            )
+        ],
+        export_element_ids=["formula"],
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.play(Create(formula))
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+        self.play(Create(formula))
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return invalid if len(self.calls) == 1 else valid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    generated, class_name = Orchestrator()._generate_validated_code(
+        scene_plan,
+        technical_spec=technical_spec,
+        stream=False,
+    )
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 2
+    assert "生命周期修复规则" in coder.calls[1]
+    assert "导出区只能有一个" in coder.calls[1]
+
+
+def test_code_generation_marks_an_unchanged_invalid_candidate(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    required=True,
+                )
+            ]
+        }
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        duplicate = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return invalid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(settings, "CODE_VALIDATION_ATTEMPTS", 3)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    with pytest.raises(module.ValidationError):
+        Orchestrator()._generate_validated_code(scene_plan, stream=False)
+
+    assert len(coder.calls) == 3
+    assert "完全相同" in coder.calls[2]
 
 
 def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports(monkeypatch):

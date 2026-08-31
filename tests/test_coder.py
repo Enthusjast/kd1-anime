@@ -245,6 +245,7 @@ class TestScene(Scene):
         assert "[Inherited Elements Code]" in message
         assert 'formula = MathTex(r"x^2")' in message
         assert "main_formula" in message
+        assert "不要把同一份继承代码同时放在 marker 外和 marker 内" in message
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_receives_continuity_bible(self, mock_call_llm, coder_agent, sample_plan):
