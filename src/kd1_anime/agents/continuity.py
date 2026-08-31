@@ -308,6 +308,24 @@ def _validate_export_expression(statement: ast.AST, defined: set[str], label: st
             raise ValueError(f"元素 {label} 使用了不允许的动态表达式")
 
 
+def _simple_export_target_names(target: ast.AST) -> set[str]:
+    """提取 helper 中安全的单变量/元组解包赋值目标。"""
+
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for item in target.elts:
+            if isinstance(item, ast.Starred):
+                return set()
+            nested = _simple_export_target_names(item)
+            if not nested or names & nested:
+                return set()
+            names.update(nested)
+        return names
+    return set()
+
+
 def _validate_export_statement(
     statement: ast.stmt,
     bound_names: set[str] | None = None,
@@ -350,8 +368,7 @@ def _validate_export_statement(
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 raise ValueError("连续性导出区不允许嵌套 helper/class 定义")
             variable_name = _validate_export_helper_statement(child, local_defined)
-            if variable_name:
-                local_defined.add(variable_name)
+            local_defined.update(variable_name)
         if not has_return:
             raise ValueError("连续性导出区的 helper 函数必须包含 return")
         # 第一个返回值表示“可交接元素赋值”；helper 本身只作为后续
@@ -397,16 +414,18 @@ def _validate_export_statement(
     return variable_name, variable_name
 
 
-def _validate_export_helper_statement(statement: ast.stmt, defined: set[str]) -> str:
+def _validate_export_helper_statement(statement: ast.stmt, defined: set[str]) -> set[str]:
     """校验纯 helper 函数中的标量赋值/条件/返回表达式。"""
 
     if isinstance(statement, (ast.Assign, ast.AnnAssign)):
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
-            raise ValueError("连续性导出区 helper 的赋值目标必须是单个变量")
-        variable_name = targets[0].id
-        _validate_export_expression(statement, defined, variable_name)
-        return variable_name
+        if len(targets) != 1:
+            raise ValueError("连续性导出区 helper 的赋值目标必须是单个变量或简单元组")
+        variable_names = _simple_export_target_names(targets[0])
+        if not variable_names:
+            raise ValueError("连续性导出区 helper 的赋值目标必须是单变量或简单元组")
+        _validate_export_expression(statement, defined, ", ".join(sorted(variable_names)))
+        return variable_names
     if isinstance(statement, ast.If):
         if statement.orelse:
             raise ValueError("连续性导出区 helper 不允许 else/elif 分支")
@@ -418,10 +437,8 @@ def _validate_export_helper_statement(statement: ast.stmt, defined: set[str]) ->
                     raise ValueError("连续性导出区 helper 的 return 必须有值")
                 _validate_export_expression(child, local_defined, "helper return")
                 continue
-            variable_name = _validate_export_helper_statement(child, local_defined)
-            if variable_name:
-                local_defined.add(variable_name)
-        return ""
+            local_defined.update(_validate_export_helper_statement(child, local_defined))
+        return set()
     raise ValueError("连续性导出区 helper 只能包含纯赋值、条件和 return")
 
 

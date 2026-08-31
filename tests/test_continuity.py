@@ -331,8 +331,7 @@ class Demo(ThreeDScene):
         # KD1_CONTINUITY_EXPORT_BEGIN
         # element_id: surface
         def paraboloid(u, v):
-            x = u
-            y = v
+            x, y = u, v
             z = x**2 + y**2
             return np.array([x, y, z])
         surface = Surface(paraboloid, u_range=[-1, 1], v_range=[-1, 1])
