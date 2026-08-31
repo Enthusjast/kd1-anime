@@ -35,6 +35,8 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 6. 不允许明显的类型错误、维度错误、空索引、除零或无界循环。
 7. Updater/always_redraw 不得形成递归引用，结束后应清除 updater。
 8. MovingCameraScene/ThreeDScene 的相机 API 必须匹配对应场景类型；普通 Scene 中不得出现 self.camera.frame。
+   OpenGL 下 `ThreeDScene`、`ThreeDAxes`、`Surface` 和 `set_camera_orientation` 是合法组合；
+   只禁止 `self.camera.frame` 和 `MovingCameraScene` 运镜，不得把三维场景误判为普通 `Scene` 错误。
 
 ## C. 数学与 LaTeX（严重）
 9. 数学公式、推导、数值和几何关系必须正确，并与分镜 computation 中的数值一致。
@@ -79,9 +81,10 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 31. 只有 elements_to_remove 中明确列出的元素才能 FadeOut；持续元素不能通过 clear()、整体淡出
     或无替换重画而丢失。
 32. 必须存在 KD1_CONTINUITY_EXPORT_BEGIN/END 导出区；导出区只能包含可独立重建的 Mobject
-    定义，以及作用于导出区内已定义对象的安全样式/布局调用，并且应覆盖
-    closing_state/new_elements 中需要交给下一场景的对象；elements_to_remove 中的元素不得导出，
-    临时碎片、辅助线和过渡标题也不得导出。
+    定义，以及作用于导出区内已定义对象的安全样式/布局调用。导出集合以结构化
+    ScenePlan/TechnicalSpec 中 `required=true` 且未移除的元素为唯一权威，不要从
+    closing_state、persistent_elements 等自由文本额外推断 optional 元素；应覆盖这些必需对象。
+    elements_to_remove 中的元素不得导出，临时碎片、辅助线和过渡标题也不得导出。
 33. GlobalVisualState 中的颜色、字体、字号、线宽和锚点是只读配置，代码不得自行创建冲突配置。
 
 ## 保守教学方案

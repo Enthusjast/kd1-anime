@@ -365,6 +365,37 @@ class Demo(ThreeDScene):
     assert "surface.set_style" in elements[0].code
 
 
+def test_extract_continuity_elements_accepts_pure_surface_lambda():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        surface = Surface(lambda u, v: np.array([u, v, u**2 + v**2]))
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("surface", "surface")]
+
+
+def test_extract_continuity_elements_rejects_lambda_defaults():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        surface = Surface(lambda u, v=0: np.array([u, v, u**2 + v**2]))
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    with pytest.raises(ValueError, match="lambda helper"):
+        extract_continuity_elements(code)
+
+
 def test_extract_continuity_elements_accepts_local_styling_and_safe_aliases():
     code = """
 from manim import *

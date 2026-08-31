@@ -239,7 +239,44 @@ def _without_export_context_assignments(block: str) -> str:
 def _validate_export_expression(statement: ast.AST, defined: set[str], label: str) -> None:
     """校验赋值或局部方法调用中的表达式，不允许外部业务依赖。"""
 
+    lambda_nodes = [node for node in ast.walk(statement) if isinstance(node, ast.Lambda)]
+    nested_lambda_ids = {
+        id(child)
+        for parent in lambda_nodes
+        for child in ast.walk(parent)
+        if isinstance(child, ast.Lambda) and child is not parent
+    }
+    top_level_lambdas = [node for node in lambda_nodes if id(node) not in nested_lambda_ids]
+    lambda_descendant_ids = {
+        id(child) for parent in top_level_lambdas for child in ast.walk(parent)
+    }
+    for lambda_node in top_level_lambdas:
+        if (
+            lambda_node.args.vararg
+            or lambda_node.args.kwarg
+            or lambda_node.args.defaults
+            or any(default is not None for default in lambda_node.args.kw_defaults)
+        ):
+            raise ValueError(f"元素 {label} 的 lambda helper 不能包含可变参数或默认参数")
+        argument_names = {
+            argument.arg
+            for argument in (
+                [
+                    *lambda_node.args.posonlyargs,
+                    *lambda_node.args.args,
+                    *lambda_node.args.kwonlyargs,
+                ]
+            )
+        }
+        _validate_export_expression(
+            lambda_node.body,
+            defined | argument_names,
+            label,
+        )
+
     for node in ast.walk(statement):
+        if id(node) in lambda_descendant_ids:
+            continue
         if isinstance(node, ast.Call) and _call_name(node) in _BANNED_EXPORT_NAMES:
             raise ValueError(f"元素 {label} 的连续性导出区包含禁止调用: {_call_name(node)}")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -267,10 +304,7 @@ def _validate_export_expression(statement: ast.AST, defined: set[str], label: st
             and not (node.id[:1].isupper() and is_call_target)
         ):
             raise ValueError(f"元素 {label} 引用了导出区外未定义变量: {node.id}")
-        if isinstance(
-            node,
-            (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
-        ):
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
             raise ValueError(f"元素 {label} 使用了不允许的动态表达式")
 
 

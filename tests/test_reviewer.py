@@ -27,6 +27,8 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "面积守恒" in REVIEWER_SYSTEM_PROMPT
     assert "保守教学方案" in REVIEWER_SYSTEM_PROMPT
     assert "evidence" in REVIEWER_SYSTEM_PROMPT
+    assert "ThreeDScene" in REVIEWER_SYSTEM_PROMPT
+    assert "结构化" in REVIEWER_SYSTEM_PROMPT
     assert "证据优先于行号" in REVIEWER_SYSTEM_PROMPT
     assert "只报告确定的问题" in REVIEWER_SYSTEM_PROMPT
 

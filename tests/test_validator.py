@@ -360,6 +360,19 @@ def test_rejects_camera_frame_in_plain_scene():
     assert "MovingCameraScene" in result.feedback
 
 
+def test_rejects_three_d_camera_setup_in_plain_scene():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.set_camera_orientation(phi=75 * DEGREES)\n"
+    )
+
+    assert not result.is_valid
+    assert "set_camera_orientation" in result.feedback
+    assert "ThreeDScene" in result.feedback
+
+
 def test_accepts_camera_frame_in_moving_camera_scene():
     result = validate_manim_code(
         "from manim import *\n"

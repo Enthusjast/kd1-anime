@@ -712,6 +712,20 @@ class _SafetyVisitor(ast.NodeVisitor):
             )
             if construct is None:
                 self.error(node, f"Scene 类 {node.name!r} 缺少 construct() 方法")
+            if "ThreeDScene" not in bases:
+                for call in ast.walk(node):
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                        and call.func.attr == "set_camera_orientation"
+                    ):
+                        self.error(
+                            call,
+                            "self.set_camera_orientation() 只适用于 ThreeDScene；"
+                            "请将场景继承改为 ThreeDScene 或删除三维相机设置",
+                        )
             # self.camera.frame 检查: 扫描整个类体 (含辅助方法, 不只是 construct)。
             # - OpenGL 渲染器固定使用 OpenGLCamera (没有 frame 属性), 继承
             #   MovingCameraScene 也无效 → 一律禁止相机运镜, 必须删除。
