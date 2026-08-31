@@ -8,6 +8,7 @@ import kd1_anime.orchestrator as module
 from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    ExtractedElement,
     LessonSpec,
     MathClaim,
     PlanningDraft,
@@ -1535,6 +1536,53 @@ class Demo(Scene):
 
     assert len(coder.calls) == 3
     assert "完全相同" in coder.calls[2]
+
+
+def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    formula = VisualElementState(
+        element_id="formula",
+        variable_name="formula",
+        semantic_state="核心公式",
+        required=True,
+    )
+    first_plan = plan().model_copy(update={"new_elements": [formula]})
+    first_code = "from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n"
+    first_state = SceneState(
+        plan=first_plan,
+        code=first_code,
+        exported_elements_code="formula = Circle()",
+        exported_elements=[
+            ExtractedElement(
+                element_id="formula",
+                variable_name="formula",
+                code="formula = Circle()",
+            )
+        ],
+    )
+    ctx = PipelineContext("prompt", paths=run_paths)
+    orchestrator = Orchestrator()
+
+    orchestrator._update_state_ledger(ctx, first_state)
+
+    second_plan = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [formula],
+            "elements_to_remove": [formula],
+        }
+    )
+    second_state = SceneState(plan=second_plan)
+
+    orchestrator._update_state_ledger(ctx, second_state)
+
+    historical = next(item for item in ctx.state_ledger.elements if item.element_id == "formula")
+    assert historical.active is False
+    assert historical.required_next is False
+    assert "formula" in ctx.state_ledger.boundaries[1].closing_element_ids
+    assert "formula" in ctx.state_ledger.boundaries[2].opening_element_ids
+    assert "formula" not in ctx.state_ledger.boundaries[2].closing_element_ids
 
 
 def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports(monkeypatch):

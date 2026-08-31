@@ -5172,15 +5172,23 @@ class Orchestrator:
                 )
             )
         removed_ids = {item.element_id for item in state.plan.elements_to_remove}
+        # StateLedger 同时保存历史场景边界。元素在当前场景退出后不能从
+        # ``elements`` 物理删除，否则历史 Scene N 的 closing_element_ids
+        # 会引用一个不存在的 element，下一次更新账本时触发完整性校验失败。
+        # 保留不可变的代码快照并标记 inactive，既能支持历史追踪，也能
+        # 让当前场景的 opening/closing 边界继续可验证。
         current_elements = [
-            item
+            (
+                item.model_copy(update={"active": False, "required_next": False})
+                if item.element_id in removed_ids
+                else item
+            )
             for item in ctx.state_ledger.elements
-            if item.element_id not in removed_ids and item.source_scene_id < state.plan.scene_id
         ]
         known = {item.element_id for item in current_elements}
         current_elements.extend(item for item in ledger_elements if item.element_id not in known)
-        # update_scene 会按 element_id 覆盖已有快照；传入的旧元素只用于
-        # 保留尚未在本场景重新导出的全片元素。
+        # update_scene 会按 element_id 覆盖当前场景重新导出的快照；历史
+        # 元素则保留为 inactive tombstone，供旧边界和恢复诊断引用。
         ctx.state_ledger = ctx.state_ledger.model_copy(update={"elements": current_elements})
         ctx.state_ledger = ctx.state_ledger.update_scene(
             scene_id=state.plan.scene_id,
