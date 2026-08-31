@@ -409,6 +409,27 @@ class Demo(Scene):
     assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
 
 
+def test_extract_continuity_elements_accepts_axes_coordinate_mapping():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: axes_3d
+        axes_3d = ThreeDAxes()
+        # element_id: point
+        point = Dot(axes_3d.c2p(1, 1, 2))
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [
+        ("axes_3d", "axes_3d"),
+        ("point", "point"),
+    ]
+
+
 def test_extract_continuity_elements_drops_context_assignments_from_marker():
     code = """
 from manim import *

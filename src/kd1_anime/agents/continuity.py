@@ -80,7 +80,9 @@ _EXPORT_MUTATION_METHODS = {
     "to_edge",
 }
 _EXPORT_PURE_MOBJECT_METHODS = {
+    "c2p",
     "copy",
+    "coords_to_point",
     "get_bottom",
     "get_center",
     "get_corner",

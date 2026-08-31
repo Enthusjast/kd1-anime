@@ -1136,6 +1136,14 @@ class Orchestrator:
                 feedback_parts.append(
                     "\n连续性导出合同校验未通过，必须修复以下问题：\n- " + continuity_error
                 )
+                if "不能包含已移除元素" in continuity_error:
+                    feedback_parts.append(
+                        "\n移除元素的修复方式：该元素仍需在 construct() 开头定义并用于"
+                        " FadeOut，但它的完整定义和 element_id 标记必须移到"
+                        " KD1_CONTINUITY_EXPORT_BEGIN 之前；导出区只能保留结束时"
+                        "仍存在的 required=true 元素。不要把已移除元素留在 marker 内，"
+                        "也不要为了删除 marker 而删除场景中的 FadeOut。\n"
+                    )
                 feedback_parts.append(
                     "\n导出区修复规则：只允许导出 required=true 的边界元素；"
                     "required=false 的对象只能作为场景内部对象，不能出现在 marker 内。"

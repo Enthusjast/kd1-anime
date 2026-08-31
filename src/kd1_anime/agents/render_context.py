@@ -11,6 +11,8 @@ def renderer_guidance(renderer: Literal["cairo", "opengl"] | None = None) -> str
         return """## 当前渲染能力
 - Renderer: OpenGL。
 - OpenGLCamera 没有 `frame`，禁止 `self.camera.frame` 和 `MovingCameraScene` 运镜。
+- `ThreeDScene`、`ThreeDAxes`、`Surface` 以及 `ThreeDScene.set_camera_orientation(...)` 均受支持；
+  三维场景应使用 `ThreeDScene`，固定视角不等于改用普通 `Scene`。
 - 需要推近或平移时，对局部 VGroup 使用 Transform/animate，或调整静态布局。
 - 不定义自定义 Mobject/VMobject 子类；使用 Manim 标准图形在 construct 中组合，避免 should_render 不兼容。"""
     return """## 当前渲染能力
