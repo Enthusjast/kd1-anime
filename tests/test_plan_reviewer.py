@@ -169,6 +169,37 @@ def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():
     assert filtered == []
 
 
+def test_plan_review_accepts_next_scene_removal_after_current_create_handoff():
+    formula = VisualElementState(
+        element_id="formula_surface",
+        variable_name="formula_surface",
+        required=True,
+    )
+    plan = make_plan().model_copy(
+        update={
+            "new_elements": [formula],
+            "handoff": [
+                SceneHandoff(
+                    element_id="formula_surface",
+                    variable_name="formula_surface",
+                    action="create",
+                )
+            ],
+        }
+    )
+    issue = PlanReviewIssue(
+        category="contract",
+        field="handoff",
+        message=(
+            "场景2的 elements_to_remove 中移除了 formula_surface，"
+            "但场景1的 handoff 将其列为 create。"
+        ),
+        fix_instruction="将当前 handoff 改为 remove。",
+    )
+
+    assert filter_verified_plan_issues(plan, [issue]) == []
+
+
 def test_plan_review_only_major_issues_block():
     plan = make_plan()
     result = PlanReviewResult(

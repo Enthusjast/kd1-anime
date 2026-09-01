@@ -1187,6 +1187,13 @@ class Orchestrator:
                         "后缀的临时变量参与动画。若使用 Transform 阶段目标，需保证"
                         "最终仍由合同中的 variable_name 对象承接。\n"
                     )
+                if "Transform 的 source 未 active" in lifecycle_error:
+                    feedback_parts.append(
+                        "\nTransform 源对象修复规则：VGroup 本身只有在整体通过 self.add、"
+                        "FadeIn/Create 等方式引入后才是 active；单独引入它的子对象不等于"
+                        "引入 VGroup。请不要先 FadeIn 子对象再 Transform 一个后创建的 group，"
+                        "应整体引入该 group，或改为对已经 active 的子对象分别执行动画。\n"
+                    )
 
             # 如果是 TexTemplate 相关错误，提供正确示例
             if any("TexTemplate" in err or "tex_template" in err for err in validation.errors):
@@ -3328,16 +3335,47 @@ class Orchestrator:
             self._checkpoint(ctx, State.DETAILING)
 
     def _normalize_scene_claim_contracts(self, ctx: PipelineContext) -> bool:
-        """删除 Detail 阶段擅自增加的数学断言引用。
+        """对齐 Detail 阶段的数学断言和时间线证据。
 
         概要阶段已经锁定了每个场景的 ``claim_ids``。Detail 模型有时会把
-        前置推导拆成 ``claim_4_derive_1`` 等新 ID，随后计划编译器会在
-        每一轮重复报告同一个错误。额外断言不是可由视觉合同推断的内容，
-        因而可以确定地从 ``math_claims`` 和时间线引用中删除；真正缺少
-        概要断言的情况仍由 Plan Reviewer 处理。
+        前置推导拆成 ``claim_4_derive_1`` 等新 ID，或遗漏概要断言的详细
+        ``math_claims``/时间线绑定，随后计划编译器会在每一轮重复报告同一个
+        错误。额外断言不是可由视觉合同推断的内容，因而可以确定地删除；
+        缺少的已锁定断言则从全片 LessonSpec 原样补回，并绑定到最相关的
+        时间线事件。这里不创造新的数学事实，只恢复概要阶段已经批准的
+        教学合同。
         """
 
         changed = False
+        lesson_claims = {claim.claim_id: claim for claim in ctx.lesson_spec.claims}
+
+        def claim_event_score(claim_text: str, event: object) -> int:
+            event_text = str(getattr(event, "action", "")).lower()
+            terms = re.findall(
+                r"[a-z][a-z0-9_]{1,}|\d+(?:\.\d+)?|[\u4e00-\u9fff]{2,}",
+                claim_text.lower(),
+            )
+            score = sum(3 for term in set(terms) if term in event_text)
+            score += sum(
+                1
+                for marker in (
+                    "公式",
+                    "曲面",
+                    "函数",
+                    "方程",
+                    "结论",
+                    "展示",
+                    "绘制",
+                    "计算",
+                    "误差",
+                    "切平面",
+                    "偏导",
+                    "全微分",
+                )
+                if marker in event_text
+            )
+            return score
+
         for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id):
             if (
                 state.failed
@@ -3354,6 +3392,15 @@ class Orchestrator:
             normalized_claims = [
                 claim for claim in state.plan.math_claims if claim.claim_id in allowed
             ]
+            present_claims = {claim.claim_id for claim in normalized_claims}
+            missing_claims = [
+                claim_id
+                for claim_id in state.plan.claim_ids
+                if claim_id not in present_claims and claim_id in lesson_claims
+            ]
+            normalized_claims.extend(
+                lesson_claims[claim_id].model_copy(deep=True) for claim_id in missing_claims
+            )
             normalized_timeline = [
                 event.model_copy(
                     update={
@@ -3366,7 +3413,53 @@ class Orchestrator:
                 else event
                 for event in state.plan.timeline
             ]
-            if not extra_claims and normalized_timeline == state.plan.timeline:
+            timeline_claims = {
+                claim_id for event in normalized_timeline for claim_id in event.math_claim_ids
+            }
+            missing_timeline_claims = [
+                claim_id
+                for claim_id in state.plan.claim_ids
+                if (claim_id in present_claims or claim_id in missing_claims)
+                and claim_id not in timeline_claims
+            ]
+            if missing_timeline_claims and normalized_timeline:
+                events = list(normalized_timeline)
+                for claim_id in missing_timeline_claims:
+                    claim = next(
+                        (item for item in normalized_claims if item.claim_id == claim_id),
+                        None,
+                    )
+                    claim_text = (
+                        " ".join(
+                            str(value)
+                            for value in (
+                                getattr(claim, "statement", ""),
+                                getattr(claim, "expression_before", ""),
+                                getattr(claim, "expression_after", ""),
+                            )
+                        )
+                        if claim is not None
+                        else claim_id
+                    )
+                    target_index = max(
+                        range(len(events)),
+                        key=lambda index: (
+                            claim_event_score(claim_text, events[index]),
+                            events[index].end_seconds - events[index].start_seconds,
+                            -events[index].start_seconds,
+                        ),
+                    )
+                    target = events[target_index]
+                    events[target_index] = target.model_copy(
+                        update={"math_claim_ids": [*target.math_claim_ids, claim_id]}
+                    )
+                normalized_timeline = events
+            if (
+                not extra_claims
+                and not missing_claims
+                and not missing_timeline_claims
+                and normalized_timeline == state.plan.timeline
+            ):
                 continue
             state.plan = state.plan.model_copy(
                 update={
@@ -3385,6 +3478,16 @@ class Orchestrator:
                 ctx.continuity_warnings.append(
                     f"Scene {state.plan.scene_id} 已删除 Detail 擅自增加的数学断言: "
                     + ", ".join(sorted(extra_claims))
+                )
+            if missing_claims:
+                ctx.continuity_warnings.append(
+                    f"Scene {state.plan.scene_id} 已从 LessonSpec 补齐数学断言: "
+                    + ", ".join(sorted(missing_claims))
+                )
+            if missing_timeline_claims:
+                ctx.continuity_warnings.append(
+                    f"Scene {state.plan.scene_id} 已将断言绑定到时间线证据: "
+                    + ", ".join(sorted(missing_timeline_claims))
                 )
             self._emit(
                 "plan_claim_contract_repaired",
@@ -4190,6 +4293,12 @@ class Orchestrator:
 
                 replan_count = replan_attempts.get(scene_id, 0)
                 if replan_count >= max_replans:
+                    # 每次重规划都会重置当前计划的审查轮数，因此复杂几何
+                    # 方案可能永远到不了上面的 ``review_round`` 上限。重规划
+                    # 预算耗尽本身也是明确的收敛信号：若反馈确认是高风险几何，
+                    # 应优先切换为保守教学方案，而不是直接把场景判死。
+                    if self._activate_safe_fallback(ctx, scene_id, state, feedback):
+                        break
                     self._plan_review_failure(
                         ctx,
                         scene_id,
@@ -4294,8 +4403,11 @@ class Orchestrator:
                         )
                         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", "")
                     if ctx.continuity_bible is not None:
+                        # 连续性审查预算是整个运行级别的预算。计划重规划
+                        # 会使状态重新进入 pending，但不能把已经消耗的
+                        # review round 清零，否则规划器可以通过反复改写
+                        # 计划无限绕过 MAX_CONTINUITY_FIX_ROUNDS。
                         ctx.continuity_review_status = "pending"
-                        ctx.continuity_review_round = 0
                     ctx.scenes = [
                         item.plan
                         for item in sorted(
@@ -5116,22 +5228,32 @@ class Orchestrator:
                     ),
                 }
             )
-        ctx.state_ledger = ctx.state_ledger.model_copy(
-            update={
-                "elements": [
-                    item for item in ctx.state_ledger.elements if item.source_scene_id != scene_id
-                ],
-                "boundaries": {
-                    key: value
-                    for key, value in ctx.state_ledger.boundaries.items()
-                    if key != scene_id
-                },
-                "current_scene_id": (
-                    max(
-                        (key for key in ctx.state_ledger.boundaries if key != scene_id),
-                        default=None,
-                    )
-                ),
+        retained_boundaries = {
+            key: value for key, value in ctx.state_ledger.boundaries.items() if key != scene_id
+        }
+        retained_references = {
+            element_id
+            for boundary in retained_boundaries.values()
+            for element_id in (*boundary.opening_element_ids, *boundary.closing_element_ids)
+        }
+        ledger_elements = []
+        for item in ctx.state_ledger.elements:
+            if item.source_scene_id != scene_id:
+                ledger_elements.append(item)
+            elif item.element_id in retained_references:
+                # 同一 element_id 可能已被后续场景重新导出，而较早的边界
+                # 仍然引用它。删除后续场景时不能把这个历史引用变成悬空
+                # ID；保留为不可继续继承的 tombstone，直到所有边界都被
+                # 删除。其源代码只用于历史追踪，不再作为当前上下文提供。
+                ledger_elements.append(
+                    item.model_copy(update={"active": False, "required_next": False})
+                )
+        ctx.state_ledger = StateLedger.model_validate(
+            {
+                **ctx.state_ledger.model_dump(mode="python"),
+                "elements": ledger_elements,
+                "boundaries": retained_boundaries,
+                "current_scene_id": max(retained_boundaries, default=None),
             }
         )
 
@@ -5954,7 +6076,6 @@ class Orchestrator:
             state.failure_category = ""
             if ctx.continuity_bible is not None:
                 ctx.continuity_review_status = "pending"
-                ctx.continuity_review_round = 0
             ctx.plan_review_status = "pending"
             ctx.continuity_warnings.append(f"Scene {scene_id} 已切换为保守教学方案：{reason}")
             ctx.scenes = [
@@ -5981,6 +6102,74 @@ class Orchestrator:
             scene_id=scene_id,
             reason=reason,
         )
+        return True
+
+    def _apply_precise_review_fixes(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+        result: ReviewResult,
+    ) -> bool:
+        """在不改动教学合同的前提下应用 Reviewer 的精确局部修复。
+
+        ``math``/``continuity`` finding 不一定意味着计划错误；例如计划
+        正确地要求某个顶点，而 Coder 只把代码里的坐标写错。若 Reviewer
+        同时给出了唯一可匹配的局部替换，先在代码层应用并重新跑全部确定性
+        校验，避免把纯实现错误错误升级为 Planner 重规划循环。
+        """
+
+        candidate = state.code
+        applied = 0
+        for fix in result.fixes:
+            if not fix.find or fix.find == fix.replace:
+                continue
+            if candidate.count(fix.find) != 1:
+                return False
+            candidate = candidate.replace(fix.find, fix.replace, 1)
+            applied += 1
+        if applied == 0 or candidate == state.code:
+            return False
+
+        validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
+        if not validation.is_valid:
+            return False
+        try:
+            extract_scene_continuity_elements(candidate, state.plan)
+        except ValueError:
+            return False
+        if state.technical_spec is not None:
+            lifecycle_result = validate_animation_lifecycle(
+                candidate,
+                state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+            )
+            if not lifecycle_result.is_valid:
+                return False
+
+        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
+        with self._state_lock:
+            state.code = candidate
+            state.class_name = validation.scene_classes[0]
+            state.reviewed = False
+            state.review_round = 0
+            state.review_signature = ""
+            state.identical_review_count = 0
+            state.rewrite_feedback = ""
+            state.artifact = None
+            state.rendered = False
+            state.exported_elements_code = ""
+            state.exported_elements = []
+            state.local_smoke_status = "pending"
+            self._remove_element_manifest_scene(ctx, scene_id)
+            self._reset_visual_receipt(ctx, state)
+            self._checkpoint(ctx, State.REVIEWING)
+        self._emit(
+            "scene_coded",
+            scene_id=scene_id,
+            file_path=str(ctx.paths.scenes / f"scene_{scene_id}.py"),
+        )
+        self._emit("scene_review_fix_applied", scene_id=scene_id, severity=result.severity)
         return True
 
     def _apply_review_result(
@@ -6014,6 +6203,10 @@ class Orchestrator:
             return True
 
         original_feedback = result.feedback or ""
+        if result.severity == "major" and self._apply_precise_review_fixes(
+            ctx, scene_id, state, result
+        ):
+            return True
         plan_finding = next(
             (
                 finding
@@ -6400,7 +6593,6 @@ class Orchestrator:
             ctx.plan_review_status = "pending"
             if ctx.continuity_bible is not None:
                 ctx.continuity_review_status = "pending"
-                ctx.continuity_review_round = 0
             ctx.final_video = None
             ctx.final_video_sha256 = ""
             self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", "")

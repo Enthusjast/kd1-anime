@@ -99,6 +99,9 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
 
 ## 审查原则
 - 不因个人审美、命名风格或实现方式偏好打回计划。
+- `handoff` 描述的是当前场景交给下一场景的边界动作，不要把下一场景的
+  `elements_to_remove` 反向要求当前场景把同一元素标成 `remove`。例如“本场景
+  create/keep → 下一场景 inherited → 下一场景再 remove”是合法的三段式交接。
 - `major` 才是阻断问题；`minor` 只记录可选提示，不要因为“无需修改”或节奏建议
   把 is_valid 设为 false。
 - 只要复杂几何不能严格验证，就要求改成面积标签、基础图形或等式变换；不要批准
@@ -228,6 +231,17 @@ def filter_verified_plan_issues(
                 "new_elements" in text
                 and "inherited_elements" in text
                 and ("未" in text or "缺" in text or "不完整" in text or "声明" in text)
+            ):
+                continue
+            # ``Scene N`` 的 handoff 可以合法地使用 create/keep，而由
+            # ``Scene N+1`` 在接管后负责 elements_to_remove。模型常把这个
+            # 两场景动作误合并成“当前 handoff 必须 remove”；只要当前
+            # handoff 自身已满足闭合合同，就不应因未来场景的退出动作打回。
+            if (
+                "elements_to_remove" in text
+                and "handoff" in text
+                and "create" in text
+                and any(action in text for action in ("移除", "remove"))
             ):
                 continue
         filtered.append(issue)
@@ -631,7 +645,7 @@ class PlanReviewerAgent(BaseAgent):
             response_model=PlanReviewResult,
             max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
             stream=False,
-            allow_truncated=True,
+            allow_truncated=False,
         )
 
     def review_batch(
@@ -734,7 +748,7 @@ class PlanReviewerAgent(BaseAgent):
             user_message=user_message,
             item_model=PlanReviewBatchItem,
             max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
-            allow_truncated=True,
+            allow_truncated=False,
         )
         expected = {plan.scene_id for plan in ordered}
         actual = [item.scene_id for item in items]

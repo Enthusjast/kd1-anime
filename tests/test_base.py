@@ -80,6 +80,27 @@ def test_healthcheck_failure_redacts_api_key(monkeypatch):
     assert "<redacted>" in str(exc_info.value)
 
 
+def test_default_client_disables_sdk_retries(monkeypatch):
+    """外层重试策略不能与 OpenAI SDK 的隐式重试叠加。"""
+
+    from kd1_anime.agents import base
+
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(base, "OpenAI", FakeClient)
+
+    _ = BaseAgent().client
+
+    assert captured["max_retries"] == 0
+
+
 class PositiveResult(BaseModel):
     value: int
 

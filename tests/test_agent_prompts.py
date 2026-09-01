@@ -47,6 +47,8 @@ def test_coder_prompt_has_continuity_contract():
     assert "导出区只能有一个" in CODER_SYSTEM_PROMPT
     assert "同时完成“接管”和“导出”" in CODER_SYSTEM_PROMPT
     assert "仅仅写入导出区不等于对象已经 active" in CODER_SYSTEM_PROMPT
+    assert "单独 FadeIn 其子对象不会使 group active" in CODER_SYSTEM_PROMPT
+    assert "initially_active=true" in CODER_SYSTEM_PROMPT
     assert "未经验证的碎片移动" in CODER_SYSTEM_PROMPT
 
 

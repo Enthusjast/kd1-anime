@@ -61,6 +61,10 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - TechnicalSpec 是只读的技术执行合同；每个 `self.play` 的对象、源/目标和生命周期
   必须与其中的动画事件对应。`Transform` 原地修改 source，target 不能在后续被当作
   已加入场景的对象；需要 target 成为活动对象时使用 `ReplacementTransform` 或显式引入。
+- `VGroup` 只有在整个 group 本身通过 `self.add` 或 introducer 动画加入场景后，才算该
+  group active；单独 FadeIn 其子对象不会使 group active。不要先逐个引入子对象，再对
+  一个新建的 group 调用 `Transform(group, target)`；要么从一开始就 FadeIn/Write 整个
+  group，要么始终对已经 active 的子对象分别执行动画。
 - 辅助方法只能构造并返回 Mobject；`self.play`、`self.add`、`self.remove`、`self.clear`
   只能出现在 `construct()` 中，以便静态生命周期校验覆盖完整动画流程。
 
@@ -93,6 +97,9 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 ## 强制上下文继承规则（不可省略）
 - 如果收到 `[Inherited Elements Code]`，必须在 `construct()` 开头（完成必要的全局颜色映射和 TexTemplate 初始化后）重新定义其中的每一个元素；
   不得把上一场景完整文件复制过来，也不得只用同名文字代替 Mobject。
+- TechnicalSpec 中 `initially_active=true` 的继承元素，重新定义后应通过一次 `self.add`
+  放入当前 Scene，除非该技术合同明确为它安排了 introducer；`self.add` 本身不是重复引入。
+  不要为了删除 `self.add` 而让继承对象既没有加入场景、也没有对应的 FadeIn/Create。
 - 必须保留每个元素的 `element_id` 和语义状态。需要改变位置、内容、大小、颜色或形状时，
   优先对已定义对象使用 `Transform`/`ReplacementTransform`，不得无理由删除后重画。
 - 只有 `[Elements To Remove]` 明确列出的对象才能 `FadeOut`；持续元素在场景结尾必须真实存在，

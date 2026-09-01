@@ -283,6 +283,196 @@ def test_normalize_technical_spec_copies_scene_removals_and_inherited_activity()
     assert repairs
 
 
+def test_normalize_technical_spec_introduces_missing_required_export():
+    formula = VisualElementState(element_id="formula", variable_name="formula", required=True)
+    plan = make_plan(new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    introduction = next(
+        event
+        for event in normalized.animations
+        if event.event_id.startswith("ensure_required_exports")
+    )
+    assert introduction.operation == "fade_in"
+    assert introduction.create_element_ids == ["formula"]
+    assert normalized.export_element_ids == ["formula"]
+    assert result.is_valid is True, result.errors
+    assert any("必需导出元素" in repair for repair in repairs)
+
+
+def test_normalize_technical_spec_filters_stale_animation_claim_ids():
+    formula = VisualElementState(element_id="formula", variable_name="formula", required=True)
+    plan = make_plan(new=[formula]).model_copy(update={"claim_ids": ["claim_2"]})
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=0,
+                end_seconds=2,
+                operation="fade_in",
+                target_element_ids=["formula"],
+                create_element_ids=["formula"],
+                claim_ids=["claim_1", "claim_2"],
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    assert normalized.animations[0].claim_ids == ["claim_2"]
+    assert result.is_valid is True, result.errors
+    assert any("动画断言" in repair for repair in repairs)
+
+
+def test_normalize_technical_spec_introduces_inactive_animate_target():
+    highlight = VisualElementState(
+        element_id="highlight",
+        variable_name="highlight",
+        required=True,
+    )
+    plan = make_plan(new=[highlight])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="highlight", variable_name="highlight")],
+        animations=[
+            TechnicalAnimation(
+                event_id="highlight",
+                start_seconds=0,
+                end_seconds=1,
+                operation="animate",
+                target_element_ids=["highlight"],
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    event = next(item for item in normalized.animations if item.event_id == "highlight")
+    assert event.operation == "fade_in"
+    assert event.create_element_ids == ["highlight"]
+    assert result.is_valid is True, result.errors
+    assert any("inactive target" in repair for repair in repairs)
+
+
+def test_normalize_technical_spec_adds_missing_inherited_removal_event():
+    inherited = VisualElementState(element_id="old", variable_name="old")
+    formula = VisualElementState(element_id="formula", variable_name="formula")
+    plan = make_plan(inherited=[inherited], removed=[inherited], new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        renderer="opengl",
+        objects=[
+            TechnicalObject(element_id="old", variable_name="old", initially_active=True),
+            TechnicalObject(element_id="formula", variable_name="formula"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=0,
+                end_seconds=2,
+                operation="fade_in",
+                target_element_ids=["formula"],
+                create_element_ids=["formula"],
+            )
+        ],
+        implementation_notes=["OpenGL 渲染器，禁止使用 camera.frame"],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec, renderer="opengl")
+    result = compile_technical_spec(plan, normalized, renderer="opengl")
+
+    removal = next(
+        event
+        for event in normalized.animations
+        if event.event_id.startswith("remove_planned_elements")
+    )
+    assert removal.operation == "fade_out"
+    assert removal.source_element_ids == ["old"]
+    assert result.is_valid is True, result.errors
+    assert any("补齐 fade_out" in repair for repair in repairs)
+
+
+def test_normalize_technical_spec_downgrades_create_of_active_target_to_animation():
+    point = VisualElementState(element_id="point", variable_name="point")
+    formula = VisualElementState(element_id="formula", variable_name="formula")
+    plan = make_plan(inherited=[point], new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(element_id="point", variable_name="point", initially_active=True),
+            TechnicalObject(element_id="formula", variable_name="formula"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=0,
+                end_seconds=1,
+                operation="fade_in",
+                target_element_ids=["formula"],
+                create_element_ids=["formula"],
+            ),
+            TechnicalAnimation(
+                event_id="draw_tangent",
+                start_seconds=1,
+                end_seconds=2,
+                operation="create",
+                target_element_ids=["point"],
+            ),
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    event = next(item for item in normalized.animations if item.event_id == "draw_tangent")
+    assert event.operation == "animate"
+    assert event.source_element_ids == ["point"]
+    assert result.is_valid is True, result.errors
+    assert any("重复 active 对象" in repair for repair in repairs)
+
+
+def test_normalize_technical_spec_turns_empty_exit_into_wait():
+    formula = VisualElementState(element_id="formula", variable_name="formula")
+    plan = make_plan(new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            TechnicalAnimation(
+                event_id="fade_out_3d",
+                start_seconds=0,
+                end_seconds=2,
+                operation="fade_out",
+            ),
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=2,
+                end_seconds=4,
+                operation="fade_in",
+                target_element_ids=["formula"],
+                create_element_ids=["formula"],
+            ),
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    assert normalized.animations[0].operation == "wait"
+    assert result.is_valid is True, result.errors
+    assert any("空退出操作" in repair for repair in repairs)
+
+
 def test_normalize_technical_spec_drops_stale_objects_after_plan_rewrite():
     plan = make_plan(
         new=[VisualElementState(element_id="transition_title", variable_name="transition_title")]

@@ -35,6 +35,39 @@ class Demo(Scene):
     assert result.is_valid is True
 
 
+def test_lifecycle_accepts_animation_of_loop_variable():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formulas = [MathTex(r"x"), MathTex(r"x^2")]
+        for formula in formulas:
+            self.play(Write(formula))
+    """
+
+    result = validate_animation_lifecycle(code, spec(exported=()))
+
+    assert result.is_valid is True
+
+
+def test_lifecycle_tracks_vgroup_aliases_for_member_objects():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        step = MathTex(r"x^2")
+        formula_group = VGroup(formula, step)
+        self.play(FadeIn(formula_group))
+        self.play(formula.animate.scale(1.1))
+        self.play(FadeOut(formula_group))
+    """
+
+    result = validate_animation_lifecycle(code, spec(exported=()))
+
+    assert result.is_valid is True
+
+
 def test_lifecycle_rejects_transform_source_that_is_not_active():
     code = """
 from manim import *

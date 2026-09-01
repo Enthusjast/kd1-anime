@@ -7,6 +7,7 @@ from kd1_anime.agents.reviewer import (
     FixSuggestion,
     ReviewFinding,
     ReviewResult,
+    filter_contradictory_review_findings,
     normalize_review_evidence,
     validate_review_evidence,
 )
@@ -29,6 +30,8 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "evidence" in REVIEWER_SYSTEM_PROMPT
     assert "ThreeDScene" in REVIEWER_SYSTEM_PROMPT
     assert "结构化" in REVIEWER_SYSTEM_PROMPT
+    assert "initially_active=true" in REVIEWER_SYSTEM_PROMPT
+    assert "VGroup 本身只有在被加入或引入后才是 active" in REVIEWER_SYSTEM_PROMPT
     assert "证据优先于行号" in REVIEWER_SYSTEM_PROMPT
     assert "只报告确定的问题" in REVIEWER_SYSTEM_PROMPT
 
@@ -238,6 +241,7 @@ def test_reviewer_accepts_unique_evidence_with_wrong_model_line_numbers(monkeypa
     )
 
     assert len(calls) == 1
+    assert calls[0]["allow_truncated"] is False
     assert reviewed.findings[0].line_start == 4
     assert reviewed.findings[0].line_end == 4
 
@@ -307,6 +311,124 @@ def test_invalid_info_severity_cannot_bypass_review():
 
     assert result.is_valid is False
     assert result.severity == "major"
+
+
+def test_filters_reviewer_claims_that_current_code_directly_disproves():
+    code = (
+        "from manim import *\n"
+        "class Demo(ThreeDScene):\n"
+        "    def construct(self):\n"
+        "        tex_template = TexTemplate(tex_compiler='xelatex', output_format='.xdv')\n"
+        "        config.tex_template = tex_template\n"
+        "        # KD1_CONTINUITY_EXPORT_BEGIN\n"
+        "        circle = Circle()\n"
+        "        # KD1_CONTINUITY_EXPORT_END\n"
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="代码使用 camera.frame，且缺少导出区",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                evidence="from manim import *",
+                why="使用 camera.frame",
+                repair="删除 camera.frame",
+            ),
+            ReviewFinding(
+                category="continuity",
+                severity="major",
+                evidence="# KD1_CONTINUITY_EXPORT_BEGIN",
+                why="缺少 KD1_CONTINUITY_EXPORT_BEGIN/END 导出区",
+                repair="添加导出区",
+            ),
+        ],
+    )
+
+    filtered, corrections = filter_contradictory_review_findings(
+        result,
+        code,
+        renderer="opengl",
+    )
+
+    assert filtered.is_valid is True
+    assert not filtered.findings
+    assert len(corrections) == 2
+
+
+def test_filters_2d_and_export_marker_findings_when_3d_inheritance_is_required():
+    from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
+
+    code = (
+        "from manim import *\n"
+        "class Demo(ThreeDScene):\n"
+        "    def construct(self):\n"
+        "        error_region = Surface(lambda u, v: [u, v, 0])\n"
+        "        label = Tex('误差', tex_template=tex_template)\n"
+        "        self.add(error_region, label)\n"
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="2D 应改为普通 Scene，并补充导出区",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                evidence="class Demo(ThreeDScene):",
+                why="本场景是 2D 平面构图，应使用普通 Scene",
+                repair="改为 Scene",
+            ),
+            ReviewFinding(
+                category="latex",
+                severity="major",
+                evidence="label = Tex('误差', tex_template=tex_template)",
+                why="Tex 调用未传入 tex_template",
+                repair="补充 tex_template",
+            ),
+            ReviewFinding(
+                category="continuity",
+                severity="major",
+                evidence="from manim import *",
+                why="缺少 KD1_CONTINUITY_EXPORT_BEGIN/END 导出区",
+                repair="添加导出区",
+            ),
+        ],
+        fixes=[
+            FixSuggestion(
+                find="class Demo(ThreeDScene):",
+                replace="class Demo(Scene):",
+                reason="2D 场景应使用普通 Scene",
+            ),
+            FixSuggestion(
+                find="label = Tex('误差', tex_template=tex_template)",
+                replace="label = Tex('误差', tex_template=tex_template)",
+                reason="补充 tex_template",
+            ),
+        ],
+    )
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        renderer="opengl",
+        objects=[
+            TechnicalObject(
+                element_id="error_region", variable_name="error_region", constructor="Surface"
+            )
+        ],
+    )
+
+    filtered, corrections = filter_contradictory_review_findings(
+        result,
+        code,
+        renderer="opengl",
+        technical_spec=technical_spec,
+    )
+
+    assert filtered.is_valid is True
+    assert not filtered.findings
+    assert not filtered.fixes
+    assert len(corrections) == 3
 
 
 def test_reviewer_receives_complete_scene_plan(monkeypatch):

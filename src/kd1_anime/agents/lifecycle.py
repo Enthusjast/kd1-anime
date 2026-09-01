@@ -146,11 +146,11 @@ def _construct_node(tree: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | N
 
 
 def _statement_nodes(construct: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
-    """按源代码顺序返回需要处理的赋值和 Scene 调用。"""
+    """按源代码顺序返回需要处理的赋值、循环绑定和 Scene 调用。"""
 
     nodes: list[ast.AST] = []
     for node in ast.walk(construct):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)) or (
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.For, ast.AsyncFor)) or (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
@@ -199,6 +199,21 @@ def _assignment_names(node: ast.Assign | ast.AnnAssign) -> tuple[str, ...]:
     return tuple(target.id for target in targets if isinstance(target, ast.Name))
 
 
+def _assignment_aliases(node: ast.Assign | ast.AnnAssign) -> dict[str, set[str]]:
+    """提取 ``group = VGroup(existing_a, existing_b)`` 的组合别名。"""
+
+    value = node.value
+    roots: set[str] = set()
+    if isinstance(value, ast.Call) and _call_name(value) in {"Group", "VGroup"}:
+        for argument in value.args:
+            roots.update(_root_names(argument))
+    elif isinstance(value, ast.Name):
+        roots.add(value.id)
+    if not roots:
+        return {}
+    return {name: set(roots) for name in _assignment_names(node)}
+
+
 def validate_animation_lifecycle(
     code: str,
     technical_spec: TechnicalSpec,
@@ -239,6 +254,7 @@ def validate_animation_lifecycle(
     }
 
     defined: set[str] = set()
+    aliases: dict[str, set[str]] = {}
     active: set[str] = {
         item.variable_name
         for item in technical_spec.objects
@@ -247,7 +263,18 @@ def validate_animation_lifecycle(
     seen_assignments: set[str] = set()
 
     def mapped(names: set[str]) -> set[str]:
-        return {name for name in names if name in element_by_variable}
+        result: set[str] = set()
+        pending = list(names)
+        visited: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            if name in element_by_variable:
+                result.add(name)
+            pending.extend(aliases.get(name, ()))
+        return result
 
     def require_defined(names: set[str], location: int, operation: str) -> None:
         missing = names - defined
@@ -257,6 +284,15 @@ def validate_animation_lifecycle(
             )
 
     for node in _statement_nodes(construct):
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            # 循环变量在 Python 中会在第一次迭代前绑定。生成代码中常用
+            # ``for formula in formulas: Write(formula)``，忽略这个绑定
+            # 会把合法的循环体误报为“Write 使用未定义对象”。这里只
+            # 记录变量名，不执行迭代器或循环体。
+            loop_names = _root_names(node.target)
+            defined.update(loop_names)
+            seen_assignments.update(loop_names)
+            continue
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             names = set(_assignment_names(node))
             redefined = names & active & seen_assignments
@@ -267,6 +303,8 @@ def validate_animation_lifecycle(
                 )
             defined.update(names)
             seen_assignments.update(names)
+            for alias, roots in _assignment_aliases(node).items():
+                aliases[alias] = roots
             continue
 
         assert isinstance(node, ast.Call)

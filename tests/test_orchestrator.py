@@ -177,6 +177,8 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
         ],
         scene_states={1: SceneState(plan=current_plan, plan_ready=True)},
         plan_review_status="pending",
+        continuity_bible=ContinuityBible(),
+        continuity_review_round=1,
     )
     orchestrator = Orchestrator()
     orchestrator._llm_sem = threading.Semaphore(1)
@@ -217,6 +219,73 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
     assert ctx.scene_states[1].failed is True
     assert ctx.plan_review_status == "failed"
     assert "达到最大次数" in ctx.scene_states[1].failure_reason
+    assert ctx.continuity_review_round == 1
+
+
+def test_plan_review_replan_budget_uses_geometry_fallback(monkeypatch, tmp_path):
+    """复杂几何重规划耗尽时应降级，而不是把场景直接判死。"""
+
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    geometry_plan = plan().model_copy(
+        update={
+            "visual_flow": ["切割碎片并无缝拼接到目标区域"],
+            "new_elements": [
+                VisualElementState(
+                    element_id="piece_a",
+                    variable_name="piece_a",
+                    color_key="primary",
+                )
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title=geometry_plan.title,
+                duration_seconds=geometry_plan.duration_seconds,
+                purpose=geometry_plan.purpose,
+                math_concept=geometry_plan.math_concept,
+            )
+        ],
+        scene_states={1: SceneState(plan=geometry_plan, plan_ready=True)},
+        plan_review_status="pending",
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+    monkeypatch.setattr(settings, "MAX_PLAN_REVIEW_ROUNDS", 2)
+    monkeypatch.setattr(settings, "MAX_PLAN_REPLAN_ATTEMPTS", 2)
+    monkeypatch.setattr(settings, "SAFE_FALLBACK_ENABLED", True)
+
+    class FakeReviewer:
+        def review(self, *args, **kwargs):
+            return PlanReviewResult(is_valid=True, severity="info")
+
+    class FakePlanner:
+        calls = 0
+
+        def plan_detail(self, *args, **kwargs):
+            self.calls += 1
+            return geometry_plan
+
+    fake_planner = FakePlanner()
+    monkeypatch.setattr(module, "PlanReviewerAgent", FakeReviewer)
+    monkeypatch.setattr(module, "PlannerAgent", lambda: fake_planner)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    state = ctx.scene_states[1]
+    assert fake_planner.calls == 2
+    assert state.safe_fallback_used is True
+    assert state.failed is False
+    assert state.give_up is False
+    assert state.plan_reviewed is False
+    assert ctx.continuity_rebuild_required is True
 
 
 def test_resume_migrates_claims_out_of_transition_scene(monkeypatch, tmp_path):
@@ -1211,6 +1280,39 @@ def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
     assert ctx.scene_states[1].review_round == 2
 
 
+def test_major_review_with_verified_local_fix_stays_in_code_review(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="代码局部实现需要修正",
+        fixes=[
+            {
+                "find": "pass",
+                "replace": "self.wait(1)",
+                "reason": "补充场景停留",
+            }
+        ],
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert "self.wait(1)" in state.code
+    assert state.reviewed is False
+    assert state.rewrite_feedback == ""
+    assert state.give_up is False
+
+
 def test_review_exhaustion_switches_high_risk_geometry_to_safe_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
     monkeypatch.setattr(module.settings, "SAFE_FALLBACK_ENABLED", True)
@@ -1585,6 +1687,47 @@ def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
     assert "formula" not in ctx.state_ledger.boundaries[2].closing_element_ids
 
 
+def test_removing_reexported_scene_keeps_ids_used_by_older_boundaries(tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    axes = VisualElementState(
+        element_id="axes",
+        variable_name="axes",
+        semantic_state="坐标轴",
+        required=True,
+    )
+    first_plan = plan().model_copy(update={"new_elements": [axes]})
+    first_state = SceneState(
+        plan=first_plan,
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        exported_elements_code="axes = ThreeDAxes()",
+        exported_elements=[
+            ExtractedElement(element_id="axes", variable_name="axes", code="axes = ThreeDAxes()")
+        ],
+    )
+    ctx = PipelineContext("prompt", paths=run_paths)
+    orchestrator = Orchestrator()
+    orchestrator._update_state_ledger(ctx, first_state)
+
+    second_plan = plan().model_copy(update={"scene_id": 2, "inherited_elements": [axes]})
+    second_state = SceneState(
+        plan=second_plan,
+        code=first_state.code,
+        exported_elements_code="axes = ThreeDAxes()",
+        exported_elements=[
+            ExtractedElement(element_id="axes", variable_name="axes", code="axes = ThreeDAxes()")
+        ],
+    )
+    orchestrator._update_state_ledger(ctx, second_state)
+
+    orchestrator._remove_element_manifest_scene(ctx, 2)
+
+    historical = next(item for item in ctx.state_ledger.elements if item.element_id == "axes")
+    assert historical.active is False
+    assert "axes" in ctx.state_ledger.boundaries[1].closing_element_ids
+    assert ctx.state_ledger.current_scene_id == 1
+
+
 def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports(monkeypatch):
     from kd1_anime.agents.validator import CodeValidationResult
 
@@ -1736,6 +1879,44 @@ def test_compile_scene_plans_removes_extra_detail_claims(monkeypatch, tmp_path):
     assert orchestrator._normalize_scene_claim_contracts(ctx) is True
     assert [claim.claim_id for claim in ctx.scene_states[1].plan.math_claims] == ["claim_1"]
     assert ctx.scene_states[1].plan.timeline[0].math_claim_ids == ["claim_1"]
+
+
+def test_normalize_scene_claim_contracts_restores_lesson_claim_and_timeline_evidence(
+    monkeypatch, tmp_path
+):
+    scene_plan = plan().model_copy(
+        update={
+            "claim_ids": ["claim_1"],
+            "math_claims": [],
+            "timeline": [
+                TimelineEvent(
+                    event_id="show_formula",
+                    start_seconds=0,
+                    end_seconds=10,
+                    action="展示函数公式",
+                )
+            ],
+        }
+    )
+    lesson_claim = MathClaim(
+        claim_id="claim_1",
+        statement="函数公式 z=x^2+y^2",
+        expression_before="z=x^2+y^2",
+        expression_after="z=x^2+y^2",
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        lesson_spec=LessonSpec(claims=[lesson_claim]),
+        scene_states={1: SceneState(plan=scene_plan, plan_ready=True)},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    assert orchestrator._normalize_scene_claim_contracts(ctx) is True
+    repaired = ctx.scene_states[1].plan
+    assert [claim.claim_id for claim in repaired.math_claims] == ["claim_1"]
+    assert repaired.timeline[0].math_claim_ids == ["claim_1"]
 
 
 def test_plan_review_revisits_neighbors_after_mechanical_handoff_repair(monkeypatch, tmp_path):

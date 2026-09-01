@@ -360,6 +360,21 @@ def test_rejects_camera_frame_in_plain_scene():
     assert "MovingCameraScene" in result.feedback
 
 
+def test_rejects_3d_objects_in_plain_opengl_scene():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        axes = ThreeDAxes()\n"
+        "        surface = Surface(lambda u, v: np.array([u, v, u + v]))\n"
+        "        self.add(axes, surface)\n",
+        renderer="opengl",
+    )
+
+    assert not result.is_valid
+    assert "必须继承 ThreeDScene" in result.feedback
+
+
 def test_rejects_three_d_camera_setup_in_plain_scene():
     result = validate_manim_code(
         "from manim import *\n"

@@ -227,6 +227,62 @@ def _normalise_technical_lifecycle(
         target_ids = set(event.target_element_ids)
         create_ids = set(event.create_element_ids)
 
+        # 模型有时把已经处于 active 的继承对象误填到一个 ``create``
+        # 事件的 target 中（例如“绘制切线”却把 point_P 当成目标）。
+        # 这不是重新创建对象；按现有对象执行 animate 才符合生命周期，
+        # 否则编译器会在不涉及新对象的事件上报重复创建。
+        if event.operation in {"create", "write", "fade_in", "add"}:
+            introduced = target_ids | create_ids
+            duplicate_active = introduced & active
+            if duplicate_active:
+                remaining_targets = target_ids - duplicate_active
+                remaining_creates = create_ids - duplicate_active
+                source_ids = list(
+                    dict.fromkeys([*event.source_element_ids, *sorted(duplicate_active)])
+                )
+                if remaining_targets or remaining_creates:
+                    event = event.model_copy(
+                        update={
+                            "target_element_ids": sorted(remaining_targets),
+                            "create_element_ids": sorted(remaining_creates),
+                            "source_element_ids": source_ids,
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "已移除 introducer 中重复的 active 对象",
+                            ),
+                        }
+                    )
+                elif source_ids:
+                    event = event.model_copy(
+                        update={
+                            "operation": "animate",
+                            "source_element_ids": source_ids,
+                            "target_element_ids": [],
+                            "create_element_ids": [],
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "目标对象已 active，按 animate 处理而非重复创建",
+                            ),
+                        }
+                    )
+                else:
+                    event = event.model_copy(
+                        update={
+                            "operation": "wait",
+                            "target_element_ids": [],
+                            "create_element_ids": [],
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "目标对象已 active 且没有新增对象，按空操作处理",
+                            ),
+                        }
+                    )
+                repairs.append(
+                    f"事件 {event.event_id} 删除重复 active 对象: "
+                    + ", ".join(sorted(duplicate_active))
+                )
+                changed = True
+
         # ``create_element_ids`` 是 target 变成后续 active 对象的明确声明；
         # 对 transform 来说，这等价于 ReplacementTransform，而不是原地
         # Transform。修正 operation 并清除重复的 create 标记，避免状态
@@ -262,10 +318,53 @@ def _normalise_technical_lifecycle(
             repairs.append(f"事件 {event.event_id} 删除了重复的 create_element_ids")
             changed = True
 
+        if event.operation in {"animate", "keep"} and not event.source_element_ids:
+            inactive_targets = target_ids - active
+            if inactive_targets:
+                # 模型有时把“显示/高亮一个新元素”写成没有 source
+                # 的 animate/keep。对于没有 source 的事件，唯一可执行
+                # 的语义就是首次引入；将其规范为 fade_in，避免在编译
+                # 时把一个从未 active 的对象当作已存在对象使用。
+                event = event.model_copy(
+                    update={
+                        "operation": "fade_in",
+                        "target_element_ids": sorted(inactive_targets),
+                        "create_element_ids": sorted(inactive_targets),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "无 source 的新对象按首次 fade_in 引入",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 将 inactive target 规范为 fade_in: "
+                    + ", ".join(sorted(inactive_targets))
+                )
+                changed = True
+
         if event.operation in {"fade_out", "uncreate", "remove"}:
             source_ids = set(event.source_element_ids)
             remove_ids = set(event.remove_element_ids)
             referenced_exit_ids = source_ids | remove_ids
+            if not referenced_exit_ids:
+                event = event.model_copy(
+                    update={
+                        "operation": "wait",
+                        "target_element_ids": [],
+                        "create_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "退出事件没有对象引用，按空操作处理",
+                        ),
+                    }
+                )
+                repairs.append(f"事件 {event.event_id} 的空退出操作已规范为 wait")
+                changed = True
+                # 空退出事件不改变 active 集合，直接进入后续统一的事件
+                # 规范化和状态模拟。
+                source_ids = set()
+                remove_ids = set()
+                referenced_exit_ids = set()
             inactive = referenced_exit_ids - active
             protected = referenced_exit_ids & required_boundary_ids
             optional_inactive = inactive - required_boundary_ids
@@ -354,6 +453,106 @@ def _normalise_technical_lifecycle(
         normalized_events.get(index, event) for index, event in enumerate(spec.animations)
     ]
     return spec.model_copy(update={"animations": animations}), tuple(repairs)
+
+
+def _ensure_planned_removals_exit(
+    spec: TechnicalSpec,
+    removed_ids: set[str],
+    *,
+    duration_seconds: float,
+) -> tuple[TechnicalSpec, tuple[str, ...]]:
+    """为计划明确要求退出、但 Technical Planner 漏写的对象补退出事件。
+
+    ``elements_to_remove`` 是场景边界合同，不应因为模型漏填一个
+    ``fade_out`` 事件而把对象错误地带到场景末尾。这里仅补机械上确定的
+    inherited 对象；非法的移除声明仍交给编译器报告，避免掩盖计划错误。
+    """
+
+    if not removed_ids:
+        return spec, ()
+    object_ids = {item.element_id for item in spec.objects}
+    initially_active = {item.element_id for item in spec.objects if item.initially_active}
+    removable_ids = removed_ids & object_ids & initially_active
+    if not removable_ids:
+        return spec, ()
+    exited_ids = {
+        element_id
+        for event in spec.animations
+        if event.operation in {"fade_out", "uncreate", "remove"}
+        for element_id in {*event.source_element_ids, *event.remove_element_ids}
+    }
+    missing = removable_ids - exited_ids
+    if not missing:
+        return spec, ()
+
+    event_ids = {event.event_id for event in spec.animations}
+    event_id = "remove_planned_elements"
+    suffix = 2
+    while event_id in event_ids:
+        event_id = f"remove_planned_elements_{suffix}"
+        suffix += 1
+    tail = min(1.0, max(0.1, duration_seconds * 0.1))
+    end_seconds = max(tail, duration_seconds)
+    event = TechnicalAnimation(
+        event_id=event_id,
+        start_seconds=max(0.0, end_seconds - tail),
+        end_seconds=end_seconds,
+        operation="fade_out",
+        source_element_ids=sorted(missing),
+        remove_element_ids=sorted(missing),
+        api_notes="根据 ScenePlan.elements_to_remove 补齐 inherited 对象的退出动画",
+    )
+    return (
+        spec.model_copy(update={"animations": [*spec.animations, event]}),
+        ("为计划移除但未声明退出事件的元素补齐 fade_out: " + ", ".join(sorted(missing)),),
+    )
+
+
+def _ensure_required_export_introductions(
+    spec: TechnicalSpec,
+    *,
+    required_exports: set[str],
+    inherited_ids: set[str],
+    duration_seconds: float,
+) -> tuple[TechnicalSpec, tuple[str, ...]]:
+    """为遗漏 introducer 的必需新元素补一条最小淡入事件。
+
+    ``export_element_ids`` 是场景边界合同。模型偶尔会把必需的新元素列入
+    objects/export，却完全忘记在 animations 中引入它，导致生命周期编译器
+    在最终状态报告“没有保留导出元素”。元素本身和其导出资格都来自
+    ScenePlan，因此补一条 ``fade_in`` 只是在恢复同一合同的确定性动作，
+    不会创造新的教学对象或数学内容。
+    """
+
+    introduced: set[str] = set()
+    for event in spec.animations:
+        if event.operation in {"create", "write", "fade_in", "add"}:
+            introduced.update(event.target_element_ids)
+            introduced.update(event.create_element_ids)
+        elif event.operation == "replacement_transform":
+            introduced.update(event.target_element_ids)
+    missing = required_exports - inherited_ids - introduced
+    if not missing:
+        return spec, ()
+    existing_ids = {event.event_id for event in spec.animations}
+    event_id = "ensure_required_exports"
+    suffix = 1
+    while event_id in existing_ids:
+        suffix += 1
+        event_id = f"ensure_required_exports_{suffix}"
+    event = TechnicalAnimation(
+        event_id=event_id,
+        start_seconds=0.0,
+        end_seconds=min(2.0, max(0.1, duration_seconds)),
+        operation="fade_in",
+        target_element_ids=sorted(missing),
+        create_element_ids=sorted(missing),
+        api_notes="根据 ScenePlan 必需导出合同补齐遗漏的元素引入",
+    )
+    return (
+        spec.model_copy(update={"animations": [event, *spec.animations]}),
+        ("为必需导出元素补齐 fade_in: " + ", ".join(sorted(missing)),),
+    )
 
 
 def normalize_technical_spec_contract(
@@ -482,11 +681,56 @@ def normalize_technical_spec_contract(
     if object_changed or unknown_object_ids:
         updates["objects"] = normalized_objects
         repairs.append("对象的 initially_active/exported 已与场景边界合同对齐")
+    allowed_claim_ids = set(plan.claim_ids)
+    normalized_animations = list(
+        (
+            event.model_copy(
+                update={
+                    "claim_ids": [
+                        claim_id for claim_id in event.claim_ids if claim_id in allowed_claim_ids
+                    ]
+                }
+            )
+            if any(claim_id not in allowed_claim_ids for claim_id in event.claim_ids)
+            else event
+        )
+        for event in spec.animations
+    )
+    if normalized_animations != list(spec.animations):
+        updates["animations"] = normalized_animations
+        repairs.append("TechnicalSpec 动画断言已与 ScenePlan.claim_ids 对齐")
+    if allowed_claim_ids and normalized_animations:
+        covered_claim_ids = {
+            claim_id for event in normalized_animations for claim_id in event.claim_ids
+        }
+        missing_claim_ids = allowed_claim_ids - covered_claim_ids
+        if missing_claim_ids:
+            target_index = max(
+                range(len(normalized_animations)),
+                key=lambda index: (
+                    normalized_animations[index].operation != "wait",
+                    normalized_animations[index].end_seconds,
+                ),
+            )
+            target = normalized_animations[target_index]
+            normalized_animations[target_index] = target.model_copy(
+                update={"claim_ids": [*target.claim_ids, *sorted(missing_claim_ids)]}
+            )
+            updates["animations"] = normalized_animations
+            repairs.append(
+                "为技术动画补齐当前场景数学断言: " + ", ".join(sorted(missing_claim_ids))
+            )
     if renderer is not None and spec.renderer != renderer:
         updates["renderer"] = renderer
         repairs.append(f"TechnicalSpec.renderer 已固定为 {renderer}")
 
     normalized_spec = spec.model_copy(update=updates) if updates else spec
+    normalized_spec, removal_repairs = _ensure_planned_removals_exit(
+        normalized_spec,
+        set(expected_removed),
+        duration_seconds=plan.duration_seconds,
+    )
+    repairs.extend(removal_repairs)
     required_boundary_ids = {
         item.element_id
         for item in [*plan.inherited_elements, *plan.new_elements]
@@ -497,6 +741,13 @@ def normalize_technical_spec_contract(
         required_boundary_ids=required_boundary_ids,
     )
     repairs.extend(lifecycle_repairs)
+    normalized_spec, introduction_repairs = _ensure_required_export_introductions(
+        normalized_spec,
+        required_exports=set(expected_exports),
+        inherited_ids=inherited_ids,
+        duration_seconds=plan.duration_seconds,
+    )
+    repairs.extend(introduction_repairs)
     if normalized_spec is spec and not repairs:
         return spec, ()
     return normalized_spec, tuple(repairs)

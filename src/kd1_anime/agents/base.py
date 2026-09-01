@@ -66,6 +66,11 @@ class BaseAgent:
             self._client = OpenAI(
                 api_key=self.profile.api_key,
                 base_url=self.profile.base_url,
+                # BaseAgent 已经在外层实现了带退避的重试。关闭 SDK 自带的
+                # 隐式重试，避免一次超时被 SDK 再重复发送，导致单个请求
+                # 实际阻塞数倍于 LLM_TIMEOUT_READ，表现为 dry-run 长时间
+                # 停在连续性审查且无法及时进入失败收敛路径。
+                max_retries=0,
                 timeout=httpx.Timeout(
                     self.profile.timeout_read,
                     connect=self.profile.timeout_connect,

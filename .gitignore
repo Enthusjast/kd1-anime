@@ -36,13 +36,7 @@ htmlcov/
 junit.xml
 
 # Workspace (runtime generated)
-workspace/scenes/*
-workspace/logs/*
-workspace/videos/*
-workspace/runs/
-!workspace/scenes/.gitkeep
-!workspace/logs/.gitkeep
-!workspace/videos/.gitkeep
+workspace/
 
 # Environment
 .env

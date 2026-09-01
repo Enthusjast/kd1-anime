@@ -234,6 +234,25 @@ BANNED_ATTRIBUTE_NAMES = {
 }
 
 SCENE_BASES = {"Scene", "ThreeDScene", "MovingCameraScene"}
+# 这些类需要三维场景的相机/渲染上下文。OpenGL 下把它们放进普通
+# ``Scene`` 是一个确定的类型错误；不要等到远端渲染才由 Reviewer 猜测。
+THREE_D_CONSTRUCTORS = {
+    "Arrow3D",
+    "Cone",
+    "Cube",
+    "Cylinder",
+    "DashedLine3D",
+    "Dot3D",
+    "Line3D",
+    "ParametricSurface",
+    "Polyhedron",
+    "Prism",
+    "Sphere",
+    "Surface",
+    "Tetrahedron",
+    "ThreeDAxes",
+    "Torus",
+}
 # mobject 继承树的根类: manim 只对"子类的基类"做 OpenGL 转换, Mobject/VMobject
 # 这两个根类本身始终是 Cairo 版。场景文件里自定义这些根类的子类, 在 OpenGL
 # 渲染下会得到缺少 should_render 的 Cairo 对象, 渲染时直接 AttributeError。
@@ -713,6 +732,22 @@ class _SafetyVisitor(ast.NodeVisitor):
             if construct is None:
                 self.error(node, f"Scene 类 {node.name!r} 缺少 construct() 方法")
             if "ThreeDScene" not in bases:
+                if self.renderer == "opengl":
+                    for call in ast.walk(node):
+                        constructor = (
+                            call.func.id
+                            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                            else call.func.attr
+                            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                            else ""
+                        )
+                        if constructor in THREE_D_CONSTRUCTORS:
+                            self.error(
+                                call,
+                                f"OpenGL 场景使用 {constructor}() 等三维对象时必须继承 "
+                                "ThreeDScene；请将当前场景基类改为 ThreeDScene，"
+                                "不要在普通 Scene 中创建三维对象",
+                            )
                 for call in ast.walk(node):
                     if (
                         isinstance(call, ast.Call)

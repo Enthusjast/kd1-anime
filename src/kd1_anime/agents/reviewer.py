@@ -1,11 +1,13 @@
 """Reviewer Agent：审查生成的 Manim 代码并返回结构化修复意见。"""
 
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kd1_anime.agents.base import BaseAgent, TruncatedResponseError
+from kd1_anime.agents.continuity import CONTINUITY_EXPORT_BEGIN, CONTINUITY_EXPORT_END
 from kd1_anime.agents.planner import (
     ContinuityBible,
     LessonSpec,
@@ -37,6 +39,10 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 8. MovingCameraScene/ThreeDScene 的相机 API 必须匹配对应场景类型；普通 Scene 中不得出现 self.camera.frame。
    OpenGL 下 `ThreeDScene`、`ThreeDAxes`、`Surface` 和 `set_camera_orientation` 是合法组合；
    只禁止 `self.camera.frame` 和 `MovingCameraScene` 运镜，不得把三维场景误判为普通 `Scene` 错误。
+   即使本场景最终只展示 2D 公式，只要 TechnicalSpec 要求在开头重建
+   `Surface`/`ThreeDAxes` 等三维继承对象，就必须保留 `ThreeDScene`；这不是违规。
+   TechnicalSpec 标记 `initially_active=true` 的继承对象时，重新定义后用一次 `self.add`
+   将其放入当前 Scene 是正确做法；只有随后又用 Create/FadeIn 重复引入同一对象时才报告问题。
 
 ## C. 数学与 LaTeX（严重）
 9. 数学公式、推导、数值和几何关系必须正确，并与分镜 computation 中的数值一致。
@@ -55,6 +61,8 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 15. Create/Write/FadeIn 会负责引入对象；不得对尚未引入且不是 introducer 目标的对象，
     或已被 ReplacementTransform/FadeOut 移除的对象继续动画。
 16. Transform 后的变量引用、VGroup 成员关系和 z-index 应保持一致。
+    VGroup 本身只有在被加入或引入后才是 active；但不要把“对子对象分别淡入”与“对未引入的
+    group 做 Transform”混为一谈，必须以当前代码中实际的 active 状态为依据。
 17. ValueTracker、Axes.c2p、plot、Surface 等 API 参数应符合 ManimCE。
 18. 动画顺序应可执行，不能同时对同一对象施加冲突动画。
 
@@ -80,7 +88,7 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
     variable_name、颜色和布局锚点不能无故改变。
 31. 只有 elements_to_remove 中明确列出的元素才能 FadeOut；持续元素不能通过 clear()、整体淡出
     或无替换重画而丢失。
-32. 必须存在 KD1_CONTINUITY_EXPORT_BEGIN/END 导出区；导出区只能包含可独立重建的 Mobject
+32. 需要跨场景交接对象时，必须存在 KD1_CONTINUITY_EXPORT_BEGIN/END 导出区；导出区只能包含可独立重建的 Mobject
     定义，以及作用于导出区内已定义对象的安全样式/布局调用。导出集合以结构化
     ScenePlan/TechnicalSpec 中 `required=true` 且未移除的元素为唯一权威，不要从
     closing_state、persistent_elements 等自由文本额外推断 optional 元素；应覆盖这些必需对象。
@@ -350,6 +358,171 @@ def normalize_review_evidence(
     return result.model_copy(update={"findings": corrected_findings}), corrections
 
 
+def filter_contradictory_review_findings(
+    result: ReviewResult,
+    code: str,
+    *,
+    renderer: Literal["cairo", "opengl"] | None = None,
+    technical_spec: TechnicalSpec | None = None,
+) -> tuple[ReviewResult, list[str]]:
+    """删除能被当前源码直接证伪的 Reviewer 幻觉。
+
+    Reviewer 的职责是补充语义审查，但不能推翻源码中可直接确认的事实。
+    长上下文下模型偶尔会把上一版代码的问题复制到当前结果（例如当前
+    已经是 ``ThreeDScene``，却仍报告 ``camera.frame`` 或“缺少导出区”）。
+    这些报告如果被当成真实的 continuity/math 问题，会错误地把代码送回
+    Planner，造成无意义的计划重写循环。这里只过滤少量可确定的矛盾项；
+    其它问题仍严格保留并交给 Coder。
+    """
+
+    if result.is_valid or not result.findings:
+        return result, []
+    source = code or ""
+    lowered = source.lower()
+    effective_renderer = renderer or settings.MANIM_RENDERER
+    technical_constructors = {
+        str(item.constructor).lower()
+        for item in (technical_spec.objects if technical_spec is not None else ())
+        if item.constructor
+    }
+    # OpenGL 不能在普通 Scene 中构造 Surface/ThreeDAxes/Arrow3D 等三维
+    # Mobject。即使最终画面已经切到 2D，只要场景开头需要重建上一场景
+    # 的三维继承对象，ThreeDScene 仍是正确且必要的宿主类型。
+    requires_3d_host = bool(
+        technical_constructors
+        & {"surface", "threeDaxes".lower(), "arrow3d", "parametricSurface".lower()}
+    )
+    removed: list[str] = []
+    kept_findings: list[ReviewFinding] = []
+
+    def finding_text(finding: ReviewFinding) -> str:
+        return "\n".join((finding.evidence, finding.why, finding.repair)).lower()
+
+    for index, finding in enumerate(result.findings, start=1):
+        text = finding_text(finding)
+        contradiction = ""
+        if "camera.frame" in text and "camera.frame" not in lowered:
+            contradiction = "当前代码没有 camera.frame"
+        elif "movingcamerascene" in text and "movingcamerascene" not in lowered:
+            contradiction = "当前代码没有 MovingCameraScene"
+        elif (
+            effective_renderer == "opengl"
+            and "继承自 scene 而非 threedscene" in text
+            and re.search(r"class\s+\w+\s*\(\s*threedscene\s*\)", lowered)
+        ):
+            contradiction = "当前场景类已经继承 ThreeDScene"
+        elif (
+            effective_renderer == "opengl"
+            and requires_3d_host
+            and re.search(r"class\s+\w+\s*\(\s*threedscene\s*\)", lowered)
+            and (
+                "应使用普通 scene" in text
+                or "使用普通 scene" in text
+                or "2d 平面" in text
+                or "2d 场景" in text
+            )
+        ):
+            contradiction = "当前场景需在 OpenGL 下重建三维继承对象，ThreeDScene 是必要宿主"
+        elif (
+            "缺少 kd1_continuity_export" in text
+            and CONTINUITY_EXPORT_BEGIN.lower() in lowered
+            and CONTINUITY_EXPORT_END.lower() in lowered
+        ):
+            contradiction = "当前代码已经包含完整连续性导出区"
+        elif (
+            "缺少 kd1_continuity_export" in text
+            and technical_spec is not None
+            and not technical_spec.export_element_ids
+        ):
+            # 没有任何需要跨场景交接的对象时，空导出区是合法的；要求
+            # 强行添加 marker 只会把 optional 的 2D 公式误变成边界合同。
+            contradiction = "TechnicalSpec 没有要求导出对象，空导出区合法"
+        elif (
+            "未传入 tex_template" in text or "未使用 tex_template" in text
+        ) and "tex_template" in finding.evidence.lower():
+            contradiction = "证据片段已经显式传入 tex_template"
+        elif (
+            "未使用 textemplate" in text
+            and "tex_template" in lowered
+            and "config.tex_template" in lowered
+        ):
+            contradiction = "当前代码已经配置并使用 TexTemplate"
+        elif "未将其赋给 config.tex_template" in text and "config.tex_template" in lowered:
+            contradiction = "当前代码已经将模板赋给 config.tex_template"
+        elif "create 后未" in text and "create(" in lowered:
+            # Manim 的 Create/FadeIn/Write introducer 会把目标加入 Scene；
+            # 不应要求在其后再用 self.add，否则会制造重复引入。
+            contradiction = "Create 本身就是 Manim 的 introducer"
+        if contradiction:
+            removed.append(f"finding[{index}]: {contradiction}")
+        else:
+            kept_findings.append(finding)
+
+    kept_fixes = []
+    for fix in result.fixes:
+        if fix.find == fix.replace:
+            # 模型有时把“请确认”写成 find/replace 完全相同的伪修复。
+            # 它既不能改变代码，也不应阻止已经没有有效 finding 的结果。
+            continue
+        text = f"{fix.find}\n{fix.reason}".lower()
+        if "camera.frame" in text and "camera.frame" not in lowered:
+            continue
+        if "movingcamerascene" in text and "movingcamerascene" not in lowered:
+            continue
+        if (
+            "导出区" in text
+            and CONTINUITY_EXPORT_BEGIN.lower() in lowered
+            and ("缺少" in text or "添加" in text or "marker" in text)
+        ):
+            # 只删除明确针对“缺少导出区”的建议，保留其它导出合同修复。
+            continue
+        if (
+            effective_renderer == "opengl"
+            and requires_3d_host
+            and re.search(r"class\s+\w+\s*\(\s*threedscene\s*\)", lowered)
+            and re.search(r"class\s+\w+\s*\(\s*threedscene\s*\)", fix.find.lower())
+            and re.search(r"class\s+\w+\s*\(\s*scene\s*\)", fix.replace.lower())
+        ):
+            # 该替换会把含有 Surface 等三维继承对象的场景改成 OpenGL
+            # 不可运行的普通 Scene，属于与技术合同冲突的伪修复。
+            continue
+        if (
+            "缺少 kd1_continuity_export" in text
+            and technical_spec is not None
+            and not technical_spec.export_element_ids
+        ):
+            continue
+        if (
+            "未传入 tex_template" in text or "未使用 tex_template" in text
+        ) and "tex_template" in fix.find.lower():
+            continue
+        kept_fixes.append(fix)
+
+    if not removed:
+        return result, []
+    if not kept_findings and not kept_fixes:
+        return ReviewResult(is_valid=True), removed
+    feedback = result.feedback
+    if any(
+        term in feedback.lower()
+        for term in (
+            "camera.frame",
+            "movingcamerascene",
+            "缺少 kd1_continuity_export",
+            "未使用 textemplate",
+        )
+    ):
+        feedback = "\n".join(
+            finding.why or finding.repair
+            for finding in kept_findings
+            if finding.why or finding.repair
+        )
+    filtered = result.model_copy(
+        update={"findings": kept_findings, "fixes": kept_fixes, "feedback": feedback}
+    )
+    return filtered, removed
+
+
 class ReviewerAgent(BaseAgent):
     """代码审查 Agent。"""
 
@@ -549,7 +722,9 @@ class ReviewerAgent(BaseAgent):
                 user_message=user_message,
                 response_model=ReviewResult,
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
-                allow_truncated=True,
+                # 审查结果必须是完整 JSON；不能把被截断的 feedback 当成
+                # 可消费结果，否则长反馈会在引号中断后直接导致场景失败。
+                allow_truncated=False,
             )
         except TruncatedResponseError:
             # 旧端点可能在长上下文中耗尽输出预算；保留代码和结构化合同，
@@ -569,9 +744,20 @@ class ReviewerAgent(BaseAgent):
                 user_message=user_message,
                 response_model=ReviewResult,
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
-                allow_truncated=True,
+                allow_truncated=False,
             )
         result, evidence_corrections = normalize_review_evidence(result, code)
+        result, contradiction_corrections = filter_contradictory_review_findings(
+            result,
+            code,
+            renderer=renderer,
+            technical_spec=technical_spec,
+        )
+        if contradiction_corrections:
+            self._log(
+                "已过滤与当前代码矛盾的审查意见：" + "；".join(contradiction_corrections),
+                style="yellow",
+            )
         if evidence_corrections:
             self._log(
                 "审查证据片段已匹配，自动校正模型行号：" + "；".join(evidence_corrections),
@@ -602,9 +788,15 @@ class ReviewerAgent(BaseAgent):
                 user_message=user_message,
                 response_model=ReviewResult,
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
-                allow_truncated=True,
+                allow_truncated=False,
             )
             result, evidence_corrections = normalize_review_evidence(result, code)
+            result, contradiction_corrections = filter_contradictory_review_findings(
+                result,
+                code,
+                renderer=renderer,
+                technical_spec=technical_spec,
+            )
             if evidence_corrections:
                 self._log(
                     "重试后的审查证据片段已匹配，自动校正模型行号："
