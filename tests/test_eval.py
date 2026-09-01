@@ -214,6 +214,21 @@ class Demo(Scene):
 
         assert any("load" in issue for issue in result.security_issues)
 
+    @pytest.mark.parametrize("constructor", ["ImageMobject", "SVGMobject", "SceneFileWriter"])
+    def test_security_check_rejects_qualified_manim_dangerous_objects(self, constructor):
+        evaluator = CodeEvaluator()
+        code = (
+            "import manim\n"
+            "class Demo(manim.Scene):\n"
+            "    def construct(self):\n"
+            f"        value = manim.{constructor}('/tmp/input')\n"
+            "        self.add(value)\n"
+        )
+
+        result = evaluator.analyze_code(code)
+
+        assert any(constructor in issue for issue in result.security_issues)
+
     def test_evaluate(self):
         """测试评估功能"""
         evaluator = CodeEvaluator()

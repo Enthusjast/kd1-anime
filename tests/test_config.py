@@ -28,6 +28,15 @@ def test_llm_config_accepts_generic_openai_compatible_provider():
     config.require_llm_key()
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["LLM_BASE_URL", "VISUAL_LLM_BASE_URL", "RAG_EMBEDDING_BASE_URL"],
+)
+def test_service_urls_reject_embedded_credentials_and_fragments(field):
+    with pytest.raises(ValueError, match=r"凭据|fragment"):
+        Settings(_env_file=None, **{field: "https://user:secret@example.invalid/v1#frag"})
+
+
 def test_default_storage_is_under_private_application_home():
     config = Settings(_env_file=None)
 

@@ -1667,7 +1667,8 @@ class PlannerAgent(BaseAgent):
                     "RAG Reference Context",
                     f'<rag_context stage="draft">\n{rag_context}\n</rag_context>',
                     priority=10,
-                    max_chars=settings.RAG_MAX_CONTEXT_CHARS,
+                    max_chars=settings.RAG_MAX_CONTEXT_CHARS + 512,
+                    atomic=True,
                 )
             )
         draft = self.call_llm_json(
@@ -1720,7 +1721,8 @@ class PlannerAgent(BaseAgent):
                     "RAG Reference Context",
                     f'<rag_context stage="outline">\n{rag_context}\n</rag_context>',
                     priority=10,
-                    max_chars=settings.RAG_MAX_CONTEXT_CHARS,
+                    max_chars=settings.RAG_MAX_CONTEXT_CHARS + 512,
+                    atomic=True,
                 )
             )
         outlines = self.call_llm_json_list(
@@ -1813,7 +1815,8 @@ class PlannerAgent(BaseAgent):
                     "RAG Reference Context",
                     f'<rag_context stage="continuity">\n{rag_context}\n</rag_context>',
                     priority=10,
-                    max_chars=settings.RAG_MAX_CONTEXT_CHARS,
+                    max_chars=settings.RAG_MAX_CONTEXT_CHARS + 512,
+                    atomic=True,
                 )
             )
         detail = self.call_llm_json(
@@ -1982,7 +1985,8 @@ class PlannerAgent(BaseAgent):
                     "RAG Reference Context",
                     f'<rag_context stage="detail">\n{rag_context}\n</rag_context>',
                     priority=10,
-                    max_chars=settings.RAG_MAX_CONTEXT_CHARS,
+                    max_chars=settings.RAG_MAX_CONTEXT_CHARS + 512,
+                    atomic=True,
                 )
             )
         detail = self.call_llm_json(

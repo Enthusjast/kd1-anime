@@ -357,6 +357,39 @@ def test_filters_reviewer_claims_that_current_code_directly_disproves():
     assert len(corrections) == 2
 
 
+def test_does_not_filter_camera_frame_finding_when_evidence_contains_it():
+    code = (
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.camera.frame.set(width=10)\n"
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="相机类型不匹配",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                evidence="self.camera.frame.set(width=10)",
+                why="普通 Scene 使用 camera.frame，应继承 MovingCameraScene",
+                repair="将 Scene 改为 MovingCameraScene",
+            )
+        ],
+    )
+
+    filtered, corrections = filter_contradictory_review_findings(
+        result,
+        code,
+        renderer="cairo",
+    )
+
+    assert filtered.is_valid is False
+    assert len(filtered.findings) == 1
+    assert corrections == []
+
+
 def test_filters_2d_and_export_marker_findings_when_3d_inheritance_is_required():
     from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 

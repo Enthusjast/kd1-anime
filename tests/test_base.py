@@ -204,6 +204,43 @@ def test_empty_json_mode_response_falls_back_to_prompt_only(monkeypatch):
     assert "response_format" not in calls[1]
 
 
+def test_call_llm_does_not_mutate_caller_messages_on_compatibility_fallback(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    messages = [
+        {"role": "system", "content": "Return JSON."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "question"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+        },
+    ]
+    original = json.loads(json.dumps(messages))
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if "response_format" in kwargs:
+                return iter([_chunk(finish="stop")])
+            return iter([_chunk('{"ok": true}', finish="stop")])
+
+    completions = FakeCompletions()
+
+    class CompatibleAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    assert CompatibleAgent().call_llm(messages=messages, json_mode=True) == '{"ok": true}'
+    assert messages == original
+
+
 def test_empty_stream_response_gets_max_tokens_boost(monkeypatch):
     # 默认 LLM_SILENT_STREAM=True: stream=False 也走静默流式。
     # 空响应(推理模型耗尽预算) → 补充 max_tokens 后重试。

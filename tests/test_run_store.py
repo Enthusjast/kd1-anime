@@ -1,4 +1,5 @@
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,7 +19,9 @@ from kd1_anime.run_store import (
     RunRepository,
     StoredSceneState,
     StoredSlurmJob,
+    is_valid_fsm_transition,
     lock_run,
+    restore_run_path,
     sha256_text,
     write_manifest,
 )
@@ -186,6 +189,52 @@ def test_manifest_validate_for_resume_rejects_semantic_corruption():
 
     with pytest.raises(ValueError, match="完整性校验失败"):
         manifest.validate_for_resume()
+
+
+@pytest.mark.parametrize(
+    ("previous", "current", "expected"),
+    [
+        ("INIT", "PLANNING", True),
+        ("REVIEWING", "FIXING", True),
+        ("DONE", "CODING", True),  # incomplete dry-run resume edge
+        ("DONE", "PLANNING", False),
+        ("UNKNOWN", "CODING", False),
+    ],
+)
+def test_fsm_transition_table_is_explicit(previous, current, expected):
+    assert is_valid_fsm_transition(previous, current) is expected
+
+
+@pytest.mark.parametrize(
+    ("status", "state", "message"),
+    [
+        ("completed", "MONITORING", "completed.*FSM"),
+        ("dry_run_complete", "CODING", "dry_run_complete.*FSM"),
+        ("failed", "DONE", "不能与 FSM 终态 DONE"),
+    ],
+)
+def test_manifest_integrity_rejects_status_state_mismatch(status, state, message):
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        status=status,
+        state=state,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        final_video="/tmp/output.mp4" if status == "completed" else None,
+    )
+
+    assert any(re.search(message, error) for error in manifest.integrity_errors())
+
+
+def test_restore_run_path_rejects_internal_symlink(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir()
+    target = root / "target.txt"
+    target.write_text("ok", encoding="utf-8")
+    (root / "link.txt").symlink_to(target)
+
+    with pytest.raises(ValueError, match="符号链接"):
+        restore_run_path(root, "link.txt")
 
 
 def test_manifest_integrity_rejects_unverified_rendered_artifact():
@@ -446,10 +495,18 @@ def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_current_manifest_uses_v5_schema():
+def test_current_manifest_uses_v6_schema_and_merge_profile():
     assert (
         RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
-        == 5
+        == 6
+    )
+    assert (
+        RunManifest(
+            run_id=RUN_ID,
+            user_prompt="test",
+            output_path="/tmp/out.mp4",
+        ).merge_profile.video_codec
+        == "libx264"
     )
 
 
@@ -471,7 +528,7 @@ def test_v4_manifest_is_readable_but_read_only(tmp_path):
     assert loaded.schema_version == 4
     with pytest.raises(ValueError, match="仅支持只读查看"):
         loaded.validate_for_resume()
-    with pytest.raises(ValueError, match="只允许写入 v5"):
+    with pytest.raises(ValueError, match="只允许写入 v6"):
         write_manifest(path, loaded)
 
 
@@ -484,6 +541,7 @@ def test_v5_manifest_must_persist_teaching_contract_fields(tmp_path):
         user_prompt="prompt",
         output_path=str((root / "output.mp4").resolve()),
     ).model_dump(mode="json")
+    raw["schema_version"] = 5
     for field_name in ("lesson_spec", "teaching_graph", "state_ledger"):
         raw.pop(field_name)
     (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")

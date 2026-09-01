@@ -462,16 +462,18 @@ class _SafetyVisitor(ast.NodeVisitor):
             node.func.id in BANNED_CALLS or node.func.id in self.dangerous_aliases
         ):
             self.error(node, f"禁止调用 {node.func.id}()")
-        # 检查属性方法调用
-        elif (
-            isinstance(node.func, ast.Attribute)
-            and (
+        # 检查属性方法/模块限定调用。此前这里只检查了
+        # ``os.system`` 这类危险属性，却漏掉了 ``manim.ImageMobject``、
+        # ``manim.SVGMobject`` 和 ``manim.SceneFileWriter`` 等以属性形式
+        # 出现的危险对象；模块别名会让这类调用绕过直接名称黑名单。
+        elif isinstance(node.func, ast.Attribute):
+            if node.func.attr in BANNED_CALLS:
+                self.error(node, f"禁止调用危险对象 {node.func.attr}()")
+            elif (
                 node.func.attr in BANNED_ATTRIBUTE_NAMES
                 or (node.func.attr.startswith("__") and not self._is_super_init(node.func))
-            )
-            and not self._is_scene_remove(node.func)
-        ):
-            self.error(node, f"禁止调用属性方法 {node.func.attr}()")
+            ) and not self._is_scene_remove(node.func):
+                self.error(node, f"禁止调用属性方法 {node.func.attr}()")
 
         # 检查 add_to_preamble 调用并提取模板变量名
         if isinstance(node.func, ast.Attribute) and node.func.attr == "add_to_preamble":
@@ -530,12 +532,45 @@ class _SafetyVisitor(ast.NodeVisitor):
             self.error(node, f"禁止引用危险能力 {node.id!r}")
         self.generic_visit(node)
 
+    def visit_While(self, node: ast.While) -> None:
+        """拒绝最明显的无界循环；运行时资源限制仍是最终防线。"""
+
+        if isinstance(node.test, ast.Constant) and node.test.value is True:
+
+            def has_direct_break(parent: ast.AST) -> bool:
+                for child in ast.iter_child_nodes(parent):
+                    if isinstance(child, ast.Break):
+                        return True
+                    if isinstance(
+                        child,
+                        (
+                            ast.For,
+                            ast.While,
+                            ast.AsyncFor,
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.ClassDef,
+                            ast.Lambda,
+                        ),
+                    ):
+                        continue
+                    if has_direct_break(child):
+                        return True
+                return False
+
+            has_break = has_direct_break(node)
+            if not has_break:
+                self.error(node, "禁止没有 break 的 while True 无界循环")
+        self.generic_visit(node)
+
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if isinstance(node.value, ast.Name) and node.value.id in {"__builtins__", "builtins"}:
             self.error(node, "禁止通过 builtins 下标访问运行时能力")
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in BANNED_CALLS:
+            self.error(node, f"禁止引用危险能力 {node.attr!r}")
         if node.attr in BANNED_ATTRIBUTE_NAMES and not self._is_scene_remove(node):
             self.error(node, f"禁止引用危险属性 {node.attr!r}")
         if node.attr.startswith("__") and not self._is_super_init(node):

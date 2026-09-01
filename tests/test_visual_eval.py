@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.config import settings
 from kd1_anime.eval.evaluator import Evaluator
+from kd1_anime.eval.metrics import EvalMetric
 from kd1_anime.eval.visual_eval import (
     FrameSample,
     VisualAnalysisResult,
@@ -300,6 +301,54 @@ def test_evaluate_run_rejects_untrusted_manifest_video(monkeypatch, tmp_path):
     )
 
     assert "路径不在允许范围内" in result.errors["visual"]
+
+
+def test_evaluate_run_rejects_scene_code_changed_after_checkpoint(monkeypatch, tmp_path):
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    run_dir = workspace / "runs" / run_id
+    code_file = run_dir / "scenes" / "scene_1.py"
+    code_file.parent.mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    code_file.write_text(code, encoding="utf-8")
+    plan = ScenePlan(
+        scene_id=1,
+        title="demo",
+        duration_seconds=1,
+        purpose="test",
+        math_concept="circle",
+        visual_design="fixed",
+        camera_movement="fixed",
+        visual_flow=["show"],
+        key_moments=["pause"],
+        computation="radius=1",
+    )
+    manifest = RunManifest(
+        run_id=run_id,
+        user_prompt="demo",
+        output_path=str((run_dir / "output.mp4").resolve()),
+        scenes={
+            1: StoredSceneState(
+                plan=plan,
+                code_file="scenes/scene_1.py",
+                code_sha256=sha256_text(code),
+                class_name="Demo",
+                reviewed=True,
+            )
+        },
+    )
+    write_manifest(run_dir / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    code_file.write_text(code + "\n# changed\n", encoding="utf-8")
+
+    result = Evaluator(enable_visual_eval=False, output_dir=tmp_path / "reports").evaluate_run(
+        run_id,
+        run_dir,
+        enable_visual=False,
+    )
+
+    assert "code:scene_1" in result.errors
+    assert not result.get_score(EvalMetric.CODE_SYNTAX)
 
 
 def test_evaluate_run_scene_uses_exact_hashed_artifact(monkeypatch, tmp_path):

@@ -85,14 +85,51 @@ class RenderProfile(BaseModel):
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def effective_transition_duration(durations: Iterable[float]) -> float:
+class MergeProfile(BaseModel):
+    """最终成片拼接配置；与单场景渲染配置分开持久化。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    transition_type: Literal["fade"] = "fade"
+    transition_duration: float = Field(gt=0, le=5)
+    video_codec: Literal["libx264", "libx265"] = "libx264"
+    video_preset: str = Field(pattern=r"^[A-Za-z0-9_-]{1,30}$")
+    video_crf: int = Field(ge=0, le=51)
+    audio_sample_rate: int = Field(ge=8_000, le=192_000)
+    audio_channel_layout: Literal["stereo"] = "stereo"
+
+    @classmethod
+    def current(cls) -> MergeProfile:
+        return cls(
+            transition_type=settings.TRANSITION_TYPE,
+            transition_duration=settings.TRANSITION_DURATION,
+            video_codec=settings.MERGE_VIDEO_CODEC,
+            video_preset=settings.MERGE_VIDEO_PRESET,
+            video_crf=settings.MERGE_VIDEO_CRF,
+            audio_sample_rate=settings.MERGE_AUDIO_SAMPLE_RATE,
+            audio_channel_layout=settings.MERGE_AUDIO_CHANNEL_LAYOUT,
+        )
+
+    def digest(self) -> str:
+        payload = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def effective_transition_duration(
+    durations: Iterable[float], merge_profile: MergeProfile | None = None
+) -> float:
     """返回 FFmpeg xfade 实际会采用的统一转场时长。"""
 
     values = [float(duration) for duration in durations]
     if len(values) < 2:
         return 0.0
     shortest = min(values)
-    return min(settings.TRANSITION_DURATION, max(0.0, shortest / 2))
+    transition_duration = (
+        merge_profile.transition_duration
+        if merge_profile is not None
+        else settings.TRANSITION_DURATION
+    )
+    return min(transition_duration, max(0.0, shortest / 2))
 
 
 class VideoMetadata(BaseModel):
@@ -122,6 +159,8 @@ class SceneArtifact(BaseModel):
     video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     metadata: VideoMetadata
     verified: bool = True
+    environment_fingerprint: dict[str, str] = Field(default_factory=dict, max_length=20)
+    environment_warning: str = Field(default="", max_length=2_000)
 
 
 def sha256_file(path: Path) -> str:

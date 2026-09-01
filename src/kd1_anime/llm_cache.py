@@ -55,6 +55,7 @@ def make_cache_key(
             "send_max_tokens": profile.send_max_tokens,
             "silent_stream": profile.silent_stream,
             "use_json_mode": profile.use_json_mode,
+            "trust_env": profile.trust_env,
             "max_retries": profile.max_retries,
             "empty_retry_max_tokens": profile.empty_retry_max_tokens,
         },

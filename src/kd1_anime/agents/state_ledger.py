@@ -32,8 +32,12 @@ class LedgerElement(BaseModel):
     export_code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
 
 
-class SceneBoundaryState(BaseModel):
-    """一个 Scene 的开场/收场状态和渲染证据。"""
+class SceneBoundaryIR(BaseModel):
+    """场景边界的唯一结构化事实来源。
+
+    计划、元素清单和代码导出区都可以从这份边界记录派生；自然语言
+    opening/closing 描述只作为展示信息，不应再单独决定交接行为。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -42,10 +46,34 @@ class SceneBoundaryState(BaseModel):
     closing_element_ids: list[str] = Field(default_factory=list, max_length=100)
     opening_math_state: str = Field(default="", max_length=4_000)
     closing_math_state: str = Field(default="", max_length=4_000)
+    removed_element_ids: list[str] = Field(default_factory=list, max_length=100)
+    transition_in: str = Field(default="", max_length=2_000)
+    transition_out: str = Field(default="", max_length=2_000)
+    visual_state_digest: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     exported_code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     artifact_video_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     opening_frame_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     ending_frame_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> SceneBoundaryIR:
+        for field_name in (
+            "opening_element_ids",
+            "closing_element_ids",
+            "removed_element_ids",
+        ):
+            values = getattr(self, field_name)
+            if len(values) != len(set(values)):
+                raise ValueError(f"场景边界 {field_name} 必须唯一")
+        removed = set(self.removed_element_ids)
+        closing = set(self.closing_element_ids)
+        if removed & closing:
+            raise ValueError("场景边界不能同时导出和移除同一个元素")
+        return self
+
+
+class SceneBoundaryState(SceneBoundaryIR):
+    """旧 API 名称的兼容子类。"""
 
 
 class StateLedger(BaseModel):
@@ -56,7 +84,7 @@ class StateLedger(BaseModel):
     schema_version: Literal[1] = 1
     current_scene_id: int | None = Field(default=None, ge=1)
     elements: list[LedgerElement] = Field(default_factory=list, max_length=200)
-    boundaries: dict[int, SceneBoundaryState] = Field(default_factory=dict, max_length=100)
+    boundaries: dict[int, SceneBoundaryIR] = Field(default_factory=dict, max_length=100)
 
     @model_validator(mode="after")
     def validate_references(self) -> StateLedger:
@@ -100,18 +128,26 @@ class StateLedger(BaseModel):
         closing_element_ids: list[str],
         opening_math_state: str = "",
         closing_math_state: str = "",
+        removed_element_ids: list[str] | None = None,
+        transition_in: str = "",
+        transition_out: str = "",
+        visual_state_digest: str = "",
         exported_code_sha256: str = "",
         artifact_video_sha256: str = "",
     ) -> StateLedger:
         by_id = {item.element_id: item for item in self.elements}
         for item in elements:
             by_id[item.element_id] = item
-        boundary = SceneBoundaryState(
+        boundary = SceneBoundaryIR(
             scene_id=scene_id,
             opening_element_ids=list(dict.fromkeys(opening_element_ids)),
             closing_element_ids=list(dict.fromkeys(closing_element_ids)),
             opening_math_state=opening_math_state,
             closing_math_state=closing_math_state,
+            removed_element_ids=list(dict.fromkeys(removed_element_ids or [])),
+            transition_in=transition_in,
+            transition_out=transition_out,
+            visual_state_digest=visual_state_digest,
             exported_code_sha256=exported_code_sha256,
             artifact_video_sha256=artifact_video_sha256,
         )

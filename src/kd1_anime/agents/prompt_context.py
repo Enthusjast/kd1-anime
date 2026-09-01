@@ -18,6 +18,9 @@ class PromptSection:
     required: bool = False
     priority: int = 0
     max_chars: int | None = None
+    # 结构化数据（如 RAG JSON 块或元素清单）不能从中间截断；空间不足时
+    # 整段省略，不能把破损 JSON 交给模型。
+    atomic: bool = False
 
 
 class PromptContextBuilder:
@@ -66,6 +69,7 @@ class PromptContextBuilder:
                         required=section.required,
                         priority=section.priority,
                         max_chars=section.max_chars,
+                        atomic=section.atomic,
                     )
                 )
         rendered: list[str] = []
@@ -77,11 +81,14 @@ class PromptContextBuilder:
                     )
                 content = section.content
             else:
-                content = (
-                    self._clip(section.content, section.max_chars)
-                    if section.max_chars is not None
-                    else section.content
-                )
+                if section.atomic and section.max_chars is not None:
+                    content = section.content if len(section.content) <= section.max_chars else ""
+                else:
+                    content = (
+                        self._clip(section.content, section.max_chars)
+                        if section.max_chars is not None
+                        else section.content
+                    )
             rendered.append(self._render(section, content))
         separator_length = 2 * max(0, len(rendered) - 1)
         if sum(len(item) for item in rendered) + separator_length <= self.max_chars:
@@ -106,6 +113,12 @@ class PromptContextBuilder:
                 break
             rendered_section = self._render(section)
             available = remaining - 2
+            if section.atomic:
+                if len(rendered_section) > available:
+                    continue
+                selected[section.name] = rendered_section
+                remaining -= len(rendered_section) + 2
+                continue
             if section.max_chars is not None:
                 available = min(available, section.max_chars + len(f"### {section.name}\n"))
             clipped = self._clip(rendered_section, available)

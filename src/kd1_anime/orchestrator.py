@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -77,6 +78,7 @@ from kd1_anime.cluster.slurm import (
     JobMonitor,
     SlurmDispatcher,
     SlurmJob,
+    SlurmMonitorCoordinator,
 )
 from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.exceptions import (
@@ -92,6 +94,7 @@ from kd1_anime.media.merger import VideoMerger
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.rag.service import RagService
 from kd1_anime.rendering import (
+    MergeProfile,
     RenderProfile,
     SceneArtifact,
     effective_transition_duration,
@@ -109,6 +112,7 @@ from kd1_anime.run_store import (
     atomic_write_json,
     atomic_write_text,
     get_reusable_video_path,
+    is_valid_fsm_transition,
     lock_run,
     restore_run_path,
     restore_slurm_job,
@@ -116,10 +120,71 @@ from kd1_anime.run_store import (
     store_slurm_job,
     write_manifest,
 )
+from kd1_anime.security import redact_jsonable, redact_text, redact_value
 
 logger = get_logger(__name__)
 console = Console()
 Callback = Callable[[str, dict], None]
+MAX_EVENT_DATA_CHARS = 50_000
+
+
+def _run_limited_process(
+    command: list[str],
+    *,
+    timeout: float,
+    memory_mb: int,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """运行本地预检并在超时后清理整个进程组。
+
+    生成代码可能启动额外子进程；``subprocess.run(timeout=...)`` 只保证
+    主进程被终止，容易留下 Manim/FFmpeg 子进程。Linux 的 ``prlimit`` 可
+    进一步限制地址空间和 CPU 时间，缺少时仍保留进程组清理兜底。
+    """
+
+    wrapped = list(command)
+    prlimit = shutil.which("prlimit")
+    if prlimit:
+        wrapped = [
+            prlimit,
+            f"--as={int(memory_mb) * 1024 * 1024}",
+            f"--cpu={max(1, int(timeout) + 5)}",
+            "--",
+            *wrapped,
+        ]
+    try:
+        process = subprocess.Popen(
+            wrapped,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+    except OSError:
+        raise
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        with suppress(OSError, ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                process.kill()
+            stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            wrapped,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from exc
+    return subprocess.CompletedProcess(wrapped, process.returncode, stdout, stderr)
+
+
 # 这些状态通常是代码之外的暂时性基础设施问题；优先重新排队，不要把
 # 节点故障/抢占交给 LLM 当成业务代码错误修改。
 RETRYABLE_INFRA_STATES = {
@@ -281,6 +346,7 @@ class PipelineContext:
     # 连续性 warning 恢复时只自动重新检查一次，避免每次 resume 都重新进入死循环。
     continuity_resume_recheck_used: bool = False
     continuity_warnings: list[str] = field(default_factory=list)
+    fsm_warnings: list[str] = field(default_factory=list)
     # Plan Compiler 的确定性发现按场景缓存，交给 Plan Reviewer 一起处理，
     # 避免每个场景重复计算或把跨场景错误丢失。
     plan_compile_issues: dict[int, list[PlanReviewIssue]] = field(default_factory=dict)
@@ -289,6 +355,7 @@ class PipelineContext:
     final_video: Path | None = None
     final_video_sha256: str = ""
     render_profile: RenderProfile = field(default_factory=RenderProfile.current)
+    merge_profile: MergeProfile = field(default_factory=MergeProfile.current)
     manifest_revision: int = 0
 
     # 增量渲染支持
@@ -326,7 +393,10 @@ class Orchestrator:
         # 渲染线程在产物完成后即可触发视觉评估；同一时刻只允许一个视觉
         # 门修改连续性状态，避免两个场景同时请求修复造成下游竞态。
         self._visual_eval_lock = threading.RLock()
+        self._slurm_monitor: SlurmMonitorCoordinator | None = None
         self._emitted_phases: set[str] = set()
+        self._event_log_lock = threading.Lock()
+        self._event_log_warning_emitted = False
         self._resource_coordinator = resource_coordinator
         self.rag = RagService(
             rag_semaphore=(resource_coordinator.rag if resource_coordinator is not None else None)
@@ -414,8 +484,80 @@ class Orchestrator:
                 category = self._ctx.scene_states[scene_id].failure_category
                 if category:
                     data["category"] = category
+        safe_data = redact_value(data, self._event_secrets())
+        self._append_event(event, safe_data)
         if self._callback:
-            self._callback(event, data)
+            self._callback(event, safe_data)
+
+    @staticmethod
+    def _event_secrets() -> tuple[str, ...]:
+        """返回可能出现在外部服务异常中的凭据值。"""
+
+        return tuple(
+            value
+            for value in (
+                settings.LLM_API_KEY,
+                settings.VISUAL_LLM_API_KEY,
+                settings.RAG_EMBEDDING_API_KEY,
+                settings.RAG_RERANK_API_KEY,
+            )
+            if value
+        )
+
+    def _append_event(self, event: str, data: object, *, durable: bool = False) -> None:
+        """将运行事件追加到私有 JSONL 日志；诊断日志失败不改变流水线结果。"""
+
+        ctx = self._ctx
+        if ctx is None:
+            return
+        path = ctx.paths.root / "events.jsonl"
+        safe_data = redact_jsonable(data, self._event_secrets())
+        encoded_data = json.dumps(safe_data, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded_data) > MAX_EVENT_DATA_CHARS:
+            safe_data = {
+                "truncated": True,
+                "sha256": sha256_text(encoded_data),
+                "preview": encoded_data[:2_000],
+            }
+        record = {
+            "schema_version": 1,
+            "event_id": uuid4().hex,
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "run_id": ctx.paths.run_id,
+            "event": event,
+            "data": safe_data,
+        }
+        try:
+            with self._event_log_lock:
+                if path.is_symlink():
+                    raise OSError(f"事件日志不能是符号链接: {path}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                descriptor = os.open(
+                    path,
+                    os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                        descriptor = -1
+                        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                        handle.write("\n")
+                        handle.flush()
+                        if durable:
+                            os.fsync(handle.fileno())
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+        except (OSError, TypeError, ValueError) as exc:
+            with self._event_log_lock:
+                should_warn = not self._event_log_warning_emitted
+                self._event_log_warning_emitted = True
+            if should_warn:
+                logger.warning(
+                    "运行事件日志写入失败: %s",
+                    redact_text(exc, self._event_secrets()),
+                )
 
     @staticmethod
     def _supports_keyword(callable_obj: object, name: str) -> bool:
@@ -433,15 +575,19 @@ class Orchestrator:
         if not self.rag.enabled:
             return RagRuntimeProfile()
         runtime = self.rag.runtime_status()
+        index = runtime.get("index") or {}
         return RagRuntimeProfile(
             enabled=bool(runtime["enabled"]),
             status=runtime["status"],
-            index_sha256=(runtime.get("index") or {}).get("index_sha256", ""),
+            index_sha256=index.get("index_sha256", ""),
             embedding_model=str(runtime.get("embedding_model", "")),
             reranker_model=str(runtime.get("reranker_model", "")),
             top_k=self.rag.config.RAG_TOP_K,
             rerank_top_n=self.rag.config.RAG_RERANK_TOP_N,
             max_context_chars=self.rag.config.RAG_MAX_CONTEXT_CHARS,
+            chunker_version=str(index.get("chunker_version", "")),
+            chunk_size=int(index.get("chunk_size", 0) or 0),
+            chunk_overlap=int(index.get("chunk_overlap", 0) or 0),
         )
 
     def _retrieve_rag(
@@ -473,7 +619,7 @@ class Orchestrator:
                 code_sha256=code_sha256,
                 inherited_elements_sha256=inherited_elements_sha256,
                 status="degraded",
-                warning=f"RAG 检索异常，已跳过: {exc}",
+                warning=f"RAG 检索异常，已跳过: {redact_text(exc, self._event_secrets())}",
             )
         else:
             receipt = result.receipt
@@ -494,6 +640,9 @@ class Orchestrator:
                 top_k=self.rag.config.RAG_TOP_K,
                 rerank_top_n=self.rag.config.RAG_RERANK_TOP_N,
                 max_context_chars=self.rag.config.RAG_MAX_CONTEXT_CHARS,
+                chunker_version=ctx.rag_profile.chunker_version,
+                chunk_size=ctx.rag_profile.chunk_size,
+                chunk_overlap=ctx.rag_profile.chunk_overlap,
             )
             if receipt.warning and receipt.warning not in ctx.rag_warnings:
                 ctx.rag_warnings.append(f"[{stage}] {receipt.warning}")
@@ -517,6 +666,9 @@ class Orchestrator:
             or previous.index_sha256 != current.index_sha256
             or previous.embedding_model != current.embedding_model
             or previous.reranker_model != current.reranker_model
+            or previous.chunker_version != current.chunker_version
+            or previous.chunk_size != current.chunk_size
+            or previous.chunk_overlap != current.chunk_overlap
         )
         if changed:
             ctx.rag_receipts.clear()
@@ -639,6 +791,15 @@ class Orchestrator:
         error: str = "",
     ) -> None:
         with self._state_lock:
+            previous_state = self._manifest.state if self._manifest is not None else ""
+            transition_warning = ""
+            if previous_state and not is_valid_fsm_transition(previous_state, state.name):
+                transition_warning = (
+                    f"FSM 检查点转移 {previous_state} -> {state.name} 不在已知转移表中；"
+                    "考虑到并发 worker/恢复入口，仅记录诊断并继续"
+                )
+                if transition_warning not in ctx.fsm_warnings:
+                    ctx.fsm_warnings.append(transition_warning)
             scenes: dict[int, StoredSceneState] = {}
             for scene_id, scene in sorted(ctx.scene_states.items()):
                 code_file = ""
@@ -727,6 +888,7 @@ class Orchestrator:
                 plan_approved=ctx.plan_approved,
                 output_path=str(ctx.paths.output),
                 render_profile=ctx.render_profile,
+                merge_profile=ctx.merge_profile,
                 outlines=ctx.outlines,
                 scenes=scenes,
                 lesson_spec=ctx.lesson_spec,
@@ -742,6 +904,7 @@ class Orchestrator:
                 continuity_review_round=ctx.continuity_review_round,
                 continuity_resume_recheck_used=ctx.continuity_resume_recheck_used,
                 continuity_warnings=ctx.continuity_warnings[-100:],
+                fsm_warnings=ctx.fsm_warnings[-100:],
                 final_video=str(ctx.final_video) if ctx.final_video else None,
                 final_video_sha256=ctx.final_video_sha256,
                 error=error[-50_000:],
@@ -756,6 +919,17 @@ class Orchestrator:
             )
             write_manifest(ctx.paths.root / MANIFEST_NAME, manifest)
             self._manifest = manifest
+            self._append_event(
+                "fsm_checkpoint",
+                {
+                    "state": state.name,
+                    "status": status,
+                    "revision": manifest.revision,
+                    "previous_state": previous_state,
+                    "transition_warning": transition_warning,
+                },
+                durable=True,
+            )
 
     def _record_checkpoint_failure(self, error: Exception) -> None:
         """记录持久化故障并停止其它 worker，避免继续推进未保存的状态。"""
@@ -765,6 +939,14 @@ class Orchestrator:
                 self._checkpoint_error = error
         self._stop_event.set()
         self._emit("checkpoint_failed", error=str(error))
+
+    def _checkpoint_slurm_job_update(self, ctx: PipelineContext, _job: SlurmJob) -> None:
+        """集中监控器发现实际启动时间变化时安全持久化。"""
+
+        try:
+            self._checkpoint(ctx, State.MONITORING)
+        except Exception as exc:
+            self._record_checkpoint_failure(exc)
 
     @staticmethod
     def _scene_phase(scene: SceneState) -> str:
@@ -1014,11 +1196,13 @@ class Orchestrator:
                 manifest, "continuity_resume_recheck_used", False
             ),
             continuity_warnings=list(manifest.continuity_warnings),
+            fsm_warnings=list(getattr(manifest, "fsm_warnings", [])),
             final_video=final_video,
             final_video_sha256=manifest.final_video_sha256,
             incremental=manifest.incremental,
             base_run_id=manifest.base_run_id,
             render_profile=manifest.render_profile,
+            merge_profile=getattr(manifest, "merge_profile", MergeProfile.current()),
             manifest_revision=manifest.revision,
             eval_round=manifest.eval_round,
             continuity_rebuild_required=getattr(manifest, "continuity_rebuild_required", False),
@@ -1032,7 +1216,7 @@ class Orchestrator:
             context.base_manifest.validate_for_resume()
         if context.expected_final_duration is None and context.outlines:
             transition = effective_transition_duration(
-                item.duration_seconds for item in context.outlines
+                (item.duration_seconds for item in context.outlines), context.merge_profile
             )
             context.expected_final_duration = max(
                 0.0,
@@ -1791,6 +1975,8 @@ class Orchestrator:
         if not user_prompt.strip():
             raise ValueError("计划文件缺少 user_prompt")
         settings.require_llm_key()
+        if settings.ENABLE_VISUAL_EVAL and not dry_run:
+            settings.require_visual_llm()
         if self.rag.enabled:
             self.rag.require_ready()
         self._callback = callback
@@ -1828,7 +2014,9 @@ class Orchestrator:
             ),
             rag_profile=self._current_rag_profile(),
         )
-        transition = effective_transition_duration(scene.duration_seconds for scene in scenes)
+        transition = effective_transition_duration(
+            (scene.duration_seconds for scene in scenes), ctx.merge_profile
+        )
         ctx.expected_final_duration = max(
             0.0,
             sum(scene.duration_seconds for scene in scenes) - transition * max(0, len(scenes) - 1),
@@ -2007,7 +2195,13 @@ class Orchestrator:
         if self._manifest is None:
             return fallback
         try:
-            return State[self._manifest.state]
+            checkpoint_state = State[self._manifest.state]
+            # 旧的/不完整 dry-run 可能最后写成 DONE，但异常收尾不能再
+            # 生成 status=failed + state=DONE 的自相矛盾清单；DONE 只允许
+            # 与 completed/dry_run_complete 配对。
+            if checkpoint_state is State.DONE:
+                return State.ERROR
+            return checkpoint_state
         except KeyError:
             return fallback
 
@@ -2140,12 +2334,10 @@ class Orchestrator:
             else:
                 command = [sys.executable, "-m", *manim_command]
             try:
-                result = subprocess.run(
+                result = _run_limited_process(
                     command,
-                    capture_output=True,
-                    text=True,
                     timeout=settings.LOCAL_SMOKE_RENDER_TIMEOUT,
-                    check=False,
+                    memory_mb=settings.LOCAL_SMOKE_RENDER_MEMORY_MB,
                     env=env,
                 )
             except subprocess.TimeoutExpired as exc:
@@ -2335,7 +2527,9 @@ class Orchestrator:
                     raise PipelineError(f"场景概要规划失败: {exc}") from exc
         ctx.outlines = outlines
         ctx.scenes = [self._placeholder_plan(o) for o in outlines]
-        transition = effective_transition_duration(item.duration_seconds for item in outlines)
+        transition = effective_transition_duration(
+            (item.duration_seconds for item in outlines), ctx.merge_profile
+        )
         ctx.expected_final_duration = max(
             0.0,
             sum(item.duration_seconds for item in outlines)
@@ -2801,22 +2995,34 @@ class Orchestrator:
         ):
             return
 
+        self._slurm_monitor = SlurmMonitorCoordinator(
+            self.slurm,
+            on_job_update=lambda job: self._checkpoint_slurm_job_update(ctx, job),
+        )
         threads: list[threading.Thread] = []
-        for scene_id, state in sorted(ctx.scene_states.items()):
-            if state.rendered or state.failed or state.give_up:
-                continue
-            if state.slurm_job is not None:
-                self._reserve_existing_slot(scene_id)
-            thread = threading.Thread(
-                target=self._scene_worker,
-                args=(ctx, scene_id, state),
-                name=f"scene-{scene_id}",
-                daemon=True,
-            )
-            threads.append(thread)
-            thread.start()
-        for thread in threads:
-            thread.join()
+        try:
+            for scene_id, state in sorted(ctx.scene_states.items()):
+                if state.rendered or state.failed or state.give_up:
+                    continue
+                if state.slurm_job is not None:
+                    self._reserve_existing_slot(scene_id)
+                thread = threading.Thread(
+                    target=self._scene_worker,
+                    args=(ctx, scene_id, state),
+                    name=f"scene-{scene_id}",
+                    daemon=True,
+                )
+                threads.append(thread)
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            monitor = self._slurm_monitor
+            if monitor is not None:
+                if self._stop_event.is_set() or self._cancel_requested.is_set():
+                    monitor.cancel_pending(reason="流水线停止")
+                monitor.close()
+            self._slurm_monitor = None
         if self._checkpoint_error is not None:
             raise RuntimeError(
                 f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
@@ -5319,6 +5525,10 @@ class Orchestrator:
             closing_element_ids=[item.element_id for item in state.exported_elements],
             opening_math_state="；".join(state.plan.opening_state),
             closing_math_state="；".join(state.plan.closing_state),
+            removed_element_ids=[item.element_id for item in state.plan.elements_to_remove],
+            transition_in=state.plan.transition_in,
+            transition_out=state.plan.transition_out,
+            visual_state_digest=sha256_text(state.plan.global_visual_state.model_dump_json()),
             exported_code_sha256=sha256_text(state.exported_elements_code)
             if state.exported_elements_code
             else "",
@@ -5602,27 +5812,38 @@ class Orchestrator:
         if job is None:
             return False
         self._phase_emit("monitoring")
-        monitor = JobMonitor(self.slurm)
-        monitor.add_job(job)
-        while monitor.pending:
-            if (
-                self._cancel_requested.is_set()
-                or self._stop_event.is_set()
-                or ctx.continuity_rebuild_required
-            ):
+        if self._slurm_monitor is not None:
+            self._slurm_monitor.register(job)
+            ok = self._slurm_monitor.wait(job.job_id, stop_event=self._stop_event)
+            if ok is None:
                 return False
-            previous_started_at = job.started_at
-            if monitor.poll_once():
-                break
-            if job.started_at is not None and job.started_at != previous_started_at:
-                # 首次从 squeue 得到实际启动时间后立即持久化，进程中断再
-                # resume 时不会丢失运行计时基准。
-                with self._state_lock:
-                    self._checkpoint(ctx, State.MONITORING)
-            time.sleep(settings.MONITOR_POLL_INTERVAL)
+            # 共享 Monitor 已经把最终状态、产物元数据和错误原因写回 Job；
+            # 以下逻辑与旧的单 Job 路径共用，保证 AutoFix/基础设施重排队
+            # 的行为不因监控实现切换而改变。
+            monitor = None
+        else:
+            monitor = JobMonitor(self.slurm)
+            monitor.add_job(job)
+            while monitor.pending:
+                if (
+                    self._cancel_requested.is_set()
+                    or self._stop_event.is_set()
+                    or ctx.continuity_rebuild_required
+                ):
+                    return False
+                previous_started_at = job.started_at
+                if monitor.poll_once():
+                    break
+                if job.started_at is not None and job.started_at != previous_started_at:
+                    # 首次从 squeue 得到实际启动时间后立即持久化，进程中断再
+                    # resume 时不会丢失运行计时基准。
+                    with self._state_lock:
+                        self._checkpoint(ctx, State.MONITORING)
+                time.sleep(settings.MONITOR_POLL_INTERVAL)
         if ctx.continuity_rebuild_required:
             return False
-        ok = monitor.results.get(job.job_id)
+        if monitor is not None:
+            ok = monitor.results.get(job.job_id)
         if ok is None:
             with self._state_lock:
                 state.give_up = True
@@ -6360,6 +6581,7 @@ class Orchestrator:
             and sha256_text(state.code) == base_scene.code_sha256
             and artifact.code_sha256 == base_scene.code_sha256
             and artifact.render_profile_sha256 == ctx.render_profile.digest()
+            and not artifact.environment_warning
         ):
             base_root = RunRepository(settings.WORKSPACE_DIR).run_root(ctx.base_run_id)
             old_video = get_reusable_video_path(ctx.base_manifest, scene_id, base_root)
@@ -6398,6 +6620,8 @@ class Orchestrator:
                         video_sha256=artifact.video_sha256,
                         metadata=artifact.metadata,
                         verified=True,
+                        environment_fingerprint=dict(artifact.environment_fingerprint),
+                        environment_warning=artifact.environment_warning,
                     )
                     self._reset_visual_receipt(ctx, state)
                     if scene_id not in ctx.scenes_to_reuse:
@@ -6468,6 +6692,8 @@ class Orchestrator:
             video_sha256=sha256_file(job.output_path),
             metadata=job.output_metadata,
             verified=True,
+            environment_fingerprint=dict(job.environment_fingerprint),
+            environment_warning=job.environment_warning,
         )
 
     @staticmethod
@@ -6612,9 +6838,10 @@ class Orchestrator:
 
     @staticmethod
     def _redact_visual_error(error: Exception) -> str:
-        detail = str(error).strip() or type(error).__name__
-        if settings.VISUAL_LLM_API_KEY:
-            detail = detail.replace(settings.VISUAL_LLM_API_KEY, "<redacted>")
+        detail = redact_text(
+            str(error).strip() or type(error).__name__,
+            (settings.VISUAL_LLM_API_KEY,),
+        )
         return detail[:10_000]
 
     def _restore_visual_candidate_into_state(
@@ -6626,10 +6853,18 @@ class Orchestrator:
     ) -> bool:
         """恢复已验证候选；返回代码是否相对当前状态发生变化。"""
 
+        # 所有恢复分支都必须在写回当前状态前验证候选视频；不能只验证
+        # 候选代码和报告，否则视频被删除/替换后仍会把 rendered=True 写入
+        # manifest，直到合并阶段才暴露问题。
+        self._artifact_video_path(ctx, candidate.artifact)
         with self._state_lock:
             inherited_hash = sha256_text(state.inherited_elements_code)
             if candidate.inherited_elements_sha256 != inherited_hash:
                 raise RuntimeError(f"Scene {scene_id} 的视觉候选基于不同的继承上下文，拒绝恢复")
+            if candidate.artifact.code_sha256 != sha256_text(candidate.code):
+                raise RuntimeError(f"Scene {scene_id} 的视觉候选代码哈希与视频产物不一致")
+            if candidate.artifact.scene_class_name != candidate.class_name:
+                raise RuntimeError(f"Scene {scene_id} 的视觉候选类名与视频产物不一致")
             code_changed = candidate.code != state.code
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate.code)
         with self._state_lock:
@@ -6919,6 +7154,7 @@ class Orchestrator:
                 and best.artifact.video_sha256 != artifact.video_sha256
                 and best.inherited_elements_sha256 == sha256_text(inherited_code)
             ):
+                self._artifact_video_path(ctx, best.artifact)
                 changed = self._restore_visual_candidate_into_state(ctx, scene_id, state, best)
                 with self._state_lock:
                     state.visual_status = "warning"
@@ -7397,15 +7633,16 @@ class Orchestrator:
             # VideoMerger 写临时文件并在验证成功后原子替换；不能提前删除旧文件，
             # 否则新的 FFmpeg 失败会丢失上一次仍可用的结果。
             video_paths = [self._artifact_video_path(ctx, item) for item in rendered_artifacts]
-            ctx.final_video = self.merger.merge(
-                video_paths,
-                ctx.paths.output,
-                replace_existing=(
+            merge_kwargs = {
+                "replace_existing": (
                     output_is_run_local
                     or (force_remerge and not output_is_run_local and checkpointed_output_matches)
                 ),
-                render_profile=ctx.render_profile,
-            )
+                "render_profile": ctx.render_profile,
+            }
+            if self._supports_keyword(self.merger.merge, "merge_profile"):
+                merge_kwargs["merge_profile"] = ctx.merge_profile
+            ctx.final_video = self.merger.merge(video_paths, ctx.paths.output, **merge_kwargs)
         ctx.final_video_sha256 = sha256_file(ctx.final_video)
         minimum = ctx.lesson_spec.requested_duration_min_seconds
         maximum = ctx.lesson_spec.requested_duration_max_seconds

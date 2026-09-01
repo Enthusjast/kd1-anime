@@ -97,6 +97,31 @@ def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
     orchestrator._run_code_review_barrier(ctx)
 
 
+def test_checkpoint_and_events_are_private_and_redacted(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    (run_paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={1: SceneState(plan=plan(), code=code, class_name="Demo")},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._ctx = ctx
+    monkeypatch.setattr(settings, "LLM_API_KEY", "top-secret-api-key")
+
+    orchestrator._checkpoint(ctx, State.CODING)
+    orchestrator._emit("diagnostic", error="request failed with top-secret-api-key")
+
+    event_path = run_paths.root / "events.jsonl"
+    assert event_path.stat().st_mode & 0o777 == 0o600
+    records = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    assert records[0]["event"] == "fsm_checkpoint"
+    assert records[-1]["data"]["error"] == "request failed with <redacted>"
+    assert "top-secret-api-key" not in event_path.read_text(encoding="utf-8")
+
+
 def test_code_barrier_does_not_turn_downstream_missing_ledger_into_failure(monkeypatch, tmp_path):
     """上游技术合同失败时，下游应等待而不是伪造继承状态错误。"""
 
@@ -1243,13 +1268,13 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
         output.write_bytes(b"smoke")
         return module.subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(module.subprocess, "run", successful_run)
+    monkeypatch.setattr(module, "_run_limited_process", successful_run)
     orchestrator._local_smoke_render(ctx, state)
 
     def failed_run(command, **kwargs):
         return module.subprocess.CompletedProcess(command, 1, "", "render boom")
 
-    monkeypatch.setattr(module.subprocess, "run", failed_run)
+    monkeypatch.setattr(module, "_run_limited_process", failed_run)
     with pytest.raises(RuntimeError, match="Smoke Render 失败"):
         orchestrator._local_smoke_render(ctx, state)
 

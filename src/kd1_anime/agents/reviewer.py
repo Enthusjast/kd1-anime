@@ -401,9 +401,17 @@ def filter_contradictory_review_findings(
     for index, finding in enumerate(result.findings, start=1):
         text = finding_text(finding)
         contradiction = ""
-        if "camera.frame" in text and "camera.frame" not in lowered:
+        if (
+            "camera.frame" in text
+            and "camera.frame" not in lowered
+            and "camera.frame" not in finding.evidence.lower()
+        ):
             contradiction = "当前代码没有 camera.frame"
-        elif "movingcamerascene" in text and "movingcamerascene" not in lowered:
+        elif (
+            "movingcamerascene" in text
+            and "movingcamerascene" not in lowered
+            and "camera.frame" not in finding.evidence.lower()
+        ):
             contradiction = "当前代码没有 MovingCameraScene"
         elif (
             effective_renderer == "opengl"
@@ -465,10 +473,6 @@ def filter_contradictory_review_findings(
             # 它既不能改变代码，也不应阻止已经没有有效 finding 的结果。
             continue
         text = f"{fix.find}\n{fix.reason}".lower()
-        if "camera.frame" in text and "camera.frame" not in lowered:
-            continue
-        if "movingcamerascene" in text and "movingcamerascene" not in lowered:
-            continue
         if (
             "导出区" in text
             and CONTINUITY_EXPORT_BEGIN.lower() in lowered

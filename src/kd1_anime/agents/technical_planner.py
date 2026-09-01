@@ -1174,7 +1174,8 @@ class TechnicalPlannerAgent(BaseAgent):
                 "RAG Reference Context",
                 f'<rag_context stage="technical">\n{rag_context}\n</rag_context>',
                 priority=10,
-                max_chars=settings.RAG_MAX_CONTEXT_CHARS,
+                max_chars=settings.RAG_MAX_CONTEXT_CHARS + 512,
+                atomic=True,
             ),
             PromptSection(
                 "输出要求",

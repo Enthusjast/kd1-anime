@@ -5,6 +5,7 @@ import pytest
 
 from kd1_anime.config import settings
 from kd1_anime.rendering import (
+    MergeProfile,
     RenderProfile,
     effective_transition_duration,
     probe_video,
@@ -34,6 +35,14 @@ def test_render_profile_digest_includes_tool_versions():
     changed = profile.model_copy(update={"manim_version": "0.20.2"})
 
     assert profile.digest() != changed.digest()
+
+
+def test_merge_profile_digest_captures_publish_settings(monkeypatch):
+    original = MergeProfile.current()
+    monkeypatch.setattr(settings, "MERGE_VIDEO_CRF", original.video_crf + 1)
+    changed = MergeProfile.current()
+
+    assert original.digest() != changed.digest()
 
 
 def test_effective_transition_duration_matches_short_video_guard(monkeypatch):

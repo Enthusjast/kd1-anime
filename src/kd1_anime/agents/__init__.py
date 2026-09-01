@@ -29,7 +29,12 @@ from kd1_anime.agents.prompt_context import (
     build_bounded_prompt,
 )
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, validate_review_evidence
-from kd1_anime.agents.state_ledger import LedgerElement, SceneBoundaryState, StateLedger
+from kd1_anime.agents.state_ledger import (
+    LedgerElement,
+    SceneBoundaryIR,
+    SceneBoundaryState,
+    StateLedger,
+)
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
     TechnicalSpec,
@@ -62,6 +67,7 @@ __all__ = [
     "PromptSection",
     "ReviewFinding",
     "ReviewerAgent",
+    "SceneBoundaryIR",
     "SceneBoundaryState",
     "StateLedger",
     "TeachingEdge",
