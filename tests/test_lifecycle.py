@@ -1,6 +1,9 @@
 """生成代码对象生命周期校验测试。"""
 
-from kd1_anime.agents.lifecycle import validate_animation_lifecycle
+from kd1_anime.agents.lifecycle import (
+    repair_required_export_alias_lifecycle,
+    validate_animation_lifecycle,
+)
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 
 
@@ -33,6 +36,88 @@ class Demo(Scene):
     result = validate_animation_lifecycle(code, spec())
 
     assert result.is_valid is True
+
+
+def test_repairs_required_export_alias_after_temporary_intro():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="v1",
+                variable_name="v1",
+                constructor="Vector",
+                exported=True,
+            ),
+            TechnicalObject(
+                element_id="v2",
+                variable_name="v2",
+                constructor="Vector",
+                exported=True,
+            ),
+        ],
+        export_element_ids=["v1", "v2"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: v1
+        v1 = Vector([1, 1])
+        # element_id: v2
+        v2 = Vector([1, -1])
+        # KD1_CONTINUITY_EXPORT_END
+        v1_initial = Vector([1, 1])
+        v2_initial = Vector([1, -1])
+        self.play(FadeIn(v1_initial), FadeIn(v2_initial))
+        v1_scaled = Vector([4, 4])
+        v2_scaled = Vector([2, -2])
+        self.play(Transform(v1_initial, v1_scaled), Transform(v2_initial, v2_scaled))
+        v1 = v1_initial
+        v2 = v2_initial
+        self.play(v1.animate.set_stroke(width=6), v2.animate.set_stroke(width=6))
+"""
+
+    repaired, repairs = repair_required_export_alias_lifecycle(code, technical_spec)
+
+    assert repairs
+    assert "v1 = v1_initial" not in repaired
+    assert "FadeIn(v1)" in repaired
+    assert "Transform(v1, v1_scaled)" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
+def test_does_not_rewrite_unrelated_python_alias():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                constructor="MathTex",
+                exported=True,
+            )
+        ],
+        export_element_ids=["formula"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = MathTex(r"x")
+        # KD1_CONTINUITY_EXPORT_END
+        formula_initial = formula.copy()
+        value = formula_initial
+        self.play(FadeIn(formula))
+"""
+
+    repaired, repairs = repair_required_export_alias_lifecycle(code, technical_spec)
+
+    assert repaired == code
+    assert repairs == ()
 
 
 def test_lifecycle_accepts_animation_of_loop_variable():

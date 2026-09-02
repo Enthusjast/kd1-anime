@@ -84,7 +84,15 @@ FSM_TRANSITIONS: dict[str, frozenset[str]] = {
     "PLAN_REVIEWING": frozenset({"PLAN_REVIEWING", "DETAILING", "CODING", "REVIEWING", "ERROR"}),
     "CODING": frozenset({"CODING", "REVIEWING", "DISPATCHING", "PLAN_REVIEWING", "ERROR"}),
     "REVIEWING": frozenset(
-        {"REVIEWING", "CODING", "DISPATCHING", "FIXING", "PLAN_REVIEWING", "ERROR"}
+        {
+            "REVIEWING",
+            "CODING",
+            "DISPATCHING",
+            "FIXING",
+            "DETAILING",
+            "PLAN_REVIEWING",
+            "ERROR",
+        }
     ),
     "DISPATCHING": frozenset(
         {

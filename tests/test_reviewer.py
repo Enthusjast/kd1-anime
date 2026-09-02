@@ -7,8 +7,10 @@ from kd1_anime.agents.reviewer import (
     FixSuggestion,
     ReviewFinding,
     ReviewResult,
+    drop_unverifiable_review_items,
     filter_contradictory_review_findings,
     normalize_review_evidence,
+    reconcile_review_evidence_by_location,
     validate_review_evidence,
 )
 
@@ -194,6 +196,53 @@ def test_normalize_review_evidence_does_not_guess_duplicate_or_missing_text():
     assert normalized_duplicate == duplicate
     assert missing_corrections == []
     assert normalized_missing == missing
+
+
+def test_reconcile_review_evidence_uses_declared_source_location():
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                line_start=3,
+                line_end=3,
+                evidence="not copied exactly",
+                why="该行存在运行时问题",
+                repair="修正该行",
+            )
+        ],
+    )
+    code = "from manim import *\nclass Demo(Scene):\n    self.wait()\n"
+
+    reconciled, corrections = reconcile_review_evidence_by_location(result, code)
+
+    assert corrections
+    assert reconciled.findings[0].evidence == "self.wait()"
+    assert validate_review_evidence(reconciled, code) == []
+
+
+def test_drop_unverifiable_review_items_does_not_block_with_only_bad_evidence():
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="模型返回了无法定位的意见",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                evidence="not in code",
+                why="无法确认",
+                repair="忽略",
+            )
+        ],
+    )
+
+    filtered, dropped = drop_unverifiable_review_items(result, "self.wait()\n")
+
+    assert dropped == ["finding[1]"]
+    assert filtered.is_valid is True
 
 
 def test_reviewer_accepts_unique_evidence_with_wrong_model_line_numbers(monkeypatch):
@@ -388,6 +437,99 @@ def test_does_not_filter_camera_frame_finding_when_evidence_contains_it():
     assert filtered.is_valid is False
     assert len(filtered.findings) == 1
     assert corrections == []
+
+
+def test_filters_self_contradictory_major_math_finding():
+    code = (
+        "from manim import *\nclass Demo(Scene):\n    def construct(self):\n        self.wait()\n"
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="数学实现存在问题",
+        findings=[
+            ReviewFinding(
+                category="math",
+                severity="major",
+                evidence="self.wait()",
+                why="数值计算正确，此处无错误",
+                repair="无需修复，但可以添加注释",
+            )
+        ],
+    )
+
+    filtered, corrections = filter_contradictory_review_findings(result, code)
+
+    assert filtered.is_valid is True
+    assert not filtered.findings
+    assert corrections
+
+
+def test_filters_false_replacement_transform_target_finding():
+    code = (
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.play(ReplacementTransform(source, target))\n"
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="目标对象没有引入",
+        findings=[
+            ReviewFinding(
+                category="lifecycle",
+                severity="major",
+                evidence="self.play(ReplacementTransform(source, target))",
+                why="ReplacementTransform 的目标对象未在场景中引入",
+                repair="先 self.add(target)",
+            )
+        ],
+    )
+
+    filtered, corrections = filter_contradictory_review_findings(result, code)
+
+    assert filtered.is_valid is True
+    assert corrections
+
+
+def test_filters_fadeout_finding_when_technical_contract_requires_exit():
+    from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
+
+    code = (
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.play(FadeOut(grid))\n"
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="grid 不应消失",
+        findings=[
+            ReviewFinding(
+                category="continuity",
+                severity="major",
+                evidence="self.play(FadeOut(grid))",
+                why="grid 应保持 active 并交接给下一场景",
+                repair="不要 FadeOut(grid)",
+            )
+        ],
+    )
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="grid", variable_name="grid")],
+        removed_element_ids=["grid"],
+    )
+
+    filtered, corrections = filter_contradictory_review_findings(
+        result,
+        code,
+        technical_spec=technical_spec,
+    )
+
+    assert filtered.is_valid is True
+    assert corrections
 
 
 def test_filters_2d_and_export_marker_findings_when_3d_inheritance_is_required():

@@ -139,6 +139,12 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   目标对象演示变化，优先对 required 变量本身使用 `Transform`，或确保最终 active 的
   变量名就是合同中的 `variable_name`，不要只让带 `_initial`/`_shrunk` 后缀的临时变量
   活跃而遗漏 required 对象。
+- **必需导出对象的唯一活动身份**：例如合同变量是 `v1` 时，直接在导出区定义 `v1`，
+  然后先执行 `self.play(FadeIn(v1))`（或 `Create/Write(v1)`），再执行
+  `v1.animate...`/`Transform(v1, target)`。不要先引入 `v1_initial`、
+  `v1_base` 等后缀对象，再用 `v1 = v1_initial` 做 Python 别名；变量重绑定不会把
+  后缀对象变成 `v1`，也不会满足边界导出。若确实要从临时对象替换为导出对象，必须
+  使用 `ReplacementTransform(v1_initial, v1)`，并且之后只能操作 active 的 `v1`。
 - 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
   面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；

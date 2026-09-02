@@ -70,6 +70,14 @@ def test_compiler_does_not_treat_geometric_constraints_as_identities():
     assert not any(issue.category == "math" for issue in result.issues)
 
 
+def test_compiler_does_not_treat_component_relations_as_identities():
+    plan = make_plan(computation=("特征向量方程给出 v1=-v2，取向量 (1,-1)；验证 A*(1,-1)=2*(1,-1)"))
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any(issue.category == "math" for issue in result)
+
+
 def test_compiler_keeps_middle_dot_equations_intact():
     plan = make_plan(computation="符号规则：a·(-b) = -ab，b·(-b) = -b²")
 

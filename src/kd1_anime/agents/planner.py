@@ -438,6 +438,97 @@ class LessonSpec(BaseModel):
             raise ValueError("LessonSpec 的最小时长不能大于最大时长")
         return self
 
+
+def repair_obvious_math_contradictions(
+    lesson_spec: LessonSpec,
+    user_prompt: str,
+) -> tuple[LessonSpec, list[str]]:
+    """修正可由给定矩阵直接判定的教学合同矛盾。
+
+    用户描述应当被尊重，但不能让一个与明确矩阵运算冲突的自然语言
+    结论进入全片唯一的数学事实合同。这里只处理一个证据充分、语义
+    边界清晰的基础情形：剪切矩阵 ``[[1, 1], [0, 1]]`` 的 x 轴是不变
+    方向。其它无法由轻量规则可靠判断的数学内容仍交给 Planner 和
+    Plan Reviewer，不在这里猜测或重写。
+    """
+
+    prompt_text = str(user_prompt or "")
+    has_unit_shear = bool(
+        re.search(
+            r"剪切矩阵[\s\S]{0,240}(?:1\s*&\s*1|1\s*,\s*1)[\s\S]{0,120}"
+            r"(?:0\s*&\s*1|0\s*,\s*1)",
+            prompt_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not has_unit_shear:
+        return lesson_spec, []
+
+    false_phrases = (
+        "没有任何向量保持在原直线上",
+        "无实特征向量",
+        "无方向不变的向量",
+    )
+    replacement = "除 x 轴方向外，没有其它向量保持在原直线上"
+    corrected_claims: list[MathClaim] = []
+    repairs: list[str] = []
+    for claim in lesson_spec.claims:
+        claim_data = claim.model_dump(mode="python")
+        changed = False
+        for field_name in ("statement", "justification", "teaching_note"):
+            value = str(claim_data.get(field_name) or "")
+            if not any(phrase in value for phrase in false_phrases):
+                continue
+            updated = value
+            updated = updated.replace(
+                "没有任何向量保持在原直线上（无实特征向量）",
+                "只有 x 轴方向的向量保持在原直线上（实特征向量方向为 (1,0)）",
+            )
+            updated = updated.replace("没有任何向量保持在原直线上", replacement)
+            updated = updated.replace("无实特征向量", "存在实特征向量 (1,0)，但没有其它不变方向")
+            updated = updated.replace("无方向不变的向量", "除 x 轴方向外没有其它方向保持不变")
+            if updated != value:
+                claim_data[field_name] = updated
+                changed = True
+        corrected_claims.append(MathClaim.model_validate(claim_data))
+        if changed:
+            repairs.append(f"已校正 {claim.claim_id}：剪切矩阵的 x 轴不变方向")
+
+    def repair_text(value: str) -> str:
+        updated = str(value or "")
+        updated = updated.replace(
+            "没有任何向量保持在原直线上（无实特征向量）", "只有 x 轴方向保持在原直线上"
+        )
+        updated = updated.replace("没有任何向量保持在原直线上", replacement)
+        updated = updated.replace("无实特征向量", "存在实特征向量 (1,0)，但没有其它不变方向")
+        updated = updated.replace("无方向不变的向量", "除 x 轴方向外没有其它方向保持不变")
+        return updated
+
+    objectives = [
+        objective.model_copy(
+            update={
+                "outcome": repair_text(objective.outcome),
+                "evidence": repair_text(objective.evidence),
+            }
+        )
+        for objective in lesson_spec.learning_objectives
+    ]
+    misconceptions = [repair_text(value) for value in lesson_spec.misconceptions]
+    acceptance_criteria = [repair_text(value) for value in lesson_spec.acceptance_criteria]
+    if not repairs:
+        return lesson_spec, []
+    return (
+        lesson_spec.model_copy(
+            update={
+                "claims": corrected_claims,
+                "learning_objectives": objectives,
+                "misconceptions": misconceptions,
+                "acceptance_criteria": acceptance_criteria,
+            }
+        ),
+        repairs,
+    )
+
     @model_validator(mode="after")
     def validate_unique_ids(self) -> "LessonSpec":
         for field_name in ("learning_objectives", "entities", "claims"):
@@ -978,6 +1069,12 @@ OUTLINE_DRAFT_PROMPT = r"""你是数学动画的课程设计师和总导演。
   的 visual_flow/timeline 证据所在场景。
 - 章节过渡/转场场景只负责切换画面，不承担核心数学断言；如果保留这类场景，claim_ids 必须为空，断言归属下一个真正展示推导的场景。
 - 涉及除法、根号、对数、不等式或几何面积时，必须写明 domain/assumptions；无法验证的几何拼接不要声称为证明。
+- 用户文字中的数学结论可能与给定公式或矩阵矛盾。输出 LessonSpec 前必须先做
+  符号核验，以可计算的数学事实为准，不能把用户的错误结论直接写入教学合同。
+  例如剪切矩阵 `[[1,1],[0,1]]` 满足 `(1,0) -> (1,0)`，因此 x 轴方向是实特征向量；
+  不得同时声称“没有任何向量保持在原直线上”。遇到这种冲突，应在 statement、
+  misconceptions 和 acceptance_criteria 中统一改成“除 x 轴方向外没有其它不变方向”，
+  并让对应场景的视觉文字使用修正后的表述。
 - 场景数量取最小必要值，通常 1-6 个，绝对不能超过系统限制。
 
 ## 输出要求
@@ -1055,6 +1152,10 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
 - 当前场景概要中的 claim_ids 是锁定的教学合同字段；每个 claim_id 必须同时出现在
   math_claims 和至少一个 timeline.math_claim_ids 中。不能通过删除 claim_ids、只显示
   “公式预览”或把断言留在自然语言里来规避数学证据要求。
+- 如果场景在时间线中明确淡出/清空某个继承元素，必须把它放入
+  `elements_to_remove`，并将 handoff 动作设为 `remove`；后一场景不能再把同一
+  element_id 作为 required keep。若后一场景要重新显示相似对象，应使用新的
+  element_id，并在 opening_state 中写明“重新创建”，不要伪造跨场景继承。
 
 ## 不要做的事
 - 不要指定 Manim 类名 (Axes, Dot, MathTex 等) — 那是动画师的决策
@@ -1080,6 +1181,8 @@ DETAIL_PROMPT = r"""你是数学动画导演. 为一个场景设计视觉方案�
 - `handoff` 是边界交接清单：每个 `required: true` 的 `new_elements` 必须在其中出现，
   每个 `handoff` 中的 `create`/`keep` 元素也必须在 `inherited_elements` 或 `new_elements` 中出现；
   不要用自然语言 closing_state 代替 element_id。
+- 最后一个场景没有下游消费者，场景内最终公式/标题即使在结尾淡出，也不需要
+  handoff；不要为了填 handoff 把它们强行标记为 required。
 
 ## 调色板
 背景 #1C1C1C(深灰), 主色 #58C4DD(蓝), 辅色 #83C167(绿), 强调 #FFFF00(黄), 警告 #FF6666(红)

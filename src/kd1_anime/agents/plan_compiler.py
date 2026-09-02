@@ -347,6 +347,7 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
     """从 computation 中提取足够短的符号等式，忽略变量赋值。"""
 
     pairs: list[tuple[str, str]] = []
+    simple_symbol = re.compile(r"^[+-]?[A-Za-z_]\w*$")
     pattern = re.compile(
         r"(?<![A-Za-z0-9_])([A-Za-z0-9_()+\-−*/^²³.·×⋅\\]{1,80})\s*(?:=|→|⟶)\s*"
         r"([A-Za-z0-9_()+\-−*/^²³.·×⋅\\]{1,80})(?![A-Za-z0-9_])"
@@ -359,6 +360,12 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
             and not re.fullmatch(r"[A-Za-z]", left)
             and set(re.findall(r"[A-Za-z]", left)) == set(re.findall(r"[A-Za-z]", right))
         ):
+            # ``v1 = -v2``、``u_x = u_y`` 通常是求解特征向量/几何
+            # 约束得到的分量关系，而不是声称两个自由符号在所有取值
+            # 下恒等。把它交给多项式恒等式检查会产生 ``v1 ≠ -v2``
+            # 这样的误报；真正的 MathClaim 等式仍由上层独立校验。
+            if simple_symbol.fullmatch(left) and simple_symbol.fullmatch(right):
+                continue
             pairs.append((left, right))
     return pairs
 

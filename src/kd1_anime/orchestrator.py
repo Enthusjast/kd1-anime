@@ -35,7 +35,10 @@ from kd1_anime.agents.continuity import (
     normalize_scene_plan_contract,
     strip_redundant_optional_export_block,
 )
-from kd1_anime.agents.lifecycle import validate_animation_lifecycle
+from kd1_anime.agents.lifecycle import (
+    repair_required_export_alias_lifecycle,
+    validate_animation_lifecycle,
+)
 from kd1_anime.agents.plan_compiler import PlanCompiler, normalize_scene_timeline_contract
 from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
@@ -58,8 +61,9 @@ from kd1_anime.agents.planner import (
     TeachingGraph,
     VisualElementState,
     normalize_transition_claim_assignments,
+    repair_obvious_math_contradictions,
 )
-from kd1_anime.agents.reviewer import ReviewerAgent, ReviewResult
+from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
 from kd1_anime.agents.safe_fallback import (
     build_safe_fallback_plan,
     fallback_reason_summary,
@@ -1299,6 +1303,18 @@ class Orchestrator:
                 plan,
                 **code_kwargs,
             )
+            if technical_spec is not None:
+                code, lifecycle_repairs = repair_required_export_alias_lifecycle(
+                    code,
+                    technical_spec,
+                )
+                if lifecycle_repairs:
+                    log = getattr(agent, "_log", None)
+                    if callable(log):
+                        log(
+                            "已应用确定性生命周期兼容修复: " + "；".join(lifecycle_repairs),
+                            style="yellow",
+                        )
             code = strip_redundant_optional_export_block(code, plan)
 
             validation = self._validate(code, renderer=renderer)
@@ -1370,6 +1386,15 @@ class Orchestrator:
                         "保持 active；不要只定义该变量或只让带 _initial、_shrunk 等"
                         "后缀的临时变量参与动画。若使用 Transform 阶段目标，需保证"
                         "最终仍由合同中的 variable_name 对象承接。\n"
+                    )
+                if "animate 作用于未 active 对象" in lifecycle_error:
+                    feedback_parts.append(
+                        "\n本次错误通常表示把 required 导出变量和 *_initial 临时变量混用了。"
+                        "请把首次 FadeIn/Create/Write 和后续所有 animate/Transform 的 source"
+                        "都改为同一个合同变量；例如直接 FadeIn(v1) 后再执行"
+                        "v1.animate.scale(...)。不要用 `v1 = v1_initial` 代替 introducer；"
+                        "若必须从临时对象交接到 v1，只能使用 ReplacementTransform(v1_initial, v1)，"
+                        "并删除之后对 v1_initial 的动画。\n"
                     )
                 if "Transform 的 source 未 active" in lifecycle_error:
                     feedback_parts.append(
@@ -2507,6 +2532,15 @@ class Orchestrator:
                     if not isinstance(draft, PlanningDraft):
                         raise ValueError("Planner.plan_draft 返回了无效的 PlanningDraft")
                     ctx.lesson_spec = draft.lesson_spec
+                    ctx.lesson_spec, math_repairs = repair_obvious_math_contradictions(
+                        ctx.lesson_spec,
+                        ctx.user_prompt,
+                    )
+                    if math_repairs:
+                        ctx.continuity_warnings.extend(
+                            "教学事实合同：" + repair for repair in math_repairs
+                        )
+                        self._emit("math_contract_repaired", repairs=math_repairs)
                     ctx.teaching_graph = draft.teaching_graph
                     outlines = draft.items
                 else:
@@ -4001,7 +4035,12 @@ class Orchestrator:
             if issue.category == "contract"
             and issue.field in {"handoff", "inherited_elements", "new_elements"}
         ]
-        if not contract_issues:
+        # 交接机械修复只能处理“元素缺失/角色不闭合”这类纯合同问题。
+        # 若同一轮还存在几何、数学、时序或 renderer 阻断，优先让
+        # Planner 针对完整反馈重写方案；否则这里修改邻接边界后立刻
+        # 触发重启，下一轮又会看到同一几何问题并重复修改，形成
+        # ``mechanical repair -> restart -> mechanical repair`` 的死循环。
+        if not contract_issues or any(issue.category != "contract" for issue in issues):
             return []
 
         ordered_states = sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
@@ -4058,6 +4097,35 @@ class Orchestrator:
         previous_state = state_by_id.get(scene_id - 1)
         changed_states: set[int] = set()
         repairs: list[str] = []
+
+        # “上一场景已移除”与“下一场景必须继承”是两个互斥的生命周期
+        # 结论。旧的机械修复只看到了 Reviewer 提到的 element_id，就把
+        # 已经在上一场景退出的对象重新提升成 keep，随后
+        # normalize_scene_plan_contract 又依据 remove 合同把它删掉；这
+        # 会触发 ``repair -> re-review -> repair`` 的无效循环，并且还会
+        # 把本来已经通过审查的上一场景改回未审查。此类冲突必须交给
+        # Planner 重写 opening/transition 文本，不能伪造一份不存在的
+        # 上游导出。
+        previous_removed_ids = (
+            {item.element_id for item in previous_state.plan.elements_to_remove}
+            if previous_state is not None
+            else set()
+        )
+        previous_removed_ids.update(
+            item.element_id
+            for item in (previous_state.plan.handoff if previous_state is not None else [])
+            if item.action == "remove"
+        )
+        if previous_state is not None:
+            previous_closing = " ".join(previous_state.plan.closing_state).lower()
+            if re.search(r"(?:所有|全部|整体).{0,20}(?:淡出|消失|清空|移除)", previous_closing):
+                previous_removed_ids.update(
+                    item.element_id
+                    for item in (
+                        *previous_state.plan.inherited_elements,
+                        *previous_state.plan.new_elements,
+                    )
+                )
 
         def find_element(plan: ScenePlan, element_id: str) -> tuple[str, VisualElementState] | None:
             for group_name, elements in (
@@ -4149,8 +4217,36 @@ class Orchestrator:
                 else None
             )
 
+            # 当前计划已经有完整 inherited + handoff 合同的元素不需要再次
+            # “修复”。Reviewer 可能只是在报告 semantic_state 与自由文本
+            # 的轻微措辞差异；重复执行下面的 upsert 会不断重写相邻场景，
+            # 令正常的几何/数学重规划永远到不了预算耗尽分支。
+            if current_declaration is not None and current_declaration[0] == "inherited":
+                current_element = current_declaration[1]
+                current_handoff = next(
+                    (item for item in state.plan.handoff if item.element_id == element_id),
+                    None,
+                )
+                current_removed = any(
+                    item.element_id == element_id for item in state.plan.elements_to_remove
+                )
+                expected_actions = {"remove"} if current_removed else {"inherit", "keep"}
+                if (
+                    current_element.required
+                    and current_handoff is not None
+                    and current_handoff.action in expected_actions
+                ):
+                    continue
+
             # 当前场景新建的元素：提升为边界对象，并同步到下一场景。
             if current_declaration is not None and current_declaration[0] == "new_elements":
+                # 最后一个场景没有消费者。若它的 closing/timeline 已经
+                # 结束时淡出该对象，所谓“必须加入 handoff”是审查模型把
+                # 场景内对象误当成交接对象；提升后又会被终态规范器改回
+                # optional，造成机械修复永远返回 changed。没有下一场景时
+                # 直接保留场景内生命周期，交给正常的计划审查即可。
+                if target_state is None:
+                    continue
                 _, element = current_declaration
                 promoted = element.model_copy(update={"required": True})
                 current_plan = replace_element(
@@ -4175,6 +4271,12 @@ class Orchestrator:
             # inherited 以及当前到下一场景的交接。
             if previous_state is not None and previous_declaration is not None:
                 previous_group, previous_element = previous_declaration
+                if element_id in previous_removed_ids:
+                    # 上游已经明确负责淡出/移除；当前场景若仍在
+                    # opening_state 或 transition_in 中提及它，应通过
+                    # 计划重规划改成“本场景重新创建/独立开始”，而不是
+                    # 在交接合同中重新制造一个可继承对象。
+                    continue
                 promoted_previous = previous_element.model_copy(update={"required": True})
                 previous_plan = replace_element(
                     previous_state.plan,
@@ -6432,7 +6534,9 @@ class Orchestrator:
             (
                 finding
                 for finding in result.findings
-                if finding.severity == "major" and finding.category in {"math", "continuity"}
+                if finding.severity == "major"
+                and finding.category in {"math", "continuity"}
+                and self._review_finding_requires_plan_repair(finding)
             ),
             None,
         )
@@ -6562,6 +6666,35 @@ class Orchestrator:
             self._checkpoint(ctx, State.REVIEWING)
         self._emit("scene_review_fail", scene_id=scene_id, severity="major")
         return True
+
+    @staticmethod
+    def _review_finding_requires_plan_repair(finding: ReviewFinding) -> bool:
+        """区分“计划本身错误”和“代码实现了错误数学/连续性动作”。
+
+        Reviewer 的 ``math``/``continuity`` 分类同时覆盖两种问题：例如
+        “分镜要求错误公式”应回到 Planner，而“代码用 apply_function 实现
+        线性剪切”应留在 Coder 修复。后者具有当前代码的行号、证据和 API
+        级 repair；若仅按 category 路由，会把代码错误误送回计划层，造成
+        重规划并丢失本来可以局部修复的正确分镜。
+        """
+
+        text = " ".join((finding.why, finding.repair)).lower()
+        plan_markers = (
+            "sceneplan",
+            "lessonspec",
+            "teachinggraph",
+            "教学合同",
+            "数学合同",
+            "计划层",
+            "计划本身",
+            "当前计划",
+            "分镜本身",
+            "重新规划",
+            "重规划",
+            "无法通过代码修复",
+            "claim_id 分配",
+        )
+        return any(marker.lower() in text for marker in plan_markers)
 
     def _apply_incremental_for_scene(
         self, ctx: PipelineContext, scene_id: int, state: SceneState

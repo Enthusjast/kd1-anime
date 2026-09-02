@@ -21,10 +21,12 @@ from kd1_anime.agents.continuity import (
 from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
+    GeometrySpec,
     GlobalVisualState,
     SceneHandoff,
     SceneOutline,
     ScenePlan,
+    TimelineEvent,
     VisualElementState,
 )
 from kd1_anime.agents.safe_fallback import (
@@ -897,6 +899,37 @@ def test_normalize_scene_plan_contract_aligns_handoff_action_with_removal():
     assert any("动作已规范为 remove" in repair for repair in repairs)
 
 
+def test_normalize_scene_plan_contract_syncs_timeline_fadeout_for_inherited_elements():
+    inherited = VisualElementState(element_id="grid", variable_name="grid", required=True)
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [inherited],
+            "handoff": [SceneHandoff(element_id="grid", variable_name="grid", action="keep")],
+            "timeline": [
+                TimelineEvent(
+                    event_id="fade_grid",
+                    start_seconds=0,
+                    end_seconds=2,
+                    action="网格淡出",
+                    element_ids=["grid"],
+                ),
+                TimelineEvent(
+                    event_id="hold_formula",
+                    start_seconds=2,
+                    end_seconds=10,
+                    action="保持公式",
+                ),
+            ],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(current, ContinuityBible())
+
+    assert [item.element_id for item in normalized.elements_to_remove] == ["grid"]
+    assert normalized.handoff[0].action == "remove"
+    assert any("时间线退出动作" in repair for repair in repairs)
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={
@@ -1125,3 +1158,27 @@ def test_safe_fallback_detects_geometry_feedback_for_square_plan():
         plan,
         "[geometry] 正方形顶点位置错误，几何关系不一致",
     )
+
+
+def test_safe_fallback_removes_invalid_geometry_and_rebuilds_timeline():
+    plan = make_plan(2).model_copy(
+        update={
+            "duration_seconds": 90,
+            "geometry_specs": [
+                GeometrySpec(
+                    geometry_id="bad_polygon",
+                    shape="polygon",
+                    vertices=[[0, 0], [2, 0], [0, 2]],
+                    declared_area=99,
+                    target_area=99,
+                )
+            ],
+        }
+    )
+
+    fallback = build_safe_fallback_plan(plan, ContinuityBible(), reason="几何无法验证")
+
+    assert fallback.duration_seconds == 75
+    assert fallback.geometry_specs == []
+    assert fallback.timeline[0].start_seconds == 0
+    assert fallback.timeline[-1].end_seconds == 75

@@ -1392,6 +1392,50 @@ def normalize_scene_plan_contract(
             normalized_event = event
         normalized_timeline.append(normalized_event)
 
+    # 时间线是比自然语言 opening/closing 更精确的生命周期证据。若
+    # inherited 元素在场景内明确执行了 FadeOut/清空，却仍被 handoff
+    # 或 required 标记为“场景结束时存在”，TechnicalSpec 会要求 Coder
+    # 在结尾继续导出一个已经不 active 的对象，最终在生命周期校验阶段
+    # 失败。把显式退出动作同步到结构化合同，避免“计划审查通过、编码
+    # 阶段才发现元素已消失”的下游失败。
+    timeline_exit_ids = {
+        element_id
+        for event in normalized_timeline
+        if _is_terminal_exit_action(event.action)
+        for element_id in event.element_ids
+        # new_elements 可能在同一个事件中既包含“保留的公式”又包含
+        # “淡出的步骤标签”，仅凭事件级 action 无法安全地逐元素推断
+        # 其生命周期；这类对象交给 Planner/TechnicalSpec 处理。
+        if element_id in inherited_ids
+    }
+    if timeline_exit_ids:
+        inherited_exit_ids = timeline_exit_ids & inherited_ids
+        removal_ids = {item.element_id for item in removals}
+        for item in inherited:
+            if item.element_id in inherited_exit_ids and item.element_id not in removal_ids:
+                removals.append(
+                    item.model_copy(
+                        update={
+                            "required": True,
+                            "reason": item.reason or "时间线明确淡出/清空",
+                        }
+                    )
+                )
+                removal_ids.add(item.element_id)
+        if inherited_exit_ids:
+            repairs.append(
+                "时间线退出动作已同步到移除合同: " + ", ".join(sorted(inherited_exit_ids))
+            )
+        if inherited_exit_ids:
+            normalized_handoff = [
+                (
+                    item.model_copy(update={"action": "remove"})
+                    if item.element_id in inherited_exit_ids and item.action != "remove"
+                    else item
+                )
+                for item in normalized_handoff
+            ]
+
     allowed_colors = set(bible.global_visual_state.colors)
     normalized_color_names = {key.lower().replace("-", "_"): key for key in allowed_colors}
     color_aliases = {

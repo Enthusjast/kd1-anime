@@ -358,6 +358,126 @@ def normalize_review_evidence(
     return result.model_copy(update={"findings": corrected_findings}), corrections
 
 
+def reconcile_review_evidence_by_location(
+    result: ReviewResult,
+    code: str,
+) -> tuple[ReviewResult, list[str]]:
+    """在协议重试后，用模型提供的行号重建无法逐字复制的证据。
+
+    部分 OpenAI 兼容端点会在长 Python 代码中改变缩进、把换行转义成
+    ``\\n``，或者把证据包进 Markdown 代码围栏。此时直接再次请求往往
+    仍会得到同一类格式错误。行号对应的源码片段是本地事实，可以安全
+    用作证据；与 ``normalize_review_evidence`` 不同，本函数只在已经
+    进入协议重试的路径使用，不改变常规审查 API 的严格语义。
+    """
+
+    if result.is_valid or not result.findings:
+        return result, []
+    lines = code.splitlines()
+    if not lines:
+        return result, []
+
+    def normalized_lines(value: str) -> list[str]:
+        value = value.strip()
+        if value.startswith("```") and value.endswith("```"):
+            value = value.split("\n", 1)[1] if "\n" in value else ""
+            if value.endswith("```"):
+                value = value[:-3]
+        value = value.replace("\\r\\n", "\n").replace("\\n", "\n")
+        return [line.strip() for line in value.splitlines() if line.strip()]
+
+    def find_whitespace_insensitive(value: str) -> tuple[int, int] | None:
+        expected = normalized_lines(value)
+        if not expected:
+            return None
+        for start in range(len(lines)):
+            if lines[start].strip() != expected[0]:
+                continue
+            end = start + len(expected)
+            if end <= len(lines) and [line.strip() for line in lines[start:end]] == expected:
+                return start + 1, end
+        return None
+
+    corrections: list[str] = []
+    repaired_findings: list[ReviewFinding] = []
+    for index, finding in enumerate(result.findings, start=1):
+        evidence = finding.evidence.strip()
+        if evidence and code.find(evidence) >= 0:
+            repaired_findings.append(finding)
+            continue
+
+        location = find_whitespace_insensitive(evidence) if evidence else None
+        if location is None and finding.line_start is not None:
+            start = finding.line_start
+            end = finding.line_end or start
+            if 1 <= start <= end <= len(lines):
+                # 优先保留模型给出的定位；协议只允许源码中的连续片段，
+                # 因而这里不会把模型原文直接写回证据。
+                location = (start, end)
+        if location is None:
+            repaired_findings.append(finding)
+            continue
+
+        start, end = location
+        source_evidence = "\n".join(lines[start - 1 : end]).strip()
+        if not source_evidence:
+            repaired_findings.append(finding)
+            continue
+        if len(source_evidence) > 2_000:
+            source_evidence = lines[start - 1].strip()[:2_000]
+        repaired_findings.append(
+            finding.model_copy(
+                update={
+                    "evidence": source_evidence,
+                    "line_start": start,
+                    "line_end": end,
+                }
+            )
+        )
+        corrections.append(f"finding[{index}] 已按源码行 {start}-{end} 重建 evidence")
+
+    return result.model_copy(update={"findings": repaired_findings}), corrections
+
+
+def drop_unverifiable_review_items(
+    result: ReviewResult,
+    code: str,
+) -> tuple[ReviewResult, list[str]]:
+    """丢弃协议重试后仍无法绑定当前源码的模型条目。
+
+    Reviewer 的 major 结论只有在存在可核验 evidence 时才能阻断流水线。
+    如果兼容端点连续返回无法在当前源码中定位的 finding/fix，继续把它
+    当作业务错误会把格式噪声升级成场景失败。可核验条目仍然保留；若
+    所有条目都不可核验，则将该次模型审查降为“无可消费意见”，让已经
+    通过的 AST、生命周期和导出合同校验继续生效。
+    """
+
+    if result.is_valid:
+        return result, []
+    valid_findings = [
+        finding
+        for finding in result.findings
+        if finding.evidence.strip() and code.find(finding.evidence.strip()) >= 0
+    ]
+    valid_fixes = [fix for fix in result.fixes if fix.find and code.count(fix.find) == 1]
+    dropped = [
+        f"finding[{index}]"
+        for index, finding in enumerate(result.findings, start=1)
+        if finding not in valid_findings
+    ]
+    dropped.extend(
+        f"fix[{index}]" for index, fix in enumerate(result.fixes, start=1) if fix not in valid_fixes
+    )
+    if not dropped:
+        return result, []
+    if not valid_findings and not valid_fixes:
+        return ReviewResult(is_valid=True), dropped
+    filtered = result.model_copy(update={"findings": valid_findings, "fixes": valid_fixes})
+    if filtered.severity == "major" and not valid_findings:
+        return ReviewResult(is_valid=True), dropped
+    return filtered, dropped
+
+
 def filter_contradictory_review_findings(
     result: ReviewResult,
     code: str,
@@ -401,7 +521,13 @@ def filter_contradictory_review_findings(
     for index, finding in enumerate(result.findings, start=1):
         text = finding_text(finding)
         contradiction = ""
-        if (
+        if ("无需修复" in text or "无需修改" in text) and any(
+            marker in text for marker in ("正确", "无错误", "符合要求")
+        ):
+            # 模型有时把“这里正确/无需修改”的说明错误地包装成
+            # major finding。它没有阻断事实，不能让代码进入重复修复。
+            contradiction = "该 finding 自身明确说明无需修复"
+        elif (
             "camera.frame" in text
             and "camera.frame" not in lowered
             and "camera.frame" not in finding.evidence.lower()
@@ -457,6 +583,38 @@ def filter_contradictory_review_findings(
             contradiction = "当前代码已经配置并使用 TexTemplate"
         elif "未将其赋给 config.tex_template" in text and "config.tex_template" in lowered:
             contradiction = "当前代码已经将模板赋给 config.tex_template"
+        elif (
+            finding.category == "lifecycle"
+            and "replacementtransform(" in finding.evidence.lower()
+            and any(marker in text for marker in ("未引入", "未在场景", "目标对象"))
+            and "source 未 active" not in text
+        ):
+            # ReplacementTransform 的 target 不需要预先 self.add；它会
+            # 在动画完成时替换 source 并成为 Scene 中的 active 对象。
+            # source 的 active 状态仍由确定性生命周期检查负责。
+            contradiction = "ReplacementTransform 会使 target 成为 active 对象"
+        elif technical_spec is not None and finding.category == "continuity":
+            removed_variables = {
+                item.variable_name
+                for item in technical_spec.objects
+                if item.element_id in set(technical_spec.removed_element_ids) and item.variable_name
+            }
+            evidence_lower = finding.evidence.lower()
+            has_removed_object = any(
+                re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(variable.lower())}(?![A-Za-z0-9_])",
+                    evidence_lower,
+                )
+                for variable in removed_variables
+            )
+            if (
+                "fadeout(" in evidence_lower
+                and has_removed_object
+                and any(
+                    marker in text for marker in ("应保留", "保持 active", "交接", "persistent")
+                )
+            ):
+                contradiction = "TechnicalSpec 明确要求该对象在本场景退出"
         elif "create 后未" in text and "create(" in lowered:
             # Manim 的 Create/FadeIn/Write introducer 会把目标加入 Scene；
             # 不应要求在其后再用 self.add，否则会制造重复引入。
@@ -795,6 +953,7 @@ class ReviewerAgent(BaseAgent):
                 allow_truncated=False,
             )
             result, evidence_corrections = normalize_review_evidence(result, code)
+            result, location_corrections = reconcile_review_evidence_by_location(result, code)
             result, contradiction_corrections = filter_contradictory_review_findings(
                 result,
                 code,
@@ -807,9 +966,24 @@ class ReviewerAgent(BaseAgent):
                     + "；".join(evidence_corrections),
                     style="yellow",
                 )
+            if location_corrections:
+                self._log(
+                    "审查证据无法逐字匹配，已按源码行重建：" + "；".join(location_corrections),
+                    style="yellow",
+                )
             protocol_errors = validate_review_evidence(result, code)
             if protocol_errors:
-                raise RuntimeError("Reviewer 输出无法通过证据协议：" + "; ".join(protocol_errors))
+                result, dropped_items = drop_unverifiable_review_items(result, code)
+                if dropped_items:
+                    self._log(
+                        "已丢弃无法绑定当前源码的审查条目：" + "；".join(dropped_items),
+                        style="yellow",
+                    )
+                protocol_errors = validate_review_evidence(result, code)
+                if protocol_errors:
+                    raise RuntimeError(
+                        "Reviewer 输出无法通过证据协议：" + "; ".join(protocol_errors)
+                    )
         if result.is_valid:
             self._log("✓ 代码审查通过", style="bold green")
         else:

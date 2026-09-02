@@ -19,7 +19,7 @@ from kd1_anime.agents.planner import (
     TimelineEvent,
     VisualElementState,
 )
-from kd1_anime.agents.reviewer import ReviewResult
+from kd1_anime.agents.reviewer import ReviewFinding, ReviewResult
 from kd1_anime.agents.technical_planner import TechnicalAnimation, TechnicalObject, TechnicalSpec
 from kd1_anime.config import settings
 from kd1_anime.eval.visual_eval import VisualAnalysisResult, VisualIssue
@@ -1338,6 +1338,43 @@ def test_major_review_with_verified_local_fix_stays_in_code_review(monkeypatch, 
     assert state.give_up is False
 
 
+def test_code_level_math_finding_is_sent_back_to_coder_not_planner(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="代码中的线性变换 API 需要修正",
+        findings=[
+            ReviewFinding(
+                category="math",
+                severity="major",
+                line_start=3,
+                line_end=3,
+                evidence="self.wait()",
+                why="代码实现使用了错误的变换 API",
+                repair="改用 apply_matrix，修复当前代码",
+            )
+        ],
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert state.rewrite_feedback
+    assert not ctx.plan_compile_issues
+    assert state.give_up is False
+
+
 def test_review_exhaustion_switches_high_risk_geometry_to_safe_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
     monkeypatch.setattr(module.settings, "SAFE_FALLBACK_ENABLED", True)
@@ -1871,6 +1908,107 @@ def test_plan_review_repairs_explicit_handoff_ids_across_neighboring_scenes(monk
         "function_label",
         "tangent_plane_surface",
     }
+
+
+def test_plan_review_does_not_resurrect_elements_from_explicit_full_exit(monkeypatch, tmp_path):
+    previous_element = VisualElementState(
+        element_id="temporary_grid",
+        variable_name="temporary_grid",
+        required=False,
+    )
+    previous = plan().model_copy(
+        update={
+            "scene_id": 1,
+            "new_elements": [previous_element],
+            "closing_state": ["所有元素整体淡出，场景结束"],
+        }
+    )
+    current = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "opening_state": ["接管 temporary_grid"],
+            "inherited_elements": [],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=previous, plan_ready=True),
+            2: SceneState(plan=current, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    repairs = orchestrator._repair_plan_handoff_issues(
+        ctx,
+        2,
+        ctx.scene_states[2],
+        [
+            PlanReviewIssue(
+                category="contract",
+                field="inherited_elements",
+                message="temporary_grid 应从场景1继承到场景2",
+                fix_instruction="将 temporary_grid 加入 inherited_elements。",
+            )
+        ],
+    )
+
+    assert repairs == []
+    assert ctx.scene_states[1].plan.new_elements[0].required is False
+    assert ctx.scene_states[2].plan.inherited_elements == []
+
+
+def test_mixed_plan_issues_do_not_trigger_handoff_repair_loop(monkeypatch, tmp_path):
+    previous = plan().model_copy(update={"scene_id": 1})
+    current = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [],
+            "new_elements": [
+                VisualElementState(
+                    element_id="grid_sheared",
+                    variable_name="grid_sheared",
+                    required=False,
+                )
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=previous, plan_ready=True),
+            2: SceneState(plan=current, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    repairs = orchestrator._repair_plan_handoff_issues(
+        ctx,
+        2,
+        ctx.scene_states[2],
+        [
+            PlanReviewIssue(
+                category="geometry",
+                field="geometry_specs[grid_sheared].vertices",
+                message="几何顶点超出安全范围",
+                fix_instruction="缩小网格或改用保守表达",
+            ),
+            PlanReviewIssue(
+                category="contract",
+                field="handoff",
+                message="grid_sheared 未列入 handoff",
+                fix_instruction="将 grid_sheared 标记为 required 并补充 handoff",
+            ),
+        ],
+    )
+
+    assert repairs == []
+    assert ctx.scene_states[1].plan == previous
+    assert ctx.scene_states[2].plan == current
 
 
 def test_compile_scene_plans_removes_extra_detail_claims(monkeypatch, tmp_path):
