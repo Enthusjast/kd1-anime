@@ -229,6 +229,121 @@ def test_plan_review_only_major_issues_block():
     assert len(warnings) == 1
 
 
+def test_plan_review_llm_major_without_verified_evidence_becomes_warning():
+    plan = make_plan()
+    result = PlanReviewResult(
+        is_valid=False,
+        severity="major",
+        issues=[
+            {
+                "category": "math",
+                "severity": "major",
+                "field": "computation",
+                "message": "这个推导可能存在问题",
+                "fix_instruction": "建议重新检查",
+            }
+        ],
+    )
+
+    _, blocking, warnings = classify_plan_review_issues(
+        plan,
+        deterministic_issues=[],
+        result=result,
+    )
+
+    assert blocking == []
+    assert len(warnings) == 1
+    assert warnings[0].severity == "minor"
+
+
+def test_plan_review_high_confidence_calculation_can_block():
+    plan = make_plan()
+    result = PlanReviewResult(
+        is_valid=False,
+        severity="major",
+        issues=[
+            {
+                "category": "math",
+                "severity": "major",
+                "confidence": "high",
+                "evidence_type": "calculation",
+                "evidence": "a²+b²=c² 与 a²+b²=d²",
+                "field": "computation",
+                "message": "公式两侧确定不等价",
+                "fix_instruction": "修正右侧表达式",
+            }
+        ],
+    )
+
+    _, blocking, warnings = classify_plan_review_issues(
+        plan,
+        deterministic_issues=[],
+        result=result,
+    )
+
+    assert len(blocking) == 1
+    assert blocking[0].confidence == "high"
+    assert warnings == []
+
+
+def test_plan_review_deterministic_style_issue_is_only_a_warning():
+    plan = make_plan()
+    issue = PlanReviewIssue(
+        category="style",
+        severity="major",
+        field="global_visual_state",
+        message="颜色配置不同",
+        fix_instruction="统一颜色",
+    )
+
+    _, blocking, warnings = classify_plan_review_issues(
+        plan,
+        deterministic_issues=[issue],
+        result=PlanReviewResult(is_valid=True),
+    )
+
+    assert blocking == []
+    assert len(warnings) == 1
+    assert warnings[0].severity == "minor"
+
+
+def test_plan_review_warnings_are_preserved_when_model_reports_valid():
+    warning = PlanReviewIssue(
+        category="timing",
+        severity="minor",
+        field="key_moments",
+        message="停顿可以更长",
+        fix_instruction="可选调整",
+    )
+    result = PlanReviewResult(is_valid=True, warnings=[warning])
+
+    _, blocking, warnings = classify_plan_review_issues(
+        make_plan(),
+        deterministic_issues=[],
+        result=result,
+    )
+
+    assert blocking == []
+    assert warnings == [warning]
+
+
+def test_plan_review_invalid_result_with_warnings_only_is_accepted():
+    warning = PlanReviewIssue(
+        category="style",
+        severity="major",
+        field="visual_design",
+        message="建议调整配色",
+        fix_instruction="可选修改",
+    )
+
+    result = PlanReviewResult(is_valid=False, severity="major", warnings=[warning])
+
+    assert result.is_valid is True
+    assert result.severity == "info"
+    assert result.issues == []
+    assert result.warnings == [warning]
+
+
 def test_plan_review_drops_model_issue_that_explicitly_says_no_change_needed():
     plan = make_plan().model_copy(
         update={
@@ -361,6 +476,8 @@ def test_plan_review_prompt_requires_math_and_geometry_validation():
     assert "顶点、面积、旋转和目标覆盖关系" in PLAN_REVIEW_PROMPT
     assert "minor" in PLAN_REVIEW_PROMPT
     assert "只输出一个 JSON 对象" in PLAN_REVIEW_PROMPT
+    assert "confidence" in PLAN_REVIEW_PROMPT
+    assert "warnings" in PLAN_REVIEW_PROMPT
 
 
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")

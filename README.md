@@ -4,6 +4,8 @@
 
 项目使用显式有限状态机、Pydantic 数据模型和 OpenAI-compatible API，不依赖 LangChain、AutoGen 或 LangGraph。当前 Python 包版本为 `0.4.0`，默认锁定 Manim Community Edition `0.20.1`。
 
+确定性校验和高置信度证据负责阻断真正的核心错误；风格建议、一般节奏意见和证据不足的模型判断会记录为 warning，不会触发无意义的重写循环。
+
 ## 目录
 
 - [kd1-anime](#kd1-anime)
@@ -183,6 +185,7 @@ INIT
 - **Plan Review** 检查数学断言、等式关系、定义域、几何方案、时间线和元素交接是否正确。失败只回到 Planner，不会让 Coder 反复修补错误计划。
 - **Technical Planner** 把分镜编译为对象、动画事件、布局、LaTeX 和最终导出清单。确定性编译失败时只有限重试。
 - **Code Review** 检查已确认计划的 Manim 实现、数学展示、API、生命周期、布局、安全和场景交接。代码变化后必须重新审查。
+- **审查分级**：确定性校验或带源码/合同证据的高置信度核心错误才是 hard blocker；可唯一匹配的局部替换先自动修复；风格建议、一般节奏和不确定的“可能问题”作为 warning 放行。
 - **Render Fix** 只处理渲染日志暴露的代码问题；环境、Slurm、字体和显示服务错误不会盲目交给模型重写。
 - **Continuity Review** 只处理跨场景边界。达到 `MAX_CONTINUITY_FIX_ROUNDS` 后会记录 warning 并沿用当时的可验证计划继续，不会因为连续性审查耗尽而阻断整条流水线。
 

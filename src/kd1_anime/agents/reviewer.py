@@ -71,7 +71,7 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 20. 文字、公式和图形不应明显重叠；长内容应缩放或分行。
 21. 颜色对背景应有足够对比度，并遵循导演分镜的颜色语义。
 22. 场景节奏、停顿和 run_time 应大致匹配预估时长。
-**E 类问题一律不阻塞**：即使存在，也必须标记 is_valid=true。
+**E 类问题一律不阻塞**：即使存在，也必须标记 is_valid=true，并放入 warnings。
 只有 E 类问题严重影响可读性时才最多给 minor，且必须同时返回可精确替换的 fixes。
 
 ## F. 导演分镜符合度（严重）
@@ -110,6 +110,12 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 - `severity="minor"`：A-D、F-G 类中存在可通过精确替换修复的小问题（如拼写错误、缺少参数、错误的 API 名称）。**必须**返回至少一个 fixes 项。
 - `severity="major"`：存在结构性问题、逻辑错误、或无法通过精确替换修复的问题。**必须**给出
   带证据的 findings，并提供详细 feedback 或在 findings 中写清原因。
+- 只有确定的错误才能使用 major。每个 finding 必须填写 `confidence` 和 `evidence_type`；
+  confidence=high 且 evidence_type=source_code 或 contract 时，才可把问题放入 findings 并阻断。
+  medium/low 置信度、缺少源码/合同证据或包含“可能/建议/似乎”等措辞的问题必须放入
+  warnings，不得触发重写。
+- 如果只有 warning，没有 hard blocker，必须返回 `is_valid=true`、`severity=info`；warnings
+  仍需保留具体原因，供 Orchestrator 和仪表盘记录。
 
 ## 审查原则
 1. **宽容风格差异**：缩进、空行、命名风格等不影响运行的问题不报错。
@@ -129,13 +135,16 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
   "findings": [{
     "category": "runtime|math|latex|lifecycle|continuity|layout",
     "severity": "minor|major",
+    "confidence": "high|medium|low",
+    "evidence_type": "deterministic|source_code|contract|visual|uncertain",
     "line_start": 1,
     "line_end": 1,
     "evidence": "当前代码中真实存在的精确片段",
     "why": "只说明可以从代码或合同确定的原因",
     "repair": "明确修复方式"
   }],
-  "fixes": [{"find": "原代码片段", "replace": "替换后片段", "reason": "原因"}]
+  "fixes": [{"find": "原代码片段", "replace": "替换后片段", "reason": "原因"}],
+  "warnings": []
 }
 
 每个 major finding 必须提供当前代码中真实存在的 evidence 和可定位的行号；不能审查
@@ -166,6 +175,10 @@ class ReviewFinding(BaseModel):
 
     category: Literal["runtime", "math", "latex", "lifecycle", "continuity", "layout"]
     severity: Literal["minor", "major"]
+    confidence: Literal["high", "medium", "low"] = "medium"
+    evidence_type: Literal["deterministic", "source_code", "contract", "visual", "uncertain"] = (
+        "uncertain"
+    )
     line_start: int | None = Field(default=None, ge=1)
     line_end: int | None = Field(default=None, ge=1)
     evidence: str = Field(default="", max_length=2_000)
@@ -193,6 +206,7 @@ class ReviewResult(BaseModel):
     feedback: str = ""
     fixes: list[FixSuggestion] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=20)
+    warnings: list[str] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="before")
     @classmethod
@@ -213,12 +227,25 @@ class ReviewResult(BaseModel):
             self.severity = "info"
             self.feedback = ""
             self.fixes = []
+            if self.findings:
+                self.warnings = [
+                    *self.warnings,
+                    *[
+                        f"[{finding.category}] {finding.why or finding.repair}"
+                        for finding in self.findings
+                    ],
+                ][:20]
             self.findings = []
             return self
         if self.severity == "info":
             # 失败结果不能因为错误的 severity 而绕过代码审查；与
             # PlanReviewResult 一样采取 fail-closed 策略。
             self.severity = "major"
+        if not self.findings and self.warnings and not self.fixes:
+            self.is_valid = True
+            self.severity = "info"
+            self.feedback = ""
+            return self
         if self.severity == "minor" and not self.fixes:
             # 没有 fixes 的 minor 升级为 major
             self.severity = "major"
@@ -468,13 +495,20 @@ def drop_unverifiable_review_items(
     dropped.extend(
         f"fix[{index}]" for index, fix in enumerate(result.fixes, start=1) if fix not in valid_fixes
     )
+    warning_messages = [f"已忽略无法核验的审查条目：{item}" for item in dropped]
     if not dropped:
         return result, []
     if not valid_findings and not valid_fixes:
-        return ReviewResult(is_valid=True), dropped
-    filtered = result.model_copy(update={"findings": valid_findings, "fixes": valid_fixes})
+        return ReviewResult(is_valid=True, warnings=warning_messages[:20]), dropped
+    filtered = result.model_copy(
+        update={
+            "findings": valid_findings,
+            "fixes": valid_fixes,
+            "warnings": [*result.warnings, *warning_messages][:20],
+        }
+    )
     if filtered.severity == "major" and not valid_findings:
-        return ReviewResult(is_valid=True), dropped
+        return ReviewResult(is_valid=True, warnings=filtered.warnings[:20]), dropped
     return filtered, dropped
 
 
@@ -662,8 +696,12 @@ def filter_contradictory_review_findings(
 
     if not removed:
         return result, []
+    warning_messages = [f"已过滤与当前代码矛盾的审查意见：{item}" for item in removed]
     if not kept_findings and not kept_fixes:
-        return ReviewResult(is_valid=True), removed
+        return ReviewResult(
+            is_valid=True,
+            warnings=[*result.warnings, *warning_messages][:20],
+        ), removed
     feedback = result.feedback
     if any(
         term in feedback.lower()
@@ -680,9 +718,121 @@ def filter_contradictory_review_findings(
             if finding.why or finding.repair
         )
     filtered = result.model_copy(
-        update={"findings": kept_findings, "fixes": kept_fixes, "feedback": feedback}
+        update={
+            "findings": kept_findings,
+            "fixes": kept_fixes,
+            "feedback": feedback,
+            "warnings": [*result.warnings, *warning_messages][:20],
+        }
     )
     return filtered, removed
+
+
+_CODE_REVIEW_HARD_CATEGORIES = frozenset({"runtime", "math", "latex", "lifecycle", "continuity"})
+_CODE_REVIEW_EVIDENCE_TYPES = frozenset({"source_code", "contract"})
+_REVIEW_UNCERTAIN_MARKERS = (
+    "可能",
+    "或许",
+    "似乎",
+    "看起来",
+    "建议",
+    "可考虑",
+    "最好",
+    "might",
+    "maybe",
+    "possibly",
+    "could",
+    "appears",
+    "seems",
+    "suggest",
+    "recommend",
+)
+
+
+def _contains_uncertain_language(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker.lower() in lowered for marker in _REVIEW_UNCERTAIN_MARKERS)
+
+
+def _is_blocking_code_finding(finding: ReviewFinding) -> bool:
+    """只有高置信度、带具体证据的核心错误才能阻断代码阶段。"""
+
+    if finding.severity != "major" or finding.category not in _CODE_REVIEW_HARD_CATEGORIES:
+        return False
+    if finding.confidence != "high" or finding.evidence_type not in _CODE_REVIEW_EVIDENCE_TYPES:
+        return False
+    if not finding.evidence.strip():
+        return False
+    return not _contains_uncertain_language(f"{finding.why}\n{finding.repair}")
+
+
+def _warning_from_finding(finding: ReviewFinding) -> str:
+    detail = finding.why.strip() or finding.repair.strip() or "未提供具体说明"
+    return f"[{finding.category}] {detail}"[:3_000]
+
+
+def apply_review_policy(
+    result: ReviewResult,
+    code: str,
+) -> tuple[ReviewResult, list[str]]:
+    """把 LLM 审查结果归一化为阻断、可修复或 warning 三类。
+
+    确定性 AST/生命周期校验在调用方进入 Reviewer 前已经执行，因此这里
+    只收紧 LLM 意见：没有 high 置信度和可核验证据的 major 不得单独阻断；
+    唯一可匹配的局部替换仍保留给 Orchestrator 做安全修复。
+    """
+
+    if result.is_valid:
+        return result, []
+
+    blocking: list[ReviewFinding] = []
+    warning_messages = list(result.warnings)
+    for finding in result.findings:
+        if _is_blocking_code_finding(finding):
+            blocking.append(finding)
+        else:
+            warning_messages.append(_warning_from_finding(finding))
+
+    repairable_fixes = [
+        fix
+        for fix in result.fixes
+        if fix.find != fix.replace and fix.find and code.count(fix.find) == 1
+    ]
+    dropped_fixes = [
+        f"fix[{index}]"
+        for index, fix in enumerate(result.fixes, start=1)
+        if fix not in repairable_fixes
+    ]
+    warning_messages.extend(f"已忽略无法唯一匹配的局部修复：{item}" for item in dropped_fixes)
+    corrections = [*dropped_fixes]
+
+    if blocking:
+        return (
+            ReviewResult(
+                is_valid=False,
+                severity="major",
+                feedback=result.feedback,
+                fixes=repairable_fixes,
+                findings=blocking,
+                warnings=warning_messages[:20],
+            ),
+            corrections,
+        )
+    if repairable_fixes:
+        return (
+            ReviewResult(
+                is_valid=False,
+                severity="minor",
+                feedback="存在可验证的局部修复，应用后重新审查。",
+                fixes=repairable_fixes,
+                warnings=warning_messages[:20],
+            ),
+            corrections,
+        )
+
+    if result.feedback.strip():
+        warning_messages.append(f"未形成可验证阻断证据：{result.feedback.strip()}"[:3_000])
+    return ReviewResult(is_valid=True, warnings=warning_messages[:20]), corrections
 
 
 class ReviewerAgent(BaseAgent):
@@ -976,14 +1126,30 @@ class ReviewerAgent(BaseAgent):
                 result, dropped_items = drop_unverifiable_review_items(result, code)
                 if dropped_items:
                     self._log(
-                        "已丢弃无法绑定当前源码的审查条目：" + "；".join(dropped_items),
+                        "已丢弃无法绑定当前源码的审查条目：" + "; ".join(dropped_items),
                         style="yellow",
                     )
                 protocol_errors = validate_review_evidence(result, code)
                 if protocol_errors:
-                    raise RuntimeError(
-                        "Reviewer 输出无法通过证据协议：" + "; ".join(protocol_errors)
-                    )
+                    # 重试后仍没有可核验证据时，将这次模型输出视为
+                    # warning，而不是把格式噪声升级为新的流水线错误。
+                    # 真正的 AST/生命周期错误已经在进入 Reviewer 前
+                    # 由确定性校验负责拦截。
+                    result, policy_corrections = apply_review_policy(result, code)
+                    if policy_corrections:
+                        self._log(
+                            "审查策略已忽略无法唯一匹配的修复：" + "；".join(policy_corrections),
+                            style="yellow",
+                        )
+                    protocol_errors = validate_review_evidence(result, code)
+            if protocol_errors:
+                raise RuntimeError("Reviewer 输出无法通过证据协议：" + "; ".join(protocol_errors))
+        result, policy_corrections = apply_review_policy(result, code)
+        if policy_corrections:
+            self._log(
+                "审查策略已忽略无法唯一匹配的修复：" + "；".join(policy_corrections),
+                style="yellow",
+            )
         if result.is_valid:
             self._log("✓ 代码审查通过", style="bold green")
         else:

@@ -113,6 +113,32 @@ class TestSceneDashboard:
         assert dash.scenes[1].stage == "代码审查"
         assert "代码审查⟳" in str(dash.scenes[1].render_row()[2])
 
+    def test_review_warning_does_not_mark_scene_complete_or_rewrite(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_review_warning",
+            {"scene_id": 1, "warnings": ["[layout] 建议调整标题位置"]},
+        )
+
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].stage == ""
+        assert "标题位置" in dash.scenes[1].message
+
+    def test_plan_review_warning_does_not_mark_scene_complete(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_plan_review_warning",
+            {"scene_id": 1, "warnings": ["[timing] 建议增加结论停顿"]},
+        )
+
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].stage == ""
+        assert "结论停顿" in dash.scenes[1].message
+
     def test_visual_enabled_scene_stays_in_progress_until_visual_gate_accepts(self):
         dash = SceneDashboard()
         dash.live = MagicMock()

@@ -853,10 +853,13 @@ def test_plan_review_passes_before_code_review(monkeypatch, tmp_path):
                     severity="major",
                     issues=[
                         {
-                            "category": "timing",
-                            "field": "key_moments",
-                            "message": "时间线需要重新安排",
-                            "fix_instruction": "重新安排关键时刻",
+                            "category": "math",
+                            "confidence": "high",
+                            "evidence_type": "calculation",
+                            "evidence": "a²+b²=25 与 a²+b²=26",
+                            "field": "computation",
+                            "message": "公式两侧确定不等价",
+                            "fix_instruction": "修正右侧表达式",
                         }
                     ],
                 )

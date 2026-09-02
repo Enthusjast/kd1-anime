@@ -70,6 +70,36 @@ def test_valid_review_after_rewrite_exits_review_loop(tmp_path):
     assert ctx.scene_states[1].review_round == 0
 
 
+def test_review_warning_is_accepted_without_rewrite(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    events = []
+    orchestrator = Orchestrator()
+    orchestrator._callback = lambda event, data: events.append((event, data))
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    handled = orchestrator._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(is_valid=True, warnings=["[layout] 建议调整标题位置"]),
+    )
+
+    assert handled is True
+    assert state.reviewed is True
+    assert state.give_up is False
+    assert state.rewrite_feedback == ""
+    assert any(event == "scene_review_warning" for event, _ in events)
+    assert any("标题位置" in warning for warning in ctx.continuity_warnings)
+
+
 def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
@@ -1279,8 +1309,8 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
         orchestrator._local_smoke_render(ctx, state)
 
 
-def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
-    monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 2)
+def test_minor_review_applies_unique_fix_before_round_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
     run_paths = paths(tmp_path)
     run_paths.scenes.mkdir(parents=True)
     ctx = PipelineContext("x", paths=run_paths)
@@ -1301,8 +1331,10 @@ def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
             fixes=[{"find": "pass", "replace": "self.wait(1)", "reason": "demo"}],
         ),
     )
-    assert ctx.scene_states[1].give_up is True
-    assert ctx.scene_states[1].review_round == 2
+    assert ctx.scene_states[1].give_up is False
+    assert ctx.scene_states[1].reviewed is False
+    assert "self.wait(1)" in ctx.scene_states[1].code
+    assert ctx.scene_states[1].review_round == 0
 
 
 def test_major_review_with_verified_local_fix_stays_in_code_review(monkeypatch, tmp_path):
@@ -2158,6 +2190,9 @@ def test_plan_review_revisits_neighbors_after_mechanical_handoff_repair(monkeypa
                         {
                             "category": "contract",
                             "field": "handoff",
+                            "confidence": "high",
+                            "evidence_type": "contract",
+                            "evidence": "tangent_plane_surface 未列入 handoff",
                             "message": (
                                 "tangent_plane_surface 未列入 handoff，应传递给场景3；"
                                 "function_label 需要从场景1继承并传递给场景3。"

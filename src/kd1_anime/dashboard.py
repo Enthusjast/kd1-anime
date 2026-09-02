@@ -385,6 +385,15 @@ class SceneDashboard:
                 status.invalidate_from("计划审查", self.stages)
                 self._mark_running(status, "计划审查", "计划正确性审查中")
 
+        elif event == "scene_plan_review_warning":
+            if status:
+                warnings = data.get("warnings", [])
+                message = str(warnings[0]) if warnings else "计划审查存在非阻断提示"
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = message
+
         elif event == "scene_plan_review_pass":
             if status:
                 status.state = "running"
@@ -493,6 +502,15 @@ class SceneDashboard:
                 status.started_at = 0.0
                 status.mark_done("审查")
                 status.message = "审查通过" if event == "scene_review_pass" else "已跳过审查"
+
+        elif event == "scene_review_warning":
+            if status:
+                warnings = data.get("warnings", [])
+                message = str(warnings[0]) if warnings else "代码审查存在非阻断提示"
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = message
 
         elif event == "scene_review_fail":
             if status:

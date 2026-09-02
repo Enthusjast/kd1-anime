@@ -128,6 +128,13 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - `minor`：至少一条可精确唯一匹配的查找替换；
 - `major`：带具体反馈并回到 Coder 重写。
 
+审查结果还经过统一的分级策略：Plan Review 的确定性编译错误仍是硬阻断，LLM-only
+问题只有在高置信度且提供计算/合同证据时才阻断；style 和一般 timing 统一降为 warning。
+Code Review 中的 layout、低置信度、含不确定措辞或无法绑定当前源码的 finding 只写入
+warning；唯一可匹配的局部 fix 先经过 AST/连续性/生命周期校验后自动应用，再重新审查。
+warning 会通过 `scene_plan_review_warning`/`scene_review_warning` 事件写入运行诊断，
+不会增加重规划或代码审查轮数。
+
 Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
 
 连续性审查与代码审查同样分离。连续性修正轮数耗尽时，系统会把当时已经通过确定性
