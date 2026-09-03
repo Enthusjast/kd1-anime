@@ -282,7 +282,7 @@ class CoderAgent(BaseAgent):
             ),
             PromptSection(
                 "稳定代码骨架",
-                build_scene_template(scene_plan, technical_spec),
+                build_scene_template(scene_plan, technical_spec, renderer=renderer),
                 required=True,
                 priority=108,
                 max_chars=12_000,

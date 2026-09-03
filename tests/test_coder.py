@@ -74,6 +74,13 @@ class TestScene(Scene):
         )
         assert select_scene_template(surface_plan) == "surface"
 
+    def test_scene_template_selects_updater_and_camera_by_renderer(self, sample_plan):
+        updater_plan = sample_plan.model_copy(update={"visual_design": "ValueTracker 动态参数"})
+        camera_plan = sample_plan.model_copy(update={"camera_movement": "镜头推近"})
+        assert select_scene_template(updater_plan) == "updater"
+        assert select_scene_template(camera_plan, renderer="cairo") == "moving_camera"
+        assert select_scene_template(camera_plan, renderer="opengl") == "generic"
+
     def test_safe_scene_code_is_a_single_valid_scene(self, sample_plan):
         code = build_safe_scene_code(sample_plan)
         assert "class Scene1(Scene)" in code
