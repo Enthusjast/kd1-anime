@@ -76,16 +76,21 @@ def classify_failure(
         "run_timeout",
     )
     oom_marker = re.search(r"\boom(?:[- ]kill|\s+event)?\b", text)
-    if status_text in {
-        "NODE_FAIL",
-        "OUT_OF_MEMORY",
-        "TIMEOUT",
-        "CANCELLED",
-        "PREEMPTED",
-        "QUEUE_TIMEOUT",
-        "RUN_TIMEOUT",
-        "UNKNOWN_TIMEOUT",
-    } or oom_marker is not None or any(marker in text for marker in infrastructure_markers):
+    if (
+        status_text
+        in {
+            "NODE_FAIL",
+            "OUT_OF_MEMORY",
+            "TIMEOUT",
+            "CANCELLED",
+            "PREEMPTED",
+            "QUEUE_TIMEOUT",
+            "RUN_TIMEOUT",
+            "UNKNOWN_TIMEOUT",
+        }
+        or oom_marker is not None
+        or any(marker in text for marker in infrastructure_markers)
+    ):
         return FailureRoute(
             "infrastructure",
             "infra_retry",
