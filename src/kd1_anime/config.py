@@ -577,6 +577,24 @@ class Settings(BaseSettings):
     MAX_CLARIFY_CONTEXT_CHARS: int = Field(default=40_000, ge=2_000, le=1_000_000)
     MAX_LOG_CHARS: int = Field(default=30_000, ge=1_000, le=1_000_000)
     CODE_VALIDATION_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    MAX_CODE_CANDIDATES_LOW: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="低风险场景允许的不同代码策略数",
+    )
+    MAX_CODE_CANDIDATES_MEDIUM: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="中风险场景允许的不同代码策略数",
+    )
+    MAX_CODE_CANDIDATES_HIGH: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="高风险场景允许的不同代码策略数",
+    )
     MONITOR_POLL_INTERVAL: int = Field(default=10, ge=1)
     MONITOR_QUEUE_TIMEOUT: int = Field(default=3600, ge=1)
     MONITOR_RUN_TIMEOUT: int = Field(default=3600, ge=1)

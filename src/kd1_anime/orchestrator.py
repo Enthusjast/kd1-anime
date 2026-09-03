@@ -68,6 +68,7 @@ from kd1_anime.agents.planner import (
 from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
 from kd1_anime.agents.render_error_parser import extract_render_error
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
+from kd1_anime.agents.risk import assess_scene_risk
 from kd1_anime.agents.safe_fallback import (
     build_safe_fallback_plan,
     fallback_reason_summary,
@@ -1276,6 +1277,12 @@ class Orchestrator:
         teaching_graph: TeachingGraph | None = None,
     ) -> tuple[str, str]:
         agent = CoderAgent()
+        scene_risk = assess_scene_risk(plan, technical_spec)
+        candidate_budget = getattr(
+            settings,
+            f"MAX_CODE_CANDIDATES_{scene_risk.level.upper()}",
+            settings.MAX_CODE_CANDIDATES_LOW,
+        )
         current_feedback = feedback
         current_previous = previous_code
         last_validation: CodeValidationResult | None = None
@@ -1302,6 +1309,12 @@ class Orchestrator:
                 "stream": stream,
                 "renderer": renderer,
             }
+            if self._supports_keyword(agent.generate_code, "candidate_index"):
+                code_kwargs["candidate_index"] = min(attempt, candidate_budget)
+            if self._supports_keyword(agent.generate_code, "candidate_budget"):
+                code_kwargs["candidate_budget"] = candidate_budget
+            if self._supports_keyword(agent.generate_code, "risk_level"):
+                code_kwargs["risk_level"] = scene_risk.level
             if continuity_bible is not None:
                 code_kwargs["continuity_bible"] = continuity_bible
             if inherited_elements_code:
@@ -5798,6 +5811,14 @@ class Orchestrator:
         code_fallback_used = False
         code_fallback_reason = ""
         program_used = False
+        scene_risk = assess_scene_risk(state.plan, state.technical_spec)
+        self._emit(
+            "scene_risk_assessed",
+            scene_id=scene_id,
+            level=scene_risk.level,
+            score=scene_risk.score,
+            reasons=list(scene_risk.reasons),
+        )
 
         def compile_ir_candidate() -> tuple[str, str]:
             program = build_scene_program_from_contract(state.plan, state.technical_spec)

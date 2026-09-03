@@ -213,6 +213,28 @@ class TestScene(Scene):
         )
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_labels_alternate_candidate(
+        self, mock_call_llm, coder_agent, sample_plan
+    ):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+
+        coder_agent.generate_code(
+            sample_plan,
+            stream=False,
+            candidate_index=2,
+            candidate_budget=3,
+            risk_level="high",
+        )
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "备选实现" in message
+        assert "2/3" in message
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_with_previous_code(self, mock_call_llm, coder_agent, sample_plan):
         """测试带之前代码的代码生成。"""
         mock_call_llm.return_value = """```python

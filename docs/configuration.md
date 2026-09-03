@@ -224,6 +224,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MAX_CLARIFY_CONTEXT_CHARS | 40000 | 多轮澄清上下文上限 |
 | MAX_LOG_CHARS | 30000 | AutoFixer 接收的日志上限 |
 | CODE_VALIDATION_ATTEMPTS | 3 | 代码校验失败后的重生成次数 |
+| MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH | 1/2/3 | 按场景风险允许的不同代码实现策略数 |
 | MONITOR_POLL_INTERVAL | 10 | Slurm 轮询间隔秒数 |
 | MONITOR_QUEUE_TIMEOUT | 3600 | 排队超时秒数 |
 | MONITOR_RUN_TIMEOUT | 3600 | 运行超时秒数 |

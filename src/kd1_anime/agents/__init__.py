@@ -43,6 +43,7 @@ from kd1_anime.agents.reviewer import (
     apply_review_policy,
     validate_review_evidence,
 )
+from kd1_anime.agents.risk import SceneRisk, assess_scene_risk
 from kd1_anime.agents.state_ledger import (
     LedgerElement,
     SceneBoundaryIR,
@@ -87,6 +88,7 @@ __all__ = [
     "ReviewerAgent",
     "SceneBoundaryIR",
     "SceneBoundaryState",
+    "SceneRisk",
     "StateLedger",
     "TeachingEdge",
     "TeachingGraph",
@@ -94,6 +96,7 @@ __all__ = [
     "TechnicalSpec",
     "TechnicalValidationResult",
     "apply_review_policy",
+    "assess_scene_risk",
     "build_bounded_prompt",
     "classify_failure",
     "classify_plan_review_issues",
