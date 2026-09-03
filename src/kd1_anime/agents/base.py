@@ -53,7 +53,9 @@ class BaseAgent:
     def __init__(self, profile: LLMRuntimeProfile | None = None):
         # 延迟构造 client: 避免 API Key 为空时在实例化阶段就崩溃
         # (让调用方有机会先给出友好的配置错误提示)
-        self.profile = profile or settings.main_llm_profile()
+        self.profile = profile or settings.main_llm_profile(
+            stage=getattr(self, "llm_stage", "default")
+        )
         self._client: OpenAI | None = None
         self.model = self.profile.model
         self.last_call_metrics: dict[str, object] = {}

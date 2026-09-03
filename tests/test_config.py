@@ -204,6 +204,20 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LOCAL_SMOKE_RENDER_MODE == "frame"
 
 
+def test_stage_model_routing_falls_back_and_overrides_per_stage():
+    config = Settings(
+        _env_file=None,
+        LLM_API_KEY="key",
+        LLM_BASE_URL="https://example.invalid/v1",
+        LLM_MODEL="main-model",
+        LLM_CODE_MODEL="code-model",
+    )
+
+    assert config.main_llm_profile(stage="planning").model == "main-model"
+    assert config.main_llm_profile(stage="code").model == "code-model"
+    assert config.main_llm_profile(stage="code").max_tokens == config.LLM_CODE_MAX_TOKENS
+
+
 def test_llm_timeout_and_silent_stream_validation():
     with pytest.raises(ValueError):
         Settings(_env_file=None, LLM_TIMEOUT_READ=5.0)  # 低于下限 10s

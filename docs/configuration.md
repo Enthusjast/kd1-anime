@@ -39,6 +39,7 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_API_KEY | 空 | 主模型 API Key；必填，除非只执行不调用模型的命令 |
 | LLM_BASE_URL | https://api.openai.com/v1 | OpenAI-compatible Base URL |
 | LLM_MODEL | 空 | 主模型名；必填 |
+| LLM_PLANNING_MODEL / LLM_TECHNICAL_MODEL / LLM_CODE_MODEL / LLM_REVIEW_MODEL / LLM_FIX_MODEL | 空 | 可选阶段模型；为空回退到 LLM_MODEL |
 | LLM_SEND_MAX_TOKENS | true | 是否向端点发送 max_tokens |
 | LLM_TEMPERATURE | 0.3 | 温度，范围 0–2 |
 | LLM_PLANNING_TEMPERATURE | 0.2 | Planner/Clarifier 温度 |

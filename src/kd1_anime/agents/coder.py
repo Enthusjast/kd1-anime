@@ -198,6 +198,7 @@ class CoderAgent(BaseAgent):
     """代码生成 Agent。"""
 
     name = "Coder"
+    llm_stage = "code"
 
     def generate_code(
         self,

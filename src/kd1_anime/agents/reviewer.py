@@ -839,6 +839,7 @@ class ReviewerAgent(BaseAgent):
     """代码审查 Agent。"""
 
     name = "Reviewer"
+    llm_stage = "review"
 
     @staticmethod
     def _bounded_text(value: str, limit: int = 4_000) -> str:

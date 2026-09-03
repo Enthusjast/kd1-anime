@@ -193,6 +193,7 @@ class AutoFixerAgent(BaseAgent):
     """自动修复 Agent"""
 
     name = "AutoFixer"
+    llm_stage = "fix"
 
     INFRASTRUCTURE_MARKERS = (
         # 环境/调度

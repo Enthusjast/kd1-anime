@@ -221,6 +221,13 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://api.openai.com/v1"
     LLM_MODEL: str = ""
+    # 可选的阶段级模型路由；为空时回退到 LLM_MODEL。端点和密钥仍由
+    # 主模型配置统一管理，避免不同阶段意外使用不同凭据。
+    LLM_PLANNING_MODEL: str = ""
+    LLM_TECHNICAL_MODEL: str = ""
+    LLM_CODE_MODEL: str = ""
+    LLM_REVIEW_MODEL: str = ""
+    LLM_FIX_MODEL: str = ""
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
     # 阶段级温度：结构化合同保持确定性，代码创作保留少量探索空间。
@@ -727,18 +734,53 @@ class Settings(BaseSettings):
 
         self.visual_llm_profile().require()
 
-    def main_llm_profile(self) -> LLMRuntimeProfile:
-        """构造主规划/编码模型的运行配置。"""
+    def main_llm_profile(self, *, stage: str = "default") -> LLMRuntimeProfile:
+        """构造主 Agent 配置，并按阶段选择可选模型。"""
+
+        stage_key = str(stage or "default").strip().lower()
+        model_fields = {
+            "planning": "LLM_PLANNING_MODEL",
+            "technical": "LLM_TECHNICAL_MODEL",
+            "code": "LLM_CODE_MODEL",
+            "review": "LLM_REVIEW_MODEL",
+            "fix": "LLM_FIX_MODEL",
+        }
+        temperature_fields = {
+            "planning": "LLM_PLANNING_TEMPERATURE",
+            "technical": "LLM_TECHNICAL_TEMPERATURE",
+            "code": "LLM_CODE_TEMPERATURE",
+            "review": "LLM_REVIEW_TEMPERATURE",
+            "fix": "LLM_FIX_TEMPERATURE",
+        }
+        token_fields = {
+            "planning": "LLM_PLANNING_MAX_TOKENS",
+            "technical": "LLM_TECHNICAL_MAX_TOKENS",
+            "code": "LLM_CODE_MAX_TOKENS",
+            "review": "LLM_REVIEW_MAX_TOKENS",
+        }
+        model = getattr(self, model_fields.get(stage_key, ""), "") or self.LLM_MODEL
+        temperature = getattr(
+            self,
+            temperature_fields.get(stage_key, "LLM_TEMPERATURE"),
+            self.LLM_TEMPERATURE,
+        )
+        max_tokens = getattr(
+            self,
+            token_fields.get(stage_key, "LLM_MAX_TOKENS"),
+            self.LLM_MAX_TOKENS,
+        )
+        if stage_key == "fix" and not getattr(self, "LLM_FIX_MODEL", ""):
+            max_tokens = self.LLM_CODE_MAX_TOKENS
 
         return LLMRuntimeProfile(
             label="LLM ",
             env_prefix="LLM",
             api_key=self.LLM_API_KEY,
             base_url=self.LLM_BASE_URL,
-            model=self.LLM_MODEL,
+            model=model,
             send_max_tokens=self.LLM_SEND_MAX_TOKENS,
-            temperature=self.LLM_TEMPERATURE,
-            max_tokens=self.LLM_MAX_TOKENS,
+            temperature=temperature,
+            max_tokens=max_tokens,
             max_retries=self.LLM_MAX_RETRIES,
             retry_base_delay=self.LLM_RETRY_BASE_DELAY,
             timeout_connect=self.LLM_TIMEOUT_CONNECT,
