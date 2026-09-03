@@ -65,6 +65,7 @@ from kd1_anime.agents.planner import (
     normalize_transition_claim_assignments,
     repair_obvious_math_contradictions,
 )
+from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
 from kd1_anime.agents.render_error_parser import extract_render_error
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
 from kd1_anime.agents.safe_fallback import (
@@ -298,6 +299,9 @@ class SceneState:
     # 渲染错误指纹: 连续相同错误 → 环境问题, 提前放弃
     last_error_fp: str = ""
     identical_error_count: int = 0
+    last_repair_code_sha256: str = ""
+    last_repair_error_fp: str = ""
+    stagnant_repair_count: int = 0
 
     reviewed: bool = False
     # Scene N 的最终导出状态，作为 Scene N+1 的唯一代码级交接来源。
@@ -868,6 +872,9 @@ class Orchestrator:
                     identical_review_count=scene.identical_review_count,
                     last_error_fp=scene.last_error_fp,
                     identical_error_count=scene.identical_error_count,
+                    last_repair_code_sha256=scene.last_repair_code_sha256,
+                    last_repair_error_fp=scene.last_repair_error_fp,
+                    stagnant_repair_count=scene.stagnant_repair_count,
                     inherited_elements_code=scene.inherited_elements_code,
                     exported_elements_code=scene.exported_elements_code,
                     exported_elements=scene.exported_elements,
@@ -1158,6 +1165,9 @@ class Orchestrator:
                 identical_review_count=getattr(stored, "identical_review_count", 0),
                 last_error_fp=getattr(stored, "last_error_fp", ""),
                 identical_error_count=getattr(stored, "identical_error_count", 0),
+                last_repair_code_sha256=getattr(stored, "last_repair_code_sha256", ""),
+                last_repair_error_fp=getattr(stored, "last_repair_error_fp", ""),
+                stagnant_repair_count=getattr(stored, "stagnant_repair_count", 0),
                 inherited_elements_code=getattr(stored, "inherited_elements_code", ""),
                 exported_elements_code=getattr(stored, "exported_elements_code", ""),
                 exported_elements=list(getattr(stored, "exported_elements", [])),
@@ -3220,6 +3230,7 @@ class Orchestrator:
                     state.slurm_job = None
                     state.exported_elements_code = ""
                     state.exported_elements = []
+                    self._reset_repair_progress(state)
                     self._remove_element_manifest_scene(ctx, scene_id)
                     state.safe_fallback_used = False
                     state.safe_fallback_reason = ""
@@ -3375,6 +3386,7 @@ class Orchestrator:
                 state.rendered = False
                 state.exported_elements_code = ""
                 state.exported_elements = []
+                self._reset_repair_progress(state)
                 self._remove_element_manifest_scene(ctx, state.plan.scene_id)
                 self._reset_visual_receipt(ctx, state, clear_candidate=True, reset_attempts=True)
                 self._write_private(ctx.paths.scenes / f"scene_{state.plan.scene_id}.py", "")
@@ -3454,6 +3466,7 @@ class Orchestrator:
             state.slurm_job = None
             state.exported_elements_code = ""
             state.exported_elements = []
+            self._reset_repair_progress(state)
             self._remove_element_manifest_scene(ctx, state.plan.scene_id)
             self._reset_visual_receipt(ctx, state, clear_candidate=True, reset_attempts=True)
             self._write_private(ctx.paths.scenes / f"scene_{state.plan.scene_id}.py", "")
@@ -6299,6 +6312,99 @@ class Orchestrator:
             excerpt = excerpt[-600:]
         return f"{base}\n最近错误日志(尾部):\n{excerpt}"
 
+    @staticmethod
+    def _reset_repair_progress(state: SceneState) -> None:
+        """代码/计划改变后清除只属于旧候选的修复停滞快照。"""
+
+        state.last_repair_code_sha256 = ""
+        state.last_repair_error_fp = ""
+        state.stagnant_repair_count = 0
+
+    def _stagnation_fallback_candidate(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+    ) -> tuple[str, str] | None:
+        """在 AutoFix 没有进展时尝试 IR/安全模板，而不是继续重复调用 LLM。"""
+
+        candidates: list[str] = []
+        if settings.CODEGEN_MODE != "python":
+            try:
+                program = build_scene_program_from_contract(state.plan, state.technical_spec)
+                candidates.append(compile_scene_program(program, state.plan))
+            except Exception as exc:
+                self._emit(
+                    "repair_stagnation_candidate_failed",
+                    scene_id=state.plan.scene_id,
+                    strategy="scene_ir",
+                    reason=str(exc)[:2_000],
+                )
+        candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
+        for candidate in candidates:
+            validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
+            if not validation.is_valid:
+                continue
+            api_result = lint_manim_api(
+                candidate,
+                renderer=ctx.render_profile.renderer,
+                scene_plan=state.plan,
+            )
+            if not api_result.is_valid:
+                continue
+            try:
+                extract_scene_continuity_elements(candidate, state.plan)
+            except ValueError:
+                continue
+            if state.technical_spec is not None:
+                lifecycle = validate_animation_lifecycle(
+                    candidate,
+                    state.technical_spec,
+                    renderer=ctx.render_profile.renderer,
+                )
+                if not lifecycle.is_valid:
+                    continue
+            if candidate != state.code:
+                return candidate, validation.scene_classes[0]
+        return None
+
+    def _install_repair_candidate(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+        candidate: str,
+        class_name: str,
+        *,
+        error_fingerprint: str,
+        reset_stagnation: bool = False,
+    ) -> bool:
+        """统一写入经过确定性校验的 AutoFix/回退候选。"""
+
+        code_changed = candidate != state.code
+        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
+        with self._state_lock:
+            state.code = candidate
+            state.class_name = class_name
+            state.review_round = 0
+            state.reviewed = False
+            state.failure_reason = ""
+            state.failure_category = ""
+            state.infra_retries = 0
+            state.slurm_job = None
+            state.artifact = None
+            state.rendered = False
+            state.exported_elements_code = ""
+            state.exported_elements = []
+            state.local_smoke_status = "pending"
+            state.last_repair_code_sha256 = sha256_text(candidate)
+            state.last_repair_error_fp = error_fingerprint
+            if reset_stagnation:
+                state.stagnant_repair_count = 0
+            self._remove_element_manifest_scene(ctx, scene_id)
+            self._reset_visual_receipt(ctx, state)
+            self._checkpoint(ctx, State.FIXING)
+        return code_changed
+
     def _request_continuity_rebuild(
         self,
         ctx: PipelineContext,
@@ -6458,9 +6564,27 @@ class Orchestrator:
                 )
                 self._emit("scene_render_patch_applied", scene_id=scene_id)
                 return
-        # 连续相同错误 → 判定为环境/配置问题, 提前放弃, 不再浪费修复次数
+        # 比较当前失败是否与上一次 AutoFix 后的结果完全相同。这里在调用
+        # LLM 之前判断，达到停滞阈值时直接尝试确定性候选，避免重复生成
+        # 同一份代码和同一份错误。
         fp = error_evidence.fingerprint or self._error_fingerprint(error_log)
         with self._state_lock:
+            previous_snapshot = (
+                ProgressSnapshot(
+                    code_sha256=state.last_repair_code_sha256,
+                    error_fingerprint=state.last_repair_error_fp,
+                )
+                if state.last_repair_code_sha256
+                else None
+            )
+            progress = classify_progress(
+                previous_snapshot,
+                ProgressSnapshot.from_values(state.code, error_fingerprint=fp),
+            )
+            if progress == "unchanged":
+                state.stagnant_repair_count += 1
+            elif progress in {"improved", "unknown"}:
+                state.stagnant_repair_count = 0
             if fp and fp == state.last_error_fp:
                 state.identical_error_count += 1
             else:
@@ -6468,7 +6592,19 @@ class Orchestrator:
                 state.last_error_fp = fp
             # 连续相同错误 → 提前放弃, 避免修复器在同一个环境错误上空转。
             # 但必须叠加 fix_attempts>=2 门槛: 修复器至少要修过 2 次才允许据此放弃。
-            if (
+            # 当用户显式把旧版“相同错误”阈值降到 2 时，保持旧的
+            # fail-closed 语义；默认阈值为 3 时才启用 IR/模板回退。
+            # 这样既兼容已有运行配置，也不会让一个明确要求快速放弃的
+            # 配置被新的回退策略覆盖。
+            stagnation_terminal = (
+                settings.MAX_FIX_IDENTICAL_ERRORS >= 3
+                and state.stagnant_repair_count >= settings.MAX_STAGNANT_ATTEMPTS
+            )
+            if stagnation_terminal:
+                # 先保存诊断状态；回退候选的安装在锁外完成。
+                self._checkpoint(ctx, State.FIXING)
+                terminal = True
+            elif (
                 state.identical_error_count >= settings.MAX_FIX_IDENTICAL_ERRORS
                 and state.fix_attempts >= 2
             ):
@@ -6494,6 +6630,42 @@ class Orchestrator:
                 terminal = False
             attempt = state.fix_attempts
         if terminal:
+            if stagnation_terminal:
+                stagnation_attempts = state.stagnant_repair_count
+                fallback = self._stagnation_fallback_candidate(ctx, state)
+                if fallback is not None:
+                    candidate, class_name = fallback
+                    code_changed = self._install_repair_candidate(
+                        ctx,
+                        scene_id,
+                        state,
+                        candidate,
+                        class_name,
+                        error_fingerprint=fp,
+                        reset_stagnation=True,
+                    )
+                    if code_changed:
+                        self._request_continuity_rebuild(
+                            ctx,
+                            scene_id,
+                            preserve_visual_candidates=state.visual_best_candidate is not None,
+                            include_failed=True,
+                        )
+                    self._emit(
+                        "repair_stagnation_fallback",
+                        scene_id=scene_id,
+                        strategy="scene_ir_or_safe_template",
+                        attempts=stagnation_attempts,
+                    )
+                    return
+                with self._state_lock:
+                    state.give_up = True
+                    state.failure_category = "render"
+                    state.failure_reason = self._give_up_reason(
+                        f"连续 {state.stagnant_repair_count} 次修复没有产生进展，且确定性回退不可用",
+                        error_log,
+                    )
+                    self._checkpoint(ctx, State.FIXING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
         rag_context = self._retrieve_rag(
@@ -6591,25 +6763,14 @@ class Orchestrator:
                 )
             else:
                 class_name = validation.scene_classes[0]
-        code_changed = candidate != state.code
-        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
-        with self._state_lock:
-            state.code = candidate
-            state.class_name = class_name
-            state.review_round = 0
-            state.reviewed = False
-            state.failure_reason = ""
-            state.failure_category = ""
-            state.infra_retries = 0
-            state.slurm_job = None
-            state.artifact = None
-            state.rendered = False
-            state.exported_elements_code = ""
-            state.exported_elements = []
-            state.local_smoke_status = "pending"
-            self._remove_element_manifest_scene(ctx, scene_id)
-            self._reset_visual_receipt(ctx, state)
-            self._checkpoint(ctx, State.FIXING)
+        code_changed = self._install_repair_candidate(
+            ctx,
+            scene_id,
+            state,
+            candidate,
+            class_name,
+            error_fingerprint=fp,
+        )
         if code_changed:
             self._request_continuity_rebuild(
                 ctx,
@@ -6694,6 +6855,7 @@ class Orchestrator:
             state.slurm_job = None
             state.exported_elements_code = ""
             state.exported_elements = []
+            self._reset_repair_progress(state)
             self._remove_element_manifest_scene(ctx, scene_id)
             state.give_up = False
             state.failed = False
@@ -6786,6 +6948,7 @@ class Orchestrator:
             state.exported_elements_code = ""
             state.exported_elements = []
             state.local_smoke_status = "pending"
+            self._reset_repair_progress(state)
             self._remove_element_manifest_scene(ctx, scene_id)
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.REVIEWING)
@@ -7213,6 +7376,7 @@ class Orchestrator:
             state.exported_elements_code = ""
             state.exported_elements = []
             state.local_smoke_status = "pending"
+            self._reset_repair_progress(state)
             state.safe_fallback_used = False
             state.safe_fallback_reason = ""
             self._reset_technical_spec(state)
@@ -7289,6 +7453,7 @@ class Orchestrator:
             state.visual_report_sha256 = candidate.report_sha256
             state.visual_artifact_sha256 = candidate.artifact.video_sha256
             state.visual_feedback = ""
+            self._reset_repair_progress(state)
         return code_changed
 
     def _visual_gate(
@@ -8216,6 +8381,7 @@ class Orchestrator:
                 state.exported_elements_code = ""
                 state.exported_elements = []
                 state.local_smoke_status = "pending"
+                self._reset_repair_progress(state)
                 # 代码和交接上下文同时失效；否则后续场景会从旧的
                 # ElementManifest 读取已经被评估淘汰的定义，TechnicalSpec
                 # 也可能在下一轮被误认为仍然与输入匹配。

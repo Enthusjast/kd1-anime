@@ -542,6 +542,12 @@ class Settings(BaseSettings):
         le=5,
         description="相同代码与相同审查反馈连续出现多少次后提前终止",
     )
+    MAX_STAGNANT_ATTEMPTS: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="渲染修复没有改变代码或错误指纹多少次后切换确定性回退",
+    )
     # 渲染失败后的最大自动修复次数。autofixer 每轮会调用 LLM 重写代码并重新提交 Slurm。
     MAX_FIX_ATTEMPTS: int = Field(default=5, ge=0, le=20)
     # Slurm 节点故障/抢占等与代码无关的终态，允许自动重新排队的次数。

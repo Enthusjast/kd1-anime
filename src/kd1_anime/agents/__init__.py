@@ -29,6 +29,7 @@ from kd1_anime.agents.planner import (
     TeachingGraph,
     repair_obvious_math_contradictions,
 )
+from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
 from kd1_anime.agents.prompt_context import (
     PromptBudgetError,
     PromptContextBuilder,
@@ -77,6 +78,7 @@ __all__ = [
     "PlanReviewerAgent",
     "PlannerAgent",
     "PlanningDraft",
+    "ProgressSnapshot",
     "PromptBudgetError",
     "PromptContextBuilder",
     "PromptSection",
@@ -95,6 +97,7 @@ __all__ = [
     "build_bounded_prompt",
     "classify_failure",
     "classify_plan_review_issues",
+    "classify_progress",
     "compile_technical_spec",
     "dedupe_plan_review_issues",
     "deterministic_plan_issues",

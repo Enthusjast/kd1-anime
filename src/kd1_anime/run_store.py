@@ -320,6 +320,11 @@ class StoredSceneState(BaseModel):
     identical_review_count: int = Field(default=0, ge=0)
     last_error_fp: str = Field(default="", max_length=64)
     identical_error_count: int = Field(default=0, ge=0)
+    # AutoFix 前后候选与错误指纹的快照；恢复时继续累计停滞次数，避免
+    # 进程重启把同一条失败路径当成全新的修复机会。
+    last_repair_code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    last_repair_error_fp: str = Field(default="", max_length=64)
+    stagnant_repair_count: int = Field(default=0, ge=0)
     slurm_job: StoredSlurmJob | None = None
     artifact: SceneArtifact | None = None
     phase: ScenePhase = "pending"

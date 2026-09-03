@@ -1411,6 +1411,19 @@ def test_explicit_smoke_override_enables_dry_run_canary(tmp_path):
     assert Orchestrator._local_smoke_enabled(ctx) is True
 
 
+def test_stagnation_fallback_produces_a_different_valid_candidate(tmp_path):
+    run_paths = paths(tmp_path)
+    state = SceneState(plan=plan(), code="old code", plan_ready=True)
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+
+    candidate = Orchestrator()._stagnation_fallback_candidate(ctx, state)
+
+    assert candidate is not None
+    code, class_name = candidate
+    assert code != state.code
+    assert class_name == "Scene1"
+
+
 def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     source = run_paths.scenes / "scene_1.py"

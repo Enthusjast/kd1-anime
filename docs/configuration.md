@@ -214,6 +214,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | SKIP_REVIEW | false | 是否跳过语义代码审查；确定性校验仍保留 |
 | SAFE_FALLBACK_ENABLED | true | 高风险几何失败后是否切换保守方案 |
 | MAX_IDENTICAL_REVIEW_ATTEMPTS | 2 | 相同代码/反馈重复次数上限 |
+| MAX_STAGNANT_ATTEMPTS | 2 | 渲染修复无进展后切换确定性回退的次数 |
 | MAX_FIX_ATTEMPTS | 5 | 渲染失败后的最大代码修复次数 |
 | MAX_INFRA_RETRIES | 2 | 基础设施故障重排队次数 |
 | MAX_FIX_IDENTICAL_ERRORS | 3 | 相同渲染错误指纹的放弃阈值 |
