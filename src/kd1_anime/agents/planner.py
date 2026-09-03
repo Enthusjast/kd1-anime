@@ -1781,6 +1781,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             response_model=PlanningDraft,
+            temperature=settings.LLM_PLANNING_TEMPERATURE,
             max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
             stream=False,
         )
@@ -1835,6 +1836,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             item_model=SceneOutline,
+            temperature=settings.LLM_PLANNING_TEMPERATURE,
             max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
         )
         # LLM 可能产生重复、跳号或从 0 开始的 ID。内部文件和状态机必须使用
@@ -1929,6 +1931,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             response_model=ContinuityBible,
+            temperature=settings.LLM_PLANNING_TEMPERATURE,
             max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
             stream=stream,
         )
@@ -2099,6 +2102,7 @@ class PlannerAgent(BaseAgent):
                 max_chars=settings.LLM_MAX_CONTEXT_CHARS,
             ),
             response_model=SceneDetail,
+            temperature=settings.LLM_PLANNING_TEMPERATURE,
             max_tokens=settings.LLM_PLANNING_MAX_TOKENS,
             stream=stream,
         )

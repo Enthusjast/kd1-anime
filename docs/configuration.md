@@ -41,6 +41,11 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_MODEL | 空 | 主模型名；必填 |
 | LLM_SEND_MAX_TOKENS | true | 是否向端点发送 max_tokens |
 | LLM_TEMPERATURE | 0.3 | 温度，范围 0–2 |
+| LLM_PLANNING_TEMPERATURE | 0.2 | Planner/Clarifier 温度 |
+| LLM_TECHNICAL_TEMPERATURE | 0.0 | TechnicalSpec 温度 |
+| LLM_CODE_TEMPERATURE | 0.2 | Coder 温度 |
+| LLM_REVIEW_TEMPERATURE | 0.0 | Plan/Code/Continuity Review 温度 |
+| LLM_FIX_TEMPERATURE | 0.1 | AutoFix 温度 |
 | LLM_MAX_TOKENS | 32768 | 全局/兼容输出上限；阶段配置优先 |
 | LLM_PLANNING_MAX_TOKENS | 16384 | 规划、澄清和计划审查预算 |
 | LLM_TECHNICAL_MAX_TOKENS | 16384 | TechnicalSpec 输出预算 |

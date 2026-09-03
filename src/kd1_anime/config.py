@@ -221,6 +221,12 @@ class Settings(BaseSettings):
     LLM_MODEL: str = ""
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
+    # 阶段级温度：结构化合同保持确定性，代码创作保留少量探索空间。
+    LLM_PLANNING_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
+    LLM_TECHNICAL_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
+    LLM_CODE_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
+    LLM_REVIEW_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
+    LLM_FIX_TEMPERATURE: float = Field(default=0.1, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int | None = Field(default=32768, ge=1, le=1_000_000)
     # 不同阶段的输出复杂度差异很大。默认使用较小的阶段预算，避免计划
     # 审查/连续性审查为极短 JSON 消耗与代码生成相同的长推理预算；用户

@@ -352,6 +352,7 @@ class AutoFixerAgent(BaseAgent):
                 )
             ),
             user_message=user_msg,
+            temperature=settings.LLM_FIX_TEMPERATURE,
             max_tokens=settings.LLM_CODE_MAX_TOKENS,
             stream=False,
         )
