@@ -9,6 +9,7 @@ import pytest
 
 from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, CoderAgent
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
+from kd1_anime.agents.scene_templates import build_scene_template, select_scene_template
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 
 
@@ -56,6 +57,18 @@ class TestScene(Scene):
         assert "from manim import *" in code
         assert "class TestScene(Scene):" in code
         assert "希望对你有帮助" not in code
+
+    def test_scene_template_is_renderer_aware(self, sample_plan):
+        template = build_scene_template(sample_plan)
+        assert "class Scene1(Scene)" in template
+        assert "KD1_CONTINUITY_EXPORT_BEGIN" in template
+        assert 'output_format=".xdv"' in template
+
+    def test_scene_template_selects_surface_for_3d_plan(self, sample_plan):
+        surface_plan = sample_plan.model_copy(
+            update={"title": "三维曲面", "visual_design": "使用 Surface 绘制抛物面"}
+        )
+        assert select_scene_template(surface_plan) == "surface"
 
     def test_extract_code_block_without_fences(self, coder_agent):
         """测试提取不带围栏的代码块。"""

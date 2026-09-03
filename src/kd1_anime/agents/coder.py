@@ -20,6 +20,7 @@ from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
     renderer_guidance,
 )
+from kd1_anime.agents.scene_templates import build_scene_template
 from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.config import settings
 
@@ -278,6 +279,13 @@ class CoderAgent(BaseAgent):
                 f"而不是用近似坐标伪造证明。\n~~~json\n{structured_contract}\n~~~",
                 required=True,
                 priority=100,
+            ),
+            PromptSection(
+                "稳定代码骨架",
+                build_scene_template(scene_plan, technical_spec),
+                required=True,
+                priority=108,
+                max_chars=12_000,
             ),
         ]
         if technical_contract:
