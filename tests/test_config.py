@@ -197,8 +197,10 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.MAX_TECHNICAL_SPEC_ATTEMPTS == 3
     assert config.MAX_PLAN_REPLAN_ATTEMPTS == 3
     assert config.SMOKE_RENDER_ENABLED is True
+    assert config.SMOKE_RENDER_MODE == "frame"
     assert config.SMOKE_RENDER_QUALITY == "l"
     assert config.LOCAL_SMOKE_RENDER_ENABLED is False
+    assert config.LOCAL_SMOKE_RENDER_MODE == "frame"
 
 
 def test_llm_timeout_and_silent_stream_validation():

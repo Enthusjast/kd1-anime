@@ -1385,6 +1385,7 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     state = SceneState(plan=plan(), class_name="Demo")
     orchestrator = Orchestrator()
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "video")
 
     def successful_run(command, **kwargs):
         media_index = command.index("--media_dir") + 1
@@ -1403,6 +1404,34 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_run_limited_process", failed_run)
     with pytest.raises(RuntimeError, match="Smoke Render 失败"):
         orchestrator._local_smoke_render(ctx, state)
+
+
+def test_local_frame_canary_checks_last_frame(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    source = run_paths.scenes / "scene_1.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n")
+    ctx = PipelineContext("x", paths=run_paths, dry_run=False)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "frame")
+    captured = {}
+
+    def successful_run(command, **kwargs):
+        captured["command"] = command
+        media_dir = Path(command[command.index("--media_dir") + 1])
+        output = media_dir / "nested" / "Demo.png"
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"frame")
+        return module.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module, "_run_limited_process", successful_run)
+    orchestrator._local_smoke_render(ctx, state)
+
+    assert "--format" in captured["command"]
+    assert "png" in captured["command"]
+    assert "--save_last_frame" in captured["command"]
 
 
 def test_minor_review_applies_unique_fix_before_round_limit(monkeypatch, tmp_path):

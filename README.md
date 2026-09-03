@@ -316,7 +316,9 @@ kd1-anime cache clear --yes
 | `MANIM_FRAME_RATE` | `60` | 输出帧率 |
 | `MANIM_OPENGL_PLATFORM` | `egl` | OpenGL 上下文后端；无显示的 HPC 通常使用 `egl` |
 | `SMOKE_RENDER_ENABLED` | `true` | 正式 Slurm 渲染前执行同 renderer 的轻量探针 |
+| `SMOKE_RENDER_MODE` | `frame` | 预检模式：最后一帧、MP4 或两者 |
 | `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外运行时预检 |
+| `LOCAL_SMOKE_RENDER_MODE` | `frame` | 本地预检模式：最后一帧、MP4 或两者 |
 | `MAX_SCENES` | `12` | 单次规划的最大场景数 |
 | `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
 | `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 计划反馈后的 Planner 总重调用次数 |

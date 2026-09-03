@@ -475,11 +475,16 @@ class Settings(BaseSettings):
         default=True,
         description="正式渲染前是否执行轻量 Smoke Render",
     )
+    SMOKE_RENDER_MODE: Literal["frame", "video", "both"] = Field(
+        default="frame",
+        description="Smoke Render 模式：最后一帧、MP4 或两者",
+    )
     SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
     # 本地生成/无 Slurm 环境的可选运行时预检；默认关闭，避免在 dry-run
     # 或共享登录节点上执行不可信生成代码。
     LOCAL_SMOKE_RENDER_ENABLED: bool = False
+    LOCAL_SMOKE_RENDER_MODE: Literal["frame", "video", "both"] = "frame"
     LOCAL_SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     LOCAL_SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
     LOCAL_SMOKE_RENDER_MEMORY_MB: int = Field(default=4_096, ge=256, le=65_536)

@@ -2319,7 +2319,59 @@ class Orchestrator:
             env["MANIM_RENDERER"] = ctx.render_profile.renderer
             if ctx.render_profile.renderer == "opengl":
                 env["PYOPENGL_PLATFORM"] = ctx.render_profile.opengl_platform
-            manim_command = [
+            image = settings.SLURM_CONTAINER_IMAGE
+
+            def run_smoke(manim_command: list[str], *, write_video: bool = False) -> None:
+                command_args = list(manim_command)
+                if write_video and ctx.render_profile.renderer == "opengl":
+                    command_args.insert(-2, "--write_to_movie")
+                if image:
+                    command = [
+                        "apptainer",
+                        "exec",
+                        "--containall",
+                        "--cleanenv",
+                        "--no-home",
+                    ]
+                    if ctx.render_profile.renderer == "opengl":
+                        command.append("--nv")
+                    command.extend(["--env", f"MANIM_RENDERER={ctx.render_profile.renderer}"])
+                    if ctx.render_profile.renderer == "opengl":
+                        command.extend(
+                            [
+                                "--env",
+                                f"PYOPENGL_PLATFORM={ctx.render_profile.opengl_platform}",
+                            ]
+                        )
+                    if settings.SLURM_CONTAINER_DISABLE_NETWORK:
+                        command.extend(["--net", "--network", "none"])
+                    command.extend(
+                        [
+                            "--bind",
+                            f"{ctx.paths.root.resolve()}:{ctx.paths.root.resolve()}",
+                            str(Path(image).expanduser().resolve()),
+                            *command_args,
+                        ]
+                    )
+                else:
+                    command = [sys.executable, "-m", *command_args]
+                try:
+                    result = _run_limited_process(
+                        command,
+                        timeout=settings.LOCAL_SMOKE_RENDER_TIMEOUT,
+                        memory_mb=settings.LOCAL_SMOKE_RENDER_MEMORY_MB,
+                        env=env,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError("本地 Smoke Render 超时") from exc
+                except OSError as exc:
+                    raise RuntimeError(f"本地 Smoke Render 无法启动: {exc}") from exc
+                if result.returncode != 0:
+                    output = (result.stderr or result.stdout or "").strip()
+                    detail = output[-10_000:] if output else f"退出码 {result.returncode}"
+                    raise RuntimeError("本地 Smoke Render 失败:\n" + detail)
+
+            common_args = [
                 "manim",
                 "render",
                 f"--renderer={ctx.render_profile.renderer}",
@@ -2329,71 +2381,49 @@ class Orchestrator:
                 "--fps",
                 str(smoke_fps),
                 "--disable_caching",
-                "--media_dir",
-                str(media_dir),
-                str(source),
-                state.class_name,
             ]
-            if ctx.render_profile.renderer == "opengl":
-                manim_command.insert(-2, "--write_to_movie")
-            image = settings.SLURM_CONTAINER_IMAGE
-            if image:
-                command = [
-                    "apptainer",
-                    "exec",
-                    "--containall",
-                    "--cleanenv",
-                    "--no-home",
+            if settings.LOCAL_SMOKE_RENDER_MODE in {"frame", "both"}:
+                frame_dir = media_dir / "__frame_smoke__"
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                run_smoke(
+                    [
+                        *common_args,
+                        "--format",
+                        "png",
+                        "--save_last_frame",
+                        "--media_dir",
+                        str(frame_dir),
+                        str(source),
+                        state.class_name,
+                    ]
+                )
+                frames = [
+                    path
+                    for path in frame_dir.rglob(f"{state.class_name}.png")
+                    if path.is_file() and path.stat().st_size > 0
                 ]
-                if ctx.render_profile.renderer == "opengl":
-                    command.append("--nv")
-                command.extend(
+                if not frames:
+                    raise RuntimeError("本地 Frame Canary 完成但没有生成最后一帧 PNG")
+            if settings.LOCAL_SMOKE_RENDER_MODE in {"video", "both"}:
+                video_dir = media_dir / "__smoke__"
+                video_dir.mkdir(parents=True, exist_ok=True)
+                run_smoke(
                     [
-                        "--env",
-                        f"MANIM_RENDERER={ctx.render_profile.renderer}",
-                    ]
+                        *common_args,
+                        "--media_dir",
+                        str(video_dir),
+                        str(source),
+                        state.class_name,
+                    ],
+                    write_video=True,
                 )
-                if ctx.render_profile.renderer == "opengl":
-                    command.extend(
-                        [
-                            "--env",
-                            f"PYOPENGL_PLATFORM={ctx.render_profile.opengl_platform}",
-                        ]
-                    )
-                if settings.SLURM_CONTAINER_DISABLE_NETWORK:
-                    command.extend(["--net", "--network", "none"])
-                command.extend(
-                    [
-                        "--bind",
-                        f"{ctx.paths.root.resolve()}:{ctx.paths.root.resolve()}",
-                        str(Path(image).expanduser().resolve()),
-                        *manim_command,
-                    ]
-                )
-            else:
-                command = [sys.executable, "-m", *manim_command]
-            try:
-                result = _run_limited_process(
-                    command,
-                    timeout=settings.LOCAL_SMOKE_RENDER_TIMEOUT,
-                    memory_mb=settings.LOCAL_SMOKE_RENDER_MEMORY_MB,
-                    env=env,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError("本地 Smoke Render 超时") from exc
-            except OSError as exc:
-                raise RuntimeError(f"本地 Smoke Render 无法启动: {exc}") from exc
-            if result.returncode != 0:
-                output = (result.stderr or result.stdout or "").strip()
-                detail = output[-10_000:] if output else f"退出码 {result.returncode}"
-                raise RuntimeError("本地 Smoke Render 失败:\n" + detail)
-            videos = [
-                path
-                for path in media_dir.rglob(f"{state.class_name}.mp4")
-                if path.is_file() and path.stat().st_size > 0
-            ]
-            if not videos:
-                raise RuntimeError("本地 Smoke Render 完成但没有生成最终 MP4")
+                videos = [
+                    path
+                    for path in video_dir.rglob(f"{state.class_name}.mp4")
+                    if path.is_file() and path.stat().st_size > 0
+                ]
+                if not videos:
+                    raise RuntimeError("本地 Video Canary 完成但没有生成最终 MP4")
         self._write_stage_artifact(
             ctx,
             f"smoke_scene_{state.plan.scene_id}_local.json",
@@ -2403,6 +2433,7 @@ class Orchestrator:
                 "status": "passed",
                 "renderer": ctx.render_profile.renderer,
                 "quality": settings.LOCAL_SMOKE_RENDER_QUALITY,
+                "mode": settings.LOCAL_SMOKE_RENDER_MODE,
                 "resolution": [smoke_width, smoke_height],
                 "frame_rate": smoke_fps,
                 "container": bool(settings.SLURM_CONTAINER_IMAGE),
