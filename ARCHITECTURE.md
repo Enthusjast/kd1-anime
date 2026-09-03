@@ -38,13 +38,20 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/failure_router.py 确定性失败分类与修复路径
        ├── agents/validator.py     AST 确定性校验
        ├── agents/auto_fixer.py    根据渲染日志修复代码
+       ├── agents/render_error_parser.py 精确 traceback/稳定错误指纹
+       ├── agents/progress.py      修复进度与停滞检测
+       ├── agents/risk.py          场景风险评分与候选预算
+       ├── agents/review_policy.py 风险分级审查预算
+       ├── agents/math_verifier.py 受限 AST 数值采样核验
+       ├── agents/scene_ir.py      结构化 Scene IR 与确定性编译回退
        ├── agents/render_context.py renderer 能力与对象生命周期约束
        ├── cluster/slurm.py        sbatch、状态查询、产物验证、超时取消
+       ├── cluster/resource_estimator.py 按场景估计 CPU/内存/时间/GPU
        ├── rendering.py            RenderProfile/MergeProfile、ffprobe、SceneArtifact
        ├── resources.py            跨批量项目的进程级 LLM/RAG/Slurm 配额
        ├── media/merger.py         精确输入列表、FFmpeg xfade/acrossfade 原子合并
        ├── rag/                    SQLite 索引、独立 Embedding/Reranker 检索
-       ├── eval/                   代码/效率评估与独立多模态视觉质量门
+       ├── eval/                   代码/效率评估、边界帧健康检查与视觉质量门
        ├── llm_cache.py            SQLite LLM 响应缓存与安全限额
        ├── stats.py                清单/事件日志离线统计
        ├── agents/state_ledger.py  场景边界语义账本与渲染证据
@@ -138,6 +145,18 @@ warning；唯一可匹配的局部 fix 先经过 AST/连续性/生命周期校�
 warning 会通过 `scene_plan_review_warning`/`scene_review_warning` 事件写入运行诊断，
 不会增加重规划或代码审查轮数。
 
+代码候选会根据三维对象、updater、几何碎片、动画数量、继承状态和渲染器等确定性特征
+划分为 low/medium/high 风险。首次候选仍优先采用最简单实现；只有确定性校验失败时才在
+有限预算内请求备选结构，避免为本来正确的场景增加无谓 LLM 调用。若渲染修复后代码和
+错误指纹连续不变，系统会先尝试 Scene IR 或安全模板；候选必须重新通过 AST、API、连续性
+和生命周期检查，不能以“降级”绕过安全闸门。
+
+Scene IR 是混合模式下的确定性后备路径：它从已经批准的 ScenePlan/TechnicalSpec 生成
+受限对象与生命周期程序，再编译成单 Scene Python。正常情况下仍优先保留 Coder 的完整
+创作结果；IR 仅在配置为 `ir` 或 Python Coder 失败时使用。`render_error_parser` 从最后一
+段 traceback 提取异常类型、源码行、上下文和稳定指纹，并把脱敏证据写入 run artifact，
+防止 AutoFix 被同一日志中较早的旧异常带偏。
+
 Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
 
 连续性审查与代码审查同样分离。连续性修正轮数耗尽时，系统会把当时已经通过确定性
@@ -147,7 +166,7 @@ Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder �
 
 连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除旧交接代码并按顺序重新编码；恢复旧清单时会优先重新提取导出区，提取失败不会静默复用下游状态。
 
-当 `LOCAL_SMOKE_RENDER_ENABLED=true` 且不是 dry-run 时，代码在进入 Reviewer 前会以低质量、
+当 `LOCAL_SMOKE_RENDER_ENABLED=true` 且不是 dry-run 时，或 CLI 显式使用 `--smoke` 时，代码在进入 Reviewer 前会以低质量、
 同 renderer 的本地命令运行一次；若配置了 Apptainer，则沿用 containall/cleanenv/no-home、当前
 run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信息的阶段快照，失败直接阻断该场景，
 不会把本地 Smoke Render 产物当作正式视频。
@@ -167,7 +186,9 @@ run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信�
 - conda base 优先使用配置，否则加载 module 并动态探测；
 - 可选 Apptainer 使用 `--containall --cleanenv --no-home`，只绑定当前 run；OpenGL 增加 `--nv` 并显式传递 `PYOPENGL_PLATFORM`。
 
-每次成功提交都会保存数字 Job ID、提交时间、代码哈希和 RenderProfile。监控区分：
+每次成功提交都会保存数字 Job ID、提交时间、代码哈希、RenderProfile 和实际资源配置。资源
+估计器默认只记录基于风险的建议；设置 `AUTO_RESOURCE_ESTIMATION=true` 后，才会对复杂场景
+向上增加 CPU、内存和时间，Cairo 仍不申请 GPU，用户显式资源不会被降低。监控区分：
 
 - 正常调度器状态；
 - `GONE`：squeue 可达，但作业不在队列且 sacct 无记录；
@@ -238,7 +259,7 @@ VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifa
 ### 3.7 VISUAL_EVALUATING / EVALUATING
 
 - 代码和效率指标由确定性逻辑计算；运行对比会聚合同一指标的所有场景分数。
-- 每个场景在合并前从精确 `SceneArtifact` 抽取 1–8 帧；抽样优先覆盖开场、首个数学状态、中段、结论和结束状态。多场景合并前另抽取真实相邻场景的 `boundary_end`/`boundary_start` 帧，检查交接对象是否丢失。每帧保存可信时间戳、语义 role 和 SHA-256，一次多模态请求联合检查数学正确性、相关性、可读性、布局与跨帧一致性；场景产物完成后立即启动该检查。
+- 每个场景在合并前从精确 `SceneArtifact` 抽取 1–8 帧；抽样优先覆盖开场、首个数学状态、中段、结论和结束状态。多场景合并前另抽取真实相邻场景的 `boundary_end`/`boundary_start` 帧，先用可选 Pillow 做尺寸、近黑帧和亮度突变的确定性健康检查，再检查交接对象是否丢失。每帧保存可信时间戳、语义 role 和 SHA-256，一次多模态请求联合检查数学正确性、相关性、可读性、布局与跨帧一致性；场景产物完成后立即启动该检查。
 - 响应使用关闭的 Pydantic schema；问题必须引用本次存在的帧 ID。视觉输出被当作不可信诊断，不能直接提供或执行代码。
 - 低于阈值或存在 major 问题时，按 `repair_target` 路由：数学/叙事问题回到 Planner，元素交接问题回到 Continuity，布局/可读性问题才交给主 Coder。所有代码重新经过 AST 校验、Reviewer 和 Slurm 渲染；每场景修复次数有界，失败时可恢复完整、哈希可验证的最佳候选。
 - 抽帧、端点或结构化响应失败时记录为 `unknown`，不填充假分数，也不丢弃已经成功渲染的视频。`passed`、`warning`、`unknown` 收据都必须绑定当前视频哈希，合并前再次校验。
