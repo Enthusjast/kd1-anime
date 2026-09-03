@@ -80,6 +80,7 @@ jobs:
         run: |
           bash -n install.sh
           test -s resources/manim-0.20.1-knowledge.tar.gz
+          test -s resources/manim-0.20.1-recipes.tar.gz
           python -m build --sdist
           archive="$(find dist -maxdepth 1 -name 'kd1_anime-*.tar.gz' -print -quit)"
           test -n "$archive"
