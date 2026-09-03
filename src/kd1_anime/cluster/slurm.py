@@ -693,14 +693,19 @@ class SlurmDispatcher:
             smoke_dir_q = shlex.quote(str(smoke_dir))
             smoke_class_q = shlex.quote(f"{scene_class_name}.mp4")
             smoke_video_q = shlex.quote(str(smoke_dir / "__smoke_video_path.txt"))
+            # 通过位置参数把宿主 shell 中的路径传入 probe 子进程；不能
+            # 只依赖未 export 的 smoke_video，尤其是 Apptainer --cleanenv
+            # 会清除普通环境变量。
             smoke_probe_command = command_for(
                 [
                     "sh",
                     "-c",
                     "ffprobe -v error -show_entries format=duration "
-                    "-of default=noprint_wrappers=1:nokey=1 \"$smoke_video\" >/dev/null",
+                    "-of default=noprint_wrappers=1:nokey=1 \"$1\" >/dev/null",
+                    "kd1-smoke-probe",
+                    "__KD1_SMOKE_VIDEO__",
                 ]
-            )
+            ).replace("__KD1_SMOKE_VIDEO__", '"$smoke_video"')
             lines.extend(
                 [
                     'echo "[Smoke] 开始轻量运行时检查"',

@@ -116,6 +116,7 @@ def test_script_runs_same_renderer_smoke_before_formal_render(monkeypatch, tmp_p
     assert "未生成有效最终 MP4" in script
     assert "ffprobe -v error" in script
     assert "partial_movie_files" in script
+    assert '"$smoke_video"' in script
 
 
 def test_script_can_disable_smoke_render(monkeypatch, tmp_path):
