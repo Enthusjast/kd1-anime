@@ -6265,6 +6265,28 @@ class Orchestrator:
                 self._checkpoint(ctx, State.FIXING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
+        deterministic_patches = fixer.deterministic_patches(state.code, error_log)
+        if deterministic_patches:
+            patch_result = ReviewResult(
+                is_valid=False,
+                severity="minor",
+                feedback="根据渲染日志发现可唯一定位的旧 API 调用",
+                fixes=deterministic_patches,
+            )
+            if self._apply_precise_review_fixes(ctx, scene_id, state, patch_result):
+                # 当前失败 Job 已经结束；补丁产生新代码后必须清除旧
+                # Job，避免渲染循环再次轮询同一个已结束作业。
+                with self._state_lock:
+                    state.slurm_job = None
+                    self._checkpoint(ctx, State.FIXING)
+                self._request_continuity_rebuild(
+                    ctx,
+                    scene_id,
+                    preserve_visual_candidates=state.visual_best_candidate is not None,
+                    include_failed=True,
+                )
+                self._emit("scene_render_patch_applied", scene_id=scene_id)
+                return
         # 连续相同错误 → 判定为环境/配置问题, 提前放弃, 不再浪费修复次数
         fp = self._error_fingerprint(error_log)
         with self._state_lock:

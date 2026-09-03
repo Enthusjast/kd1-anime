@@ -19,6 +19,7 @@ from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
     renderer_guidance,
 )
+from kd1_anime.agents.reviewer import FixSuggestion
 from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.config import settings
 
@@ -224,6 +225,32 @@ class AutoFixerAgent(BaseAgent):
         "no module named 'manim'",
         "no module named manim",
     )
+
+    @staticmethod
+    def deterministic_patches(code: str, error_log: str) -> list[FixSuggestion]:
+        """返回可由唯一文本匹配证明安全的常见 API 补丁。
+
+        这些补丁只处理明确的旧 API 拼写，不猜测数学或动画结构。调用方
+        仍必须执行 AST、连续性和生命周期校验；无法唯一匹配时返回空列表，
+        继续使用完整 AutoFix LLM。
+        """
+
+        text = (error_log or "").lower()
+        candidates = (
+            ("ShowCreation", "Create", "ManimCE 已移除 ShowCreation"),
+            ("TextMobject", "Text", "ManimCE 使用 Text"),
+            ("TexMobject", "MathTex", "ManimCE 使用 MathTex"),
+            (".setColor(", ".set_color(", "ManimCE 使用 snake_case 方法名"),
+            (".moveToEdge(", ".to_edge(", "ManimCE 使用 to_edge"),
+        )
+        patches: list[FixSuggestion] = []
+        for find, replace, reason in candidates:
+            error_token = find.lower().replace(".", "").replace("(", "")
+            if error_token not in text:
+                continue
+            if code.count(find) == 1:
+                patches.append(FixSuggestion(find=find, replace=replace, reason=reason))
+        return patches
 
     def fix(
         self,
