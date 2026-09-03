@@ -28,6 +28,7 @@ from kd1_anime.agents.planner import (
 )
 from kd1_anime.agents.state_ledger import StateLedger
 from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
@@ -242,6 +243,7 @@ class StoredSlurmJob(BaseModel):
     started_at: float | None = Field(default=None, gt=0)
     code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
+    resource_profile: RenderResourceProfile | None = None
     output_path: str | None = None
     output_metadata: VideoMetadata | None = None
     output_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
@@ -314,6 +316,7 @@ class StoredSceneState(BaseModel):
     technical_input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     technical_status: TechnicalStatus = "pending"
     technical_error: str = Field(default="", max_length=50_000)
+    resource_profile: RenderResourceProfile | None = None
     local_smoke_status: LocalSmokeStatus = "pending"
     rewrite_feedback: str = Field(default="", max_length=50_000)
     review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
@@ -699,6 +702,7 @@ def store_slurm_job(job: SlurmJob, root: Path) -> StoredSlurmJob:
         started_at=job.started_at,
         code_sha256=job.code_sha256,
         render_profile=job.render_profile,
+        resource_profile=job.resource_profile,
         output_path=_run_relative(root, job.output_path) if job.output_path else None,
         output_metadata=job.output_metadata,
         output_sha256=job.output_sha256,
@@ -724,6 +728,7 @@ def restore_slurm_job(stored: StoredSlurmJob, root: Path) -> SlurmJob:
         started_at=stored.started_at,
         code_sha256=stored.code_sha256,
         render_profile=stored.render_profile,
+        resource_profile=stored.resource_profile,
         output_path=(restore_run_path(root, stored.output_path) if stored.output_path else None),
         output_metadata=stored.output_metadata,
         output_sha256=stored.output_sha256,

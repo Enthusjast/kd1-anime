@@ -161,6 +161,7 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | SLURM_MEM_GB | 空 | 可选内存约束，如 32G |
 | SLURM_GPU_TYPE | 空 | OpenGL 作业的 GPU 类型 |
 | SLURM_GPU_COUNT | 1 | OpenGL GPU 数 |
+| AUTO_RESOURCE_ESTIMATION | false | 是否按场景复杂度自动增加资源（只向上调整） |
 | SLURM_MAX_IN_FLIGHT | 0 | 最大在途场景作业数；0 表示不限制 |
 | SLURM_SUBMIT_RETRIES | 3 | 明确 sbatch 失败的重试次数 |
 | SLURM_SUBMIT_RETRY_DELAY | 2.0 | sbatch 重试退避秒数 |

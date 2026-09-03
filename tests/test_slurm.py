@@ -2,6 +2,7 @@ import time
 
 import pytest
 
+from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.cluster.slurm import JobMonitor, SlurmDispatcher, SlurmJob, SlurmMonitorCoordinator
 from kd1_anime.config import settings
 from kd1_anime.rendering import VideoMetadata
@@ -63,6 +64,32 @@ def test_opengl_script_forces_write_to_movie(monkeypatch, tmp_path):
     assert "--renderer=opengl" in script
     assert "--write_to_movie" in script
     assert "--gres=gpu" in script
+
+
+def test_script_uses_per_scene_resource_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    resources = RenderResourceProfile(
+        cpus_per_task=8,
+        mem_gb=32,
+        time_limit="02:00:00",
+        gpu_type="A100",
+        gpu_count=2,
+    )
+
+    script = SlurmDispatcher()._build_script(
+        1,
+        tmp_path / "scene.py",
+        "Demo",
+        tmp_path / "media",
+        tmp_path / "out",
+        tmp_path / "err",
+        resource_profile=resources,
+    )
+
+    assert "#SBATCH --cpus-per-task=8" in script
+    assert "#SBATCH --mem=32G" in script
+    assert "#SBATCH -t 02:00:00" in script
+    assert "#SBATCH --gres=gpu:A100:2" in script
 
 
 def test_opengl_container_receives_pyopengl_platform(monkeypatch, tmp_path):

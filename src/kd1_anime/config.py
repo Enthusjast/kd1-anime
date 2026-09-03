@@ -462,6 +462,10 @@ class Settings(BaseSettings):
     SLURM_MEM_GB: str = ""
     SLURM_GPU_TYPE: str = ""
     SLURM_GPU_COUNT: int = Field(default=1, ge=1)
+    AUTO_RESOURCE_ESTIMATION: bool = Field(
+        default=False,
+        description="是否按场景复杂度自动增加 Slurm CPU/内存/时间资源",
+    )
     # 0 表示不额外限制；正整数用于避免一次向共享集群提交过多场景。
     SLURM_MAX_IN_FLIGHT: int = Field(default=0, ge=0, le=1_000)
     SLURM_SUBMIT_RETRIES: int = Field(default=3, ge=1, le=10)

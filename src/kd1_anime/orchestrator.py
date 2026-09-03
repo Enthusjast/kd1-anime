@@ -89,6 +89,10 @@ from kd1_anime.agents.technical_planner import (
     normalize_technical_spec_contract,
 )
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
+from kd1_anime.cluster.resource_estimator import (
+    RenderResourceProfile,
+    estimate_render_resources,
+)
 from kd1_anime.cluster.slurm import (
     FAILURE_STATES,
     JobMonitor,
@@ -290,6 +294,7 @@ class SceneState:
     technical_input_sha256: str = ""
     technical_status: str = "pending"
     technical_error: str = ""
+    resource_profile: RenderResourceProfile | None = None
     # 本地 Smoke Render 的恢复凭据；未通过或未完成时，恢复/AutoFix 后
     # 必须在 Reviewer 前重新执行，不能只依赖旧的内存状态。
     local_smoke_status: str = "pending"
@@ -868,6 +873,7 @@ class Orchestrator:
                     technical_input_sha256=scene.technical_input_sha256,
                     technical_status=scene.technical_status,
                     technical_error=scene.technical_error,
+                    resource_profile=scene.resource_profile,
                     local_smoke_status=scene.local_smoke_status,
                     rewrite_feedback=scene.rewrite_feedback,
                     review_signature=scene.review_signature,
@@ -1161,6 +1167,10 @@ class Orchestrator:
                 technical_input_sha256=getattr(stored, "technical_input_sha256", ""),
                 technical_status=getattr(stored, "technical_status", "pending"),
                 technical_error=getattr(stored, "technical_error", ""),
+                resource_profile=(
+                    getattr(stored, "resource_profile", None)
+                    or (getattr(job, "resource_profile", None) if job is not None else None)
+                ),
                 local_smoke_status=getattr(stored, "local_smoke_status", "pending"),
                 rewrite_feedback=getattr(stored, "rewrite_feedback", ""),
                 review_signature=getattr(stored, "review_signature", ""),
@@ -6119,15 +6129,42 @@ class Orchestrator:
         state.class_name = validation.scene_classes[0]
         job: SlurmJob | None = None
         try:
+            resource_profile = estimate_render_resources(
+                state.plan,
+                state.technical_spec,
+                ctx.render_profile,
+                cpus_per_task=settings.SLURM_CPUS_PER_TASK,
+                mem_gb=settings.SLURM_MEM_GB,
+                time_limit=settings.SLURM_TIME_LIMIT,
+                gpu_type=settings.SLURM_GPU_TYPE,
+                gpu_count=settings.SLURM_GPU_COUNT,
+                apply_estimate=settings.AUTO_RESOURCE_ESTIMATION,
+            )
+            with self._state_lock:
+                state.resource_profile = resource_profile
+            self._emit(
+                "scene_resources_estimated",
+                scene_id=scene_id,
+                estimated=resource_profile.estimated,
+                cpus_per_task=resource_profile.cpus_per_task,
+                mem_gb=resource_profile.mem_gb,
+                time_limit=resource_profile.time_limit,
+                reasons=list(resource_profile.reasons),
+            )
+            submit_kwargs = {
+                "scenes_dir": ctx.paths.scenes,
+                "logs_dir": ctx.paths.logs,
+                "videos_dir": ctx.paths.videos,
+                "code_sha256": sha256_text(state.code),
+                "render_profile": ctx.render_profile,
+            }
+            if self._supports_keyword(self.slurm.submit_scene, "resource_profile"):
+                submit_kwargs["resource_profile"] = resource_profile
             job = self.slurm.submit_scene(
                 scene_id,
                 source_path,
                 state.class_name,
-                scenes_dir=ctx.paths.scenes,
-                logs_dir=ctx.paths.logs,
-                videos_dir=ctx.paths.videos,
-                code_sha256=sha256_text(state.code),
-                render_profile=ctx.render_profile,
+                **submit_kwargs,
             )
             expected_code_hash = sha256_text(state.code)
             if job.code_sha256 and job.code_sha256 != expected_code_hash:
