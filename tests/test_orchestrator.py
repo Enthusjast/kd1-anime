@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
+from kd1_anime.agents.api_linter import lint_manim_api
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
@@ -60,6 +61,28 @@ def test_failure_router_separates_plan_math_from_runtime_api_errors():
         classify_failure("AttributeError: OpenGLCamera has no frame", phase="render").handler
         == "code_patch"
     )
+
+
+def test_api_linter_rejects_deprecated_manim_api():
+    result = lint_manim_api(
+        "from manim import *\nclass Demo(Scene):\n"
+        "    def construct(self): self.play(ShowCreation(Circle()))"
+    )
+    assert result.is_valid is False
+    assert any("ShowCreation" in error for error in result.errors)
+
+
+def test_api_linter_warns_about_unbounded_graph_and_updater():
+    result = lint_manim_api(
+        "from manim import *\nclass Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        axes = Axes()\n"
+        "        graph = axes.plot(lambda x: x**2)\n"
+        "        dot = always_redraw(lambda: Dot())\n"
+    )
+    assert result.is_valid is True
+    assert any("x_range" in warning for warning in result.warnings)
+    assert any("clear_updaters" in warning for warning in result.warnings)
 
 
 def test_continuity_context_mode_defaults_to_only_requested_exports(monkeypatch, tmp_path):

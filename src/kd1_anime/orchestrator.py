@@ -24,6 +24,7 @@ from uuid import uuid4
 from rich.console import Console
 from rich.prompt import Confirm
 
+from kd1_anime.agents.api_linter import lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import (
@@ -1257,6 +1258,7 @@ class Orchestrator:
         last_validation: CodeValidationResult | None = None
         last_continuity_error = ""
         last_lifecycle_error = ""
+        last_api_errors: tuple[str, ...] = ()
         if technical_spec is not None:
             technical_result = compile_technical_spec(
                 plan,
@@ -1322,6 +1324,7 @@ class Orchestrator:
             code = strip_redundant_optional_export_block(code, plan)
 
             validation = self._validate(code, renderer=renderer)
+            api_result = lint_manim_api(code, renderer=renderer, scene_plan=plan)
             continuity_error = ""
             try:
                 extract_scene_continuity_elements(code, plan)
@@ -1336,9 +1339,15 @@ class Orchestrator:
                 )
                 if not lifecycle_result.is_valid:
                     lifecycle_error = "\n".join(lifecycle_result.errors)
-            if validation.is_valid and not continuity_error and not lifecycle_error:
+            if (
+                validation.is_valid
+                and api_result.is_valid
+                and not continuity_error
+                and not lifecycle_error
+            ):
                 return code, validation.scene_classes[0]
             last_validation = validation
+            last_api_errors = api_result.errors
             last_continuity_error = continuity_error
             last_lifecycle_error = lifecycle_error
             # 提供详细的修复指导
@@ -1348,6 +1357,10 @@ class Orchestrator:
                 "次修复。不得原样返回上一候选代码，必须针对下面的确定性错误做最小修改：\n"
                 f"{validation.feedback}"
             ]
+            if api_result.errors:
+                feedback_parts.append(
+                    "\nManim API 静态检查未通过，必须先修复：\n- " + "\n- ".join(api_result.errors)
+                )
             if current_previous and code == current_previous:
                 feedback_parts.append(
                     "\n上一候选代码与本次输出完全相同，说明上一次修复没有生效；"
@@ -1437,6 +1450,9 @@ class Orchestrator:
                         if last_continuity_error
                         else "",
                         f"动画生命周期错误: {last_lifecycle_error}" if last_lifecycle_error else "",
+                        "Manim API 静态检查错误: " + "; ".join(last_api_errors)
+                        if last_api_errors
+                        else "",
                     )
                     if part
                 )
@@ -5853,6 +5869,13 @@ class Orchestrator:
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.CODING)
         self._local_smoke_render(ctx, state)
+        api_result = lint_manim_api(
+            code,
+            renderer=ctx.render_profile.renderer,
+            scene_plan=state.plan,
+        )
+        if api_result.warnings:
+            self._emit("scene_api_warning", scene_id=scene_id, warnings=list(api_result.warnings))
         self._emit("scene_coded", scene_id=scene_id, file_path=str(path))
 
     def _scene_review(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
@@ -5958,6 +5981,23 @@ class Orchestrator:
                 self._checkpoint(ctx, State.DISPATCHING)
             self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
             return
+        api_result = lint_manim_api(
+            on_disk_code,
+            renderer=ctx.render_profile.renderer,
+            scene_plan=state.plan,
+        )
+        if not api_result.is_valid:
+            with self._state_lock:
+                self._mark_failed(
+                    state,
+                    "提交前 Manim API 静态检查失败:\n" + "\n".join(api_result.errors),
+                    "coding",
+                )
+                self._checkpoint(ctx, State.DISPATCHING)
+            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+            return
+        if api_result.warnings:
+            self._emit("scene_api_warning", scene_id=scene_id, warnings=list(api_result.warnings))
         if state.technical_spec is not None:
             lifecycle_result = validate_animation_lifecycle(
                 on_disk_code,
