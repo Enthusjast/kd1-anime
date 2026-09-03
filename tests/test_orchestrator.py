@@ -61,6 +61,63 @@ def test_failure_router_separates_plan_math_from_runtime_api_errors():
     )
 
 
+def test_continuity_context_mode_defaults_to_only_requested_exports(monkeypatch, tmp_path):
+    previous_plan = plan()
+    previous_plan = previous_plan.model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="kept", variable_name="kept"),
+                VisualElementState(element_id="other", variable_name="other"),
+            ]
+        }
+    )
+    current_plan = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [
+                VisualElementState(element_id="kept", variable_name="kept")
+            ],
+        }
+    )
+    previous = SceneState(
+        plan=previous_plan,
+        exported_elements_code="kept = Circle()\n\nother = Square()",
+        exported_elements=[
+            ExtractedElement(element_id="kept", variable_name="kept", code="kept = Circle()"),
+            ExtractedElement(element_id="other", variable_name="other", code="other = Square()"),
+        ],
+    )
+    state = SceneState(plan=current_plan)
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={1: previous, 2: state},
+    )
+    orchestrator = Orchestrator()
+
+    monkeypatch.setattr(settings, "CONTINUITY_CONTEXT_MODE", "minimal")
+    orchestrator._prepare_inherited_context(ctx, 2, state)
+    assert state.inherited_elements_code == "kept = Circle()"
+
+    monkeypatch.setattr(settings, "CONTINUITY_CONTEXT_MODE", "full")
+    orchestrator._prepare_inherited_context(ctx, 2, state)
+    assert "other = Square()" in state.inherited_elements_code
+
+
+def test_stateless_mode_does_not_inject_unrequested_legacy_exports(monkeypatch, tmp_path):
+    previous = SceneState(
+        plan=plan(),
+        exported_elements_code="old = Circle()",
+    )
+    current = SceneState(plan=plan().model_copy(update={"scene_id": 2}))
+    ctx = PipelineContext("prompt", paths=paths(tmp_path), scene_states={1: previous, 2: current})
+    monkeypatch.setattr(settings, "CONTINUITY_CONTEXT_MODE", "stateless")
+
+    Orchestrator()._prepare_inherited_context(ctx, 2, current)
+
+    assert current.inherited_elements_code == ""
+
+
 def paths(tmp_path: Path):
     root = tmp_path / "run"
     return RunPaths(

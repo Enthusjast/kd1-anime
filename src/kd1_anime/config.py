@@ -509,6 +509,10 @@ class Settings(BaseSettings):
     MAX_PLAN_REPLAN_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     # 全片分镜连续性审查发现冲突后的最大局部重规划轮数。
     MAX_CONTINUITY_FIX_ROUNDS: int = Field(default=2, ge=0, le=10)
+    CONTINUITY_CONTEXT_MODE: Literal["minimal", "full", "stateless"] = Field(
+        default="minimal",
+        description="Coder 接收的跨场景上下文范围；默认只传递当前场景需要的元素",
+    )
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
     SAFE_FALLBACK_ENABLED: bool = Field(
         default=True,

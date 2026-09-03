@@ -201,6 +201,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MAX_PLAN_REVIEW_ROUNDS | 2 | 单场景计划审查轮数 |
 | MAX_PLAN_REPLAN_ATTEMPTS | 3 | 计划反馈后的 Planner 总重调用次数 |
 | MAX_CONTINUITY_FIX_ROUNDS | 2 | 连续性局部重规划次数；耗尽后 warning 放行 |
+| CONTINUITY_CONTEXT_MODE | minimal | 跨场景代码上下文范围：minimal、full 或 stateless |
 | SKIP_REVIEW | false | 是否跳过语义代码审查；确定性校验仍保留 |
 | SAFE_FALLBACK_ENABLED | true | 高风险几何失败后是否切换保守方案 |
 | MAX_IDENTICAL_REVIEW_ATTEMPTS | 2 | 相同代码/反馈重复次数上限 |

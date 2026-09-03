@@ -5486,6 +5486,7 @@ class Orchestrator:
                 for item in exported_elements
             ]
         inherited_ids = {item.element_id for item in state.plan.inherited_elements}
+        context_mode = settings.CONTINUITY_CONTEXT_MODE
         if inherited_ids and previous.exported_elements:
             selected = [
                 item.code for item in previous.exported_elements if item.element_id in inherited_ids
@@ -5501,7 +5502,11 @@ class Orchestrator:
                     f"Scene {scene_id} 所需继承元素未由 Scene {scene_id - 1} 导出: "
                     + ", ".join(sorted(missing_ids))
                 )
-            state.inherited_elements_code = "\n\n".join(selected)
+            state.inherited_elements_code = (
+                previous.exported_elements_code
+                if context_mode == "full"
+                else "\n\n".join(selected)
+            )
         elif inherited_ids:
             selected_entries = ctx.element_manifest.for_elements(inherited_ids)
             selected_ids = {entry.element_id for entry in selected_entries}
@@ -5511,14 +5516,19 @@ class Orchestrator:
                     f"Scene {scene_id} 所需继承元素没有可验证的状态账本记录: "
                     + ", ".join(sorted(missing_ids))
                 )
-            state.inherited_elements_code = "\n\n".join(
-                entry.source_code for entry in selected_entries
+            state.inherited_elements_code = (
+                "\n\n".join(entry.source_code for entry in ctx.element_manifest.entries)
+                if context_mode == "full"
+                else "\n\n".join(entry.source_code for entry in selected_entries)
             )
             if not state.inherited_elements_code.strip():
                 raise ValueError(f"Scene {scene_id} 的继承元素记录为空，禁止继续编码")
         else:
-            # 旧计划没有结构化 inherited_elements 时保留原有交接行为。
-            state.inherited_elements_code = previous.exported_elements_code
+            # 没有结构化继承合同的旧计划只在 full 模式保留旧的完整交接；
+            # stateless 明确关闭上下文，minimal 不向无继承场景注入临时对象。
+            state.inherited_elements_code = (
+                previous.exported_elements_code if context_mode == "full" else ""
+            )
 
     @staticmethod
     def _refresh_scene_export(state: SceneState) -> None:
