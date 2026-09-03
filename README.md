@@ -258,6 +258,10 @@ kd1-anime resume <run-id>
 # 只重试某个失败场景
 kd1-anime retry <run-id> --scene-id 2
 
+# 查看离线成功率、审查/修复次数和失败分类；不会调用 LLM 或 Slurm
+kd1-anime stats
+kd1-anime stats <run-id> --json
+
 # 清理 30 天前的已结束运行
 kd1-anime clean --older-than 30d --yes
 ```

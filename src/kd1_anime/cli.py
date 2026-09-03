@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -728,6 +729,52 @@ def status(
             f"{rendered}/{len(manifest.scenes)}",
         )
     console.print(table)
+
+
+@app.command()
+def stats(
+    run_id: str = typer.Argument(None, help="运行 ID；省略时汇总最近运行"),
+    limit: int = typer.Option(20, "--limit", min=1, max=200, help="最多汇总的运行数"),
+    json_output: bool = typer.Option(False, "--json", help="以机器可读 JSON 输出"),
+):
+    """查看离线生成统计，不调用 LLM 或 Slurm。"""
+
+    from kd1_anime.stats import collect_stats
+
+    try:
+        report = collect_stats(settings.WORKSPACE_DIR, run_id, limit=limit)
+    except Exception as exc:
+        console.print(f"[bold red]统计失败:[/] {exc}", markup=False)
+        raise typer.Exit(1) from exc
+    if json_output:
+        console.print_json(json.dumps(report, ensure_ascii=False))
+        return
+    runs = report["runs"]
+    if not runs:
+        console.print("没有可用的运行记录")
+        return
+    table = Table(title="Pipeline statistics")
+    for column in ("Run ID", "Status", "Scenes", "Plan reviews", "Code reviews", "Fixes", "Fallbacks"):
+        table.add_column(column)
+    for item in runs:
+        scenes = item["scenes"]
+        table.add_row(
+            item["run_id"],
+            item["status"],
+            f"{scenes['rendered']}/{item['scene_count']}",
+            str(item["plan_review_attempts"]),
+            str(item["review_attempts"]),
+            str(item["fix_attempts"]),
+            str(scenes["safe_fallback"]),
+        )
+    console.print(table)
+    category_counts = Counter()
+    for item in runs:
+        category_counts.update(item["failure_categories"])
+    if category_counts:
+        console.print("失败分类: " + ", ".join(f"{key}={value}" for key, value in sorted(category_counts.items())))
+    if report["read_errors"]:
+        console.print(f"[yellow]有 {len(report['read_errors'])} 个运行清单读取失败[/]")
 
 
 @app.command()

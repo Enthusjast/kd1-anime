@@ -15,7 +15,16 @@ def test_cli_registers_all_public_commands():
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0, result.output
-    for command in ("generate", "resume", "batch", "doctor", "evaluate", "test-llm", "rag"):
+    for command in (
+        "generate",
+        "resume",
+        "batch",
+        "doctor",
+        "evaluate",
+        "test-llm",
+        "stats",
+        "rag",
+    ):
         assert command in result.output
 
 
