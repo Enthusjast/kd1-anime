@@ -79,6 +79,7 @@ class TestScene(Scene):
         assert "class Scene1(Scene)" in code
         assert code.count("class ") == 1
         assert "KD1_CONTINUITY_EXPORT_BEGIN" in code
+        assert "圆形面积" in code
 
     def test_extract_code_block_without_fences(self, coder_agent):
         """测试提取不带围栏的代码块。"""

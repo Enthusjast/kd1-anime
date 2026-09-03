@@ -196,7 +196,10 @@ def build_safe_scene_code(
             "        # KD1_CONTINUITY_EXPORT_END",
             "",
             f"        title = Text({quote(scene_plan.title[:120])}, font_size=32)",
+            f"        summary = Text({quote((scene_plan.math_concept + '：' + scene_plan.computation)[:240])}, font_size=24)",
+            "        summary.next_to(title, DOWN, buff=0.5)",
             "        self.play(FadeIn(title), run_time=0.5)",
+            "        self.play(FadeIn(summary), run_time=0.5)",
         ]
     )
     for index, item in enumerate(removed):
