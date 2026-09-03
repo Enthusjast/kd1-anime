@@ -337,6 +337,9 @@ class PipelineContext:
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    # 显式 --smoke 可让 dry-run 执行一次本地低质量预检；该开关写入
+    # manifest，恢复时继续沿用，不能因 CLI 省略参数而悄悄跳过。
+    local_smoke_enabled: bool = False
     # Direct ``render`` runs already contain user-reviewed code.  They must
     # never enter the planning/TechnicalSpec/Reviewer LLM stages, including
     # after a no-wait run is resumed.
@@ -899,6 +902,7 @@ class Orchestrator:
                 dry_run=ctx.dry_run,
                 interactive=ctx.interactive,
                 auto_fix=ctx.auto_fix,
+                local_smoke_enabled=ctx.local_smoke_enabled,
                 direct_render=ctx.direct_render,
                 approve_plan=ctx.approve_plan,
                 plan_approved=ctx.plan_approved,
@@ -1180,6 +1184,7 @@ class Orchestrator:
             dry_run=manifest.dry_run,
             interactive=manifest.interactive,
             auto_fix=manifest.auto_fix,
+            local_smoke_enabled=getattr(manifest, "local_smoke_enabled", False),
             direct_render=direct_render,
             approve_plan=getattr(manifest, "approve_plan", False),
             plan_approved=getattr(manifest, "plan_approved", False),
@@ -1477,6 +1482,7 @@ class Orchestrator:
         interactive: bool = False,
         output_path: Path | None = None,
         approve_plan: bool = False,
+        smoke: bool = False,
     ) -> Path | None:
         """增量渲染：只重新渲染受 prompt 变化影响的场景。"""
         # CLI 会在进入流水线前做真实网络探测；库调用方至少也必须通过
@@ -1512,6 +1518,7 @@ class Orchestrator:
             original_prompt=user_prompt,
             dry_run=dry_run,
             interactive=interactive,
+            local_smoke_enabled=smoke,
             incremental=True,
             approve_plan=approve_plan,
             base_run_id=base_run_id,
@@ -1537,6 +1544,7 @@ class Orchestrator:
         interactive: bool = False,
         output_path: Path | None = None,
         approve_plan: bool = False,
+        smoke: bool = False,
     ) -> Path | None:
         # 保持 programmatic API 与 CLI 的配置门槛一致。网络可用性由 CLI
         # 的启动探测负责，底层 Agent 仍会在真正调用时给出详细错误。
@@ -1560,6 +1568,7 @@ class Orchestrator:
             interactive=interactive,
             paths=RunPaths.create(output_path),
             approve_plan=approve_plan,
+            local_smoke_enabled=smoke,
             visual_eval_profile=self._configured_visual_profile(
                 enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
             ),
@@ -2005,6 +2014,7 @@ class Orchestrator:
         interactive: bool = False,
         output_path: Path | None = None,
         approve_plan: bool = False,
+        smoke: bool = False,
     ) -> Path | None:
         """从 ``kd1-anime plan --output`` 生成的计划文件继续执行。"""
 
@@ -2041,6 +2051,7 @@ class Orchestrator:
             paths=RunPaths.create(output_path),
             dry_run=dry_run,
             interactive=interactive,
+            local_smoke_enabled=smoke,
             approve_plan=approve_plan,
             outlines=[
                 SceneOutline(
@@ -2296,7 +2307,7 @@ class Orchestrator:
     ) -> None:
         """运行并持久化本地 Smoke Render 状态。"""
 
-        enabled = not ctx.dry_run and settings.LOCAL_SMOKE_RENDER_ENABLED
+        enabled = self._local_smoke_enabled(ctx)
         with self._state_lock:
             state.local_smoke_status = "running" if enabled else "skipped"
         if not enabled:
@@ -2317,6 +2328,14 @@ class Orchestrator:
             state.local_smoke_status = "passed"
             self._checkpoint(ctx, State.CODING)
         self._emit("scene_smoke_rendered", scene_id=state.plan.scene_id)
+
+    @staticmethod
+    def _local_smoke_enabled(ctx: PipelineContext) -> bool:
+        """判断当前运行是否明确允许执行本地 Smoke/Frame Canary。"""
+
+        return bool(
+            ctx.local_smoke_enabled or (not ctx.dry_run and settings.LOCAL_SMOKE_RENDER_ENABLED)
+        )
 
     def _local_smoke_render_impl(
         self,
@@ -3262,11 +3281,7 @@ class Orchestrator:
                     if not state.code or state.rewrite_feedback:
                         self._phase_emit("coding")
                         self._scene_code(ctx, scene_id, state)
-                    elif (
-                        not ctx.dry_run
-                        and settings.LOCAL_SMOKE_RENDER_ENABLED
-                        and state.local_smoke_status != "passed"
-                    ):
+                    elif self._local_smoke_enabled(ctx) and state.local_smoke_status != "passed":
                         self._local_smoke_render(ctx, state)
                     self._phase_emit("reviewing")
                     self._scene_review(ctx, scene_id, state)
@@ -5319,11 +5334,7 @@ class Orchestrator:
                     self._scene_code(ctx, scene_id, state)
                     if state.failed or state.give_up:
                         return
-                elif (
-                    not ctx.dry_run
-                    and settings.LOCAL_SMOKE_RENDER_ENABLED
-                    and state.local_smoke_status != "passed"
-                ):
+                elif self._local_smoke_enabled(ctx) and state.local_smoke_status != "passed":
                     self._local_smoke_render(ctx, state)
                 self._phase_emit("reviewing")
                 self._scene_review(ctx, scene_id, state)
@@ -5370,11 +5381,7 @@ class Orchestrator:
                     if state.rewrite_feedback:
                         self._phase_emit("coding")
                         self._scene_code(ctx, scene_id, state)
-                    elif (
-                        not ctx.dry_run
-                        and settings.LOCAL_SMOKE_RENDER_ENABLED
-                        and state.local_smoke_status != "passed"
-                    ):
+                    elif self._local_smoke_enabled(ctx) and state.local_smoke_status != "passed":
                         self._local_smoke_render(ctx, state)
                     self._phase_emit("reviewing")
                     self._scene_review(ctx, scene_id, state)

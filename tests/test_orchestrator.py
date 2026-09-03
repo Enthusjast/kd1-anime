@@ -1400,6 +1400,17 @@ def test_local_smoke_render_is_skipped_for_dry_run(monkeypatch, tmp_path):
     assert called is False
 
 
+def test_explicit_smoke_override_enables_dry_run_canary(tmp_path):
+    ctx = PipelineContext(
+        "x",
+        paths=paths(tmp_path),
+        dry_run=True,
+        local_smoke_enabled=True,
+    )
+
+    assert Orchestrator._local_smoke_enabled(ctx) is True
+
+
 def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     source = run_paths.scenes / "scene_1.py"

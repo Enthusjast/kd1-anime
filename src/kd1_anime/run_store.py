@@ -376,6 +376,7 @@ class RunManifest(BaseModel):
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    local_smoke_enabled: bool = False
     # Direct ``render`` runs contain user-supplied code and intentionally skip
     # every generation/review LLM stage, including on resume.
     direct_render: bool = False
