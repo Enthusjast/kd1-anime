@@ -5971,6 +5971,7 @@ class Orchestrator:
             state.exported_elements_code = ""
             state.exported_elements = []
             state.local_smoke_status = "pending"
+            self._reset_repair_progress(state)
             if code_fallback_used:
                 state.safe_fallback_used = True
                 state.safe_fallback_reason = (

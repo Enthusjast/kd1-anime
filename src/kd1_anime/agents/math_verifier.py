@@ -139,7 +139,11 @@ def verify_expression_samples(
             right_value = _evaluate(right_tree, values)
         except (ArithmeticError, ValueError, OverflowError):
             continue
-        if not math.isfinite(left_value) or not math.isfinite(right_value):
+        try:
+            finite = math.isfinite(left_value) and math.isfinite(right_value)
+        except TypeError:
+            continue
+        if not finite:
             continue
         valid += 1
         difference = abs(left_value - right_value)
