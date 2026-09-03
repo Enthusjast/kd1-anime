@@ -8,6 +8,7 @@ Planner 负责创意，Plan Reviewer 负责语义判断；本模块只做不需�
 from __future__ import annotations
 
 import ast
+import math
 import re
 from fractions import Fraction
 from typing import Literal
@@ -329,9 +330,48 @@ def _safe_numeric(expression: str) -> float | None:
         return None
 
 
+def _safe_matrix(expression: str) -> tuple[tuple[float, ...], ...] | None:
+    """解析纯数字二维矩阵，不执行表达式或用户代码。"""
+
+    value = _normalise_expression(expression)
+    if not value.startswith("[[") or not value.endswith("]]" ):
+        return None
+    try:
+        parsed = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(parsed, (list, tuple)) or not parsed:
+        return None
+    rows: list[tuple[float, ...]] = []
+    width: int | None = None
+    for row in parsed:
+        if not isinstance(row, (list, tuple)) or not row:
+            return None
+        values: list[float] = []
+        for item in row:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                return None
+            number = float(item)
+            if not math.isfinite(number):
+                return None
+            values.append(number)
+        if width is None:
+            width = len(values)
+        if len(values) != width:
+            return None
+        rows.append(tuple(values))
+    return tuple(rows)
+
+
 def expressions_are_equivalent(left: str, right: str) -> bool | None:
     """返回 True/False；无法安全解析时返回 None。"""
 
+    left_matrix = _safe_matrix(left)
+    right_matrix = _safe_matrix(right)
+    if left_matrix is not None or right_matrix is not None:
+        if left_matrix is None or right_matrix is None:
+            return None
+        return left_matrix == right_matrix
     left_value = _polynomial(left)
     right_value = _polynomial(right)
     if left_value is not None and right_value is not None:
@@ -368,6 +408,18 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
                 continue
             pairs.append((left, right))
     return pairs
+
+
+_MATRIX_LITERAL = r"\[\s*\[[^\[\]]{1,120}\]\s*(?:,\s*\[[^\[\]]{1,120}\]\s*)*\]"
+_MATRIX_EQUATION_RE = re.compile(
+    rf"({_MATRIX_LITERAL})\s*(?:=|→|⟶)\s*({_MATRIX_LITERAL})"
+)
+
+
+def _matrix_equations(text: str) -> list[tuple[str, str]]:
+    """从自由文本中提取纯数字矩阵等式。"""
+
+    return _MATRIX_EQUATION_RE.findall(str(text or ""))
 
 
 class PlanCompiler:
@@ -627,7 +679,8 @@ class PlanCompiler:
                         )
                     )
 
-        for index, (left, right) in enumerate(_simple_equations(plan.computation), start=1):
+        simple_equations = _simple_equations(plan.computation)
+        for index, (left, right) in enumerate(simple_equations, start=1):
             if expressions_are_equivalent(left, right) is False:
                 issues.append(
                     PlanCompilerIssue(
@@ -636,6 +689,18 @@ class PlanCompiler:
                         scene_ids=scene_ids,
                         message=f"computation 中的等式不等价：{left} ≠ {right}。",
                         fix_instruction="修正等式，或把变量赋值与需要证明的等式分开书写。",
+                    )
+                )
+
+        for index, (left, right) in enumerate(_matrix_equations(plan.computation), start=1):
+            if expressions_are_equivalent(left, right) is False:
+                issues.append(
+                    PlanCompilerIssue(
+                        category="math",
+                        field=f"computation.matrix_equation_{len(simple_equations) + index}",
+                        scene_ids=scene_ids,
+                        message=f"computation 中的矩阵等式不等价：{left} ≠ {right}。",
+                        fix_instruction="逐项核对矩阵行列、元素和乘法结果。",
                     )
                 )
 
