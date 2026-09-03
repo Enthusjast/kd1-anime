@@ -690,15 +690,45 @@ class SlurmDispatcher:
             ]
             smoke_args = add_renderer_specific_args(smoke_args)
             smoke_command = command_for(smoke_args)
+            smoke_dir_q = shlex.quote(str(smoke_dir))
+            smoke_class_q = shlex.quote(f"{scene_class_name}.mp4")
+            smoke_video_q = shlex.quote(str(smoke_dir / "__smoke_video_path.txt"))
+            smoke_probe_command = command_for(
+                [
+                    "sh",
+                    "-c",
+                    "ffprobe -v error -show_entries format=duration "
+                    "-of default=noprint_wrappers=1:nokey=1 \"$smoke_video\" >/dev/null",
+                ]
+            )
             lines.extend(
                 [
                     'echo "[Smoke] 开始轻量运行时检查"',
-                    f"mkdir -p {shlex.quote(str(smoke_dir))}",
-                    (
-                        "if command -v timeout >/dev/null 2>&1; then "
-                        f"timeout {settings.SMOKE_RENDER_TIMEOUT}s {smoke_command}; "
-                        f"else {smoke_command}; fi"
-                    ),
+                    f"rm -f {smoke_video_q}",
+                    f"mkdir -p {smoke_dir_q}",
+                    "if command -v timeout >/dev/null 2>&1; then "
+                    f"timeout {settings.SMOKE_RENDER_TIMEOUT}s {smoke_command}; "
+                    f"else {smoke_command}; fi",
+                    # Manim 的退出码为 0 并不保证 OpenGL 已经写出最终
+                    # MP4（例如缺少 --write_to_movie 时）。必须把产物
+                    # 存在性作为 canary 的第二个独立成功条件。
+                    f"smoke_video=$(find {smoke_dir_q} -type f -name {smoke_class_q} "
+                    "! -path '*/partial_movie_files/*' -print -quit)",
+                    'if [ -z "$smoke_video" ] || [ ! -s "$smoke_video" ]; then',
+                    '    echo "[Smoke] 未生成有效最终 MP4" >&2',
+                    f"    mkdir -p {shlex.quote(str(smoke_marker.parent))}",
+                    marker_line("failed"),
+                    "    exit 1",
+                    "fi",
+                    # 读取一项元数据，尽早捕获空文件/损坏容器，而不是
+                    # 让正式高清渲染完成后才在合并阶段失败。
+                    f"if ! {smoke_probe_command}; then",
+                    '    echo "[Smoke] MP4 容器无法通过 ffprobe 校验" >&2',
+                    f"    mkdir -p {shlex.quote(str(smoke_marker.parent))}",
+                    marker_line("failed"),
+                    "    exit 1",
+                    "fi",
+                    f"printf '%s\\n' \"$smoke_video\" > {smoke_video_q}",
                     'echo "[Smoke] 运行时检查通过"',
                     f"mkdir -p {shlex.quote(str(smoke_marker.parent))}",
                     marker_line("passed"),
