@@ -7882,6 +7882,30 @@ class Orchestrator:
             )
             if not samples:
                 return False
+            from kd1_anime.eval.boundary_checks import check_boundary_samples
+
+            deterministic_report = check_boundary_samples(samples)
+            self._write_stage_artifact(
+                ctx,
+                "boundary_deterministic.json",
+                {
+                    "schema_version": 1,
+                    "scope": "scene_boundaries",
+                    "report": deterministic_report.to_dict(),
+                },
+            )
+            self._emit(
+                "boundary_deterministic_check",
+                status=deterministic_report.status,
+                checks=len(deterministic_report.checks),
+            )
+            if deterministic_report.status in {"failed", "warning"}:
+                with self._state_lock:
+                    ctx.continuity_warnings.extend(
+                        f"边界确定性检查：{message}"
+                        for check in deterministic_report.checks
+                        for message in check.messages
+                    )
             with self._state_lock:
                 boundaries = dict(ctx.state_ledger.boundaries)
                 for sample in samples:
@@ -7947,6 +7971,7 @@ class Orchestrator:
                     }
                     for sample in samples
                 ],
+                "deterministic_checks": deterministic_report.to_dict(),
                 "result": result.to_dict(),
                 "error": "",
             }
