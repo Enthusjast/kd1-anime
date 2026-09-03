@@ -93,7 +93,7 @@ def select_scene_template(
 
 def _base_template(scene_id: int, parent: str, *, marker: str) -> str:
     class_name = f"Scene{scene_id}"
-    return f'''```python
+    return f"""```python
 from manim import *
 
 class {class_name}({parent}):
@@ -109,7 +109,7 @@ class {class_name}({parent}):
 
         # 用 TechnicalSpec 中声明的真实对象和动画替换这里的示意注释。
         # 必须在本方法中完成 self.add/self.play/self.wait。
-```'''
+```"""
 
 
 def build_scene_template(

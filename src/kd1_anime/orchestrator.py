@@ -5503,9 +5503,7 @@ class Orchestrator:
                     + ", ".join(sorted(missing_ids))
                 )
             state.inherited_elements_code = (
-                previous.exported_elements_code
-                if context_mode == "full"
-                else "\n\n".join(selected)
+                previous.exported_elements_code if context_mode == "full" else "\n\n".join(selected)
             )
         elif inherited_ids:
             selected_entries = ctx.element_manifest.for_elements(inherited_ids)
@@ -5758,7 +5756,11 @@ class Orchestrator:
             except ValueError as fallback_exc:
                 fallback_continuity_error = str(fallback_exc)
             fallback_lifecycle_error = ""
-            if state.technical_spec is not None and fallback_validation.is_valid and not fallback_continuity_error:
+            if (
+                state.technical_spec is not None
+                and fallback_validation.is_valid
+                and not fallback_continuity_error
+            ):
                 lifecycle_result = validate_animation_lifecycle(
                     fallback_code,
                     state.technical_spec,

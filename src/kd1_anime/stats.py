@@ -58,9 +58,7 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
 
     scenes = list(manifest.scenes.values())
     failures = Counter(
-        scene.failure_category or "unknown"
-        for scene in scenes
-        if scene.failed or scene.give_up
+        scene.failure_category or "unknown" for scene in scenes if scene.failed or scene.give_up
     )
     events = _read_events(root) if root is not None else []
     event_counts = Counter(str(event["event"]) for event in events)

@@ -74,9 +74,7 @@ def test_continuity_context_mode_defaults_to_only_requested_exports(monkeypatch,
     current_plan = plan().model_copy(
         update={
             "scene_id": 2,
-            "inherited_elements": [
-                VisualElementState(element_id="kept", variable_name="kept")
-            ],
+            "inherited_elements": [VisualElementState(element_id="kept", variable_name="kept")],
         }
     )
     previous = SceneState(

@@ -754,7 +754,15 @@ def stats(
         console.print("没有可用的运行记录")
         return
     table = Table(title="Pipeline statistics")
-    for column in ("Run ID", "Status", "Scenes", "Plan reviews", "Code reviews", "Fixes", "Fallbacks"):
+    for column in (
+        "Run ID",
+        "Status",
+        "Scenes",
+        "Plan reviews",
+        "Code reviews",
+        "Fixes",
+        "Fallbacks",
+    ):
         table.add_column(column)
     for item in runs:
         scenes = item["scenes"]
@@ -772,7 +780,10 @@ def stats(
     for item in runs:
         category_counts.update(item["failure_categories"])
     if category_counts:
-        console.print("失败分类: " + ", ".join(f"{key}={value}" for key, value in sorted(category_counts.items())))
+        console.print(
+            "失败分类: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(category_counts.items()))
+        )
     if report["read_errors"]:
         console.print(f"[yellow]有 {len(report['read_errors'])} 个运行清单读取失败[/]")
 

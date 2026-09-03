@@ -334,7 +334,7 @@ def _safe_matrix(expression: str) -> tuple[tuple[float, ...], ...] | None:
     """解析纯数字二维矩阵，不执行表达式或用户代码。"""
 
     value = _normalise_expression(expression)
-    if not value.startswith("[[") or not value.endswith("]]" ):
+    if not value.startswith("[[") or not value.endswith("]]"):
         return None
     try:
         parsed = ast.literal_eval(value)
@@ -411,9 +411,7 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
 
 
 _MATRIX_LITERAL = r"\[\s*\[[^\[\]]{1,120}\]\s*(?:,\s*\[[^\[\]]{1,120}\]\s*)*\]"
-_MATRIX_EQUATION_RE = re.compile(
-    rf"({_MATRIX_LITERAL})\s*(?:=|→|⟶)\s*({_MATRIX_LITERAL})"
-)
+_MATRIX_EQUATION_RE = re.compile(rf"({_MATRIX_LITERAL})\s*(?:=|→|⟶)\s*({_MATRIX_LITERAL})")
 
 
 def _matrix_equations(text: str) -> list[tuple[str, str]]:

@@ -701,7 +701,7 @@ class SlurmDispatcher:
                     "sh",
                     "-c",
                     "ffprobe -v error -show_entries format=duration "
-                    "-of default=noprint_wrappers=1:nokey=1 \"$1\" >/dev/null",
+                    '-of default=noprint_wrappers=1:nokey=1 "$1" >/dev/null',
                     "kd1-smoke-probe",
                     "__KD1_SMOKE_VIDEO__",
                 ]
