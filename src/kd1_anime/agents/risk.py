@@ -59,6 +59,10 @@ def assess_scene_risk(
         score += 1
         reasons.append("存在跨场景继承")
     if technical_spec is not None:
+        if any(item.constructor in {"Surface", "ThreeDAxes"} for item in technical_spec.objects):
+            score += 4
+            if "三维/曲面或切平面" not in reasons:
+                reasons.append("TechnicalSpec 包含三维对象")
         if technical_spec.renderer == "opengl":
             score += 2
             reasons.append("OpenGL 渲染")
@@ -68,6 +72,9 @@ def assess_scene_risk(
         if len(technical_spec.animations) >= 12:
             score += 2
             reasons.append("动画事件较多")
+        if any(item.operation == "animate" for item in technical_spec.animations):
+            score += 1
+            reasons.append("TechnicalSpec 含连续属性动画")
         if technical_spec.latex.required:
             score += 1
             reasons.append("需要 XeLaTeX")
