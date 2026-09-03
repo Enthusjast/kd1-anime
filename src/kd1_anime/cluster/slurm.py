@@ -713,12 +713,14 @@ class SlurmDispatcher:
                 ]
                 frame_dir_q = shlex.quote(str(frame_dir))
                 frame_class_q = shlex.quote(f"{scene_class_name}.png")
+                frame_versioned_class_q = shlex.quote(f"{scene_class_name}_*.png")
                 frame_command = command_for(frame_args)
                 lines.extend(
                     [
                         f"mkdir -p {frame_dir_q}",
                         smoke_run(frame_command),
-                        f"smoke_frame=$(find {frame_dir_q} -type f -name {frame_class_q} "
+                        f"smoke_frame=$(find {frame_dir_q} -type f \\( -name {frame_class_q} "
+                        f"-o -name {frame_versioned_class_q} \\) "
                         "! -path '*/partial_movie_files/*' -print -quit)",
                         'if [ -z "$smoke_frame" ] || [ ! -s "$smoke_frame" ]; then',
                         *smoke_failure("未生成有效最后一帧 PNG"),

@@ -2415,8 +2415,13 @@ class Orchestrator:
                 )
                 frames = [
                     path
-                    for path in frame_dir.rglob(f"{state.class_name}.png")
-                    if path.is_file() and path.stat().st_size > 0
+                    for path in frame_dir.rglob("*.png")
+                    if path.is_file()
+                    and path.stat().st_size > 0
+                    and (
+                        path.stem == state.class_name
+                        or path.stem.startswith(f"{state.class_name}_")
+                    )
                 ]
                 if not frames:
                     raise RuntimeError("本地 Frame Canary 完成但没有生成最后一帧 PNG")

@@ -137,6 +137,7 @@ def test_script_can_run_fast_frame_canary_without_video_probe(monkeypatch, tmp_p
 
     assert "--format png" in script
     assert "--save_last_frame" in script
+    assert "-name 'Demo_*.png'" in script
     assert "未生成有效最后一帧 PNG" in script
     assert "smoke_video=$(find" not in script
     assert "ffprobe -v error" not in script
