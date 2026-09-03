@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -65,7 +66,6 @@ def classify_failure(
         "invalid qos",
         "permission denied",
         "out of memory",
-        "oom",
         "time limit",
         "cancelled",
         "cancelled at",
@@ -75,6 +75,7 @@ def classify_failure(
         "queue_timeout",
         "run_timeout",
     )
+    oom_marker = re.search(r"\boom(?:[- ]kill|\s+event)?\b", text)
     if status_text in {
         "NODE_FAIL",
         "OUT_OF_MEMORY",
@@ -84,7 +85,7 @@ def classify_failure(
         "QUEUE_TIMEOUT",
         "RUN_TIMEOUT",
         "UNKNOWN_TIMEOUT",
-    } or any(marker in text for marker in infrastructure_markers):
+    } or oom_marker is not None or any(marker in text for marker in infrastructure_markers):
         return FailureRoute(
             "infrastructure",
             "infra_retry",

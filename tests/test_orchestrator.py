@@ -51,6 +51,7 @@ def test_failure_router_prioritizes_infrastructure_over_code_rewrite():
     )
     assert route.category == "infrastructure"
     assert route.handler == "infra_retry"
+    assert classify_failure("render boom", phase="render").category == "render"
 
 
 def test_failure_router_separates_plan_math_from_runtime_api_errors():
