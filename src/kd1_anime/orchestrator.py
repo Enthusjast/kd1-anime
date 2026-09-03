@@ -5522,10 +5522,10 @@ class Orchestrator:
             if not state.inherited_elements_code.strip():
                 raise ValueError(f"Scene {scene_id} 的继承元素记录为空，禁止继续编码")
         else:
-            # 没有结构化继承合同的旧计划只在 full 模式保留旧的完整交接；
-            # stateless 明确关闭上下文，minimal 不向无继承场景注入临时对象。
+            # 没有结构化继承合同的旧计划保留历史交接行为；只有显式
+            # stateless 才关闭它，避免升级后破坏旧清单的跨场景动画。
             state.inherited_elements_code = (
-                previous.exported_elements_code if context_mode == "full" else ""
+                "" if context_mode == "stateless" else previous.exported_elements_code
             )
 
     @staticmethod
@@ -6267,7 +6267,10 @@ class Orchestrator:
                 self._checkpoint(ctx, State.FIXING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
-        deterministic_patches = fixer.deterministic_patches(state.code, error_log)
+        patch_builder = getattr(fixer, "deterministic_patches", None)
+        deterministic_patches = (
+            patch_builder(state.code, error_log) if callable(patch_builder) else []
+        )
         if deterministic_patches:
             patch_result = ReviewResult(
                 is_valid=False,
