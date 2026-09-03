@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -79,7 +80,7 @@ def _memory_gb(value: str) -> int | None:
     amount = int(match.group(1))
     unit = (match.group(2) or "G").upper()
     factors = {"K": 1 / (1024**2), "M": 1 / 1024, "G": 1, "T": 1024, "P": 1024**2}
-    return max(1, int(amount * factors[unit]))
+    return max(1, math.ceil(amount * factors[unit]))
 
 
 def estimate_render_resources(

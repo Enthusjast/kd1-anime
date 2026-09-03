@@ -6447,6 +6447,9 @@ class Orchestrator:
             state.class_name = class_name
             state.review_round = 0
             state.reviewed = False
+            state.rewrite_feedback = ""
+            state.review_signature = ""
+            state.identical_review_count = 0
             state.failure_reason = ""
             state.failure_category = ""
             state.infra_retries = 0

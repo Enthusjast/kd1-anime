@@ -86,3 +86,16 @@ def test_resource_profile_rejects_unsafe_slurm_values():
             time_limit="01:00:00",
             gpu_type="RTX5090\n#SBATCH --exclusive",
         )
+
+
+def test_estimator_rounds_memory_up_to_avoid_under_allocation():
+    result = estimate_render_resources(
+        make_plan(),
+        None,
+        render_profile(),
+        cpus_per_task=4,
+        mem_gb="1536M",
+        time_limit="00:10:00",
+    )
+
+    assert result.mem_gb == 2
