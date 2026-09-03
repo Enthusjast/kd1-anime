@@ -35,6 +35,7 @@ from kd1_anime.agents.continuity import (
     normalize_scene_plan_contract,
     strip_redundant_optional_export_block,
 )
+from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
     repair_required_export_alias_lifecycle,
     validate_animation_lifecycle,
@@ -2153,7 +2154,17 @@ class Orchestrator:
                         self._stop_event.clear()
                     self._checkpoint(ctx, State.CODING)
                     continue
-                self._merge(ctx)
+                try:
+                    self._merge(ctx)
+                except Exception as exc:
+                    route = classify_failure(str(exc), phase="merge")
+                    self._emit(
+                        "failure_routed",
+                        category=route.category,
+                        handler=route.handler,
+                        reason=route.reason,
+                    )
+                    raise RuntimeError(f"视频合并失败（{route.category}）：{exc}") from exc
                 self._final_visual_report(ctx)
                 improve = self._eval(ctx)
 
@@ -3205,8 +3216,16 @@ class Orchestrator:
             except Exception as exc:
                 if self._activate_safe_fallback(ctx, scene_id, state, str(exc)):
                     continue
+                route = classify_failure(str(exc), phase="coding")
+                self._emit(
+                    "failure_routed",
+                    scene_id=scene_id,
+                    category=route.category,
+                    handler=route.handler,
+                    reason=route.reason,
+                )
                 with self._state_lock:
-                    category = "continuity" if "连续性" in str(exc) else "coding"
+                    category = route.category if route.category != "unknown" else "coding"
                     self._mark_failed(
                         state,
                         f"Scene {scene_id} 编码/审查失败: {exc}",
@@ -6218,7 +6237,15 @@ class Orchestrator:
                 self._checkpoint(ctx, State.FIXING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
-        if fixer.is_infrastructure_error(error_log):
+        route = classify_failure(error_log, phase="render", status=job.status)
+        self._emit(
+            "failure_routed",
+            scene_id=scene_id,
+            category=route.category,
+            handler=route.handler,
+            reason=route.reason,
+        )
+        if route.category == "infrastructure" or fixer.is_infrastructure_error(error_log):
             with self._state_lock:
                 state.give_up = True
                 state.failure_category = "infrastructure"

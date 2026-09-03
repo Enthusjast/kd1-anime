@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
+from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
     ContinuityBible,
@@ -40,6 +41,23 @@ def plan():
         visual_flow=["show circle"],
         key_moments=["pause"],
         computation="radius=1",
+    )
+
+
+def test_failure_router_prioritizes_infrastructure_over_code_rewrite():
+    route = classify_failure(
+        "FileNotFoundError: No such file or directory: 'xelatex'",
+        phase="render",
+    )
+    assert route.category == "infrastructure"
+    assert route.handler == "infra_retry"
+
+
+def test_failure_router_separates_plan_math_from_runtime_api_errors():
+    assert classify_failure("数学断言不等价", phase="review").handler == "plan_review"
+    assert (
+        classify_failure("AttributeError: OpenGLCamera has no frame", phase="render").handler
+        == "code_patch"
     )
 
 
