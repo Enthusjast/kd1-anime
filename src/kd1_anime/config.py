@@ -527,6 +527,12 @@ class Settings(BaseSettings):
 
     # --- Agent 与监控 ---
     MAX_REVIEW_ROUNDS: int = Field(default=5, ge=1, le=10)
+    MAX_LOW_RISK_REVIEW_ROUNDS: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="低风险场景的语义代码审查轮数；确定性检查始终执行",
+    )
     # 单个场景计划在进入 Coder 前允许的重规划审查轮数。
     MAX_PLAN_REVIEW_ROUNDS: int = Field(default=2, ge=1, le=10)
     # 同一场景在计划审查反馈后允许重新调用 Planner 的总次数；独立于

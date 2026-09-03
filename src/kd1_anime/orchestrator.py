@@ -67,6 +67,7 @@ from kd1_anime.agents.planner import (
 )
 from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
 from kd1_anime.agents.render_error_parser import extract_render_error
+from kd1_anime.agents.review_policy import review_budget
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
 from kd1_anime.agents.risk import assess_scene_risk
 from kd1_anime.agents.safe_fallback import (
@@ -7095,7 +7096,19 @@ class Orchestrator:
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return True
 
-        if review_round >= settings.MAX_REVIEW_ROUNDS:
+        budget = review_budget(
+            state.plan,
+            state.technical_spec,
+            global_max_rounds=settings.MAX_REVIEW_ROUNDS,
+            low_risk_max_rounds=settings.MAX_LOW_RISK_REVIEW_ROUNDS,
+        )
+        self._emit(
+            "scene_review_budget",
+            scene_id=scene_id,
+            risk_level=budget.risk_level,
+            max_rounds=budget.max_rounds,
+        )
+        if review_round >= budget.max_rounds:
             if self._activate_safe_fallback(ctx, scene_id, state, original_feedback):
                 return True
             with self._state_lock:

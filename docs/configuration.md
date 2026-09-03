@@ -208,6 +208,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
 | MAX_REVIEW_ROUNDS | 5 | 单场景代码审查/重写轮数 |
+| MAX_LOW_RISK_REVIEW_ROUNDS | 2 | 低风险场景的代码审查轮数；确定性检查不跳过 |
 | MAX_PLAN_REVIEW_ROUNDS | 2 | 单场景计划审查轮数 |
 | MAX_PLAN_REPLAN_ATTEMPTS | 3 | 计划反馈后的 Planner 总重调用次数 |
 | MAX_CONTINUITY_FIX_ROUNDS | 2 | 连续性局部重规划次数；耗尽后 warning 放行 |
