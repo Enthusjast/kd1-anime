@@ -311,6 +311,10 @@ class Settings(BaseSettings):
     LLM_MAX_REVIEW_CONTEXT_CHARS: int = Field(default=90_000, ge=10_000, le=2_000_000)
     LLM_MAX_TECHNICAL_SPEC_CHARS: int = Field(default=30_000, ge=5_000, le=500_000)
     MAX_TECHNICAL_SPEC_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    CODEGEN_MODE: Literal["hybrid", "python", "ir"] = Field(
+        default="hybrid",
+        description="代码生成模式：普通 Python、结构化 IR，或失败时 IR 回退",
+    )
 
     # --- 独立视觉 LLM API ---
     # 视觉评估绝不隐式复用主 LLM 的 Key、端点或模型。未启用时可以留空。

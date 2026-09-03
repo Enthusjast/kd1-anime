@@ -71,6 +71,11 @@ from kd1_anime.agents.safe_fallback import (
     fallback_reason_summary,
     is_high_confidence_geometry_conflict,
 )
+from kd1_anime.agents.scene_ir import (
+    SceneProgramCompileError,
+    build_scene_program_from_contract,
+    compile_scene_program,
+)
 from kd1_anime.agents.scene_templates import build_safe_scene_code
 from kd1_anime.agents.state_ledger import LedgerElement, StateLedger
 from kd1_anime.agents.technical_planner import (
@@ -5771,87 +5776,133 @@ class Orchestrator:
         )
         code_fallback_used = False
         code_fallback_reason = ""
-        try:
-            with self._llm_sem:
-                code, class_name = self._generate_validated_code(
-                    state.plan,
-                    feedback=state.rewrite_feedback or "",
-                    previous_code=state.code if state.rewrite_feedback else "",
-                    stream=False,
-                    renderer=ctx.render_profile.renderer,
-                    continuity_bible=ctx.continuity_bible,
-                    inherited_elements_code=state.inherited_elements_code,
-                    inherited_elements=state.plan.inherited_elements,
-                    elements_to_remove=state.plan.elements_to_remove,
-                    element_manifest=(
-                        ctx.element_manifest.model_copy(
-                            update={
-                                "entries": ctx.element_manifest.for_elements(
-                                    {item.element_id for item in state.plan.inherited_elements}
-                                )
-                            }
-                        )
-                        if state.plan.inherited_elements
-                        else None
-                    ),
-                    technical_spec=state.technical_spec,
-                    rag_context=rag_context,
-                    lesson_spec=ctx.lesson_spec,
-                    teaching_graph=ctx.teaching_graph,
-                )
-        except Exception as exc:
-            # Coder 的网络/截断/结构化输出故障不应直接把一个已经通过
-            # Plan/TechnicalSpec 的场景判死。使用不依赖 LLM 的最小代码
-            # 作为最后保险；它仍必须通过与正常候选完全相同的校验链。
-            fallback_code = build_safe_scene_code(state.plan, state.technical_spec)
-            fallback_validation = self._validate(
-                fallback_code,
-                renderer=ctx.render_profile.renderer,
-            )
-            fallback_continuity_error = ""
+        program_used = False
+
+        def compile_ir_candidate() -> tuple[str, str]:
+            program = build_scene_program_from_contract(state.plan, state.technical_spec)
+            candidate = compile_scene_program(program, state.plan)
+            validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
+            if not validation.is_valid:
+                raise SceneProgramCompileError(validation.feedback)
             try:
-                extract_scene_continuity_elements(fallback_code, state.plan)
-            except ValueError as fallback_exc:
-                fallback_continuity_error = str(fallback_exc)
-            fallback_lifecycle_error = ""
-            if (
-                state.technical_spec is not None
-                and fallback_validation.is_valid
-                and not fallback_continuity_error
-            ):
+                extract_scene_continuity_elements(candidate, state.plan)
+            except ValueError as exc:
+                raise SceneProgramCompileError(str(exc)) from exc
+            if state.technical_spec is not None:
                 lifecycle_result = validate_animation_lifecycle(
-                    fallback_code,
+                    candidate,
                     state.technical_spec,
                     renderer=ctx.render_profile.renderer,
                 )
                 if not lifecycle_result.is_valid:
-                    fallback_lifecycle_error = "; ".join(lifecycle_result.errors)
-            if (
-                not fallback_validation.is_valid
-                or fallback_continuity_error
-                or fallback_lifecycle_error
-            ):
-                raise RuntimeError(
-                    "Coder 生成失败，且安全代码降级未通过确定性校验："
-                    + "；".join(
-                        part
-                        for part in (
-                            "; ".join(fallback_validation.errors),
-                            fallback_continuity_error,
-                            fallback_lifecycle_error,
-                        )
-                        if part
-                    )
-                ) from exc
-            code = fallback_code
-            class_name = fallback_validation.scene_classes[0]
-            code_fallback_used = True
-            code_fallback_reason = str(exc)[:5_000]
-            self._emit(
-                "scene_code_fallback",
-                scene_id=scene_id,
-                reason=code_fallback_reason,
+                    raise SceneProgramCompileError("；".join(lifecycle_result.errors))
+            self._write_stage_artifact(
+                ctx,
+                f"scene_{scene_id}_program.json",
+                {"schema_version": 1, "program": program.model_dump(mode="json")},
             )
+            return candidate, validation.scene_classes[0]
+
+        if settings.CODEGEN_MODE == "ir":
+            code, class_name = compile_ir_candidate()
+            program_used = True
+            self._emit("scene_program_compiled", scene_id=scene_id)
+        else:
+            try:
+                with self._llm_sem:
+                    code, class_name = self._generate_validated_code(
+                        state.plan,
+                        feedback=state.rewrite_feedback or "",
+                        previous_code=state.code if state.rewrite_feedback else "",
+                        stream=False,
+                        renderer=ctx.render_profile.renderer,
+                        continuity_bible=ctx.continuity_bible,
+                        inherited_elements_code=state.inherited_elements_code,
+                        inherited_elements=state.plan.inherited_elements,
+                        elements_to_remove=state.plan.elements_to_remove,
+                        element_manifest=(
+                            ctx.element_manifest.model_copy(
+                                update={
+                                    "entries": ctx.element_manifest.for_elements(
+                                        {item.element_id for item in state.plan.inherited_elements}
+                                    )
+                                }
+                            )
+                            if state.plan.inherited_elements
+                            else None
+                        ),
+                        technical_spec=state.technical_spec,
+                        rag_context=rag_context,
+                        lesson_spec=ctx.lesson_spec,
+                        teaching_graph=ctx.teaching_graph,
+                    )
+            except Exception as exc:
+                if settings.CODEGEN_MODE == "hybrid":
+                    try:
+                        code, class_name = compile_ir_candidate()
+                    except Exception:
+                        code = ""
+                    else:
+                        program_used = True
+                        code_fallback_reason = str(exc)[:5_000]
+                        self._emit(
+                            "scene_program_compiled",
+                            scene_id=scene_id,
+                            reason="Coder 生成失败后使用结构化程序编译",
+                        )
+                if not program_used:
+                    # Coder 的网络/截断/结构化输出故障不应直接把一个已经通过
+                    # Plan/TechnicalSpec 的场景判死。使用不依赖 LLM 的最小代码
+                    # 作为最后保险；它仍必须通过与正常候选完全相同的校验链。
+                    fallback_code = build_safe_scene_code(state.plan, state.technical_spec)
+                    fallback_validation = self._validate(
+                        fallback_code,
+                        renderer=ctx.render_profile.renderer,
+                    )
+                    fallback_continuity_error = ""
+                    try:
+                        extract_scene_continuity_elements(fallback_code, state.plan)
+                    except ValueError as fallback_exc:
+                        fallback_continuity_error = str(fallback_exc)
+                    fallback_lifecycle_error = ""
+                    if (
+                        state.technical_spec is not None
+                        and fallback_validation.is_valid
+                        and not fallback_continuity_error
+                    ):
+                        lifecycle_result = validate_animation_lifecycle(
+                            fallback_code,
+                            state.technical_spec,
+                            renderer=ctx.render_profile.renderer,
+                        )
+                        if not lifecycle_result.is_valid:
+                            fallback_lifecycle_error = "; ".join(lifecycle_result.errors)
+                    if (
+                        not fallback_validation.is_valid
+                        or fallback_continuity_error
+                        or fallback_lifecycle_error
+                    ):
+                        raise RuntimeError(
+                            "Coder 生成失败，且安全代码降级未通过确定性校验："
+                            + "；".join(
+                                part
+                                for part in (
+                                    "; ".join(fallback_validation.errors),
+                                    fallback_continuity_error,
+                                    fallback_lifecycle_error,
+                                )
+                                if part
+                            )
+                        ) from exc
+                    code = fallback_code
+                    class_name = fallback_validation.scene_classes[0]
+                    code_fallback_used = True
+                    code_fallback_reason = str(exc)[:5_000]
+                    self._emit(
+                        "scene_code_fallback",
+                        scene_id=scene_id,
+                        reason=code_fallback_reason,
+                    )
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
         with self._state_lock:

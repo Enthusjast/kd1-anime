@@ -204,6 +204,7 @@ def test_coder_failure_uses_validated_safe_code_fallback(monkeypatch, tmp_path):
     ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
     orchestrator = Orchestrator()
     monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "python")
     monkeypatch.setattr(
         orchestrator,
         "_generate_validated_code",

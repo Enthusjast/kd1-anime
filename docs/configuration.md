@@ -71,6 +71,7 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_MAX_REVIEW_CONTEXT_CHARS | 90000 | Reviewer 输入预算 |
 | LLM_MAX_TECHNICAL_SPEC_CHARS | 30000 | TechnicalSpec 注入预算 |
 | MAX_TECHNICAL_SPEC_ATTEMPTS | 3 | TechnicalSpec 编译失败后的重生成次数 |
+| CODEGEN_MODE | hybrid | 代码模式：hybrid、python 或 ir |
 
 阶段预算独立设置，可以减少推理模型把输出预算耗在分析过程而导致 JSON 或代码
 截断。若模型能力或输出复杂度不同，可以只调整对应阶段。
