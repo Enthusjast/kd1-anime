@@ -87,6 +87,7 @@ def cache_clear(
 def rag_index(
     docs_dir: Path | None = typer.Option(None, "--docs-dir", help="Manim 文档目录"),
     examples_dir: Path | None = typer.Option(None, "--examples-dir", help="Manim 示例目录"),
+    recipes_dir: Path | None = typer.Option(None, "--recipes-dir", help="Manim Recipe 目录"),
     rebuild: bool = typer.Option(False, "--rebuild", help="忽略已有索引，强制重新计算 Embedding"),
 ):
     """索引 Manim 文档和示例。"""
@@ -99,11 +100,15 @@ def rag_index(
     if examples_dir is not None and not examples_dir.is_dir():
         console.print(f"[red]示例目录不存在: {examples_dir}[/]", markup=False)
         raise typer.Exit(1)
+    if recipes_dir is not None and not recipes_dir.is_dir():
+        console.print(f"[red]Recipe 目录不存在: {recipes_dir}[/]", markup=False)
+        raise typer.Exit(1)
     try:
         service = RagService()
         result = service.build_index(
             docs_dir=docs_dir,
             examples_dir=examples_dir,
+            recipes_dir=recipes_dir,
             rebuild=rebuild,
         )
     except Exception as exc:
@@ -131,6 +136,7 @@ def rag_status():
     console.print(f"索引: {data['index_path']}")
     console.print(f"文档目录: {data['docs_dir'] or '未配置'}")
     console.print(f"示例目录: {data['examples_dir'] or '未配置'}")
+    console.print(f"Recipe 目录: {data.get('recipes_dir') or '未配置'}")
     console.print(f"Embedding: {data['embedding_model'] or '未配置'}")
     console.print(f"Reranker: {data['reranker_model'] or '未配置'}")
     if data["index"]:

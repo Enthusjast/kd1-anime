@@ -16,7 +16,7 @@ class RagChunk(BaseModel):
 
     chunk_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_path: str = Field(min_length=1, max_length=4_000)
-    source_kind: Literal["manim_doc", "example"]
+    source_kind: Literal["manim_doc", "example", "recipe"]
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     ordinal: int = Field(ge=0)
@@ -106,6 +106,7 @@ class RagIndexInfo(BaseModel):
     # 配置是否仍然指向生成该索引的那组文件。
     source_docs_dir: str = Field(default="", max_length=4_000)
     source_examples_dir: str = Field(default="", max_length=4_000)
+    source_recipes_dir: str = Field(default="", max_length=4_000)
     # 旧索引没有这些字段时读取为 0/空值，但不会被新配置复用；必须
     # 重新构建，避免修改 chunker 参数后仍使用旧分块。
     chunker_version: str = Field(default="", max_length=50)

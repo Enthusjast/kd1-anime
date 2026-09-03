@@ -29,7 +29,7 @@ EXCLUDED_PARTS = frozenset(
     }
 )
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
-SourceKind = Literal["manim_doc", "example"]
+SourceKind = Literal["manim_doc", "example", "recipe"]
 _SENSITIVE_LINE = re.compile(
     r"(?:api[_ -]?key|access[_ -]?token|secret|password|private\s+key|bearer\s+[A-Za-z0-9._-]+)",
     re.IGNORECASE,
@@ -57,6 +57,7 @@ def _safe_root(path: Path | None) -> Path | None:
 def iter_source_files(
     docs_dir: Path | None,
     examples_dir: Path | None,
+    recipes_dir: Path | None = None,
 ) -> list[tuple[Path, SourceKind]]:
     """列出允许索引的文件，拒绝运行目录和隐藏构建目录。"""
 
@@ -65,6 +66,7 @@ def iter_source_files(
     for root, source_kind in (
         (_safe_root(docs_dir), "manim_doc"),
         (_safe_root(examples_dir), "example"),
+        (_safe_root(recipes_dir), "recipe"),
     ):
         if root is None:
             continue
@@ -98,6 +100,7 @@ def iter_source_files(
 def source_manifest_digest(
     docs_dir: Path | None,
     examples_dir: Path | None,
+    recipes_dir: Path | None = None,
 ) -> str | None:
     """计算当前知识库源文件的摘要，用于发现索引过期。
 
@@ -109,12 +112,13 @@ def source_manifest_digest(
     roots = {
         "manim_doc": _safe_root(docs_dir),
         "example": _safe_root(examples_dir),
+        "recipe": _safe_root(recipes_dir),
     }
-    if docs_dir is None and examples_dir is None:
+    if docs_dir is None and examples_dir is None and recipes_dir is None:
         return None
 
     values: list[tuple[str, str]] = []
-    for path, source_kind in iter_source_files(docs_dir, examples_dir):
+    for path, source_kind in iter_source_files(docs_dir, examples_dir, recipes_dir):
         root = roots[source_kind]
         if root is None:
             continue
@@ -214,10 +218,11 @@ def chunk_file(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_CHUNK_OVERLAP,
     display_path: str | None = None,
+    metadata: dict[str, str] | None = None,
 ) -> list[SourceChunk]:
     """切分单个源文件；调用方负责处理读取失败。"""
 
-    if source_kind not in {"manim_doc", "example"}:
+    if source_kind not in {"manim_doc", "example", "recipe"}:
         raise ValueError(f"不支持的知识库来源类型: {source_kind}")
     if chunk_size < 100 or overlap < 0 or overlap >= chunk_size:
         raise ValueError("chunk_size 必须 >=100，且 overlap 必须满足 0 <= overlap < chunk_size")
@@ -232,6 +237,29 @@ def chunk_file(
     else:
         segments = _python_segments(text)
     contents = _pack_segments(segments, chunk_size, overlap)
+    relative_name = Path(display_path or path.name).as_posix().lower()
+    version_match = re.search(r"(?:manim[-_])?(\d+\.\d+(?:\.\d+)?)", relative_name)
+    inferred_metadata = {
+        "suffix": path.suffix.lower(),
+        "framework": "manimce" if source_kind == "recipe" else "unknown",
+        "version": version_match.group(1) if version_match else "unknown",
+    }
+    if source_kind == "recipe":
+        inferred_metadata.update(
+            {
+                "topic": path.stem.lower().replace(" ", "_"),
+                "renderer": (
+                    "opengl"
+                    if "opengl" in relative_name
+                    else "both"
+                    if any(marker in relative_name for marker in ("3d", "camera"))
+                    else "cairo"
+                ),
+                "apis": path.stem.lower().replace(" ", "_"),
+            }
+        )
+    if metadata:
+        inferred_metadata.update({str(key): str(value) for key, value in metadata.items()})
     result: list[SourceChunk] = []
     for ordinal, content in enumerate(contents):
         result.append(
@@ -241,7 +269,7 @@ def chunk_file(
                 source_sha256=source_sha256,
                 ordinal=ordinal,
                 text=content,
-                metadata={"suffix": path.suffix.lower()},
+                metadata=inferred_metadata,
                 display_path=display_path or path.name,
             )
         )

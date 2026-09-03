@@ -119,6 +119,7 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | RAG_INDEX_PATH | ~/.kd1-anime/rag/index.sqlite3 | SQLite 索引路径 |
 | RAG_DOCS_DIR | ~/.kd1-anime/knowledge/docs | 文档源目录 |
 | RAG_EXAMPLES_DIR | ~/.kd1-anime/knowledge/examples | 示例源目录 |
+| RAG_RECIPES_DIR | ~/.kd1-anime/knowledge/recipes | 版本化 Manim Recipe 目录 |
 | RAG_EMBEDDING_API_KEY | 空 | Embedding API Key |
 | RAG_EMBEDDING_BASE_URL | 空 | OpenAI-compatible Embedding 端点 |
 | RAG_EMBEDDING_MODEL | 空 | Embedding 模型名 |

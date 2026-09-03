@@ -16,6 +16,8 @@ MANIM_SPEC="${KD1_ANIME_MANIM_SPEC:-manim==0.20.1}"
 MANIM_KNOWLEDGE_VERSION="0.20.1"
 MANIM_KNOWLEDGE_ARCHIVE="resources/manim-0.20.1-knowledge.tar.gz"
 MANIM_KNOWLEDGE_ARCHIVE_SHA256="e202d20612f443a40c54b50e5a1e0d27b142e93f606939b04d0db38022c02372"
+MANIM_RECIPE_ARCHIVE="resources/manim-0.20.1-recipes.tar.gz"
+MANIM_RECIPE_ARCHIVE_SHA256="a1dbcdb0358d5b2f26347e3cc9b4fa77af1171645e720e10d3b04241e99d6142"
 CONFIGURE_MODE="${KD1_ANIME_CONFIGURE_MODE:-auto}"
 case "$CONFIGURE_MODE" in
     auto|interactive|never) ;;
@@ -417,6 +419,7 @@ rewrite_legacy_storage_defaults() {
         -e 's|^RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3$|RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3|' \
         -e 's|^RAG_DOCS_DIR=$|RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs|' \
         -e 's|^RAG_EXAMPLES_DIR=$|RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples|' \
+        -e 's|^RAG_RECIPES_DIR=$|RAG_RECIPES_DIR=~/.kd1-anime/knowledge/recipes|' \
         -e 's|^WORKSPACE_DIR=workspace$|WORKSPACE_DIR=~/.kd1-anime/workspace|' \
         -e 's|^SCENES_DIR=workspace/scenes$|SCENES_DIR=~/.kd1-anime/workspace/scenes|' \
         -e 's|^LOGS_DIR=workspace/logs$|LOGS_DIR=~/.kd1-anime/workspace/logs|' \
@@ -429,6 +432,7 @@ write_user_config() {
         "$CONFIG_DIR" \
         "$CONFIG_DIR/knowledge/docs" \
         "$CONFIG_DIR/knowledge/examples" \
+        "$CONFIG_DIR/knowledge/recipes" \
         "$CONFIG_DIR/rag" \
         "$CONFIG_DIR/workspace"
     chmod 700 "$CONFIG_DIR"
@@ -500,6 +504,7 @@ RAG_ENABLED=false
 RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
 RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
 RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
+RAG_RECIPES_DIR=~/.kd1-anime/knowledge/recipes
 RAG_EMBEDDING_API_KEY=
 RAG_EMBEDDING_BASE_URL=
 RAG_EMBEDDING_MODEL=
@@ -709,6 +714,108 @@ install_manim_knowledge() {
         fi
     done < <(find "$source_root" -type f -print0 | sort -z)
     log "Manim ${MANIM_KNOWLEDGE_VERSION} 文档和示例已安装到 $CONFIG_DIR/knowledge"
+}
+
+install_manim_recipes() {
+    local archive ref archive_url expected actual tmp extract source_root source relative target temporary_target
+    archive="$SCRIPT_DIR/$MANIM_RECIPE_ARCHIVE"
+    if [ ! -f "$archive" ]; then
+        ref="${KD1_ANIME_REF:-main}"
+        if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$ref" == *".."* ]] || [[ "$ref" == /* ]]; then
+            err "KD1_ANIME_REF 包含不安全字符: $ref"
+            return 1
+        fi
+        tmp="$(mktemp -d)"
+        cleanup_dirs+=("$tmp")
+        archive="$tmp/manim-recipes.tar.gz"
+        archive_url="https://raw.githubusercontent.com/Enthusjast/kd1-anime/${ref}/${MANIM_RECIPE_ARCHIVE}"
+        info "下载 Manim ${MANIM_KNOWLEDGE_VERSION} Recipe 包"
+        download "$archive_url" "$archive"
+    fi
+
+    expected="${KD1_ANIME_RECIPE_ARCHIVE_SHA256:-$MANIM_RECIPE_ARCHIVE_SHA256}"
+    expected="${expected,,}"
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        err "KD1_ANIME_RECIPE_ARCHIVE_SHA256 必须是 64 位十六进制 SHA-256"
+        return 1
+    fi
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        err "Manim Recipe 包 SHA-256 不匹配"
+        err "expected: $expected"
+        err "actual:   $actual"
+        return 1
+    fi
+
+    local entries
+    entries="$(tar -tzf "$archive")" || {
+        err "无法读取 Manim Recipe 包: $archive"
+        return 1
+    }
+    while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        if [[ "$relative" == /* || "$relative" == *".."* ]]; then
+            err "Manim Recipe 包包含不安全路径: $relative"
+            return 1
+        fi
+        case "$relative" in
+            knowledge/|knowledge/recipes/|knowledge/recipes/manim-${MANIM_KNOWLEDGE_VERSION}/|\
+            knowledge/recipes/manim-${MANIM_KNOWLEDGE_VERSION}/*.md) ;;
+            *)
+                err "Manim Recipe 包包含未允许的路径: $relative"
+                return 1
+                ;;
+        esac
+    done <<< "$entries"
+
+    extract="$(mktemp -d)"
+    cleanup_dirs+=("$extract")
+    tar -xzf "$archive" -C "$extract" --no-same-owner --no-same-permissions
+    source_root="$extract/knowledge"
+    [ -d "$source_root/recipes/manim-${MANIM_KNOWLEDGE_VERSION}" ] || {
+        err "Manim Recipe 包缺少 Recipe 目录"
+        return 1
+    }
+    if find "$source_root" -type l -print -quit | grep -q .; then
+        err "Manim Recipe 包不允许包含符号链接"
+        return 1
+    fi
+
+    mkdir -p "$CONFIG_DIR/knowledge/recipes/manim-${MANIM_KNOWLEDGE_VERSION}"
+    chmod 700 "$CONFIG_DIR/knowledge/recipes" \
+        "$CONFIG_DIR/knowledge/recipes/manim-${MANIM_KNOWLEDGE_VERSION}"
+    while IFS= read -r -d '' source; do
+        relative="${source#"$source_root/"}"
+        case "$relative" in
+            recipes/manim-${MANIM_KNOWLEDGE_VERSION}/*.md) ;;
+            *)
+                err "Manim Recipe 包包含未允许的文件: $relative"
+                return 1
+                ;;
+        esac
+        target="$CONFIG_DIR/knowledge/$relative"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            if [ -f "$target" ] && cmp -s "$source" "$target"; then
+                continue
+            fi
+            warn "Recipe 文件已存在，保留用户版本: $target"
+            continue
+        fi
+        temporary_target="$(mktemp "$CONFIG_DIR/.recipe.XXXXXX")"
+        cleanup_dirs+=("$temporary_target")
+        cp "$source" "$temporary_target"
+        chmod 600 "$temporary_target"
+        if ln "$temporary_target" "$target" 2>/dev/null; then
+            rm -f "$temporary_target"
+        elif [ -e "$target" ] || [ -L "$target" ]; then
+            warn "Recipe 文件在安装期间已出现，保留现有版本: $target"
+            rm -f "$temporary_target"
+        else
+            err "无法安全安装 Recipe 文件: $target"
+            return 1
+        fi
+    done < <(find "$source_root" -type f -print0 | sort -z)
+    log "Manim ${MANIM_KNOWLEDGE_VERSION} Recipe 已安装到 $CONFIG_DIR/knowledge/recipes"
 }
 
 config_value() {
@@ -1078,6 +1185,7 @@ fi
 
 write_user_config
 install_manim_knowledge
+install_manim_recipes
 configure_user_models
 
 info "最终验证"

@@ -354,6 +354,7 @@ RAG_ENABLED=true
 RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
 RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
 RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
+RAG_RECIPES_DIR=~/.kd1-anime/knowledge/recipes
 RAG_EMBEDDING_API_KEY=your-embedding-key
 RAG_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 RAG_EMBEDDING_MODEL=your-embedding-model
@@ -371,10 +372,11 @@ RAG_RERANK_MODEL=your-reranker-model
 ```text
 ~/.kd1-anime/knowledge/
 ├── docs/manim-0.20.1/       # Markdown/reStructuredText 文档
-└── examples/manim-0.20.1/   # Python 示例
+├── examples/manim-0.20.1/   # Python 示例
+└── recipes/manim-0.20.1/    # 带 renderer/风险标签的可信 API 配方
 ```
 
-索引只读取 `.md`、`.rst` 和 `.py`，并将源目录、源文件哈希、分块参数和 Embedding 模型写入 SQLite 索引。修改知识库文件、分块参数或 Embedding 模型后，旧索引会被标记为过期：
+索引只读取 `.md`、`.rst` 和 `.py`，并将源目录、源文件哈希、分块参数和 Embedding 模型写入 SQLite 索引。Recipe 会额外带有 ManimCE、版本、renderer、主题和风险标签，供 Coder 选择相关 API 配方。修改知识库文件、分块参数或 Embedding 模型后，旧索引会被标记为过期：
 
 ```bash
 # 使用配置中的默认目录建立或复用索引

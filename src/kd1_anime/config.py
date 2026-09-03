@@ -29,6 +29,7 @@ LEGACY_RAG_INDEX_PATH = Path.home() / ".cache" / "kd1-anime" / "rag" / "index.sq
 DEFAULT_KNOWLEDGE_DIR = APP_HOME / "knowledge"
 DEFAULT_RAG_DOCS_DIR = DEFAULT_KNOWLEDGE_DIR / "docs"
 DEFAULT_RAG_EXAMPLES_DIR = DEFAULT_KNOWLEDGE_DIR / "examples"
+DEFAULT_RAG_RECIPES_DIR = DEFAULT_KNOWLEDGE_DIR / "recipes"
 DEFAULT_WORKSPACE_DIR = APP_HOME / "workspace"
 DEFAULT_SCENES_DIR = DEFAULT_WORKSPACE_DIR / "scenes"
 DEFAULT_LOGS_DIR = DEFAULT_WORKSPACE_DIR / "logs"
@@ -38,6 +39,7 @@ _LEGACY_STORAGE_DEFAULTS = {
     "RAG_INDEX_PATH": ("~/.cache/kd1-anime/rag/index.sqlite3", str(DEFAULT_RAG_INDEX_PATH)),
     "RAG_DOCS_DIR": ("", str(DEFAULT_RAG_DOCS_DIR)),
     "RAG_EXAMPLES_DIR": ("", str(DEFAULT_RAG_EXAMPLES_DIR)),
+    "RAG_RECIPES_DIR": ("", str(DEFAULT_RAG_RECIPES_DIR)),
     "WORKSPACE_DIR": ("workspace", str(DEFAULT_WORKSPACE_DIR)),
     "SCENES_DIR": ("workspace/scenes", str(DEFAULT_SCENES_DIR)),
     "LOGS_DIR": ("workspace/logs", str(DEFAULT_LOGS_DIR)),
@@ -366,6 +368,7 @@ class Settings(BaseSettings):
     # 知识库源文件也有固定的用户目录；用户仍可用绝对路径接入其它文档。
     RAG_DOCS_DIR: Path | None = DEFAULT_RAG_DOCS_DIR
     RAG_EXAMPLES_DIR: Path | None = DEFAULT_RAG_EXAMPLES_DIR
+    RAG_RECIPES_DIR: Path | None = DEFAULT_RAG_RECIPES_DIR
     RAG_EMBEDDING_API_KEY: str = ""
     RAG_EMBEDDING_BASE_URL: str = ""
     RAG_EMBEDDING_MODEL: str = ""
@@ -386,7 +389,7 @@ class Settings(BaseSettings):
     RAG_CHUNK_OVERLAP: int = Field(default=200, ge=0, le=20_000)
     RAG_PARALLEL_WORKERS: int = Field(default=2, ge=1, le=16)
 
-    @field_validator("RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", mode="before")
+    @field_validator("RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", "RAG_RECIPES_DIR", mode="before")
     @classmethod
     def normalize_rag_source_dir(cls, value):
         """空的 RAG 源目录必须保持为 None，不能变成 Path('.')。"""

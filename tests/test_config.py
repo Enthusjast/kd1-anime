@@ -46,6 +46,7 @@ def test_default_storage_is_under_private_application_home():
     assert config.RAG_INDEX_PATH == config_module.DEFAULT_RAG_INDEX_PATH
     assert config.RAG_DOCS_DIR == config_module.DEFAULT_RAG_DOCS_DIR
     assert config.RAG_EXAMPLES_DIR == config_module.DEFAULT_RAG_EXAMPLES_DIR
+    assert config.RAG_RECIPES_DIR == config_module.DEFAULT_RAG_RECIPES_DIR
     assert config.WORKSPACE_DIR == config_module.DEFAULT_WORKSPACE_DIR
     assert config.SCENES_DIR == config_module.DEFAULT_SCENES_DIR
     assert config.LOGS_DIR == config_module.DEFAULT_LOGS_DIR

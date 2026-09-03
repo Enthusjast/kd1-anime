@@ -604,6 +604,7 @@ class Orchestrator:
         receipt_key: str,
         stage: str,
         source_kinds: set[str] | None = None,
+        preferred_source_kinds: set[str] | None = None,
         code_sha256: str = "",
         inherited_elements_sha256: str = "",
     ) -> str:
@@ -614,6 +615,7 @@ class Orchestrator:
                 query[:50_000],
                 stage=stage,
                 source_kinds=source_kinds,
+                preferred_source_kinds=preferred_source_kinds,
                 code_sha256=code_sha256,
                 inherited_elements_sha256=inherited_elements_sha256,
             )
@@ -2534,7 +2536,7 @@ class Orchestrator:
                     ctx.user_prompt,
                     receipt_key="outline",
                     stage="outline",
-                    source_kinds={"manim_doc", "example"},
+                    source_kinds={"manim_doc", "example", "recipe"},
                 )
                 draft_method = getattr(self.planner, "plan_draft", None)
                 if callable(draft_method):
@@ -2649,7 +2651,7 @@ class Orchestrator:
                 + "\n".join(f"{item.title}: {item.math_concept}" for item in ctx.outlines),
                 receipt_key="continuity",
                 stage="continuity",
-                source_kinds={"manim_doc", "example"},
+                source_kinds={"manim_doc", "example", "recipe"},
             )
             bible_kwargs: dict[str, object] = {
                 "stream": False,
@@ -3409,7 +3411,8 @@ class Orchestrator:
             ),
             receipt_key=f"scene:{scene_id}:technical",
             stage="technical",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
+            preferred_source_kinds={"recipe"},
             inherited_elements_sha256=sha256_text(state.inherited_elements_code)
             if state.inherited_elements_code
             else "",
@@ -5388,7 +5391,7 @@ class Orchestrator:
             f"{state.plan.title}\n{state.plan.purpose}\n{state.plan.math_concept}",
             receipt_key=f"scene:{scene_id}:detail",
             stage="detail",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
         )
         with self._llm_sem:
             outline = next(o for o in ctx.outlines if o.scene_id == scene_id)
@@ -5705,7 +5708,8 @@ class Orchestrator:
             ),
             receipt_key=f"scene:{scene_id}:code",
             stage="code",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
+            preferred_source_kinds={"recipe"},
             code_sha256=sha256_text(state.code) if state.code else "",
             inherited_elements_sha256=sha256_text(state.inherited_elements_code)
             if state.inherited_elements_code
@@ -6342,7 +6346,8 @@ class Orchestrator:
             ),
             receipt_key=f"scene:{scene_id}:fix:{attempt}",
             stage="fix",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
+            preferred_source_kinds={"recipe"},
             code_sha256=sha256_text(state.code) if state.code else "",
             inherited_elements_sha256=sha256_text(state.inherited_elements_code)
             if state.inherited_elements_code
