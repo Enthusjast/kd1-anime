@@ -100,6 +100,28 @@ def test_review_warning_is_accepted_without_rewrite(monkeypatch, tmp_path):
     assert any("标题位置" in warning for warning in ctx.continuity_warnings)
 
 
+def test_coder_failure_uses_validated_safe_code_fallback(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    state = SceneState(plan=plan(), plan_ready=True)
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        orchestrator,
+        "_generate_validated_code",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("模拟 Coder 截断")),
+    )
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_local_smoke_render", lambda *args, **kwargs: None)
+
+    orchestrator._scene_code(ctx, 1, state)
+
+    assert state.code.startswith("from manim import *")
+    assert state.safe_fallback_used is True
+    assert "最小安全代码降级" in state.safe_fallback_reason
+
+
 def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"

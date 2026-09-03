@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Literal
 
 from kd1_anime.agents.planner import ScenePlan
@@ -134,4 +136,93 @@ def build_scene_template(
     )
 
 
-__all__ = ["SceneTemplateKind", "build_scene_template", "select_scene_template"]
+def build_safe_scene_code(
+    scene_plan: ScenePlan,
+    technical_spec: TechnicalSpec | None = None,
+) -> str:
+    """构造不依赖 LLM 的最小可渲染代码。
+
+    该代码不是正常创作路径，而是 Coder 输出为空、截断或反复无效时的
+    最后保险。它只展示场景标题和合同中声明的元素标签，不猜测坐标、几何
+    碎片或数学推导；结果仍由调用方执行全部确定性校验和 Code Review。
+    """
+
+    kind = select_scene_template(scene_plan, technical_spec)
+    parent = "ThreeDScene" if kind == "surface" else "Scene"
+    objects = {item.element_id: item for item in (technical_spec.objects if technical_spec else ())}
+    removed_ids = {item.element_id for item in scene_plan.elements_to_remove}
+    declared = [*scene_plan.inherited_elements, *scene_plan.new_elements]
+    required = [item for item in declared if item.required and item.element_id not in removed_ids]
+    removed = [item for item in scene_plan.elements_to_remove if item.element_id in objects]
+
+    def variable_name(item: object) -> str:
+        element_id = str(getattr(item, "element_id", "element"))
+        technical = objects.get(element_id)
+        candidate = str(getattr(technical, "variable_name", "") or "")
+        candidate = candidate or str(getattr(item, "variable_name", "") or "")
+        candidate = candidate or re.sub(r"[^A-Za-z0-9_]", "_", element_id)
+        if candidate and (candidate[0].isalpha() or candidate[0] == "_"):
+            return candidate
+        return "element_" + candidate
+
+    def quote(value: str) -> str:
+        return json.dumps(str(value or ""), ensure_ascii=False)
+
+    lines = [
+        "from manim import *",
+        "",
+        f"class Scene{scene_plan.scene_id}({parent}):",
+        "    def construct(self):",
+        '        COLORS = {"primary": BLUE, "secondary": GREEN, "highlight": YELLOW}',
+    ]
+    # 被移除对象需要在 marker 外定义，并先加入场景再 FadeOut；这样既不
+    # 进入边界导出，也满足生命周期检查的 source/active 约束。
+    for item in removed:
+        variable = variable_name(item)
+        lines.append(
+            f"        {variable} = Text({quote(item.role or item.element_id)}, "
+            'color=COLORS["primary"])'
+        )
+    lines.extend(["", "        # KD1_CONTINUITY_EXPORT_BEGIN"])
+    for item in required:
+        variable = variable_name(item)
+        lines.append(f"        # element_id: {item.element_id}")
+        lines.append(
+            f"        {variable} = Text({quote(item.role or item.element_id)}, "
+            'color=COLORS["primary"])'
+        )
+    lines.extend(
+        [
+            "        # KD1_CONTINUITY_EXPORT_END",
+            "",
+            f"        title = Text({quote(scene_plan.title[:120])}, font_size=32)",
+            "        self.play(FadeIn(title), run_time=0.5)",
+        ]
+    )
+    for index, item in enumerate(removed):
+        variable = variable_name(item)
+        lines.extend(
+            [
+                f"        {variable}.move_to(DOWN * {index + 1})",
+                f"        self.add({variable})",
+                f"        self.play(FadeOut({variable}), run_time=0.3)",
+            ]
+        )
+    for index, item in enumerate(required):
+        variable = variable_name(item)
+        lines.append(f"        {variable}.move_to(DOWN * {index + 1})")
+        technical = objects.get(item.element_id)
+        if bool(getattr(technical, "initially_active", False)):
+            lines.append(f"        self.add({variable})")
+        else:
+            lines.append(f"        self.play(FadeIn({variable}), run_time=0.3)")
+    lines.append("        self.wait(1)")
+    return "\n".join(lines) + "\n"
+
+
+__all__ = [
+    "SceneTemplateKind",
+    "build_safe_scene_code",
+    "build_scene_template",
+    "select_scene_template",
+]

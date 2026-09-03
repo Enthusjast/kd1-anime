@@ -9,7 +9,11 @@ import pytest
 
 from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, CoderAgent
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
-from kd1_anime.agents.scene_templates import build_scene_template, select_scene_template
+from kd1_anime.agents.scene_templates import (
+    build_safe_scene_code,
+    build_scene_template,
+    select_scene_template,
+)
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 
 
@@ -69,6 +73,12 @@ class TestScene(Scene):
             update={"title": "三维曲面", "visual_design": "使用 Surface 绘制抛物面"}
         )
         assert select_scene_template(surface_plan) == "surface"
+
+    def test_safe_scene_code_is_a_single_valid_scene(self, sample_plan):
+        code = build_safe_scene_code(sample_plan)
+        assert "class Scene1(Scene)" in code
+        assert code.count("class ") == 1
+        assert "KD1_CONTINUITY_EXPORT_BEGIN" in code
 
     def test_extract_code_block_without_fences(self, coder_agent):
         """测试提取不带围栏的代码块。"""
