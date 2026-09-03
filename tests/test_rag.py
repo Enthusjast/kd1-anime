@@ -43,7 +43,7 @@ def _source_chunk(text: str, ordinal: int = 0) -> SourceChunk:
     )
 
 
-def test_recipe_chunks_carry_manimec_version_and_topic_metadata(tmp_path):
+def test_recipe_chunks_carry_manimce_version_and_topic_metadata(tmp_path):
     source = tmp_path / "transform.md"
     source.write_text("# Transform recipe\nUse ReplacementTransform.", encoding="utf-8")
 
@@ -56,7 +56,7 @@ def test_recipe_chunks_carry_manimec_version_and_topic_metadata(tmp_path):
     assert chunks[0].metadata["framework"] == "manimce"
     assert chunks[0].metadata["version"] == "0.20.1"
     assert chunks[0].metadata["topic"] == "transform"
-    assert chunks[0].metadata["renderer"] == "cairo"
+    assert chunks[0].metadata["renderer"] == "both"
 
 
 def test_chunker_splits_python_and_removes_sensitive_lines(tmp_path):
@@ -431,6 +431,37 @@ def test_rag_service_can_prefer_recipe_candidates(tmp_path, monkeypatch):
     )
 
     assert result.chunks[0].chunk.source_kind == "recipe"
+
+
+def test_rag_service_excludes_manimgl_framework_by_default(tmp_path, monkeypatch):
+    config = _config(tmp_path, RAG_DOCS_DIR=None, RAG_EXAMPLES_DIR=None)
+    service = RagService(config)
+    ce = SourceChunk(
+        path=Path("ce.md"),
+        source_kind="manim_doc",
+        source_sha256="a" * 64,
+        ordinal=0,
+        text="ManimCE Create",
+        metadata={"framework": "manimce"},
+    )
+    gl = SourceChunk(
+        path=Path("gl.md"),
+        source_kind="manim_doc",
+        source_sha256="b" * 64,
+        ordinal=1,
+        text="ManimGL ShowCreation",
+        metadata={"framework": "manimgl"},
+    )
+    RagIndex.build(
+        config.RAG_INDEX_PATH, [ce, gl], [[1.0, 0.0], [1.0, 0.0]], embedding_model="embed-test"
+    )
+    monkeypatch.setattr(service.embedding, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(service.reranker, "rerank", lambda query, texts, top_n: [(0, 0.9)])
+
+    result = service.search("Create", stage="code")
+
+    assert result.chunks
+    assert all(item.chunk.metadata.get("framework") != "manimgl" for item in result.chunks)
 
 
 def test_rag_context_uses_complete_json_reference_blocks(tmp_path):

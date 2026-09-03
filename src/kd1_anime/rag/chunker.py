@@ -239,9 +239,14 @@ def chunk_file(
     contents = _pack_segments(segments, chunk_size, overlap)
     relative_name = Path(display_path or path.name).as_posix().lower()
     version_match = re.search(r"(?:manim[-_])?(\d+\.\d+(?:\.\d+)?)", relative_name)
+    framework = "manimce"
+    if source_kind != "recipe" and (
+        "manimgl" in relative_name or "manimlib" in text.lower() or "from manimlib" in text.lower()
+    ):
+        framework = "manimgl"
     inferred_metadata = {
         "suffix": path.suffix.lower(),
-        "framework": "manimce" if source_kind == "recipe" else "unknown",
+        "framework": framework,
         "version": version_match.group(1) if version_match else "unknown",
     }
     if source_kind == "recipe":
@@ -252,8 +257,10 @@ def chunk_file(
                     "opengl"
                     if "opengl" in relative_name
                     else "both"
-                    if any(marker in relative_name for marker in ("3d", "camera"))
+                    if any(marker in relative_name for marker in ("3d", "three_d", "surface"))
                     else "cairo"
+                    if "camera" in relative_name
+                    else "both"
                 ),
                 "apis": path.stem.lower().replace(" ", "_"),
             }

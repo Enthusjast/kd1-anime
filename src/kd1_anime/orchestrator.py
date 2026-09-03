@@ -606,6 +606,7 @@ class Orchestrator:
         stage: str,
         source_kinds: set[str] | None = None,
         preferred_source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
         code_sha256: str = "",
         inherited_elements_sha256: str = "",
     ) -> str:
@@ -617,6 +618,7 @@ class Orchestrator:
                 stage=stage,
                 source_kinds=source_kinds,
                 preferred_source_kinds=preferred_source_kinds,
+                exclude_frameworks=exclude_frameworks,
                 code_sha256=code_sha256,
                 inherited_elements_sha256=inherited_elements_sha256,
             )

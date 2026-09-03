@@ -353,6 +353,7 @@ class RagIndex:
         *,
         top_k: int,
         source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
     ) -> list[RetrievedChunk]:
         if top_k < 1:
             raise ValueError("top_k 必须大于 0")
@@ -361,6 +362,7 @@ class RagIndex:
             query_embedding,
             top_k=top_k,
             source_kinds=source_kinds,
+            exclude_frameworks=exclude_frameworks,
             info=snapshot.info,
             snapshot=snapshot,
         )
@@ -371,6 +373,7 @@ class RagIndex:
         *,
         top_k: int,
         source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
         info: RagIndexInfo,
         snapshot: VerifiedIndexSnapshot | None = None,
     ) -> list[RetrievedChunk]:
@@ -399,6 +402,7 @@ class RagIndex:
             query_embedding,
             top_k=top_k,
             source_kinds=source_kinds,
+            exclude_frameworks=exclude_frameworks,
             info=info,
             snapshot=snapshot,
         )
@@ -409,6 +413,7 @@ class RagIndex:
         *,
         top_k: int,
         source_kinds: set[str] | None,
+        exclude_frameworks: set[str] | None,
         info: RagIndexInfo,
         snapshot: VerifiedIndexSnapshot | None = None,
     ) -> list[RetrievedChunk]:
@@ -423,6 +428,11 @@ class RagIndex:
 
         def append_candidate(chunk: RagChunk, vector: Sequence[float]) -> None:
             if source_kinds is not None and chunk.source_kind not in source_kinds:
+                return
+            if (
+                exclude_frameworks is not None
+                and chunk.metadata.get("framework", "") in exclude_frameworks
+            ):
                 return
             candidates.append(RetrievedChunk(chunk=chunk, score=_cosine_similarity(query, vector)))
 

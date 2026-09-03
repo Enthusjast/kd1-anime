@@ -356,6 +356,7 @@ class RagService:
         stage: str,
         source_kinds: set[str] | None = None,
         preferred_source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
         top_k: int | None = None,
         code_sha256: str = "",
         inherited_elements_sha256: str = "",
@@ -364,6 +365,9 @@ class RagService:
 
         if not isinstance(query, str) or not query.strip():
             raise ValueError("RAG query 必须是非空字符串")
+        effective_exclude_frameworks = (
+            {"manimgl"} if exclude_frameworks is None else set(exclude_frameworks)
+        )
         effective_top_k = self.config.RAG_TOP_K if top_k is None else top_k
         if effective_top_k < 1:
             raise ValueError("RAG top_k 必须大于 0")
@@ -407,6 +411,7 @@ class RagService:
                 tuple(sorted(preferred_source_kinds))
                 if preferred_source_kinds is not None
                 else None,
+                tuple(sorted(effective_exclude_frameworks)),
                 effective_top_k,
                 self.config.RAG_RERANK_TOP_N,
                 self.config.RAG_RERANK_MODEL,
@@ -426,6 +431,7 @@ class RagService:
                 # 不会因为普通文档的向量分数略高而完全遮蔽配方。
                 top_k=(effective_top_k * 2 if preferred_source_kinds else effective_top_k),
                 source_kinds=source_kinds,
+                exclude_frameworks=effective_exclude_frameworks,
                 info=info,
                 snapshot=snapshot,
             )
