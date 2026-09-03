@@ -65,6 +65,7 @@ from kd1_anime.agents.planner import (
     normalize_transition_claim_assignments,
     repair_obvious_math_contradictions,
 )
+from kd1_anime.agents.render_error_parser import extract_render_error
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
 from kd1_anime.agents.safe_fallback import (
     build_safe_fallback_plan,
@@ -6389,6 +6390,31 @@ class Orchestrator:
                 self._checkpoint(ctx, State.FIXING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
+        error_evidence = extract_render_error(
+            error_log,
+            source_code=state.code,
+            renderer=ctx.render_profile.renderer,
+            secrets=(settings.LLM_API_KEY, settings.VISUAL_LLM_API_KEY),
+        )
+        self._write_stage_artifact(
+            ctx,
+            f"render_error_scene_{scene_id}_{max(1, state.fix_attempts + 1)}.json",
+            {
+                "schema_version": 1,
+                "scene_id": scene_id,
+                "job_id": job.job_id,
+                "code_sha256": sha256_text(state.code),
+                "evidence": error_evidence.to_dict(),
+            },
+        )
+        self._emit(
+            "render_error_extracted",
+            scene_id=scene_id,
+            category=error_evidence.category,
+            error_type=error_evidence.error_type,
+            line=error_evidence.line,
+            fingerprint=error_evidence.fingerprint,
+        )
         route = classify_failure(error_log, phase="render", status=job.status)
         self._emit(
             "failure_routed",
@@ -6433,7 +6459,7 @@ class Orchestrator:
                 self._emit("scene_render_patch_applied", scene_id=scene_id)
                 return
         # 连续相同错误 → 判定为环境/配置问题, 提前放弃, 不再浪费修复次数
-        fp = self._error_fingerprint(error_log)
+        fp = error_evidence.fingerprint or self._error_fingerprint(error_log)
         with self._state_lock:
             if fp and fp == state.last_error_fp:
                 state.identical_error_count += 1
@@ -6474,7 +6500,7 @@ class Orchestrator:
             ctx,
             "\n".join(
                 (
-                    error_log[-20_000:],
+                    error_evidence.prompt_text(),
                     state.plan.math_concept,
                     state.plan.computation,
                     ctx.render_profile.renderer,
@@ -6507,6 +6533,8 @@ class Orchestrator:
                 fix_kwargs["lesson_spec"] = ctx.lesson_spec
             if self._supports_keyword(fixer.fix, "teaching_graph"):
                 fix_kwargs["teaching_graph"] = ctx.teaching_graph
+            if self._supports_keyword(fixer.fix, "error_evidence"):
+                fix_kwargs["error_evidence"] = error_evidence
             candidate = fixer.fix(state.code, error_log, **fix_kwargs)
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             continuity_error = ""
@@ -6535,6 +6563,7 @@ class Orchestrator:
                             else ""
                         )
                         + (f"动画生命周期错误：\n{lifecycle_error}\n" if lifecycle_error else "")
+                        + f"\n精准 traceback 证据：\n{error_evidence.prompt_text()}\n"
                         + f"\n原始渲染错误：\n{error_log}"
                     ),
                     previous_code=candidate,

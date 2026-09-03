@@ -35,6 +35,7 @@ from kd1_anime.agents.prompt_context import (
     PromptSection,
     build_bounded_prompt,
 )
+from kd1_anime.agents.render_error_parser import RenderErrorEvidence, extract_render_error
 from kd1_anime.agents.reviewer import (
     ReviewerAgent,
     ReviewFinding,
@@ -79,6 +80,7 @@ __all__ = [
     "PromptBudgetError",
     "PromptContextBuilder",
     "PromptSection",
+    "RenderErrorEvidence",
     "ReviewFinding",
     "ReviewerAgent",
     "SceneBoundaryIR",
@@ -96,6 +98,7 @@ __all__ = [
     "compile_technical_spec",
     "dedupe_plan_review_issues",
     "deterministic_plan_issues",
+    "extract_render_error",
     "filter_verified_plan_issues",
     "lint_manim_api",
     "normalize_technical_spec_contract",
