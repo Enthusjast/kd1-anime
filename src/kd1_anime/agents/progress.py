@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Literal
-
-from kd1_anime.run_store import sha256_text
 
 ProgressKind = Literal["improved", "unchanged", "regressed", "unknown"]
 
@@ -27,7 +26,7 @@ class ProgressSnapshot:
         issue_count: int | None = None,
     ) -> ProgressSnapshot:
         return cls(
-            code_sha256=sha256_text(code) if code else "",
+            code_sha256=(hashlib.sha256(code.encode("utf-8")).hexdigest() if code else ""),
             error_fingerprint=str(error_fingerprint or ""),
             issue_count=issue_count,
         )
