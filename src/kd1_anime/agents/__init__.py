@@ -9,6 +9,7 @@ from kd1_anime.agents.lifecycle import (
     repair_required_export_alias_lifecycle,
     validate_animation_lifecycle,
 )
+from kd1_anime.agents.math_verifier import MathVerification, verify_expression_samples
 from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
@@ -74,6 +75,7 @@ __all__ = [
     "LessonSpec",
     "LifecycleValidationResult",
     "MathEntity",
+    "MathVerification",
     "PlanReviewIssue",
     "PlanReviewResult",
     "PlanReviewerAgent",
@@ -113,4 +115,5 @@ __all__ = [
     "validate_animation_lifecycle",
     "validate_manim_code",
     "validate_review_evidence",
+    "verify_expression_samples",
 ]

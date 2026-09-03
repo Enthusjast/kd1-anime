@@ -8,6 +8,7 @@ Planner 负责创意，Plan Reviewer 负责语义判断；本模块只做不需�
 from __future__ import annotations
 
 import ast
+import json
 import math
 import re
 from fractions import Fraction
@@ -15,6 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kd1_anime.agents.math_verifier import verify_expression_samples
 from kd1_anime.agents.planner import (
     ContinuityBible,
     LessonSpec,
@@ -604,6 +606,24 @@ class PlanCompiler:
                         fix_instruction="修正表达式或将 relation 改为真实的非等价关系，并说明推导依据。",
                     )
                 )
+            if equivalent is None and claim.relation in {"equivalent", "equals", "area"}:
+                sampled = verify_expression_samples(left, right)
+                if sampled.status == "counterexample":
+                    values = json.dumps(
+                        sampled.counterexample or {}, ensure_ascii=False, sort_keys=True
+                    )
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="math",
+                            field=f"math_claims[{claim.claim_id}]",
+                            scene_ids=scene_ids,
+                            message=(
+                                f"数学断言 {claim.claim_id} 在安全采样点发现反例："
+                                f"{left} ≠ {right}（变量取值 {values}）。"
+                            ),
+                            fix_instruction="修正表达式、定义域或前提条件；采样反例不能被解释为舍入误差。",
+                        )
+                    )
             if (
                 claim.relation in {"equivalent", "equals", "inequality"}
                 and not claim.domain.strip()
@@ -679,13 +699,18 @@ class PlanCompiler:
 
         simple_equations = _simple_equations(plan.computation)
         for index, (left, right) in enumerate(simple_equations, start=1):
-            if expressions_are_equivalent(left, right) is False:
+            equivalent = expressions_are_equivalent(left, right)
+            sampled = verify_expression_samples(left, right) if equivalent is None else None
+            if equivalent is False or (sampled is not None and sampled.status == "counterexample"):
+                suffix = ""
+                if sampled is not None and sampled.counterexample:
+                    suffix = f"（采样反例 {json.dumps(sampled.counterexample, sort_keys=True)}）"
                 issues.append(
                     PlanCompilerIssue(
                         category="math",
                         field=f"computation.equation_{index}",
                         scene_ids=scene_ids,
-                        message=f"computation 中的等式不等价：{left} ≠ {right}。",
+                        message=f"computation 中的等式不等价：{left} ≠ {right}{suffix}。",
                         fix_instruction="修正等式，或把变量赋值与需要证明的等式分开书写。",
                     )
                 )
