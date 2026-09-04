@@ -603,6 +603,24 @@ class Orchestrator:
                     redact_text(exc, self._event_secrets()),
                 )
 
+    def _write_run_report(self, ctx: PipelineContext) -> None:
+        """尽力写入离线运行报告；报告失败不改变已确定的运行终态。"""
+
+        manifest = self._manifest
+        if manifest is None:
+            return
+        try:
+            from kd1_anime.stats import write_run_report
+
+            report_path = write_run_report(manifest, ctx.paths.root)
+        except Exception as exc:
+            logger.warning(
+                "运行报告写入失败: %s",
+                redact_text(exc, self._event_secrets()),
+            )
+            return
+        self._emit("run_report_written", path=str(report_path.relative_to(ctx.paths.root)))
+
     @staticmethod
     def _supports_keyword(callable_obj: object, name: str) -> bool:
         """判断可选能力，兼容外部集成和旧测试替身。"""
@@ -2313,6 +2331,7 @@ class Orchestrator:
                     self._checkpoint(ctx, State.ERROR, status="failed", error=message)
                     raise RuntimeError(message)
                 self._checkpoint(ctx, State.DONE, status="dry_run_complete")
+                self._write_run_report(ctx)
                 self._emit("dry_run_complete", run_dir=str(ctx.paths.root))
                 return None
             if ctx.final_video is None:
@@ -2320,6 +2339,7 @@ class Orchestrator:
                 self._checkpoint(ctx, State.ERROR, status="failed", error=message)
                 raise RuntimeError(message)
             self._checkpoint(ctx, State.DONE, status="completed")
+            self._write_run_report(ctx)
             return ctx.final_video
         except KeyboardInterrupt:
             self.cancel_all()
@@ -2332,6 +2352,7 @@ class Orchestrator:
                 )
             except Exception as checkpoint_error:
                 console.print(f"[yellow]写入中断清单失败: {checkpoint_error}[/]", markup=False)
+            self._write_run_report(ctx)
             raise
         except Exception as exc:
             self.cancel_all()
@@ -2344,6 +2365,7 @@ class Orchestrator:
                 )
             except Exception as checkpoint_error:
                 console.print(f"[yellow]写入失败清单失败: {checkpoint_error}[/]", markup=False)
+            self._write_run_report(ctx)
             raise
 
     def _latest_checkpoint_state(self, fallback: State) -> State:
