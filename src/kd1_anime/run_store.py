@@ -218,6 +218,7 @@ VisualStatus = Literal[
 ]
 TechnicalStatus = Literal["pending", "generating", "passed", "failed"]
 LocalSmokeStatus = Literal["pending", "running", "passed", "failed", "skipped"]
+CandidateVerification = Literal["validated", "smoke", "rendered"]
 
 
 def utc_now() -> datetime:
@@ -295,6 +296,22 @@ class StoredVisualCandidate(BaseModel):
     report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class StoredCodeCandidate(BaseModel):
+    """场景可回滚的代码候选；代码本体保存在 run 内私有文件。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code_file: str
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    class_name: str = Field(min_length=1, max_length=200)
+    verification: CandidateVerification = "validated"
+    inherited_elements_sha256: str = Field(default="", max_length=64)
+    exported_elements_code: str = Field(default="", max_length=30_000)
+    exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
+    artifact: SceneArtifact | None = None
+    visual_score: float | None = Field(default=None, ge=1.0, le=5.0)
+
+
 class StoredSceneState(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -369,6 +386,7 @@ class StoredSceneState(BaseModel):
     visual_artifact_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     visual_feedback: str = Field(default="", max_length=20_000)
     visual_best_candidate: StoredVisualCandidate | None = None
+    candidates: list[StoredCodeCandidate] = Field(default_factory=list, max_length=3)
 
 
 class RunManifest(BaseModel):

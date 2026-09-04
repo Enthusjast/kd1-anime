@@ -1424,6 +1424,40 @@ def test_stagnation_fallback_produces_a_different_valid_candidate(tmp_path):
     assert class_name == "Scene1"
 
 
+def test_code_candidate_history_keeps_at_most_three_versions(tmp_path):
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext("prompt", paths=run_paths)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+
+    for index in range(4):
+        state.code = f"from manim import *\n# candidate {index}\n"
+        orchestrator._record_code_candidate(ctx, state, verification="validated")
+
+    assert len(state.candidates) == 3
+    assert all(
+        item.code_file.startswith("artifacts/candidates/scene_1/") for item in state.candidates
+    )
+
+
+def test_rollback_restores_a_previous_smoke_candidate(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext("prompt", paths=run_paths)
+    good_code = "from manim import *\nclass Good(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(plan=plan(), code=good_code, class_name="Good")
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    orchestrator._record_code_candidate(ctx, state, verification="smoke")
+    state.code = "from manim import *\nclass Bad(Scene):\n    def construct(self): pass\n"
+    state.class_name = "Bad"
+
+    assert orchestrator._rollback_to_best_candidate(ctx, 1, state) is True
+    assert state.code == good_code
+    assert state.class_name == "Good"
+    assert state.rendered is False
+    assert state.reviewed is False
+
+
 def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     source = run_paths.scenes / "scene_1.py"

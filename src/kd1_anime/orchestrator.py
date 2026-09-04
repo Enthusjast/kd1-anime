@@ -132,6 +132,7 @@ from kd1_anime.run_store import (
     MANIFEST_NAME,
     RunManifest,
     RunRepository,
+    StoredCodeCandidate,
     StoredSceneState,
     StoredVisualCandidate,
     VisualEvalProfile,
@@ -331,6 +332,7 @@ class SceneState:
     visual_artifact_sha256: str = ""
     visual_feedback: str = ""
     visual_best_candidate: VisualCandidate | None = None
+    candidates: list[StoredCodeCandidate] = field(default_factory=list)
 
 
 @dataclass
@@ -481,6 +483,7 @@ class Orchestrator:
         state.technical_error = ""
         state.capability_contract = None
         state.capability_status = "pending"
+        state.candidates = []
 
     def _cancel_unfinished_scene_job(self, state: SceneState, *, reason: str) -> None:
         """在丢弃场景代码/计划前取消仍可能执行的旧 Job。
@@ -910,6 +913,7 @@ class Orchestrator:
                         if scene.visual_best_candidate is not None
                         else None
                     ),
+                    candidates=list(scene.candidates),
                 )
             ctx.manifest_revision = (
                 max(
@@ -1062,6 +1066,32 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _restore_code_candidates(
+        candidates: list[StoredCodeCandidate],
+        root: Path,
+    ) -> list[StoredCodeCandidate]:
+        """只恢复代码文件和哈希均匹配的回滚候选。"""
+
+        restored: list[StoredCodeCandidate] = []
+        for candidate in candidates[-3:]:
+            try:
+                path = restore_run_path(root, candidate.code_file)
+                if path.is_symlink() or not path.is_file():
+                    continue
+                code = path.read_text(encoding="utf-8")
+                if sha256_text(code) != candidate.code_sha256:
+                    continue
+                if (
+                    candidate.artifact is not None
+                    and candidate.artifact.code_sha256 != candidate.code_sha256
+                ):
+                    continue
+            except (OSError, UnicodeError, ValueError):
+                continue
+            restored.append(candidate)
+        return restored
+
+    @staticmethod
     def _context_from_manifest(manifest: RunManifest, root: Path) -> PipelineContext:
         root = root.resolve()
         output = Path(manifest.output_path).expanduser()
@@ -1207,6 +1237,7 @@ class Orchestrator:
                 visual_best_candidate=Orchestrator._restore_visual_candidate(
                     stored.visual_best_candidate, root
                 ),
+                candidates=Orchestrator._restore_code_candidates(stored.candidates, root),
             )
         direct_render = getattr(manifest, "direct_render", False) or (
             not manifest.auto_fix
@@ -2375,6 +2406,7 @@ class Orchestrator:
             raise
         with self._state_lock:
             state.local_smoke_status = "passed"
+            self._record_code_candidate(ctx, state, verification="smoke")
             self._checkpoint(ctx, State.CODING)
         self._emit("scene_smoke_rendered", scene_id=state.plan.scene_id)
 
@@ -6101,6 +6133,7 @@ class Orchestrator:
                 )[:5_000]
             self._remove_element_manifest_scene(ctx, scene_id)
             self._reset_visual_receipt(ctx, state)
+            self._record_code_candidate(ctx, state, verification="validated")
             self._checkpoint(ctx, State.CODING)
         self._local_smoke_render(ctx, state)
         api_result = lint_manim_api(
@@ -6427,6 +6460,12 @@ class Orchestrator:
                 state.rendered = True
                 state.failure_reason = ""
                 state.failure_category = ""
+                self._record_code_candidate(
+                    ctx,
+                    state,
+                    verification="rendered",
+                    artifact=state.artifact,
+                )
                 self._reset_visual_receipt(ctx, state)
                 self._update_state_ledger(ctx, state)
                 self._checkpoint(ctx, State.MONITORING)
@@ -6535,6 +6574,155 @@ class Orchestrator:
         state.last_repair_error_fp = ""
         state.stagnant_repair_count = 0
 
+    @staticmethod
+    def _candidate_rank(candidate: StoredCodeCandidate) -> tuple[int, float]:
+        verification_rank = {"validated": 1, "smoke": 2, "rendered": 3}.get(
+            candidate.verification,
+            0,
+        )
+        return verification_rank, candidate.visual_score or 0.0
+
+    def _record_code_candidate(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+        *,
+        verification: str,
+        artifact: SceneArtifact | None = None,
+        visual_score: float | None = None,
+    ) -> None:
+        """保存当前代码的有限回滚凭据，不把代码直接塞进 manifest。"""
+
+        if not state.code:
+            return
+        code_hash = sha256_text(state.code)
+        candidate_dir = ctx.paths.root / "artifacts" / "candidates" / f"scene_{state.plan.scene_id}"
+        candidate_path = candidate_dir / f"{verification}_{code_hash[:16]}.py"
+        if not candidate_path.is_file():
+            self._write_private(candidate_path, state.code)
+        existing = next(
+            (item for item in state.candidates if item.code_sha256 == code_hash),
+            None,
+        )
+        if existing is None:
+            state.candidates.append(
+                StoredCodeCandidate(
+                    code_file=candidate_path.relative_to(ctx.paths.root).as_posix(),
+                    code_sha256=code_hash,
+                    class_name=state.class_name,
+                    verification=verification,
+                    inherited_elements_sha256=sha256_text(state.inherited_elements_code),
+                    exported_elements_code=state.exported_elements_code,
+                    exported_elements=list(state.exported_elements),
+                    artifact=artifact,
+                    visual_score=visual_score,
+                )
+            )
+        else:
+            if self._candidate_rank(
+                StoredCodeCandidate(
+                    code_file=existing.code_file,
+                    code_sha256=existing.code_sha256,
+                    class_name=existing.class_name,
+                    verification=verification,
+                    inherited_elements_sha256=existing.inherited_elements_sha256,
+                    exported_elements_code=existing.exported_elements_code,
+                    exported_elements=list(existing.exported_elements),
+                    artifact=artifact or existing.artifact,
+                    visual_score=visual_score
+                    if visual_score is not None
+                    else existing.visual_score,
+                )
+            ) > self._candidate_rank(existing):
+                existing.verification = verification  # type: ignore[misc]
+            if artifact is not None:
+                existing.artifact = artifact
+            if visual_score is not None:
+                existing.visual_score = visual_score
+            if state.exported_elements_code:
+                existing.exported_elements_code = state.exported_elements_code
+                existing.exported_elements = list(state.exported_elements)
+        state.candidates.sort(key=self._candidate_rank, reverse=True)
+        del state.candidates[3:]
+
+    def _best_code_candidate(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+    ) -> StoredCodeCandidate | None:
+        """返回当前代码之外的、可验证的最高等级成功候选。"""
+
+        current_hash = sha256_text(state.code) if state.code else ""
+        for candidate in sorted(state.candidates, key=self._candidate_rank, reverse=True):
+            if candidate.code_sha256 == current_hash or candidate.verification not in {
+                "smoke",
+                "rendered",
+            }:
+                continue
+            try:
+                path = restore_run_path(ctx.paths.root, candidate.code_file)
+                if path.is_symlink() or not path.is_file():
+                    continue
+                code = path.read_text(encoding="utf-8")
+                if sha256_text(code) != candidate.code_sha256:
+                    continue
+                if candidate.artifact is not None:
+                    self._artifact_video_path(ctx, candidate.artifact)
+            except (OSError, UnicodeError, ValueError, RuntimeError):
+                continue
+            return candidate
+        return None
+
+    def _rollback_to_best_candidate(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+    ) -> bool:
+        """回滚到最近可验证版本；返回是否找到可用候选。"""
+
+        candidate = self._best_code_candidate(ctx, state)
+        if candidate is None:
+            return False
+        path = restore_run_path(ctx.paths.root, candidate.code_file)
+        code = path.read_text(encoding="utf-8")
+        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", code)
+        with self._state_lock:
+            state.code = code
+            state.class_name = candidate.class_name
+            state.rewrite_feedback = ""
+            state.review_signature = ""
+            state.identical_review_count = 0
+            state.review_round = 0
+            state.slurm_job = None
+            state.local_smoke_status = (
+                "passed" if candidate.verification in {"smoke", "rendered"} else "pending"
+            )
+            state.exported_elements_code = candidate.exported_elements_code
+            state.exported_elements = list(candidate.exported_elements)
+            state.artifact = candidate.artifact
+            state.rendered = candidate.artifact is not None and candidate.verification == "rendered"
+            state.reviewed = state.rendered
+            state.failure_reason = ""
+            state.failure_category = ""
+            self._reset_repair_progress(state)
+            self._reset_visual_receipt(ctx, state)
+            self._checkpoint(ctx, State.FIXING)
+        self._emit(
+            "scene_code_rolled_back",
+            scene_id=scene_id,
+            verification=candidate.verification,
+            code_sha256=candidate.code_sha256,
+        )
+        self._request_continuity_rebuild(
+            ctx,
+            scene_id,
+            reason="恢复最近可信代码候选",
+            preserve_visual_candidates=True,
+            include_failed=True,
+        )
+        return True
+
     def _stagnation_fallback_candidate(
         self,
         ctx: PipelineContext,
@@ -6619,6 +6807,7 @@ class Orchestrator:
             if reset_stagnation:
                 state.stagnant_repair_count = 0
             self._remove_element_manifest_scene(ctx, scene_id)
+            self._record_code_candidate(ctx, state, verification="validated")
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.FIXING)
         return code_changed
@@ -6707,6 +6896,8 @@ class Orchestrator:
         fixer = AutoFixerAgent()
         error_log = self.slurm.get_error_log(job=job)
         if not error_log:
+            if self._rollback_to_best_candidate(ctx, scene_id, state):
+                return
             with self._state_lock:
                 state.give_up = True
                 state.failure_category = "render"
@@ -6884,6 +7075,8 @@ class Orchestrator:
                         error_log,
                     )
                     self._checkpoint(ctx, State.FIXING)
+            if self._rollback_to_best_candidate(ctx, scene_id, state):
+                return
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
         rag_context = self._retrieve_rag(
@@ -7684,6 +7877,13 @@ class Orchestrator:
             state.visual_artifact_sha256 = candidate.artifact.video_sha256
             state.visual_feedback = ""
             self._reset_repair_progress(state)
+            self._record_code_candidate(
+                ctx,
+                state,
+                verification="rendered",
+                artifact=candidate.artifact,
+                visual_score=candidate.score,
+            )
         return code_changed
 
     def _visual_gate(
