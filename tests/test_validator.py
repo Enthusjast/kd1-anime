@@ -1,3 +1,5 @@
+import pytest
+
 from kd1_anime.agents.validator import validate_manim_code
 from kd1_anime.config import settings
 
@@ -11,6 +13,18 @@ def test_valid_manim_scene():
     )
     assert result.is_valid
     assert result.scene_classes == ["Demo"]
+
+
+def test_allows_common_local_names_that_shadow_manim_internals():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        scene = VGroup(Circle())\n"
+        "        animation = Create(scene)\n"
+        "        self.play(animation)\n"
+    )
+    assert result.is_valid, result.feedback
 
 
 def test_rejects_dangerous_import_and_call():
@@ -47,6 +61,82 @@ def test_rejects_numpy_file_io():
     )
     assert not result.is_valid
     assert "save" in result.feedback
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        (
+            "from manim import *\n"
+            "from numpy import load\n"
+            "class Demo(Scene):\n"
+            "    def construct(self):\n"
+            "        load('secret.npy')\n",
+            "导入符号 'load'",
+        ),
+        (
+            "from manim import *\n"
+            "from numpy import *\n"
+            "class Demo(Scene):\n"
+            "    def construct(self): pass\n",
+            "通配符导入",
+        ),
+        (
+            "from manim import *\n"
+            "from manim import config as cfg\n"
+            "class Demo(Scene):\n"
+            "    def construct(self):\n"
+            "        cfg.media_dir = '/tmp/escape'\n",
+            "config 创建别名",
+        ),
+        (
+            "from manim import *\n"
+            "import manim.utils.file_ops\n"
+            "class Demo(Scene):\n"
+            "    def construct(self): pass\n",
+            "模块路径",
+        ),
+    ],
+)
+def test_rejects_import_allowlist_bypasses(source, expected):
+    result = validate_manim_code(source)
+    assert not result.is_valid
+    assert expected in result.feedback
+
+
+def test_rejects_manim_module_alias_config_access():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "import manim as m\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        m.config.media_dir = '/tmp/escape'\n"
+    )
+    assert not result.is_valid
+    assert "模块别名" in result.feedback
+
+
+def test_rejects_config_alias_created_by_assignment():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        cfg = config\n"
+        "        cfg.media_dir = '/tmp/escape'\n"
+    )
+    assert not result.is_valid
+    assert "config 别名" in result.feedback
+
+
+def test_rejects_manim_internal_module_exposed_by_wildcard_import():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        utils.file_ops.write_file('/tmp/escape', 'x')\n"
+    )
+    assert not result.is_valid
+    assert "内部模块" in result.feedback or "file_ops" in result.feedback
 
 
 def test_rejects_dynamic_module_assignment():
@@ -92,6 +182,36 @@ def test_accepts_xelatex_ctex_template_for_mathtex():
     assert result.is_valid, result.feedback
 
 
+def test_rejects_xelatex_template_without_xdv_output():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        template = TexTemplate(tex_compiler='xelatex', output_format='.pdf')\n"
+        "        template.add_to_preamble(r'\\usepackage{ctex}')\n"
+        "        config.tex_template = template\n"
+        "        self.add(Tex('x', tex_template=template))\n"
+    )
+
+    assert result.is_valid is False
+    assert "output_format='.xdv'" in result.feedback
+
+
+def test_rejects_dangerous_attribute_reference_without_direct_call():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "import numpy as np\n"
+        "from functools import partial\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        loader = partial(np.load, 'secret.npy')\n"
+        "        self.wait()\n"
+    )
+
+    assert result.is_valid is False
+    assert "禁止引用危险属性 'load'" in result.feedback
+
+
 def test_rejects_mathtex_using_default_pdflatex_template():
     result = validate_manim_code(
         "from manim import *\n"
@@ -120,8 +240,9 @@ def test_rejects_xelatex_template_without_ctex_or_global_registration():
     assert "config.tex_template" in result.feedback
 
 
-def test_rejects_custom_mobject_subclass():
+def test_rejects_custom_mobject_subclass(monkeypatch):
     """自定义 mobject 子类 (class X(VMobject)) 在 OpenGL 下缺 should_render, 必须拦截。"""
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
     result = validate_manim_code(
         "from manim import *\n"
         "class Polygon(VMobject):\n"
@@ -135,12 +256,65 @@ def test_rejects_custom_mobject_subclass():
     assert "自定义 mobject 子类" in result.feedback
 
 
+def test_allows_custom_mobject_subclass_for_cairo(monkeypatch):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Shape(VMobject):\n"
+        "    def __init__(self, **kwargs):\n"
+        "        super().__init__(**kwargs)\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(Shape())\n"
+    )
+    assert result.is_valid
+
+
+def test_rejects_qualified_custom_mobject_subclass_for_opengl(monkeypatch):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    result = validate_manim_code(
+        "from manim import *\n"
+        "import manim\n"
+        "class Shape(manim.VMobject):\n"
+        "    pass\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(Shape())\n"
+    )
+    assert not result.is_valid
+    assert "自定义 mobject 子类" in result.feedback
+
+
+def test_rejects_dangerous_callable_hidden_in_container():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        funcs = [open]\n"
+        "        funcs[0]('/tmp/out', 'w')\n"
+    )
+    assert not result.is_valid
+    assert "危险能力 'open'" in result.feedback
+
+
+def test_qualified_tex_still_requires_template():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "import manim\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(manim.Tex('中文'))\n"
+    )
+    assert not result.is_valid
+    assert "xelatex" in result.feedback
+
+
 def test_allows_helper_class():
     """非 mobject 的普通辅助类不应被误拦截。"""
     result = validate_manim_code(
         "from manim import *\n"
         "class Helper:\n"
-        "    LABEL = \"demo\"\n"
+        '    LABEL = "demo"\n'
         "class Demo(Scene):\n"
         "    def construct(self):\n"
         "        self.add(Circle())\n"
@@ -167,6 +341,19 @@ def test_accepts_camera_frame_in_moving_camera_scene():
         "    def construct(self):\n"
         "        self.camera.frame.set(width=14, height=6.5)\n"
     )
+    assert result.is_valid
+
+
+def test_explicit_renderer_context_overrides_process_setting(monkeypatch):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "opengl")
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(MovingCameraScene):\n"
+        "    def construct(self):\n"
+        "        self.camera.frame.set(width=10)\n",
+        renderer="cairo",
+    )
+
     assert result.is_valid
 
 
@@ -208,3 +395,29 @@ def test_accepts_moving_camera_scene_without_frame_under_opengl(monkeypatch):
         "        self.add(Circle())\n"
     )
     assert result.is_valid
+
+
+def test_rejects_generated_code_overriding_global_output_configuration():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        config.media_dir = '/tmp/escaped'\n"
+        "        self.add(Circle())\n"
+    )
+
+    assert not result.is_valid
+    assert "config.media_dir" in result.feedback
+
+
+def test_rejects_module_level_attribute_assignment():
+    result = validate_manim_code(
+        "from manim import *\n"
+        "config.output_file = '/tmp/escaped.mp4'\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        self.add(Circle())\n"
+    )
+
+    assert not result.is_valid
+    assert "顶层" in result.feedback

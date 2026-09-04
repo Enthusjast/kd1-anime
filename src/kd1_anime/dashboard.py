@@ -20,6 +20,7 @@ from rich.text import Text
 
 console = Console()
 
+
 class _DashboardState:
     """模块级共享状态 (避免用 global 语句)."""
 
@@ -83,9 +84,9 @@ class SceneStatus:
 
     scene_id: int
     title: str = ""
-    stage: str = ""          # 当前活动阶段 ("" = 阶段间隙, 等待下一个事件)
-    state: str = "pending"   # pending/running/completed/failed/skipped
-    message: str = ""        # 最近事件摘要
+    stage: str = ""  # 当前活动阶段 ("" = 阶段间隙, 等待下一个事件)
+    state: str = "pending"  # pending/running/completed/failed/skipped
+    message: str = ""  # 最近事件摘要
     started_at: float = 0.0  # 当前阶段开始时间 (用于显示耗时)
     done: list[str] = field(default_factory=list)  # 已完成的流水线阶段
 
@@ -93,6 +94,12 @@ class SceneStatus:
         """记录一个阶段完成 (去重)。"""
         if stage_name not in self.done:
             self.done.append(stage_name)
+
+    def invalidate_from(self, stage_name: str) -> None:
+        """重做某阶段时清除该阶段及所有下游的完成标记。"""
+
+        start = STAGES.index(stage_name)
+        self.done = [name for name in self.done if STAGES.index(name) < start]
 
     @property
     def icon(self) -> str:
@@ -211,9 +218,7 @@ class SceneDashboard:
     def _apply_event(self, event: str, data: dict) -> None:
         scene_id = data.get("scene_id")
         if scene_id is not None:
-            status = self.scenes.setdefault(
-                int(scene_id), SceneStatus(scene_id=int(scene_id))
-            )
+            status = self.scenes.setdefault(int(scene_id), SceneStatus(scene_id=int(scene_id)))
         else:
             status = None
 
@@ -246,19 +251,34 @@ class SceneDashboard:
                 self.scenes.setdefault(sid, SceneStatus(scene_id=sid))
                 self.scenes[sid].title = scene.title
 
-        elif event in ("scene_detailing", "scene_coding", "scene_rewriting", "scene_fixing"):
+        elif event in (
+            "scene_detailing",
+            "scene_coding",
+            "scene_rewriting",
+            "scene_reviewing",
+            "scene_fixing",
+            "scene_retrying",
+        ):
             if status:
                 if event == "scene_detailing":
+                    status.invalidate_from("分镜")
                     status.title = status.title or data.get("title", "")
                     self._mark_running(status, "分镜", "生成分镜中")
                 elif event == "scene_coding":
+                    status.invalidate_from("编码")
                     self._mark_running(status, "编码", "生成代码中")
                 elif event == "scene_rewriting":
+                    status.invalidate_from("编码")
                     self._mark_running(status, "编码", "修正代码中")
+                elif event == "scene_reviewing":
+                    status.invalidate_from("审查")
+                    self._mark_running(status, "审查", "代码审查中")
                 elif event == "scene_fixing":
-                    self._mark_running(
-                        status, "修复", f"自动修复 #{data.get('attempt', 0)}"
-                    )
+                    status.invalidate_from("审查")
+                    self._mark_running(status, "修复", f"自动修复 #{data.get('attempt', 0)}")
+                elif event == "scene_retrying":
+                    status.invalidate_from("渲染")
+                    self._mark_running(status, "渲染", "基础设施故障，重新排队")
 
         elif event in ("scene_detailed", "scene_coded"):
             if status:
@@ -273,13 +293,13 @@ class SceneDashboard:
                     status.mark_done("编码")
                     status.message = "代码就绪"
 
-        elif event == "scene_review_pass":
+        elif event in ("scene_review_pass", "scene_review_skipped"):
             if status:
                 status.state = "running"
                 status.stage = ""
                 status.started_at = 0.0
                 status.mark_done("审查")
-                status.message = "审查通过"
+                status.message = "审查通过" if event == "scene_review_pass" else "已跳过审查"
 
         elif event == "scene_review_fail":
             if status:

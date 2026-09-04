@@ -8,6 +8,15 @@
 ## [未发布]
 
 ### 新增
+- **环境能力探针**：`doctor --probe` 可在不提交 Slurm 的情况下验证 FFmpeg、XeLaTeX `.xdv` 和当前 Manim renderer 的真实视频产物
+- **批量中断恢复**：批量 Ctrl-C 会取消已登记的 Orchestrator/远端作业，并将任务与运行清单标记为可恢复的 interrupted 状态
+- **可验证渲染产物**：新增 RenderProfile、ffprobe 元数据、代码/配置/视频哈希绑定和 Manifest v2 向后迁移
+- **多帧视觉评估**：均匀抽取最终视频关键帧，以一次严格结构化多模态请求联合评估
+- **批量全局配额**：多个批量项目共享 LLM 与 Slurm 并发限制，并预检输出冲突
+- **Renderer 能力上下文**：Planner、Coder、Reviewer 和 AutoFixer 使用一致的 Cairo/OpenGL 约束
+- **作业尝试隔离**：每次 Slurm 提交使用独立媒体目录，防止旧 MP4 污染修复重试
+- **最终输出凭据**：清单保存最终视频 SHA-256，FFmpeg 临时产物通过 ffprobe 后才原子替换
+
 - **异常层次结构**：定义项目自定义异常类型，提供更细粒度的错误处理
   - `KD1Error`：所有项目异常的基类
   - `LLMError`/`LLMAuthError`/`LLMRateLimitError`/`LLMTimeoutError`/`LLMResponseError`：LLM 相关异常
@@ -46,10 +55,19 @@
 
 ### 改进
 
+- 收紧生成代码导入白名单：只允许精确的顶层纯计算模块，阻断模块路径、别名、通配符和 Manim 内部模块绕过
+- 统一 Slurm 监控状态机，按当前作业目录竞态安全地发现嵌套 MP4；显式监控超时不再被旧配置覆盖
+- Manifest、评估结果和报告使用带 fsync 的原子写入；视觉评估限制关键帧数量与单帧大小，并校验最终视频路径和哈希
+- Slurm 监控区分 GONE 与 UNKNOWN，验证嵌套 Manim 成品，并修复抢占回退后的超时计时
+- AutoFix 后强制重新审查；危险属性别名、XeLaTeX `.xdv` 和 renderer API 由确定性校验兜底
+- LLM 非空截断响应不再被直接消费；持续截断会返回明确错误
+- 视觉评估失败记为 unknown 并从总分排除；运行对比聚合所有场景指标
+- 恢复运行会补发已完成场景快照，并保守处理旧版或无法验证的产物
+
 - **AST 校验增强**：
-  - 新增 `BANNED_IMPORT_MODULES` 集合，禁止更多危险模块（os、sys、subprocess、logging 等）
-  - 增强对动态构造危险调用的检测（如 `getattr(os, "system")`）
-  - 改进导入检查逻辑，跟踪已导入模块
+  - 收紧允许导入根模块集合，禁止 os、sys、subprocess 等危险模块
+  - 增强对动态构造危险调用和危险属性别名的检测
+  - 补充 OpenGL 相机、Mobject 继承和 XeLaTeX 配置的确定性检查
 
 - **异常处理改进**：
   - `orchestrator.py`：使用自定义异常替代宽泛的 `except Exception`

@@ -23,9 +23,21 @@ case "${KD1_ANIME_TEXLIVE_PLATFORM:-$(uname -m)}" in
         exit 1
         ;;
 esac
+if [[ ! "$TEXLIVE_PLATFORM" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    err "KD1_ANIME_TEXLIVE_PLATFORM 包含不安全字符: $TEXLIVE_PLATFORM"
+    exit 1
+fi
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kd1-anime"
 CONFIG_FILE="$CONFIG_DIR/.env"
 USER_BIN_DIR="${KD1_ANIME_USER_BIN_DIR:-$HOME/.local/bin}"
+REQUIRE_CHECKSUM="${KD1_ANIME_REQUIRE_CHECKSUM:-0}"
+case "$REQUIRE_CHECKSUM" in
+    0|1) ;;
+    *)
+        err "KD1_ANIME_REQUIRE_CHECKSUM 只能是 0 或 1"
+        exit 1
+        ;;
+esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONDA_BASE=""
 TEX_BIN=""
@@ -165,11 +177,32 @@ download() {
 }
 
 install_texlive() {
-    local tmp installer release root
+    local tmp installer release root expected actual
     tmp="$(mktemp -d)"
     cleanup_dirs+=("$tmp")
     info "从 USTC 镜像下载 TeX Live 安装器..."
     download "$LIVE_REPO/install-tl-unx.tar.gz" "$tmp/install-tl.tar.gz"
+    expected="${KD1_ANIME_TEXLIVE_INSTALLER_SHA256:-}"
+    if [ -n "$expected" ]; then
+        expected="${expected,,}"
+        [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || {
+            err "KD1_ANIME_TEXLIVE_INSTALLER_SHA256 必须是 64 位十六进制 SHA-256"
+            exit 1
+        }
+        actual="$(sha256sum "$tmp/install-tl.tar.gz" | awk '{print $1}')"
+        [ "$actual" = "$expected" ] || {
+            err "TeX Live 安装器 SHA-256 不匹配"
+            err "expected: $expected"
+            err "actual:   $actual"
+            exit 1
+        }
+        log "TeX Live 安装器 SHA-256 验证通过"
+    elif [ "$REQUIRE_CHECKSUM" = 1 ]; then
+        err "安全模式要求设置 KD1_ANIME_TEXLIVE_INSTALLER_SHA256"
+        exit 1
+    else
+        warn "未设置 KD1_ANIME_TEXLIVE_INSTALLER_SHA256；建议固定安装器摘要"
+    fi
     tar xzf "$tmp/install-tl.tar.gz" -C "$tmp"
     installer="$(find "$tmp" -maxdepth 1 -type d -name 'install-tl-*' | head -1 || true)"
     [ -n "$installer" ] || { err "解压后未找到 install-tl"; exit 1; }
@@ -350,6 +383,10 @@ install_python_package() {
             fi
             log "源码归档 SHA-256 验证通过"
         else
+            if [ "$REQUIRE_CHECKSUM" = 1 ]; then
+                err "安全模式要求设置 KD1_ANIME_ARCHIVE_SHA256"
+                exit 1
+            fi
             warn "未设置 KD1_ANIME_ARCHIVE_SHA256；建议发布安装时固定 tag 并提供摘要"
         fi
         env_pip install --upgrade "$archive"
@@ -369,6 +406,17 @@ LLM_API_KEY=sk-your-key-here
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=your-model-name
 LLM_SEND_MAX_TOKENS=true
+LLM_TEMPERATURE=0.3
+LLM_MAX_TOKENS=32768
+LLM_MAX_RETRIES=3
+LLM_RETRY_BASE_DELAY=2.0
+LLM_TIMEOUT_CONNECT=30.0
+LLM_TIMEOUT_READ=600.0
+LLM_SILENT_STREAM=true
+LLM_EMPTY_RETRY_MAX_TOKENS=16384
+LLM_JSON_REPAIR_ATTEMPTS=2
+LLM_USE_JSON_MODE=true
+LLM_DEBUG=false
 SLURM_PARTITION=
 SLURM_QOS=
 SLURM_ACCOUNT=
@@ -376,14 +424,48 @@ SLURM_CONDA_ENV=$ENV_NAME
 SLURM_CONDA_BASE=$CONDA_BASE
 SLURM_TIME_LIMIT=01:00:00
 SLURM_CPUS_PER_TASK=4
+SLURM_MEM_GB=
+SLURM_GPU_TYPE=
+SLURM_GPU_COUNT=1
+SLURM_MAX_IN_FLIGHT=0
 SLURM_SUBMIT_RETRIES=3
 SLURM_SUBMIT_RETRY_DELAY=2.0
+SLURM_CONTAINER_IMAGE=
+SLURM_REQUIRE_CONTAINER=false
+SLURM_CONTAINER_DISABLE_NETWORK=false
+MAX_INFRA_RETRIES=2
 MANIM_RENDERER=cairo
+MANIM_QUALITY=h
+MANIM_PIXEL_WIDTH=1920
+MANIM_PIXEL_HEIGHT=1080
+MANIM_FRAME_RATE=60
+MANIM_OPENGL_PLATFORM=egl
+ALLOW_PARTIAL_OUTPUT=false
+OVERWRITE_OUTPUT=false
 LLM_PARALLEL_WORKERS=4
+MAX_REVIEW_ROUNDS=5
+SKIP_REVIEW=false
+MAX_FIX_ATTEMPTS=5
+MAX_FIX_IDENTICAL_ERRORS=3
+MAX_CLARIFY_ROUNDS=12
 MAX_SCENES=12
 MAX_PROMPT_CHARS=50000
+MAX_CLARIFY_CONTEXT_CHARS=40000
 MAX_LOG_CHARS=30000
-ALLOW_PARTIAL_OUTPUT=false
+CODE_VALIDATION_ATTEMPTS=3
+MONITOR_POLL_INTERVAL=10
+MONITOR_QUEUE_TIMEOUT=3600
+MONITOR_RUN_TIMEOUT=3600
+MONITOR_UNKNOWN_TIMEOUT=300
+MONITOR_ARTIFACT_GRACE=60
+MONITOR_MAX_UNKNOWN=5
+LOG_TAIL_LINES=80
+ENABLE_AUTO_EVAL=false
+ENABLE_VISUAL_EVAL=false
+EVAL_THRESHOLD=3.5
+MAX_EVAL_ROUNDS=2
+WORKSPACE_DIR=workspace
+OUTPUT_FILE=output_final.mp4
 EOF
     cp "$CONFIG_DIR/.env.example" "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"

@@ -92,6 +92,25 @@ class TestSceneDashboard:
         assert "编码⟳" in pipeline
         assert "渲染·" in pipeline
 
+    def test_regeneration_clears_stale_downstream_checkmarks(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("scene_detailed", {"scene_id": 1})
+        dash.on_event("scene_coded", {"scene_id": 1})
+        dash.on_event("scene_review_pass", {"scene_id": 1})
+        dash.on_event("scene_rendered", {"scene_id": 1})
+
+        dash.on_event("scene_coding", {"scene_id": 1, "title": "S1"})
+
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].stage == "编码"
+        assert dash.scenes[1].done == ["分镜"]
+        pipeline = str(dash.scenes[1].render_row()[2])
+        assert "编码⟳" in pipeline
+        assert "审查·" in pipeline
+        assert "渲染·" in pipeline
+
     def test_failed_and_give_up(self):
         dash = SceneDashboard()
         dash.live = MagicMock()
@@ -129,6 +148,17 @@ class TestSceneDashboardEvents:
         assert dash.scenes[1].state == "completed"
         assert dash.scenes[1].stage == "渲染"
         assert dash.scenes[1].message == "复用旧视频"
+
+    def test_reused_scene_is_emitted_after_review(self):
+        """增量复用必须在审查事件之后落地, 不得把终态又刷回进行中。"""
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("scene_review_pass", {"scene_id": 1})
+        dash.on_event("scene_reused", {"scene_id": 1})
+
+        assert dash.scenes[1].state == "completed"
+        assert dash.scenes[1].done == ["审查", "渲染"]
 
     def test_run_started_sets_run_id_and_timer(self):
         dash = SceneDashboard()

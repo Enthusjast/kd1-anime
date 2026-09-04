@@ -1,425 +1,442 @@
-"""
-主评估器 - 整合多维度评估功能
+"""代码、视觉和运行效率的统一评估入口。"""
 
-参照 TheoremExplainAgent 的评估系统设计，提供：
-- 代码质量评估
-- 视觉效果评估
-- 生成效率评估
-- 批量评估和对比功能
-"""
+from __future__ import annotations
 
 import json
-from typing import Dict, List, Optional, Any, Union
-from pathlib import Path
-from datetime import datetime
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-from .metrics import EvalMetric, EvalResult, QualityScore, ComparisonResult
-from .code_eval import CodeEvaluator
-from .visual_eval import VisualEvaluator
-from ..exceptions import KD1Error
+from kd1_anime.config import resolve_runtime_path, settings
+from kd1_anime.eval.code_eval import CodeEvaluator
+from kd1_anime.eval.metrics import ComparisonResult, EvalMetric, EvalResult, QualityScore
+from kd1_anime.eval.visual_eval import VisualEvaluator
+from kd1_anime.exceptions import KD1Error
+from kd1_anime.rendering import probe_video, sha256_file
+from kd1_anime.run_store import RunRepository, atomic_write_json
 
 
 class EvaluationError(KD1Error):
-    """评估相关错误"""
     pass
 
 
+MAX_VISUAL_FRAMES = 8
+MAX_VISUAL_FRAME_BYTES = 2 * 1024 * 1024
+
+
 class Evaluator:
-    """主评估器
-    
-    整合代码质量、视觉效果和生成效率的多维度评估。
-    
-    Example:
-        >>> evaluator = Evaluator()
-        >>> result = evaluator.evaluate_run("run-123")
-        >>> print(f"Overall score: {result.overall_score}")
-    """
-    
     def __init__(
         self,
         enable_visual_eval: bool = True,
-        visual_eval_model: Optional[str] = None,
-        output_dir: Optional[Path] = None,
-    ):
-        """初始化评估器
-        
-        Args:
-            enable_visual_eval: 是否启用视觉评估
-            visual_eval_model: 视觉评估使用的模型
-            output_dir: 评估结果输出目录
-        """
+        visual_eval_model: str | None = None,
+        output_dir: Path | None = None,
+    ) -> None:
         self.code_evaluator = CodeEvaluator()
-        self.visual_evaluator = VisualEvaluator(visual_eval_model) if enable_visual_eval else None
-        self.output_dir = output_dir or Path("eval_results")
+        self.visual_evaluator = (
+            VisualEvaluator(visual_eval_model or settings.EVAL_VISUAL_MODEL)
+            if enable_visual_eval
+            else None
+        )
+        self.output_dir = output_dir or (
+            resolve_runtime_path(settings.WORKSPACE_DIR) / "eval_results"
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
-    
+        self.output_dir.chmod(0o700)
+
     def evaluate_code(self, code: str) -> EvalResult:
-        """评估代码质量
-        
-        Args:
-            code: Python/Manim 代码
-            
-        Returns:
-            EvalResult: 评估结果
-        """
         result = EvalResult(run_id=f"code_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        
-        # 代码评估
-        code_scores = self.code_evaluator.evaluate(code)
-        for score in code_scores:
+        for score in self.code_evaluator.evaluate(code):
             result.add_score(score)
-        
-        result.summary = f"Code evaluation completed. Overall score: {result.overall_score:.2f}"
+        result.summary = self._generate_summary(result)
         return result
-    
-    def evaluate_visual(
-        self,
-        image_path: Union[str, Path],
-        description: str = "",
-    ) -> EvalResult:
-        """评估视觉效果
-        
-        Args:
-            image_path: 渲染截图路径
-            description: 动画描述
-            
-        Returns:
-            EvalResult: 评估结果
-        """
-        if not self.visual_evaluator:
+
+    def evaluate_visual(self, image_path: str | Path, description: str = "") -> EvalResult:
+        if self.visual_evaluator is None:
             raise EvaluationError("Visual evaluation is disabled")
-        
         result = EvalResult(run_id=f"visual_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        
-        # 视觉评估
-        visual_scores = self.visual_evaluator.evaluate(image_path, description)
-        for score in visual_scores:
+        for score in self.visual_evaluator.evaluate(image_path, description):
             result.add_score(score)
-        
-        result.summary = f"Visual evaluation completed. Overall score: {result.overall_score:.2f}"
+        result.summary = self._generate_summary(result)
         return result
-    
+
+    @staticmethod
+    def extract_video_frames(
+        video_path: Path,
+        output_dir: Path,
+        *,
+        frame_count: int = 6,
+    ) -> list[Path]:
+        if not 1 <= frame_count <= MAX_VISUAL_FRAMES:
+            raise ValueError(f"frame_count 必须在 1..{MAX_VISUAL_FRAMES} 之间")
+        metadata = probe_video(video_path)
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise EvaluationError("未找到 ffmpeg，无法抽取视觉评估关键帧")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.chmod(0o700)
+        frames: list[Path] = []
+        for index in range(frame_count):
+            timestamp = metadata.duration_seconds * (index + 1) / (frame_count + 1)
+            output = output_dir / f"frame_{index + 1:02d}.jpg"
+            try:
+                result = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-ss",
+                        f"{timestamp:.3f}",
+                        "-i",
+                        str(video_path),
+                        "-vf",
+                        "scale=1024:1024:force_original_aspect_ratio=decrease",
+                        "-frames:v",
+                        "1",
+                        "-c:v",
+                        "mjpeg",
+                        "-q:v",
+                        "5",
+                        str(output),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise EvaluationError(f"关键帧抽取超时 ({index + 1}/{frame_count})") from exc
+            if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
+                raise EvaluationError(
+                    f"关键帧抽取失败 ({index + 1}/{frame_count}): {result.stderr[-500:]}"
+                )
+            if output.stat().st_size > MAX_VISUAL_FRAME_BYTES:
+                raise EvaluationError(
+                    f"关键帧过大 ({index + 1}/{frame_count}): "
+                    f"{output.stat().st_size} bytes > {MAX_VISUAL_FRAME_BYTES}"
+                )
+            output.chmod(0o600)
+            frames.append(output)
+        return frames
+
     def evaluate_run(
         self,
         run_id: str,
-        run_dir: Optional[Path] = None,
+        run_dir: Path | None = None,
         description: str = "",
         enable_visual: bool = True,
     ) -> EvalResult:
-        """评估完整的运行结果
-        
-        Args:
-            run_id: 运行 ID
-            run_dir: 运行目录路径
-            description: 动画描述
-            enable_visual: 是否进行视觉评估
-            
-        Returns:
-            EvalResult: 综合评估结果
-        """
+        repository = RunRepository(settings.WORKSPACE_DIR)
         if run_dir is None:
-            run_dir = Path(f"workspace/runs/{run_id}")
-        
-        if not run_dir.exists():
-            raise EvaluationError(f"Run directory not found: {run_dir}")
-        
+            manifest = repository.load(run_id)
+            run_dir = repository.run_root(run_id)
+        else:
+            run_dir = run_dir.resolve()
+            if not run_dir.is_dir():
+                raise EvaluationError(f"Run directory not found: {run_dir}")
+            manifest = None
+            manifest_path = run_dir / "manifest.json"
+            if manifest_path.is_file():
+                try:
+                    manifest = (
+                        repository.load(run_id) if run_dir == repository.run_root(run_id) else None
+                    )
+                except (FileNotFoundError, ValueError):
+                    manifest = None
+
         result = EvalResult(
             run_id=run_id,
-            metadata={
-                "run_dir": str(run_dir),
-                "description": description,
-            }
+            metadata={"run_dir": str(run_dir), "description": description},
         )
-        
-        # 1. 代码质量评估
-        code_files = list(run_dir.glob("**/*.py"))
-        if code_files:
-            # 评估主场景文件
-            for code_file in code_files[:3]:  # 最多评估3个文件
+        code_files = sorted((run_dir / "scenes").glob("scene_*.py"))
+        if not code_files:
+            code_files = sorted(run_dir.glob("scene_*.py"))
+        for code_file in code_files:
+            try:
+                for score in self.code_evaluator.evaluate(code_file.read_text(encoding="utf-8")):
+                    score.details["file"] = str(code_file)
+                    result.add_score(score)
+            except (OSError, UnicodeError, ValueError) as exc:
+                result.add_error(f"code:{code_file.name}", str(exc))
+
+        if enable_visual and self.visual_evaluator is not None:
+            final_video = None
+            manifest_video_rejected = False
+            if manifest and manifest.final_video:
+                candidate = Path(manifest.final_video).expanduser().resolve()
+                run_root = run_dir.resolve()
+                allowed_external = Path(manifest.output_path).expanduser().resolve()
                 try:
-                    code = code_file.read_text(encoding='utf-8')
-                    code_scores = self.code_evaluator.evaluate(code)
-                    for score in code_scores:
-                        # 添加文件信息到详情
-                        score.details["file"] = str(code_file)
-                        result.add_score(score)
-                except Exception as e:
-                    print(f"Warning: Failed to evaluate {code_file}: {e}")
-        
-        # 2. 视觉效果评估
-        if enable_visual and self.visual_evaluator:
-            # 查找渲染截图
-            image_files = list(run_dir.glob("**/*.png")) + list(run_dir.glob("**/*.jpg"))
-            if image_files:
+                    candidate.relative_to(run_root)
+                    is_allowed = True
+                except ValueError:
+                    is_allowed = candidate == allowed_external
+                if not is_allowed:
+                    manifest_video_rejected = True
+                    result.add_error("visual", "清单中的最终视频路径不在允许范围内")
+                elif not candidate.is_file():
+                    manifest_video_rejected = True
+                    result.add_error("visual", f"清单中的最终视频不存在: {candidate}")
+                else:
+                    try:
+                        hash_matches = not manifest.final_video_sha256 or (
+                            sha256_file(candidate) == manifest.final_video_sha256
+                        )
+                    except OSError as exc:
+                        hash_matches = False
+                        manifest_video_rejected = True
+                        result.add_error("visual", f"读取最终视频失败，拒绝视觉评估: {exc}")
+                    if not hash_matches and "visual" not in result.errors:
+                        manifest_video_rejected = True
+                        result.add_error("visual", "清单中的最终视频哈希不匹配，拒绝视觉评估")
+                    if hash_matches:
+                        final_video = candidate
+            if final_video is None and not manifest_video_rejected:
+                candidate = run_dir / "output_final.mp4"
+                if candidate.is_file():
+                    final_video = candidate
+            if final_video:
                 try:
-                    visual_scores = self.visual_evaluator.evaluate(
-                        image_files[0],
-                        description,
-                    )
-                    for score in visual_scores:
+                    frames = self.extract_video_frames(final_video, run_dir / "eval_frames")
+                    for score in self.visual_evaluator.evaluate_frames(frames, description):
                         result.add_score(score)
-                except Exception as e:
-                    print(f"Warning: Visual evaluation failed: {e}")
-        
-        # 3. 生成效率评估
-        efficiency_scores = self._evaluate_efficiency(run_dir)
-        for score in efficiency_scores:
+                except Exception as exc:
+                    result.add_error("visual", str(exc))
+            elif final_video is None and not result.errors.get("visual"):
+                result.add_error("visual", "未找到最终视频，无法进行视觉评估")
+
+        for score in self._evaluate_efficiency(run_dir, manifest):
             result.add_score(score)
-        
         result.summary = self._generate_summary(result)
         return result
-    
-    def _evaluate_efficiency(self, run_dir: Path) -> List[QualityScore]:
-        """评估生成效率"""
-        scores = []
-        
-        # 检查 manifest 获取效率信息
-        manifest_path = run_dir / "manifest.json"
-        if manifest_path.exists():
+
+    @staticmethod
+    def _score_render_time(seconds: float) -> int:
+        if seconds < 30:
+            return 5
+        if seconds < 60:
+            return 4
+        if seconds < 120:
+            return 3
+        if seconds < 300:
+            return 2
+        return 1
+
+    def _evaluate_efficiency(self, run_dir: Path, manifest=None) -> list[QualityScore]:
+        raw: dict[str, Any] = {}
+        if manifest is None:
             try:
-                with open(manifest_path, 'r', encoding='utf-8') as f:
-                    manifest = json.load(f)
-                
-                # 渲染时间评估
-                render_time = manifest.get("render_time_seconds", 0)
-                if render_time > 0:
-                    if render_time < 30:
-                        time_score = 5
-                    elif render_time < 60:
-                        time_score = 4
-                    elif render_time < 120:
-                        time_score = 3
-                    elif render_time < 300:
-                        time_score = 2
-                    else:
-                        time_score = 1
-                    
-                    scores.append(QualityScore(
-                        metric=EvalMetric.RENDER_TIME,
-                        score=time_score,
-                        justification=f"Render time: {render_time:.1f} seconds",
-                        details={"render_time_seconds": render_time}
-                    ))
-                
-                # 成功率评估
-                total_scenes = manifest.get("total_scenes", 0)
-                successful_scenes = manifest.get("successful_scenes", 0)
-                
-                if total_scenes > 0:
-                    success_rate = successful_scenes / total_scenes
-                    if success_rate >= 0.95:
-                        rate_score = 5
-                    elif success_rate >= 0.8:
-                        rate_score = 4
-                    elif success_rate >= 0.6:
-                        rate_score = 3
-                    elif success_rate >= 0.4:
-                        rate_score = 2
-                    else:
-                        rate_score = 1
-                    
-                    scores.append(QualityScore(
-                        metric=EvalMetric.SUCCESS_RATE,
-                        score=rate_score,
-                        justification=f"Success rate: {success_rate:.1%} ({successful_scenes}/{total_scenes})",
-                        details={
-                            "total_scenes": total_scenes,
-                            "successful_scenes": successful_scenes,
-                            "success_rate": success_rate,
-                        }
-                    ))
-                
-                # 重试次数评估
-                retry_count = manifest.get("retry_count", 0)
-                if retry_count > 0:
-                    if retry_count <= 1:
-                        retry_score = 5
-                    elif retry_count <= 3:
-                        retry_score = 4
-                    elif retry_count <= 5:
-                        retry_score = 3
-                    elif retry_count <= 10:
-                        retry_score = 2
-                    else:
-                        retry_score = 1
-                    
-                    scores.append(QualityScore(
-                        metric=EvalMetric.RETRY_COUNT,
-                        score=retry_score,
-                        justification=f"Total retries: {retry_count}",
-                        details={"retry_count": retry_count}
-                    ))
-                    
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"Warning: Failed to parse manifest: {e}")
-        
+                raw = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return []
+        scenes = manifest.scenes if manifest is not None else raw.get("scenes", {})
+        if scenes:
+            values = list(scenes.values())
+            rendered = sum(
+                1
+                for scene in values
+                if (scene.rendered if manifest is not None else scene.get("rendered", False))
+            )
+            total = len(values)
+            retries = sum(
+                scene.fix_attempts if manifest is not None else int(scene.get("fix_attempts", 0))
+                for scene in values
+            )
+            elapsed_values = []
+            for scene in values:
+                job = scene.slurm_job if manifest is not None else scene.get("slurm_job")
+                if job:
+                    elapsed = (
+                        job.elapsed_seconds if manifest is not None else job.get("elapsed_seconds")
+                    )
+                    if elapsed:
+                        elapsed_values.append(float(elapsed))
+        else:
+            # 兼容旧的独立评估 fixture。
+            total = int(raw.get("total_scenes", 0))
+            rendered = int(raw.get("successful_scenes", 0))
+            retries = int(raw.get("retry_count", 0))
+            elapsed_values = (
+                [float(raw["render_time_seconds"])] if raw.get("render_time_seconds") else []
+            )
+
+        scores: list[QualityScore] = []
+        if elapsed_values:
+            render_time = sum(elapsed_values)
+            scores.append(
+                QualityScore(
+                    EvalMetric.RENDER_TIME,
+                    self._score_render_time(render_time),
+                    f"Render time: {render_time:.1f} seconds",
+                    {"render_time_seconds": render_time},
+                )
+            )
+        if total:
+            success_rate = rendered / total
+            rate_score = (
+                5
+                if success_rate >= 0.95
+                else 4
+                if success_rate >= 0.8
+                else 3
+                if success_rate >= 0.6
+                else 2
+                if success_rate >= 0.4
+                else 1
+            )
+            scores.append(
+                QualityScore(
+                    EvalMetric.SUCCESS_RATE,
+                    rate_score,
+                    f"Success rate: {success_rate:.1%} ({rendered}/{total})",
+                    {
+                        "total_scenes": total,
+                        "successful_scenes": rendered,
+                        "success_rate": success_rate,
+                    },
+                )
+            )
+        if total:
+            retry_score = (
+                5
+                if retries <= 1
+                else 4
+                if retries <= 3
+                else 3
+                if retries <= 5
+                else 2
+                if retries <= 10
+                else 1
+            )
+            scores.append(
+                QualityScore(
+                    EvalMetric.RETRY_COUNT,
+                    retry_score,
+                    f"Total retries: {retries}",
+                    {"retry_count": retries},
+                )
+            )
         return scores
-    
-    def _generate_summary(self, result: EvalResult) -> str:
-        """生成评估摘要"""
-        categories = {
-            "code": result.get_scores_by_category("code"),
-            "visual": result.get_scores_by_category("visual"),
-            "render": result.get_scores_by_category("render"),
-            "success": result.get_scores_by_category("success"),
-            "retry": result.get_scores_by_category("retry"),
-        }
-        
-        summary_parts = [f"Overall score: {result.overall_score:.2f}/5.00"]
-        
-        for category, scores in categories.items():
+
+    @staticmethod
+    def _generate_summary(result: EvalResult) -> str:
+        if result.overall_score is None:
+            return "Overall score: unknown"
+        parts = [f"Overall score: {result.overall_score:.2f}/5.00"]
+        for category in ("code", "visual", "render", "success", "retry"):
+            scores = result.get_scores_by_category(category)
             if scores:
-                avg = sum(s.score for s in scores) / len(scores)
-                summary_parts.append(f"{category.capitalize()}: {avg:.1f}/5.0")
-        
-        return " | ".join(summary_parts)
-    
+                parts.append(
+                    f"{category.capitalize()}: "
+                    f"{sum(score.score for score in scores) / len(scores):.1f}/5.0"
+                )
+        if result.errors:
+            parts.append("Unknown: " + ", ".join(sorted(result.errors)))
+        return " | ".join(parts)
+
     def evaluate_batch(
         self,
-        run_ids: List[str],
-        base_dir: Optional[Path] = None,
+        run_ids: list[str],
+        base_dir: Path | None = None,
         description: str = "",
         max_workers: int = 4,
-    ) -> List[EvalResult]:
-        """批量评估多个运行
-        
-        Args:
-            run_ids: 运行 ID 列表
-            base_dir: 运行目录基础路径
-            description: 动画描述
-            max_workers: 最大并行数
-            
-        Returns:
-            List[EvalResult]: 评估结果列表
-        """
+    ) -> list[EvalResult]:
+        if max_workers < 1:
+            raise ValueError("max_workers 必须大于 0")
         if base_dir is None:
-            base_dir = Path("workspace/runs")
-        
-        results = []
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
+            repository = RunRepository(settings.WORKSPACE_DIR)
+            # 默认 workspace 是受信任的运行存储；不要让 API 调用者通过
+            # run_id=../... 把批量评估读到 workspace 之外。
             for run_id in run_ids:
-                run_dir = base_dir / run_id
-                future = executor.submit(
+                repository.run_root(run_id)
+            base_dir = repository.runs_root
+        results: dict[int, EvalResult] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
                     self.evaluate_run,
                     run_id,
-                    run_dir,
+                    base_dir / run_id,
                     description,
-                    False,  # 批量评估禁用视觉评估以提高速度
-                )
-                futures[future] = run_id
-            
+                    False,
+                ): (index, run_id)
+                for index, run_id in enumerate(run_ids)
+            }
             for future in as_completed(futures):
-                run_id = futures[future]
+                index, run_id = futures[future]
                 try:
-                    result = future.result()
-                    results.append(result)
-                    print(f"✓ Evaluated {run_id}: {result.overall_score:.2f}")
-                except Exception as e:
-                    print(f"✗ Failed to evaluate {run_id}: {e}")
-        
-        return results
-    
+                    results[index] = future.result()
+                except Exception as exc:
+                    unknown = EvalResult(run_id=run_id)
+                    unknown.add_error("evaluation", str(exc))
+                    unknown.summary = self._generate_summary(unknown)
+                    results[index] = unknown
+        return [results[index] for index in range(len(run_ids))]
+
     def compare_runs(
         self,
         baseline_run_id: str,
         current_run_id: str,
-        base_dir: Optional[Path] = None,
+        base_dir: Path | None = None,
     ) -> ComparisonResult:
-        """对比两个运行的结果
-        
-        Args:
-            baseline_run_id: 基准运行 ID
-            current_run_id: 当前运行 ID
-            base_dir: 运行目录基础路径
-            
-        Returns:
-            ComparisonResult: 对比结果
-        """
         if base_dir is None:
-            base_dir = Path("workspace/runs")
-        
-        baseline_result = self.evaluate_run(baseline_run_id, base_dir / baseline_run_id)
-        current_result = self.evaluate_run(current_run_id, base_dir / current_run_id)
-        
-        # 分析改进和退化
-        improvements = []
-        regressions = []
-        
+            repository = RunRepository(settings.WORKSPACE_DIR)
+            repository.run_root(baseline_run_id)
+            repository.run_root(current_run_id)
+            base_dir = repository.runs_root
+        baseline = self.evaluate_run(baseline_run_id, base_dir / baseline_run_id)
+        current = self.evaluate_run(current_run_id, base_dir / current_run_id)
+        improvements: list[str] = []
+        regressions: list[str] = []
         for metric in EvalMetric:
-            baseline_score = baseline_result.get_score(metric)
-            current_score = current_result.get_score(metric)
-            
-            if baseline_score and current_score:
-                diff = current_score.score - baseline_score.score
-                if diff > 0:
-                    improvements.append(f"{metric.value}: {baseline_score.score} → {current_score.score}")
-                elif diff < 0:
-                    regressions.append(f"{metric.value}: {baseline_score.score} → {current_score.score}")
-        
+            before = baseline.get_metric_average(metric)
+            after = current.get_metric_average(metric)
+            if before is not None and after is not None and before != after:
+                target = improvements if after > before else regressions
+                target.append(f"{metric.value}: {before:.2f} → {after:.2f}")
         return ComparisonResult(
-            baseline_run_id=baseline_run_id,
-            current_run_id=current_run_id,
-            baseline_result=baseline_result,
-            current_result=current_result,
-            improvements=improvements,
-            regressions=regressions,
+            baseline_run_id,
+            current_run_id,
+            baseline,
+            current,
+            improvements,
+            regressions,
         )
-    
+
     def generate_report(
         self,
-        results: List[EvalResult],
-        output_path: Optional[Path] = None,
+        results: list[EvalResult],
+        output_path: Path | None = None,
     ) -> Path:
-        """生成评估报告
-        
-        Args:
-            results: 评估结果列表
-            output_path: 输出路径
-            
-        Returns:
-            Path: 报告文件路径
-        """
-        if output_path is None:
-            output_path = self.output_dir / f"eval_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
+        output_path = output_path or (
+            self.output_dir / f"eval_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        numeric = [result.overall_score for result in results if result.overall_score is not None]
         report = {
             "generated_at": datetime.now().isoformat(),
             "total_runs": len(results),
-            "average_score": sum(r.overall_score for r in results) / len(results) if results else 0,
-            "results": [r.to_dict() for r in results],
+            "average_score": sum(numeric) / len(numeric) if numeric else None,
+            "results": [result.to_dict() for result in results],
             "summary": self._generate_batch_summary(results),
         }
-        
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        
+        atomic_write_json(output_path, report)
         return output_path
-    
-    def _generate_batch_summary(self, results: List[EvalResult]) -> Dict[str, Any]:
-        """生成批量评估摘要"""
-        if not results:
-            return {}
-        
-        scores = [r.overall_score for r in results]
-        
-        # 找出最佳和最差
-        best_result = max(results, key=lambda r: r.overall_score)
-        worst_result = min(results, key=lambda r: r.overall_score)
-        
+
+    @staticmethod
+    def _generate_batch_summary(results: list[EvalResult]) -> dict[str, Any]:
+        rated = [result for result in results if result.overall_score is not None]
+        if not rated:
+            return {"rated_runs": 0, "unknown_runs": len(results)}
+        best = max(rated, key=lambda item: item.overall_score or 0)
+        worst = min(rated, key=lambda item: item.overall_score or 0)
+        scores = [item.overall_score or 0 for item in rated]
         return {
+            "rated_runs": len(rated),
+            "unknown_runs": len(results) - len(rated),
             "average_score": sum(scores) / len(scores),
             "min_score": min(scores),
             "max_score": max(scores),
-            "best_run": best_result.run_id,
-            "worst_run": worst_result.run_id,
-            "score_distribution": {
-                "excellent (4-5)": sum(1 for s in scores if s >= 4),
-                "good (3-4)": sum(1 for s in scores if 3 <= s < 4),
-                "acceptable (2-3)": sum(1 for s in scores if 2 <= s < 3),
-                "poor (1-2)": sum(1 for s in scores if s < 2),
-            }
+            "best_run": best.run_id,
+            "worst_run": worst.run_id,
         }

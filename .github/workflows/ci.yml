@@ -24,6 +24,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
       - run: ruff check .
+      - run: ruff format --check .
       - run: python -m compileall -q .
       - run: bash -n install.sh
       - run: pytest -q

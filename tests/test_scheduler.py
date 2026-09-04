@@ -2,6 +2,7 @@
 
 每个 Scene 独立推进 分镜→编码→审查→提交→渲染→修复, 互不等待。
 """
+
 import threading
 import time
 from pathlib import Path
@@ -13,6 +14,8 @@ from kd1_anime.agents.validator import CodeValidationResult
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
+from kd1_anime.rendering import VideoMetadata
+from kd1_anime.run_store import sha256_text
 
 CODE = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
 
@@ -63,7 +66,7 @@ class FakePlanner:
         self.detail_delay = detail_delay
         self.events = events
 
-    def plan_detail(self, outline, all_outlines, user_prompt, *, stream=False):
+    def plan_detail(self, outline, all_outlines, user_prompt, *, stream=False, renderer=None):
         if self.events is not None:
             self.events.append(("detail_start", outline.scene_id, time.time()))
         if self.detail_delay:
@@ -77,7 +80,15 @@ class FakeCoder:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []  # (feedback, previous_code)
 
-    def generate_code(self, scene_plan, feedback="", previous_code="", *, stream=True):
+    def generate_code(
+        self,
+        scene_plan,
+        feedback="",
+        previous_code="",
+        *,
+        stream=True,
+        renderer=None,
+    ):
         self.calls.append((feedback, previous_code))
         return CODE
 
@@ -89,7 +100,7 @@ class FakeReviewer:
         self.results = list(results) if results else []
         self.calls = 0
 
-    def review(self, code, scene_plan):
+    def review(self, code, scene_plan, *, renderer=None):
         self.calls += 1
         if self.results:
             return self.results.pop(0)
@@ -104,7 +115,7 @@ class FakeAutoFixer:
     def is_infrastructure_error(self, error_log):
         return self.infra
 
-    def fix(self, code, error_log):
+    def fix(self, code, error_log, *, renderer=None):
         self.fix_calls += 1
         return CODE
 
@@ -133,6 +144,8 @@ class FakeSlurm:
             media_dir=self.run_paths.videos / f"scene_{scene_id}",
             scene_class_name=scene_class_name,
             submitted_at=time.time(),
+            code_sha256=kw.get("code_sha256", ""),
+            render_profile=kw.get("render_profile") or PipelineContext("x").render_profile,
         )
         self.jobs[job_id] = job
         self.submitted.append(scene_id)
@@ -152,6 +165,26 @@ class FakeSlurm:
     def _forward_log(self, job, positions):
         pass
 
+    def validate_completed_job(self, job):
+        job.media_dir.mkdir(parents=True, exist_ok=True)
+        video = job.media_dir / f"{job.scene_class_name}.mp4"
+        video.write_bytes(b"fake-video")
+        job.output_path = video
+        job.output_metadata = VideoMetadata(
+            size_bytes=video.stat().st_size,
+            duration_seconds=1,
+            width=job.render_profile.pixel_width,
+            height=job.render_profile.pixel_height,
+            frame_rate=job.render_profile.frame_rate,
+        )
+        return True
+
+    def _classify_gone(self, job):
+        if any(job.media_dir.rglob(f"{job.scene_class_name}.mp4")):
+            self.validate_completed_job(job)
+            return "COMPLETED"
+        return None
+
     def cancel_job(self, job_id):
         return False
 
@@ -169,20 +202,28 @@ class _CallableAgent:
         return self._instance
 
 
-def make_orchestrator(monkeypatch, tmp_path, run_paths, *, slurm=None, planner=None,
-                      coder=None, reviewer=None, autofixer=None):
+def make_orchestrator(
+    monkeypatch,
+    tmp_path,
+    run_paths,
+    *,
+    slurm=None,
+    planner=None,
+    coder=None,
+    reviewer=None,
+    autofixer=None,
+):
     orchestrator = Orchestrator()
     monkeypatch.setattr(
         orchestrator,
         "_validate",
-        lambda value: CodeValidationResult(True, scene_classes=["Demo"]),
+        lambda value, **kwargs: CodeValidationResult(True, scene_classes=["Demo"]),
     )
     orchestrator.slurm = slurm or FakeSlurm(run_paths)
-    if autofixer is not None:
-        orchestrator.auto_fixer = autofixer
     monkeypatch.setattr(module, "PlannerAgent", _CallableAgent(planner or FakePlanner()))
     monkeypatch.setattr(module, "CoderAgent", _CallableAgent(coder or FakeCoder()))
     monkeypatch.setattr(module, "ReviewerAgent", _CallableAgent(reviewer or FakeReviewer()))
+    monkeypatch.setattr(module, "AutoFixerAgent", _CallableAgent(autofixer or FakeAutoFixer()))
     monkeypatch.setattr(settings, "MONITOR_POLL_INTERVAL", 1)
     return orchestrator
 
@@ -196,7 +237,7 @@ def test_ready_scene_submits_while_other_scene_still_detailing(monkeypatch, tmp_
     detail_done = threading.Event()
 
     class SlowPlanner(FakePlanner):
-        def plan_detail(self, outline, all_outlines, user_prompt, *, stream=False):
+        def plan_detail(self, outline, all_outlines, user_prompt, *, stream=False, renderer=None):
             if outline.scene_id == 2:
                 events.append(("detail_start", time.time()))
                 time.sleep(0.3)
@@ -212,8 +253,11 @@ def test_ready_scene_submits_while_other_scene_still_detailing(monkeypatch, tmp_
     ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1), make_outline(2)])
     # Scene 1: 分镜/编码/审查全部完成 → 立即可提交
     ctx.scene_states[1] = SceneState(
-        plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True,
+        plan=make_plan(make_outline(1)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
     )
     (run_paths.scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
     # Scene 2: 只有占位 plan, 需要先 detail
@@ -223,9 +267,7 @@ def test_ready_scene_submits_while_other_scene_still_detailing(monkeypatch, tmp_
 
     # Scene 1 在 Scene 2 的 detail 完成之前就已提交
     detail_end_time = next(t for e, t in events if e == "detail_end")
-    scene1_submit_time = next(
-        t for e, sid, t in slurm.events if e == "submit" and sid == 1
-    )
+    scene1_submit_time = next(t for e, sid, t in slurm.events if e == "submit" and sid == 1)
     assert scene1_submit_time < detail_end_time
     assert ctx.scene_states[1].rendered is True
     assert ctx.scene_states[2].rendered is True
@@ -239,6 +281,8 @@ def test_multiple_scenes_complete_independently(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
     slurm = FakeSlurm(run_paths)
     orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, slurm=slurm)
+    emitted: list[tuple[str, int | None]] = []
+    orchestrator._callback = lambda event, data: emitted.append((event, data.get("scene_id")))
 
     ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1), make_outline(2)])
     ctx.scene_states = {i: SceneState(plan=make_plan(make_outline(i))) for i in (1, 2)}
@@ -251,6 +295,12 @@ def test_multiple_scenes_complete_independently(monkeypatch, tmp_path):
         assert state.reviewed is True
         assert state.rendered is True
     assert sorted(slurm.submitted) == [1, 2]
+    for scene_id in (1, 2):
+        scene_events = [event for event, sid in emitted if sid == scene_id]
+        assert "scene_detailing" in scene_events
+        assert "scene_coding" in scene_events
+        assert "scene_reviewing" in scene_events
+        assert "scene_rendered" in scene_events
 
 
 # ---------------------------------------------------------------------------
@@ -271,13 +321,17 @@ def test_major_review_queues_rewrite_then_passes(monkeypatch, tmp_path):
         ]
     )
     orchestrator = make_orchestrator(
-        monkeypatch, tmp_path, run_paths,
-        coder=coder, reviewer=reviewer,
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        coder=coder,
+        reviewer=reviewer,
     )
 
     ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1)])
     ctx.scene_states[1] = SceneState(
-        plan=make_plan(make_outline(1)), plan_ready=True,
+        plan=make_plan(make_outline(1)),
+        plan_ready=True,
     )
 
     orchestrator._run_scheduler(ctx)
@@ -306,14 +360,23 @@ def test_render_failure_triggers_fix_and_resubmit(monkeypatch, tmp_path):
 
     slurm = FakeSlurm(run_paths, status_map=status_for, error_log="render boom\n")
     autofixer = FakeAutoFixer()
+    reviewer = FakeReviewer()
     orchestrator = make_orchestrator(
-        monkeypatch, tmp_path, run_paths, slurm=slurm, autofixer=autofixer,
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        slurm=slurm,
+        autofixer=autofixer,
+        reviewer=reviewer,
     )
 
     ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1)])
     ctx.scene_states[1] = SceneState(
-        plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True,
+        plan=make_plan(make_outline(1)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
     )
     (run_paths.scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
 
@@ -324,6 +387,45 @@ def test_render_failure_triggers_fix_and_resubmit(monkeypatch, tmp_path):
     assert state.rendered is True
     assert state.fix_attempts == 1
     assert len(slurm.submitted) == 2  # 首次 + 修复后重新提交
+    assert reviewer.calls == 1  # 初始代码已审查；AutoFix 代码必须重新审查
+
+
+def test_infrastructure_failure_requeues_without_autofix(monkeypatch, tmp_path):
+    """节点终态应重排队，不应依赖 AutoFix 开关或调用 LLM。"""
+    run_paths = make_paths(tmp_path)
+
+    class InfraSlurm(FakeSlurm):
+        def poll_all_statuses(self, job_ids):
+            status = "NODE_FAIL" if len(self.submitted) == 1 else "COMPLETED"
+            return {job_id: status for job_id in job_ids}
+
+    slurm = InfraSlurm(run_paths)
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, slurm=slurm)
+    monkeypatch.setattr(settings, "MAX_INFRA_RETRIES", 1)
+
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        auto_fix=False,
+        outlines=[make_outline(1)],
+    )
+    ctx.scene_states[1] = SceneState(
+        plan=make_plan(make_outline(1)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    (run_paths.scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
+
+    orchestrator._run_scheduler(ctx)
+
+    state = ctx.scene_states[1]
+    assert state.rendered is True
+    assert state.failed is False
+    assert state.give_up is False
+    assert state.infra_retries == 1
+    assert slurm.submitted == [1, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -334,13 +436,20 @@ def test_non_fixable_failure_gives_up(monkeypatch, tmp_path):
     slurm = FakeSlurm(run_paths, status_map={"1": "CANCELLED"})
     autofixer = FakeAutoFixer()
     orchestrator = make_orchestrator(
-        monkeypatch, tmp_path, run_paths, slurm=slurm, autofixer=autofixer,
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        slurm=slurm,
+        autofixer=autofixer,
     )
 
     ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1)])
     ctx.scene_states[1] = SceneState(
-        plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True,
+        plan=make_plan(make_outline(1)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
     )
     (run_paths.scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
 
@@ -365,8 +474,13 @@ def test_in_flight_limit_is_respected(monkeypatch, tmp_path):
 
     ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1), make_outline(2)])
     ctx.scene_states = {
-        i: SceneState(plan=make_plan(make_outline(i)), code=CODE, class_name="Demo",
-                      plan_ready=True, reviewed=True)
+        i: SceneState(
+            plan=make_plan(make_outline(i)),
+            code=CODE,
+            class_name="Demo",
+            plan_ready=True,
+            reviewed=True,
+        )
         for i in (1, 2)
     }
     for i in (1, 2):
@@ -378,6 +492,78 @@ def test_in_flight_limit_is_respected(monkeypatch, tmp_path):
     assert ctx.scene_states[1].rendered is True
     assert ctx.scene_states[2].rendered is True
     assert slurm.submitted == [1, 2]
+
+
+def test_restored_job_reserves_slot_before_new_submission(monkeypatch, tmp_path):
+    from kd1_anime.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "SLURM_MAX_IN_FLIGHT", 1)
+    run_paths = make_paths(tmp_path)
+
+    class CountingSlurm(FakeSlurm):
+        def __init__(self, paths):
+            super().__init__(paths)
+            self.remote_active = 1
+            self.max_remote_active = 1
+            self._active_lock = threading.Lock()
+
+        def submit_scene(self, *args, **kwargs):
+            with self._active_lock:
+                self.remote_active += 1
+                self.max_remote_active = max(self.max_remote_active, self.remote_active)
+            return super().submit_scene(*args, **kwargs)
+
+        def poll_all_statuses(self, job_ids):
+            if "99" in job_ids:
+                time.sleep(0.1)
+            return {job_id: "COMPLETED" for job_id in job_ids}
+
+        def validate_completed_job(self, job):
+            valid = super().validate_completed_job(job)
+            with self._active_lock:
+                self.remote_active -= 1
+            return valid
+
+    slurm = CountingSlurm(run_paths)
+    existing = SlurmJob(
+        job_id="99",
+        scene_id=1,
+        script_path=run_paths.scenes / "render_1.sh",
+        log_out=run_paths.logs / "scene_1.out",
+        log_err=run_paths.logs / "scene_1.err",
+        media_dir=run_paths.videos / "scene_1",
+        scene_class_name="Demo",
+        submitted_at=time.time(),
+        code_sha256=sha256_text(CODE),
+        render_profile=PipelineContext("x").render_profile,
+    )
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, slurm=slurm)
+    ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1), make_outline(2)])
+    ctx.scene_states = {
+        1: SceneState(
+            plan=make_plan(make_outline(1)),
+            code=CODE,
+            class_name="Demo",
+            plan_ready=True,
+            reviewed=True,
+            slurm_job=existing,
+        ),
+        2: SceneState(
+            plan=make_plan(make_outline(2)),
+            code=CODE,
+            class_name="Demo",
+            plan_ready=True,
+            reviewed=True,
+        ),
+    }
+    for scene_id in (1, 2):
+        (run_paths.scenes / f"scene_{scene_id}.py").write_text(CODE, encoding="utf-8")
+
+    orchestrator._run_scheduler(ctx)
+
+    assert slurm.max_remote_active == 1
+    assert slurm.submitted == [2]
+    assert all(state.rendered for state in ctx.scene_states.values())
 
 
 # ---------------------------------------------------------------------------
@@ -416,12 +602,11 @@ def test_execute_dry_run_end_to_end(monkeypatch, tmp_path):
     result = orchestrator._execute(ctx, State.INIT)
 
     assert result is None
-    assert all(
-        st.plan_ready and st.reviewed for st in ctx.scene_states.values()
-    )
-    manifest = (run_paths.root / "manifest.json")
+    assert all(st.plan_ready and st.reviewed for st in ctx.scene_states.values())
+    manifest = run_paths.root / "manifest.json"
     assert manifest.is_file()
     import json
+
     data = json.loads(manifest.read_text(encoding="utf-8"))
     assert data["status"] == "dry_run_complete"
 
@@ -434,14 +619,15 @@ def test_execute_full_pipeline_with_merge(monkeypatch, tmp_path):
     slurm = FakeSlurm(run_paths)
 
     class FakeMerger:
-        def merge_jobs(self, rendered_jobs, output_path=None):
+        def merge(self, videos, output_path, *, replace_existing=False, render_profile=None):
+            # run-local 输出属于当前私有 run；合并器必须能够在校验通过后
+            # 原子替换之前的结果，而不是因为旧文件存在而直接拒绝。
+            assert replace_existing is True
+            assert render_profile == ctx.render_profile
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"\x00" * 100)
             return output_path
-
-        def collect_incremental_videos(self, *args, **kwargs):
-            return []
 
     orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, slurm=slurm)
     orchestrator.merger = FakeMerger()
@@ -455,6 +641,7 @@ def test_execute_full_pipeline_with_merge(monkeypatch, tmp_path):
     assert result.exists()
     assert ctx.scene_states[1].rendered is True
     import json
+
     data = json.loads((run_paths.root / "manifest.json").read_text(encoding="utf-8"))
     assert data["status"] == "completed"
 
@@ -481,38 +668,60 @@ def test_reconcile_restored_jobs_clears_gone_and_reuses_completed(monkeypatch, t
             media_dir=media_dir,
             scene_class_name="Demo",
             submitted_at=0,
+            code_sha256=sha256_text(CODE),
+            render_profile=ctx.render_profile,
         )
 
     # 场景1: 作业已从集群消失 (GONE) → 清空引用, resume 后重新提交
     ctx.scene_states[1] = SceneState(
-        plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True, slurm_job=make_job(1, "1", run_paths.videos / "s1"),
+        plan=make_plan(make_outline(1)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        slurm_job=make_job(1, "1", run_paths.videos / "s1"),
     )
     # 场景2: 上次已完成且视频存在 → 直接复用
     video_dir = run_paths.videos / "s2"
     video_dir.mkdir(parents=True)
     (video_dir / "Demo.mp4").write_bytes(b"fake")
     ctx.scene_states[2] = SceneState(
-        plan=make_plan(make_outline(2)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True, slurm_job=make_job(2, "2", video_dir),
+        plan=make_plan(make_outline(2)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        slurm_job=make_job(2, "2", video_dir),
     )
     # 场景3: 仍在运行 → 保留继续监控
     ctx.scene_states[3] = SceneState(
-        plan=make_plan(make_outline(3)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True, slurm_job=make_job(3, "3", run_paths.videos / "s3"),
+        plan=make_plan(make_outline(3)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        slurm_job=make_job(3, "3", run_paths.videos / "s3"),
     )
-    # 场景4: 作业不可见 (UNKNOWN) 且无视频 → 清空引用, 重新提交
+    # 场景4: 作业不可见 (UNKNOWN) 且无视频 → 保留引用，禁止重复提交
     ctx.scene_states[4] = SceneState(
-        plan=make_plan(make_outline(4)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True, slurm_job=make_job(4, "4", run_paths.videos / "s4"),
+        plan=make_plan(make_outline(4)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        slurm_job=make_job(4, "4", run_paths.videos / "s4"),
     )
-    # 场景5: 作业不可见 (UNKNOWN) 但已有成品视频 → 直接复用, 标记渲染完成
+    # 场景5: UNKNOWN 即使已有文件也不越过调度器身份验证
     video_dir5 = run_paths.videos / "s5"
     video_dir5.mkdir(parents=True)
     (video_dir5 / "Demo.mp4").write_bytes(b"fake")
     ctx.scene_states[5] = SceneState(
-        plan=make_plan(make_outline(5)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True, slurm_job=make_job(5, "5", video_dir5),
+        plan=make_plan(make_outline(5)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        slurm_job=make_job(5, "5", video_dir5),
     )
 
     orchestrator._reconcile_restored_jobs(ctx)
@@ -522,11 +731,11 @@ def test_reconcile_restored_jobs_clears_gone_and_reuses_completed(monkeypatch, t
     assert ctx.scene_states[2].slurm_job is not None
     assert ctx.scene_states[3].slurm_job is not None
     assert ctx.scene_states[3].rendered is False
-    # UNKNOWN 且无视频 → 清空重跑; UNKNOWN 但有视频 → 复用
-    assert ctx.scene_states[4].slurm_job is None
+    # UNKNOWN 一律保留 Job ID，直到确认终态或成功取消。
+    assert ctx.scene_states[4].slurm_job is not None
     assert ctx.scene_states[4].rendered is False
     assert ctx.scene_states[5].slurm_job is not None
-    assert ctx.scene_states[5].rendered is True
+    assert ctx.scene_states[5].rendered is False
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +746,7 @@ def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
     error_log = (
         "Rendering:   0%|          | 0/60 [00:00<?, ?it/s]\n"
         "Traceback (most recent call last):\n"
-        "  File \"scene_1.py\", line 42, in construct\n"
+        '  File "scene_1.py", line 42, in construct\n'
         "ValueError: something deterministic\n"
     )
     slurm = FakeSlurm(
@@ -547,14 +756,21 @@ def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
     )
     autofixer = FakeAutoFixer()
     orchestrator = make_orchestrator(
-        monkeypatch, tmp_path, run_paths, slurm=slurm, autofixer=autofixer,
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        slurm=slurm,
+        autofixer=autofixer,
     )
     monkeypatch.setattr(module.settings, "MAX_FIX_IDENTICAL_ERRORS", 2)
 
     ctx = PipelineContext("x", paths=run_paths, outlines=[make_outline(1)])
     ctx.scene_states[1] = SceneState(
-        plan=make_plan(make_outline(1)), code=CODE, class_name="Demo",
-        plan_ready=True, reviewed=True,
+        plan=make_plan(make_outline(1)),
+        code=CODE,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
     )
     (run_paths.scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
 
@@ -573,15 +789,22 @@ def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
 def test_error_fingerprint_normalizes_digits(monkeypatch, tmp_path):
     from kd1_anime.orchestrator import Orchestrator
 
-    fp1 = Orchestrator._error_fingerprint(
-        "Traceback line 42: ValueError at frame 1234"
-    )
-    fp2 = Orchestrator._error_fingerprint(
-        "Traceback line 99: ValueError at frame 9999"
-    )
+    fp1 = Orchestrator._error_fingerprint("Traceback line 42: ValueError at frame 1234")
+    fp2 = Orchestrator._error_fingerprint("Traceback line 99: ValueError at frame 9999")
     assert fp1 == fp2  # 数字不同 → 指纹相同
 
-    fp3 = Orchestrator._error_fingerprint(
-        "Traceback line 42: KeyError at frame 1234"
-    )
+    fp3 = Orchestrator._error_fingerprint("Traceback line 42: KeyError at frame 1234")
     assert fp1 != fp3  # 错误类型不同 → 指纹不同
+
+
+def test_error_fingerprint_normalizes_attempt_paths_and_hex_names():
+    first = Orchestrator._error_fingerprint(
+        "ValueError: failed in workspace/runs/20260811-120000-abcdef12/"
+        "videos/scene_1/attempt_0123456789ab/Tex/aa11bb22cc33dd44.svg"
+    )
+    second = Orchestrator._error_fingerprint(
+        "ValueError: failed in workspace/runs/20260812-130000-1234abcd/"
+        "videos/scene_1/attempt_fedcba987654/Tex/ffeeddccbbaa9988.svg"
+    )
+
+    assert first == second
