@@ -16,7 +16,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kd1_anime.agents.math_verifier import verify_expression_samples
+from kd1_anime.agents.math_verifier import (
+    verify_expression_samples,
+    verify_numeric_matrix_product,
+)
 from kd1_anime.agents.planner import (
     ContinuityBible,
     LessonSpec,
@@ -422,6 +425,16 @@ def _matrix_equations(text: str) -> list[tuple[str, str]]:
     return _MATRIX_EQUATION_RE.findall(str(text or ""))
 
 
+def _matrix_products(text: str) -> list[tuple[str, str, str]]:
+    """提取 ``数字矩阵 * 数字矩阵 = 数字矩阵``。"""
+
+    pattern = re.compile(
+        rf"({_MATRIX_LITERAL})\s*(?:\*|×|⋅)\s*({_MATRIX_LITERAL})\s*="
+        rf"\s*({_MATRIX_LITERAL})"
+    )
+    return pattern.findall(str(text or ""))
+
+
 class PlanCompiler:
     """对整部动画计划执行一次确定性编译。"""
 
@@ -724,6 +737,24 @@ class PlanCompiler:
                         scene_ids=scene_ids,
                         message=f"computation 中的矩阵等式不等价：{left} ≠ {right}。",
                         fix_instruction="逐项核对矩阵行列、元素和乘法结果。",
+                    )
+                )
+
+        for index, (left, right, expected) in enumerate(
+            _matrix_products(plan.computation), start=1
+        ):
+            matrix_result = verify_numeric_matrix_product(left, right, expected)
+            if matrix_result.status == "counterexample":
+                issues.append(
+                    PlanCompilerIssue(
+                        category="math",
+                        field=f"computation.matrix_product_{index}",
+                        scene_ids=scene_ids,
+                        message=(
+                            "computation 中的矩阵乘法不成立："
+                            f"{left} × {right} ≠ {expected}；{matrix_result.reason}。"
+                        ),
+                        fix_instruction="逐项核对矩阵维度和乘法结果，修正错误元素。",
                     )
                 )
 
