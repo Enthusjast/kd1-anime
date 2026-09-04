@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from rich.console import Console
 
+from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.config import settings
 from kd1_anime.rendering import RenderProfile, VideoMetadata, sha256_file, verify_video
 
@@ -74,6 +75,7 @@ class SlurmJob:
     started_at: float | None = None
     code_sha256: str = ""
     render_profile: RenderProfile = field(default_factory=RenderProfile.current)
+    resource_profile: RenderResourceProfile | None = None
     output_path: Path | None = None
     output_metadata: VideoMetadata | None = None
     output_sha256: str = ""
@@ -423,6 +425,7 @@ class SlurmDispatcher:
         videos_dir: Path | None = None,
         attempt_token: str | None = None,
         render_profile: RenderProfile | None = None,
+        resource_profile: RenderResourceProfile | None = None,
     ) -> tuple[Path, Path, Path, Path]:
         scene_id = self._validate_scene_id(scene_id)
         scene_class_name = self._validate_scene_class_name(scene_class_name)
@@ -451,6 +454,7 @@ class SlurmDispatcher:
             log_err=log_err,
             run_root=scenes_dir.parent,
             render_profile=render_profile,
+            resource_profile=resource_profile,
         )
         script_path.write_text(content, encoding="utf-8")
         script_path.chmod(0o700)
@@ -468,6 +472,7 @@ class SlurmDispatcher:
         log_err: Path,
         run_root: Path | None = None,
         render_profile: RenderProfile | None = None,
+        resource_profile: RenderResourceProfile | None = None,
     ) -> str:
         self._validate_scene_id(scene_id)
         self._validate_scene_class_name(scene_class_name)
@@ -481,9 +486,10 @@ class SlurmDispatcher:
             if any(character in str(value) for character in ("\x00", "\r", "\n")):
                 raise ValueError(f"{label}必须是单行值")
         profile = render_profile or RenderProfile.current()
+        resources = resource_profile or RenderResourceProfile.from_settings()
         renderer = profile.renderer
         use_gpu = renderer == "opengl"
-        if use_gpu and not settings.SLURM_GPU_TYPE:
+        if use_gpu and not resources.gpu_type:
             raise RuntimeError(
                 "MANIM_RENDERER=opengl 时必须配置 SLURM_GPU_TYPE；否则无法保证作业分配到 GPU 节点。"
             )
@@ -507,21 +513,21 @@ class SlurmDispatcher:
             [
                 f"#SBATCH -J {job_name}",
                 "#SBATCH -N 1",
-                f"#SBATCH --cpus-per-task={settings.SLURM_CPUS_PER_TASK}",
+                f"#SBATCH --cpus-per-task={resources.cpus_per_task}",
             ]
         )
         # Cairo 不使用 GPU；只为 OpenGL 作业申请 GPU。
         if use_gpu:
-            lines.append(f"#SBATCH --gres=gpu:{settings.SLURM_GPU_TYPE}:{settings.SLURM_GPU_COUNT}")
+            lines.append(f"#SBATCH --gres=gpu:{resources.gpu_type}:{resources.gpu_count}")
         lines.extend(
             [
-                f"#SBATCH -t {settings.SLURM_TIME_LIMIT}",
+                f"#SBATCH -t {resources.time_limit}",
                 f"#SBATCH -o {shlex.quote(str(log_out))}",
                 f"#SBATCH -e {shlex.quote(str(log_err))}",
             ]
         )
-        if settings.SLURM_MEM_GB:
-            lines.append(f"#SBATCH --mem={settings.SLURM_MEM_GB}")
+        if resources.mem_gb:
+            lines.append(f"#SBATCH --mem={resources.mem_gb}G")
 
         lines.extend(["", "set -euo pipefail", "umask 077", ""])
 
@@ -1402,6 +1408,7 @@ class SlurmDispatcher:
         videos_dir: Path | None = None,
         code_sha256: str = "",
         render_profile: RenderProfile | None = None,
+        resource_profile: RenderResourceProfile | None = None,
     ) -> SlurmJob:
         scene_id = self._validate_scene_id(scene_id)
         scene_class_name = self._validate_scene_class_name(scene_class_name)
@@ -1417,6 +1424,7 @@ class SlurmDispatcher:
             # 把上一次作业的 MP4 误认为当前作业产物。
             attempt_token=uuid4().hex[:12],
             render_profile=profile,
+            resource_profile=resource_profile,
         )
         submitted_at = time.time()
         job_id = self.submit(script_path)
@@ -1431,6 +1439,7 @@ class SlurmDispatcher:
             submitted_at=submitted_at,
             code_sha256=code_sha256,
             render_profile=profile,
+            resource_profile=resource_profile,
         )
 
 

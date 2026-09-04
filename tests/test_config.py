@@ -195,12 +195,27 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_MAX_REVIEW_CONTEXT_CHARS == 90_000
     assert config.LLM_MAX_TECHNICAL_SPEC_CHARS == 30_000
     assert config.MAX_TECHNICAL_SPEC_ATTEMPTS == 3
+    assert config.CODEGEN_MODE == "hybrid"
     assert config.MAX_PLAN_REPLAN_ATTEMPTS == 3
     assert config.SMOKE_RENDER_ENABLED is True
     assert config.SMOKE_RENDER_MODE == "frame"
     assert config.SMOKE_RENDER_QUALITY == "l"
     assert config.LOCAL_SMOKE_RENDER_ENABLED is False
     assert config.LOCAL_SMOKE_RENDER_MODE == "frame"
+
+
+def test_stage_model_routing_falls_back_and_overrides_per_stage():
+    config = Settings(
+        _env_file=None,
+        LLM_API_KEY="key",
+        LLM_BASE_URL="https://example.invalid/v1",
+        LLM_MODEL="main-model",
+        LLM_CODE_MODEL="code-model",
+    )
+
+    assert config.main_llm_profile(stage="planning").model == "main-model"
+    assert config.main_llm_profile(stage="code").model == "code-model"
+    assert config.main_llm_profile(stage="code").max_tokens == config.LLM_CODE_MAX_TOKENS
 
 
 def test_llm_timeout_and_silent_stream_validation():

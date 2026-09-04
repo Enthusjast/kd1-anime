@@ -76,6 +76,24 @@ def test_compiler_checks_simple_equations_in_free_form_computation():
     assert any(issue.category == "math" for issue in result.issues)
 
 
+def test_compiler_uses_sampling_when_symbolic_parser_cannot_decide():
+    plan = make_plan(
+        math_claims=[
+            MathClaim(
+                claim_id="fraction_claim",
+                statement="x/(x+1)=x",
+                expression_before="x/(x+1)",
+                expression_after="x",
+                relation="equivalent",
+            )
+        ]
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert any("采样点" in issue.message for issue in result)
+
+
 def test_compiler_does_not_treat_geometric_constraints_as_identities():
     plan = make_plan(computation="直角三角形满足 a^2+b^2=c^2")
 

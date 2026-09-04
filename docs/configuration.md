@@ -39,6 +39,7 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_API_KEY | 空 | 主模型 API Key；必填，除非只执行不调用模型的命令 |
 | LLM_BASE_URL | https://api.openai.com/v1 | OpenAI-compatible Base URL |
 | LLM_MODEL | 空 | 主模型名；必填 |
+| LLM_PLANNING_MODEL / LLM_TECHNICAL_MODEL / LLM_CODE_MODEL / LLM_REVIEW_MODEL / LLM_FIX_MODEL | 空 | 可选阶段模型；为空回退到 LLM_MODEL |
 | LLM_SEND_MAX_TOKENS | true | 是否向端点发送 max_tokens |
 | LLM_TEMPERATURE | 0.3 | 温度，范围 0–2 |
 | LLM_PLANNING_TEMPERATURE | 0.2 | Planner/Clarifier 温度 |
@@ -71,6 +72,7 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_MAX_REVIEW_CONTEXT_CHARS | 90000 | Reviewer 输入预算 |
 | LLM_MAX_TECHNICAL_SPEC_CHARS | 30000 | TechnicalSpec 注入预算 |
 | MAX_TECHNICAL_SPEC_ATTEMPTS | 3 | TechnicalSpec 编译失败后的重生成次数 |
+| CODEGEN_MODE | hybrid | 代码模式：hybrid、python 或 ir |
 
 阶段预算独立设置，可以减少推理模型把输出预算耗在分析过程而导致 JSON 或代码
 截断。若模型能力或输出复杂度不同，可以只调整对应阶段。
@@ -159,6 +161,7 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | SLURM_MEM_GB | 空 | 可选内存约束，如 32G |
 | SLURM_GPU_TYPE | 空 | OpenGL 作业的 GPU 类型 |
 | SLURM_GPU_COUNT | 1 | OpenGL GPU 数 |
+| AUTO_RESOURCE_ESTIMATION | false | 是否按场景复杂度自动增加资源（只向上调整） |
 | SLURM_MAX_IN_FLIGHT | 0 | 最大在途场景作业数；0 表示不限制 |
 | SLURM_SUBMIT_RETRIES | 3 | 明确 sbatch 失败的重试次数 |
 | SLURM_SUBMIT_RETRY_DELAY | 2.0 | sbatch 重试退避秒数 |
@@ -206,6 +209,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
 | MAX_REVIEW_ROUNDS | 5 | 单场景代码审查/重写轮数 |
+| MAX_LOW_RISK_REVIEW_ROUNDS | 2 | 低风险场景的代码审查轮数；确定性检查不跳过 |
 | MAX_PLAN_REVIEW_ROUNDS | 2 | 单场景计划审查轮数 |
 | MAX_PLAN_REPLAN_ATTEMPTS | 3 | 计划反馈后的 Planner 总重调用次数 |
 | MAX_CONTINUITY_FIX_ROUNDS | 2 | 连续性局部重规划次数；耗尽后 warning 放行 |
@@ -213,6 +217,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | SKIP_REVIEW | false | 是否跳过语义代码审查；确定性校验仍保留 |
 | SAFE_FALLBACK_ENABLED | true | 高风险几何失败后是否切换保守方案 |
 | MAX_IDENTICAL_REVIEW_ATTEMPTS | 2 | 相同代码/反馈重复次数上限 |
+| MAX_STAGNANT_ATTEMPTS | 2 | 渲染修复无进展后切换确定性回退的次数 |
 | MAX_FIX_ATTEMPTS | 5 | 渲染失败后的最大代码修复次数 |
 | MAX_INFRA_RETRIES | 2 | 基础设施故障重排队次数 |
 | MAX_FIX_IDENTICAL_ERRORS | 3 | 相同渲染错误指纹的放弃阈值 |
@@ -222,6 +227,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MAX_CLARIFY_CONTEXT_CHARS | 40000 | 多轮澄清上下文上限 |
 | MAX_LOG_CHARS | 30000 | AutoFixer 接收的日志上限 |
 | CODE_VALIDATION_ATTEMPTS | 3 | 代码校验失败后的重生成次数 |
+| MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH | 1/2/3 | 按场景风险允许的不同代码实现策略数 |
 | MONITOR_POLL_INTERVAL | 10 | Slurm 轮询间隔秒数 |
 | MONITOR_QUEUE_TIMEOUT | 3600 | 排队超时秒数 |
 | MONITOR_RUN_TIMEOUT | 3600 | 运行超时秒数 |

@@ -163,6 +163,27 @@ def test_global_dry_run_is_forwarded_to_generate(monkeypatch, tmp_path):
     assert calls == [("demo", True)]
 
 
+def test_generate_smoke_is_forwarded_to_orchestrator(monkeypatch):
+    import kd1_anime.orchestrator as orchestrator_module
+
+    calls = []
+
+    class FakeOrchestrator:
+        def run(self, prompt, *, dry_run=False, smoke=False):
+            calls.append((prompt, dry_run, smoke))
+            return None
+
+    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
+    monkeypatch.setattr(settings, "LLM_API_KEY", "key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "model")
+
+    result = CliRunner().invoke(app, ["generate", "demo", "--dry-run", "--smoke"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("demo", True, True)]
+
+
 def test_generate_exits_before_pipeline_when_healthcheck_fails(monkeypatch):
     monkeypatch.setattr(settings, "LLM_API_KEY", "key")
     monkeypatch.setattr(settings, "LLM_MODEL", "model")

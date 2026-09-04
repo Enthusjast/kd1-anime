@@ -1315,6 +1315,7 @@ class TechnicalPlannerAgent(BaseAgent):
     """根据 ScenePlan 生成 TechnicalSpec；确定性编译由流水线统一执行。"""
 
     name = "TechnicalPlanner"
+    llm_stage = "technical"
 
     def plan(
         self,

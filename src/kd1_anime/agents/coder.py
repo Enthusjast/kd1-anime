@@ -198,6 +198,7 @@ class CoderAgent(BaseAgent):
     """代码生成 Agent。"""
 
     name = "Coder"
+    llm_stage = "code"
 
     def generate_code(
         self,
@@ -217,6 +218,9 @@ class CoderAgent(BaseAgent):
         rag_context: str = "",
         lesson_spec: LessonSpec | None = None,
         teaching_graph: TeachingGraph | None = None,
+        candidate_index: int = 1,
+        candidate_budget: int = 1,
+        risk_level: Literal["low", "medium", "high"] = "low",
     ) -> str:
         self._log(f"正在为 Scene {scene_plan.scene_id} [{scene_plan.title}] 生成代码...")
         structured_contract = json.dumps(
@@ -244,6 +248,12 @@ class CoderAgent(BaseAgent):
             elements_to_remove if elements_to_remove is not None else scene_plan.elements_to_remove
         )
         visual_state = global_visual_state or scene_plan.global_visual_state
+        candidate_note = (
+            "这是首选实现，请优先使用最简单、最稳健的 Manim API。"
+            if candidate_index <= 1
+            else "这是一个备选实现。请改变导致校验失败的局部结构，不能原样复制上一候选，"
+            "但仍必须完整满足同一份数学、生命周期和连续性合同。"
+        )
         sections = [
             PromptSection(
                 "场景概览",
@@ -256,6 +266,14 @@ class CoderAgent(BaseAgent):
                 ),
                 required=True,
                 priority=100,
+            ),
+            PromptSection(
+                "候选策略",
+                f"场景风险等级: {risk_level}\n"
+                f"当前候选: {max(1, candidate_index)}/{max(1, candidate_budget)}\n"
+                f"{candidate_note}",
+                required=True,
+                priority=95,
             ),
             PromptSection("画面设计", scene_plan.visual_design, priority=30, max_chars=8_000),
             PromptSection("运镜方案", scene_plan.camera_movement, priority=40, max_chars=4_000),

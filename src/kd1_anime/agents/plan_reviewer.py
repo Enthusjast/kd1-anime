@@ -557,6 +557,7 @@ class PlanReviewerAgent(BaseAgent):
     """在 Coder 运行前审查单个场景计划。"""
 
     name = "PlanReviewer"
+    llm_stage = "review"
 
     @staticmethod
     def _compact_plan(plan: ScenePlan) -> dict:
