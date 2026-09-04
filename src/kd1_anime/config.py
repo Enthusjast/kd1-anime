@@ -272,6 +272,21 @@ class Settings(BaseSettings):
         default=True,
         description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级",
     )
+    # 非流式业务请求的本地响应缓存。缓存只保存去除 API Key 后的请求指纹和
+    # 完整文本响应，默认位于用户私有目录；流式交互请求永不写入缓存。
+    LLM_CACHE_ENABLED: bool = Field(
+        default=True,
+        description="是否启用本地 LLM 响应缓存（不缓存流式交互请求）",
+    )
+    LLM_CACHE_PATH: Path = APP_HOME / "cache" / "llm.sqlite3"
+    LLM_CACHE_MAX_ENTRIES: int = Field(default=512, ge=0, le=100_000)
+    # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
+    # 裁剪，低优先级的 RAG/自然语言说明会优先让出空间。
+    LLM_MAX_CONTEXT_CHARS: int = Field(default=120_000, ge=10_000, le=2_000_000)
+    LLM_MAX_CODE_CONTEXT_CHARS: int = Field(default=60_000, ge=5_000, le=1_000_000)
+    LLM_MAX_REVIEW_CONTEXT_CHARS: int = Field(default=90_000, ge=10_000, le=2_000_000)
+    LLM_MAX_TECHNICAL_SPEC_CHARS: int = Field(default=30_000, ge=5_000, le=500_000)
+    MAX_TECHNICAL_SPEC_ATTEMPTS: int = Field(default=3, ge=1, le=10)
 
     # --- 独立视觉 LLM API ---
     # 视觉评估绝不隐式复用主 LLM 的 Key、端点或模型。未启用时可以留空。
@@ -413,6 +428,19 @@ class Settings(BaseSettings):
     MANIM_PIXEL_HEIGHT: int = Field(default=1080, ge=16, multiple_of=2)
     MANIM_FRAME_RATE: int = Field(default=60, ge=1, le=240)
     MANIM_OPENGL_PLATFORM: Literal["egl", "glx"] = "egl"
+    # 正式 Slurm 渲染前先用同一 renderer/节点资源执行一次轻量 smoke render，
+    # 及早暴露 OpenGL、XeLaTeX、Manim API 和运行时异常；dry-run 永不执行它。
+    SMOKE_RENDER_ENABLED: bool = Field(
+        default=True,
+        description="正式渲染前是否执行轻量 Smoke Render",
+    )
+    SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
+    SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
+    # 本地生成/无 Slurm 环境的可选运行时预检；默认关闭，避免在 dry-run
+    # 或共享登录节点上执行不可信生成代码。
+    LOCAL_SMOKE_RENDER_ENABLED: bool = False
+    LOCAL_SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
+    LOCAL_SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
     ALLOW_PARTIAL_OUTPUT: bool = False
     OVERWRITE_OUTPUT: bool = False
     TRANSITION_TYPE: Literal["fade"] = "fade"
@@ -441,9 +469,21 @@ class Settings(BaseSettings):
 
     # --- Agent 与监控 ---
     MAX_REVIEW_ROUNDS: int = Field(default=5, ge=1, le=10)
+    # 单个场景计划在进入 Coder 前允许的重规划审查轮数。
+    MAX_PLAN_REVIEW_ROUNDS: int = Field(default=2, ge=1, le=10)
     # 全片分镜连续性审查发现冲突后的最大局部重规划轮数。
     MAX_CONTINUITY_FIX_ROUNDS: int = Field(default=2, ge=0, le=10)
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
+    SAFE_FALLBACK_ENABLED: bool = Field(
+        default=True,
+        description="复杂几何方案审查耗尽后是否自动切换为保守教学方案",
+    )
+    MAX_IDENTICAL_REVIEW_ATTEMPTS: int = Field(
+        default=2,
+        ge=2,
+        le=5,
+        description="相同代码与相同审查反馈连续出现多少次后提前终止",
+    )
     # 渲染失败后的最大自动修复次数。autofixer 每轮会调用 LLM 重写代码并重新提交 Slurm。
     MAX_FIX_ATTEMPTS: int = Field(default=5, ge=0, le=20)
     # Slurm 节点故障/抢占等与代码无关的终态，允许自动重新排队的次数。
@@ -517,6 +557,13 @@ class Settings(BaseSettings):
             return None
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("LLM_CACHE_PATH", mode="before")
+    @classmethod
+    def normalize_llm_cache_path(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return APP_HOME / "cache" / "llm.sqlite3"
         return value
 
     @field_validator("SLURM_CONDA_BASE", mode="before")

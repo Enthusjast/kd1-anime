@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
 from kd1_anime.agents.reviewer import ReviewResult
+from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import SceneArtifact, VideoMetadata, sha256_file
 from kd1_anime.run_store import RunManifest, StoredSceneState, sha256_text, write_manifest
@@ -323,6 +324,73 @@ def test_resume_reopens_continuity_warning_for_unfinished_scenes(monkeypatch, tm
     assert captured["context"].continuity_review_round == 0
 
 
+def test_context_derives_pending_plan_review_for_legacy_incomplete_run(tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_paths.run_id,
+        status="failed",
+        state="REVIEWING",
+        user_prompt="prompt",
+        output_path=str(run_paths.output.resolve()),
+        scenes={
+            1: StoredSceneState(
+                plan=plan(),
+                plan_ready=True,
+                reviewed=False,
+            )
+        },
+    )
+    raw = manifest.model_dump(mode="json")
+    raw.pop("plan_review_status", None)
+    (run_paths.root / "manifest.json").write_text(
+        json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+    )
+
+    loaded = RunManifest.model_validate_json((run_paths.root / "manifest.json").read_text())
+    context = Orchestrator._context_from_manifest(loaded, run_paths.root)
+
+    assert context.plan_review_status == "pending"
+
+
+def test_resume_does_not_block_code_recovery_on_stale_plan_failure(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / run_id
+    root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_id,
+        status="failed",
+        state="REVIEWING",
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
+        plan_review_status="failed",
+        scenes={
+            1: StoredSceneState(
+                plan=plan(),
+                plan_ready=True,
+                plan_reviewed=True,
+                failed=True,
+                failure_reason="代码审查失败",
+            )
+        },
+    )
+    write_manifest(root / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    captured = {}
+
+    def fake_execute(self, context, state):
+        captured["context"] = context
+        return None
+
+    monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
+
+    assert Orchestrator().resume(run_id) is None
+    assert captured["context"].plan_review_status == "passed"
+
+
 def test_run_paths_are_unique(monkeypatch, tmp_path):
     from kd1_anime.config import settings
 
@@ -330,6 +398,57 @@ def test_run_paths_are_unique(monkeypatch, tmp_path):
     first = RunPaths.create()
     second = RunPaths.create()
     assert first.root != second.root
+
+
+def test_local_smoke_render_is_skipped_for_dry_run(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    source = run_paths.scenes / "scene_1.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n")
+    ctx = PipelineContext("x", paths=run_paths, dry_run=True)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+    called = False
+
+    def unexpected_run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(module.subprocess, "run", unexpected_run)
+
+    orchestrator._local_smoke_render(ctx, state)
+
+    assert called is False
+
+
+def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    source = run_paths.scenes / "scene_1.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n")
+    ctx = PipelineContext("x", paths=run_paths, dry_run=False)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+
+    def successful_run(command, **kwargs):
+        media_index = command.index("--media_dir") + 1
+        media_dir = Path(command[media_index])
+        output = media_dir / "nested" / "Demo.mp4"
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"smoke")
+        return module.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", successful_run)
+    orchestrator._local_smoke_render(ctx, state)
+
+    def failed_run(command, **kwargs):
+        return module.subprocess.CompletedProcess(command, 1, "", "render boom")
+
+    monkeypatch.setattr(module.subprocess, "run", failed_run)
+    with pytest.raises(RuntimeError, match="Smoke Render 失败"):
+        orchestrator._local_smoke_render(ctx, state)
 
 
 def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
@@ -356,6 +475,113 @@ def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
     )
     assert ctx.scene_states[1].give_up is True
     assert ctx.scene_states[1].review_round == 2
+
+
+def test_review_exhaustion_switches_high_risk_geometry_to_safe_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
+    monkeypatch.setattr(module.settings, "SAFE_FALLBACK_ENABLED", True)
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    geometry_plan = plan().model_copy(
+        update={
+            "visual_flow": ["切割碎片并无缝拼接到目标区域"],
+            "new_elements": [
+                VisualElementState(
+                    element_id="piece_a",
+                    variable_name="piece_a",
+                    color_key="primary",
+                )
+            ],
+        }
+    )
+    state = SceneState(
+        plan=geometry_plan,
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        continuity_bible=ContinuityBible(),
+        scene_states={1: state},
+    )
+    events = []
+    orchestrator = Orchestrator()
+    orchestrator._callback = lambda event, data: events.append((event, data))
+
+    orchestrator._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(
+            is_valid=False,
+            severity="major",
+            feedback="碎片几何关系无法验证，目标区域覆盖不正确",
+        ),
+    )
+
+    assert state.safe_fallback_used is True
+    assert state.reviewed is False
+    assert state.give_up is False
+    assert state.review_round == 0
+    assert state.code == ""
+    assert "保守教学方案" in state.rewrite_feedback
+    assert any(event == "scene_safe_fallback" for event, _ in events)
+
+
+def test_identical_review_feedback_stops_repeated_rewrites(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="缺少一个明确的动画步骤",
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+    assert state.give_up is False
+    # 模拟 Coder 原样返回同一份代码、Reviewer 原样返回同一份反馈。
+    state.rewrite_feedback = ""
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert state.give_up is True
+    assert "相同代码和审查反馈" in state.failure_reason
+
+
+def test_safe_fallback_is_not_repeated_after_resume(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
+    monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    geometry_plan = plan().model_copy(update={"visual_flow": ["切割碎片并无缝拼接到目标区域"]})
+    state = SceneState(
+        plan=geometry_plan,
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+        safe_fallback_used=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+
+    Orchestrator()._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(is_valid=False, severity="major", feedback="几何方案错误"),
+    )
+
+    assert state.give_up is True
+    assert state.safe_fallback_used is True
+    assert "保守教学方案" not in state.failure_reason
 
 
 def test_scene_review_rejects_invalid_export_before_llm(monkeypatch, tmp_path):
@@ -390,6 +616,58 @@ class Demo(Scene):
     assert "连续性导出区无效" in state.rewrite_feedback
 
 
+def test_code_generation_validates_continuity_contract_before_code_review(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={"new_elements": [VisualElementState(element_id="formula", variable_name="formula")]}
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        other = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return invalid if len(self.calls) == 1 else valid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    generated, class_name = Orchestrator()._generate_validated_code(
+        scene_plan,
+        stream=False,
+    )
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 2
+    assert "连续性导出合同" in coder.calls[1]
+
+
 def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     ctx = PipelineContext(
@@ -415,6 +693,32 @@ def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path)
     )
     assert manifest.status == "failed"
     assert manifest.state == "ERROR"
+
+
+def test_dry_run_repeats_after_continuity_rebuild(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    state = SceneState(plan=plan(), plan_ready=True)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        dry_run=True,
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    calls = 0
+
+    def scheduler(current):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            current.continuity_rebuild_required = True
+        else:
+            current.scene_states[1].reviewed = True
+
+    monkeypatch.setattr(orchestrator, "_run_scheduler", scheduler)
+
+    assert orchestrator._execute(ctx, State.CODING) is None
+    assert calls == 2
 
 
 def test_run_directories_and_prompt_are_private(monkeypatch, tmp_path):
@@ -1133,6 +1437,19 @@ def test_visual_rebuild_preserves_and_reuses_compatible_passed_downstream_candid
     first.visual_status = "warning"
     first.visual_artifact_sha256 = first_candidate.artifact.video_sha256
     monkeypatch.setattr(orchestrator, "_refresh_scene_export", lambda state: None)
+
+    class FakeTechnicalPlanner:
+        def plan(self, scene_plan, *, renderer=None, **kwargs):
+            return TechnicalSpec(
+                scene_id=scene_plan.scene_id,
+                renderer=renderer or "cairo",
+            )
+
+    monkeypatch.setattr(
+        module,
+        "TechnicalPlannerAgent",
+        FakeTechnicalPlanner,
+    )
     orchestrator._stop_event.clear()
 
     orchestrator._run_code_review_barrier(ctx)

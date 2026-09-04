@@ -17,8 +17,11 @@ from kd1_anime.agents.planner import (
     ExtractedElement,
     SceneOutline,
     ScenePlan,
+    VisualElementState,
 )
+from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
+from kd1_anime.config import settings
 
 CONTINUITY_EXPORT_BEGIN = "KD1_CONTINUITY_EXPORT_BEGIN"
 CONTINUITY_EXPORT_END = "KD1_CONTINUITY_EXPORT_END"
@@ -42,6 +45,51 @@ _BANNED_EXPORT_NAMES = {
     "globals",
     "locals",
     "vars",
+}
+_EXPORT_MUTATION_METHODS = {
+    "add",
+    "add_to_back",
+    "align_to",
+    "arrange",
+    "center",
+    "match_height",
+    "match_width",
+    "move_to",
+    "next_to",
+    "rotate",
+    "scale",
+    "set_color",
+    "set_color_by_tex",
+    "set_fill",
+    "set_opacity",
+    "set_stroke",
+    "set_x",
+    "set_y",
+    "set_z",
+    "set_z_index",
+    "shift",
+    "stretch",
+    "to_corner",
+    "to_edge",
+}
+_EXPORT_PURE_MOBJECT_METHODS = {
+    "copy",
+    "get_bottom",
+    "get_center",
+    "get_corner",
+    "get_end",
+    "get_family",
+    "get_height",
+    "get_left",
+    "get_right",
+    "get_start",
+    "get_top",
+    "get_unit_vector",
+    "get_vertices",
+    "get_width",
+    "get_x",
+    "get_y",
+    "get_z",
 }
 
 # 这些名称由 `from manim import *`、Coder 约定的全局视觉映射或
@@ -81,14 +129,86 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
+def _receiver_name(node: ast.AST) -> str:
+    """返回 Mobject 链式调用最左侧的变量名。"""
+
+    current = node
+    while isinstance(current, (ast.Attribute, ast.Subscript)):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else ""
+
+
+def _validate_export_expression(statement: ast.AST, defined: set[str], label: str) -> None:
+    """校验赋值或局部方法调用中的表达式，不允许外部业务依赖。"""
+
+    for node in ast.walk(statement):
+        if isinstance(node, ast.Call) and _call_name(node) in _BANNED_EXPORT_NAMES:
+            raise ValueError(f"元素 {label} 的连续性导出区包含禁止调用: {_call_name(node)}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            method = node.func.attr
+            receiver = _receiver_name(node.func.value)
+            if (
+                method not in _EXPORT_MUTATION_METHODS
+                and method not in _EXPORT_PURE_MOBJECT_METHODS
+                and receiver not in {"np", "math"}
+            ):
+                raise ValueError(f"元素 {label} 的导出区调用了不允许的方法: {method}")
+        if isinstance(node, ast.Attribute) and node.attr in _BANNED_EXPORT_NAMES:
+            raise ValueError(f"元素 {label} 的连续性导出区包含禁止属性: {node.attr}")
+        if isinstance(node, ast.Name) and node.id in {"self", "__builtins__"}:
+            raise ValueError(f"元素 {label} 的连续性导出区不能引用 self 或运行时内建对象")
+        is_call_target = any(
+            isinstance(parent, ast.Call) and parent.func is node for parent in ast.walk(statement)
+        )
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id not in defined
+            and node.id not in _SAFE_EXPORT_CONTEXT_NAMES
+            and not node.id.isupper()
+            and not (node.id[:1].isupper() and is_call_target)
+        ):
+            raise ValueError(f"元素 {label} 引用了导出区外未定义变量: {node.id}")
+        if isinstance(
+            node,
+            (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
+        ):
+            raise ValueError(f"元素 {label} 使用了不允许的动态表达式")
+
+
 def _validate_export_statement(
     statement: ast.stmt,
     bound_names: set[str] | None = None,
 ) -> tuple[str, str]:
-    """校验一条导出语句，只允许可独立重建的无副作用 Mobject 赋值。"""
+    """校验导出定义及其安全的局部样式/布局调用。"""
 
+    defined = bound_names or set()
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        call = statement.value
+        if (
+            not isinstance(call.func, ast.Attribute)
+            or call.func.attr not in _EXPORT_MUTATION_METHODS
+        ):
+            if isinstance(call.func, ast.Attribute):
+                raise ValueError(f"连续性导出区包含不允许的方法: {call.func.attr}")
+            raise ValueError("连续性导出区只能包含变量赋值或白名单内的 Mobject 样式/布局调用")
+        receiver = _receiver_name(call.func.value)
+        if not receiver or receiver not in defined:
+            raise ValueError("连续性导出区的方法调用必须作用于已定义的 Mobject")
+        _validate_export_expression(statement, defined, receiver)
+        return "", receiver
+    if isinstance(statement, ast.If):
+        if statement.orelse:
+            raise ValueError("连续性导出区不允许 else/elif 分支")
+        _validate_export_expression(statement.test, defined, "条件")
+        local_defined = set(defined)
+        for child in statement.body:
+            variable_name, _ = _validate_export_statement(child, local_defined)
+            if variable_name:
+                local_defined.add(variable_name)
+        return "", ""
     if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-        raise ValueError("连续性导出区只能包含变量赋值")
+        raise ValueError("连续性导出区只能包含变量赋值或白名单内的 Mobject 样式/布局调用")
     targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
     if len(targets) != 1 or not isinstance(targets[0], ast.Name):
         raise ValueError("连续性导出区的赋值目标必须是单个变量")
@@ -98,32 +218,79 @@ def _validate_export_statement(
         raise ValueError(f"元素 {variable_name} 的定义不是 Mobject 表达式")
     if isinstance(value, ast.Call) and not _call_name(value):
         raise ValueError(f"元素 {variable_name} 的构造器必须是明确的名称或属性")
-    defined = bound_names or set()
-    for node in ast.walk(statement):
-        if isinstance(node, ast.Call) and _call_name(node) in _BANNED_EXPORT_NAMES:
-            raise ValueError(f"连续性导出区包含禁止调用: {_call_name(node)}")
-        if isinstance(node, ast.Attribute) and node.attr in _BANNED_EXPORT_NAMES:
-            raise ValueError(f"连续性导出区包含禁止属性: {node.attr}")
-        if isinstance(node, ast.Name) and node.id in {"self", "__builtins__"}:
-            raise ValueError("连续性导出区不能引用 self 或运行时内建对象")
-        # Manim 构造器/常量通常是首字母大写；允许它们，但不允许任意
-        # 未声明的小写业务变量泄漏进下一场景。
-        if (
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Load)
-            and node.id not in defined
-            and node.id not in _SAFE_EXPORT_CONTEXT_NAMES
-            and not node.id[:1].isupper()
-        ):
-            raise ValueError(f"元素 {variable_name} 引用了导出区外未定义变量: {node.id}")
-        if isinstance(
-            node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-        ):
-            raise ValueError(f"元素 {variable_name} 使用了不允许的动态表达式")
+    _validate_export_expression(statement, defined, variable_name)
     return variable_name, variable_name
 
 
-def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
+def _safe_alias_prefix(code: str, begin_line: int, block: str) -> str:
+    """提取 marker 之前定义的静态颜色/布局别名，随交接代码一起携带。"""
+
+    try:
+        block_tree = ast.parse(block)
+        full_tree = ast.parse(code)
+    except SyntaxError:
+        return ""
+    required = {
+        node.id
+        for node in ast.walk(block_tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id not in _SAFE_EXPORT_CONTEXT_NAMES
+        # 携带小写视觉别名和全大写颜色常量；首字母大写但含小写的
+        # ``C_point`` 一类业务变量仍必须在导出区内定义，不能借别名逃过
+        # 外部依赖检查。
+        and (node.id[:1].islower() or node.id.isupper())
+    }
+    if not required:
+        return ""
+    construct = next(
+        (
+            node
+            for node in ast.walk(full_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "construct"
+            and node.lineno < begin_line <= (node.end_lineno or begin_line)
+        ),
+        None,
+    )
+    if construct is None:
+        return ""
+    known = set(_SAFE_EXPORT_CONTEXT_NAMES)
+    aliases: list[str] = []
+    for statement in construct.body:
+        if (statement.end_lineno or statement.lineno) >= begin_line:
+            break
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in required:
+            continue
+        # 只携带静态常量、全局视觉字典索引和安全的纯计算别名，不把
+        # 任意业务对象或函数调用偷偷带入下一场景。
+        value = statement.value
+        safe_value = isinstance(value, ast.Constant) and isinstance(
+            value.value, (str, int, float, bool, type(None))
+        )
+        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+            safe_value = _receiver_name(value) in _SAFE_EXPORT_CONTEXT_NAMES
+        if not safe_value:
+            continue
+        try:
+            _validate_export_expression(statement, known, target.id)
+        except ValueError:
+            continue
+        source = ast.get_source_segment(code, statement)
+        if source:
+            aliases.append(textwrap.dedent(source).strip())
+            known.add(target.id)
+    return "\n\n".join(aliases)
+
+
+def _parse_export_block(
+    code: str,
+    *,
+    prefix_code: str = "",
+) -> tuple[str, list[ExtractedElement]]:
     lines = code.splitlines()
     begin = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line]
     end = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line]
@@ -134,47 +301,168 @@ def _parse_export_block(code: str) -> tuple[str, list[ExtractedElement]]:
     block_lines = lines[begin[0] + 1 : end[0]]
     block = textwrap.dedent("\n".join(block_lines)).strip()
     if not block:
-        return "", []
+        return prefix_code, []
+    full_block = "\n\n".join(item for item in (prefix_code, block) if item)
     try:
         tree = ast.parse(block)
     except SyntaxError as exc:
         raise ValueError(f"连续性导出区不是合法 Python: {exc}") from exc
     elements: list[ExtractedElement] = []
-    pending_id = ""
     bound_names: set[str] = set()
+    if prefix_code:
+        try:
+            prefix_tree = ast.parse(prefix_code)
+        except SyntaxError as exc:
+            raise ValueError(f"连续性导出别名不是合法 Python: {exc}") from exc
+        prefix_defined = set(_SAFE_EXPORT_CONTEXT_NAMES)
+        for prefix_statement in prefix_tree.body:
+            if not isinstance(prefix_statement, ast.Assign) or len(prefix_statement.targets) != 1:
+                raise ValueError("连续性导出别名只能包含单变量赋值")
+            target = prefix_statement.targets[0]
+            if not isinstance(target, ast.Name):
+                raise ValueError("连续性导出别名的目标必须是变量")
+            _validate_export_expression(prefix_statement, prefix_defined, target.id)
+            prefix_defined.add(target.id)
+        bound_names = prefix_defined
     block_source_lines = block.splitlines()
-    for statement in tree.body:
-        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+    statements = [
+        statement
+        for statement in tree.body
+        if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))
+    ]
+    if not statements:
+        return full_block, []
+
+    # ``element_id`` 标记有两种常见写法：
+    #   1. 紧邻一个赋值，直接标记该对象；
+    #   2. 放在一组 helper Mobject 前，最后再赋给 composite 变量。
+    # 第二种写法对三角形、VGroup 和带子部件的公式很自然。整组代码仍然
+    # 会被注入下一场景，但只把最后的 composite 记录为一个交接元素。
+    annotations: list[tuple[int, str]] = []
+    for line_number, line in enumerate(block_source_lines, start=1):
+        match = re.search(r"element_id\s*:\s*([A-Za-z_][A-Za-z0-9_.-]{0,99})", line)
+        if match:
+            annotations.append((line_number, match.group(1)))
+
+    # 没有 element_id 注释时，维持旧行为：每个赋值都作为一个候选元素。
+    if not annotations:
+        groups = [(index, index, "") for index in range(len(statements))]
+    else:
+        groups: list[tuple[int, int, str]] = []
+        for annotation_index, (annotation_line, element_id) in enumerate(annotations):
+            start = next(
+                (
+                    index
+                    for index, statement in enumerate(statements)
+                    if statement.lineno > annotation_line
+                ),
+                None,
+            )
+            if start is None:
+                continue
+            next_annotation_line = (
+                annotations[annotation_index + 1][0]
+                if annotation_index + 1 < len(annotations)
+                else len(block_source_lines) + 1
+            )
+            end = next(
+                (
+                    index - 1
+                    for index, statement in enumerate(statements[start:], start=start)
+                    if statement.lineno >= next_annotation_line
+                ),
+                len(statements) - 1,
+            )
+            if end < start:
+                continue
+            groups.append((start, end, element_id))
+        if not groups:
+            raise ValueError("连续性导出区中的 element_id 标记没有对应赋值")
+
+        # 注释之前的无标记赋值通常是导出对象所需的纯 helper 定义。它们
+        # 会被校验并随 block 一起交接，但不冒充一个计划中的元素。
+        first_start = groups[0][0]
+        if first_start > 0:
+            groups.insert(0, (0, first_start - 1, ""))
+
+    for start, end, annotated_id in groups:
+        group_statements = statements[start : end + 1]
+        group_variables: list[str] = []
+        for statement in group_statements:
+            source = ast.get_source_segment(block, statement)
+            if not source:
+                raise ValueError("无法读取连续性导出语句")
+            variable_name, _ = _validate_export_statement(statement, bound_names)
+            group_variables.append(variable_name)
+            if variable_name:
+                bound_names.add(variable_name)
+
+        # 无标记 helper 组只负责为后续对象提供安全的本地依赖。
+        if not annotated_id:
+            if annotations:
+                continue
+            for statement, variable_name in zip(group_statements, group_variables, strict=True):
+                if not variable_name:
+                    raise ValueError("没有 element_id 标记时，样式/布局调用必须和对象赋值一起声明")
+                source = ast.get_source_segment(block, statement)
+                elements.append(
+                    ExtractedElement(
+                        element_id=variable_name,
+                        variable_name=variable_name,
+                        code=source.strip(),
+                    )
+                )
             continue
-        source = ast.get_source_segment(block, statement)
-        if not source:
-            raise ValueError("无法读取连续性导出语句")
-        variable_name, _ = _validate_export_statement(statement, bound_names)
-        element_id = variable_name
-        # 支持紧邻赋值前的 ``# element_id: ...`` 注释；没有注释时使用变量名。
-        comment_lines = []
-        line_index = max(0, statement.lineno - 2)
-        while line_index >= 0 and block_source_lines[line_index].lstrip().startswith("#"):
-            comment_lines.append(block_source_lines[line_index])
-            line_index -= 1
-        for line in [*comment_lines, *source.splitlines()]:
-            match = re.search(r"element_id\s*:\s*([A-Za-z_][A-Za-z0-9_.-]{0,99})", line)
-            if match:
-                pending_id = match.group(1)
-        if pending_id:
-            element_id = pending_id
-            pending_id = ""
+
+        bound_group_variables = [variable for variable in group_variables if variable]
+        if not bound_group_variables:
+            raise ValueError(f"元素 {annotated_id} 缺少 Mobject 赋值")
+        if len(group_statements) == 1:
+            exported_variable = bound_group_variables[0]
+        else:
+            # 复合对象的最后一条赋值就是标记的语义对象；element_id
+            # 可以和 variable_name 不同（例如 ``main_triangle`` 对应
+            # ``triangle``）。helper 语句保留在 exported_elements_code
+            # 中，但不参加 element_id 合同。
+            exported_variable = bound_group_variables[-1]
+        group_source = "\n\n".join(
+            ast.get_source_segment(block, statement).strip() for statement in group_statements
+        )
+        if prefix_code:
+            group_source = "\n\n".join((prefix_code, group_source))
         elements.append(
             ExtractedElement(
-                element_id=element_id,
-                variable_name=variable_name,
-                code=source.strip(),
+                element_id=annotated_id,
+                variable_name=exported_variable,
+                code=group_source,
             )
         )
-        bound_names.add(variable_name)
     if len({item.element_id for item in elements}) != len(elements):
         raise ValueError("连续性导出区包含重复 element_id")
-    return block, elements
+    return full_block, elements
+
+
+def _marker_is_inside_construct(lines: list[str], node: ast.FunctionDef, line: int) -> bool:
+    """判断注释标记是否仍处在 construct 的缩进块中。
+
+    AST 的 ``end_lineno`` 不包含函数末尾紧邻的注释。导出区通常以结束
+    注释作为 construct 的最后一行，因此不能简单用 ``line <= end_lineno``。
+    """
+
+    if node.lineno < line <= (node.end_lineno or node.lineno):
+        return True
+    marker = lines[line - 1]
+    marker_indent = len(marker) - len(marker.lstrip())
+    definition = lines[node.lineno - 1]
+    definition_indent = len(definition) - len(definition.lstrip())
+    if marker_indent <= definition_indent:
+        return False
+    for source_line in lines[node.end_lineno or node.lineno : line - 1]:
+        if source_line.strip():
+            indent = len(source_line) - len(source_line.lstrip())
+            if indent <= definition_indent:
+                return False
+    return True
 
 
 def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]:
@@ -198,13 +486,21 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name == "construct"
         ]
+        lines = code.splitlines()
         if not construct_nodes or not any(
-            all(node.lineno < line <= (node.end_lineno or node.lineno) for line in marker_lines)
+            all(_marker_is_inside_construct(lines, node, line) for line in marker_lines)
             for node in construct_nodes
         ):
             raise ValueError("连续性导出区必须位于 Scene.construct() 内")
-    marked_code, marked_elements = _parse_export_block(code)
     if marker_lines:
+        lines = code.splitlines()
+        begin_index = next(
+            index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line
+        )
+        end_index = next(index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line)
+        block_text = textwrap.dedent("\n".join(lines[begin_index + 1 : end_index])).strip()
+        prefix_code = _safe_alias_prefix(code, begin_index + 1, block_text)
+        marked_code, marked_elements = _parse_export_block(code, prefix_code=prefix_code)
         return marked_code, marked_elements
 
     tree = parsed_tree
@@ -257,11 +553,22 @@ def validate_export_contract(
 ) -> None:
     """把结构化分镜交接合同与实际导出代码做确定性对齐。
 
-    旧计划没有结构化元素列表时保持兼容；新计划一旦声明了 required
-    元素，就必须在代码导出区中出现，并且显式 variable_name 不能漂移。
+    旧计划没有结构化元素列表时保持兼容；新计划一旦声明了结构化元素，
+    导出区只能包含仍需交接的元素，required 元素必须出现且显式 variable_name
+    不能漂移。
     """
 
+    inherited_ids = {item.element_id for item in plan.inherited_elements}
     removed_ids = {item.element_id for item in plan.elements_to_remove}
+    unknown_removals = removed_ids - inherited_ids
+    if unknown_removals:
+        raise ValueError(
+            "elements_to_remove 包含未继承的元素: " + ", ".join(sorted(unknown_removals))
+        )
+    exported_ids = {item.element_id for item in elements}
+    removed_exports = exported_ids & removed_ids
+    if removed_exports:
+        raise ValueError("连续性导出区不能包含已移除元素: " + ", ".join(sorted(removed_exports)))
     declared = [
         item
         for item in [*plan.inherited_elements, *plan.new_elements]
@@ -269,6 +576,16 @@ def validate_export_contract(
     ]
     if not declared:
         return
+    declared_ids = {item.element_id for item in declared}
+    undeclared_exports = exported_ids - declared_ids
+    if undeclared_exports:
+        raise ValueError("连续性导出区包含未声明元素: " + ", ".join(sorted(undeclared_exports)))
+    declared_by_id = {item.element_id: item for item in declared}
+    optional_exports = {
+        element_id for element_id in exported_ids if not declared_by_id[element_id].required
+    }
+    if optional_exports:
+        raise ValueError("连续性导出区不能包含非交接元素: " + ", ".join(sorted(optional_exports)))
     exported_by_id = {item.element_id: item for item in elements}
     for expected in declared:
         if not expected.required:
@@ -281,6 +598,213 @@ def validate_export_contract(
                 f"元素 {expected.element_id} 的变量名不一致: "
                 f"期望 {expected.variable_name}，实际 {actual.variable_name}"
             )
+
+
+def normalize_scene_plan_contract(
+    plan: ScenePlan,
+    bible: ContinuityBible,
+    *,
+    previous_plan: ScenePlan | None = None,
+) -> tuple[ScenePlan, list[str]]:
+    """确定性修复分镜交接合同中的机械性错误。
+
+    这个函数不替 Planner 决定叙事或几何方案，只处理可以从合同本身确定的
+    问题：重复 ID、无效移除、第一场景误继承、未知颜色键以及上一场景没有
+    导出的继承对象。这样 Reviewer 不会把同一个结构错误反复交给 LLM。
+    """
+
+    repairs: list[str] = []
+
+    def unique(items: list[VisualElementState], field_name: str) -> list[VisualElementState]:
+        result: list[VisualElementState] = []
+        seen: set[str] = set()
+        for item in items:
+            if item.element_id in seen:
+                repairs.append(f"{field_name} 删除重复元素 {item.element_id}")
+                continue
+            seen.add(item.element_id)
+            result.append(item)
+        return result
+
+    inherited = unique(list(plan.inherited_elements), "inherited_elements")
+    removals = unique(list(plan.elements_to_remove), "elements_to_remove")
+    new_elements = unique(list(plan.new_elements), "new_elements")
+    previous_available_by_id: dict[str, VisualElementState] = {}
+
+    if plan.scene_id == 1 and inherited:
+        existing_new_ids = {item.element_id for item in new_elements}
+        moved = [item for item in inherited if item.element_id not in existing_new_ids]
+        new_elements.extend(moved)
+        inherited = []
+        repairs.append("Scene 1 清空 inherited_elements，并将未重复的元素移入 new_elements")
+
+    if previous_plan is not None:
+        previous_removed = {item.element_id for item in previous_plan.elements_to_remove}
+        previous_available_by_id = {
+            item.element_id: item
+            for item in [*previous_plan.inherited_elements, *previous_plan.new_elements]
+            if item.element_id not in previous_removed
+        }
+        previous_available = set(previous_available_by_id)
+        if previous_available:
+            kept = [item for item in inherited if item.element_id in previous_available]
+            dropped = [
+                item.element_id for item in inherited if item.element_id not in previous_available
+            ]
+            if dropped:
+                repairs.append("删除上一场景未声明导出的继承元素: " + ", ".join(sorted(dropped)))
+            inherited = kept
+
+            # element_id 是语义身份，variable_name 是代码级身份。Planner
+            # 经常会在相邻场景里把同一个对象从 ``triangle`` 改名为
+            # ``right_triangle``；如果不在这里固定为上一场景的变量名，
+            # Coder 会收到互相矛盾的继承代码和结构化合同，最终生成重复
+            # 或无法导出的连续性区。
+            aligned_inherited: list[VisualElementState] = []
+            for current_item in inherited:
+                previous_item = previous_available_by_id[current_item.element_id]
+                aligned_item = current_item
+                if (
+                    previous_item.variable_name
+                    and current_item.variable_name != previous_item.variable_name
+                ):
+                    repairs.append(
+                        f"元素 {current_item.element_id} 的变量名固定为上一场景的 "
+                        f"{previous_item.variable_name}"
+                    )
+                    aligned_item = current_item.model_copy(
+                        update={"variable_name": previous_item.variable_name}
+                    )
+                aligned_inherited.append(aligned_item)
+            inherited = aligned_inherited
+
+    inherited_ids = {item.element_id for item in inherited}
+    valid_removals: list[VisualElementState] = []
+    for current_item in removals:
+        if current_item.element_id not in inherited_ids:
+            repairs.append(f"删除无效的 elements_to_remove: {current_item.element_id}")
+            continue
+        aligned_item = current_item
+        if previous_plan is not None:
+            previous_item = next(
+                (
+                    candidate
+                    for candidate in [
+                        *previous_plan.inherited_elements,
+                        *previous_plan.new_elements,
+                    ]
+                    if candidate.element_id == current_item.element_id
+                ),
+                None,
+            )
+            if (
+                previous_item is not None
+                and previous_item.variable_name
+                and current_item.variable_name != previous_item.variable_name
+            ):
+                repairs.append(
+                    f"移除元素 {current_item.element_id} 的变量名固定为上一场景的 "
+                    f"{previous_item.variable_name}"
+                )
+                aligned_item = current_item.model_copy(
+                    update={"variable_name": previous_item.variable_name}
+                )
+        valid_removals.append(aligned_item)
+    removals = valid_removals
+
+    removal_ids = {item.element_id for item in removals}
+    inherited_ids = {item.element_id for item in inherited}
+    valid_new: list[VisualElementState] = []
+    for item in new_elements:
+        if item.element_id in inherited_ids or item.element_id in removal_ids:
+            repairs.append(f"删除与继承/移除声明冲突的新元素: {item.element_id}")
+            continue
+        valid_new.append(item)
+    new_elements = valid_new
+
+    # handoff 是场景边界的显式合同：它列出的对象必须能在本场景结束时
+    # 被代码导出；反之，没有出现在 handoff 中的 new_elements 通常只是
+    # 场景内部的临时步骤。模型经常会把这两类对象混在 new_elements 里，
+    # 若照单全收，Coder 会被迫导出已经淡出的中间公式，随后确定性合同
+    # 又会把合法代码判成失败。这里用边界合同消除这种机械歧义，并保留
+    # repair 记录供仪表盘和运行清单追踪。
+    normalized_handoff = list(plan.handoff)
+    if normalized_handoff:
+        handoff_ids = {item.element_id for item in normalized_handoff}
+        declared_ids = {item.element_id for item in [*inherited, *removals, *new_elements]}
+        for handoff_item in normalized_handoff:
+            if handoff_item.element_id in declared_ids or handoff_item.action == "remove":
+                continue
+            previous_item = previous_available_by_id.get(handoff_item.element_id)
+            inferred = VisualElementState(
+                element_id=handoff_item.element_id,
+                role="",
+                kind=previous_item.kind if previous_item is not None else "Mobject",
+                semantic_state=(
+                    handoff_item.semantic_state
+                    or (previous_item.semantic_state if previous_item is not None else "")
+                ),
+                color_key=previous_item.color_key if previous_item is not None else "",
+                anchor=previous_item.anchor if previous_item is not None else "",
+                variable_name=(
+                    handoff_item.variable_name
+                    or (previous_item.variable_name if previous_item is not None else "")
+                ),
+                required=True,
+            )
+            if previous_item is not None:
+                inherited.append(inferred)
+                repairs.append(
+                    f"handoff 中的元素 {handoff_item.element_id} 已补入 inherited_elements"
+                )
+            else:
+                new_elements.append(inferred)
+                repairs.append(f"handoff 中的元素 {handoff_item.element_id} 已补入 new_elements")
+            declared_ids.add(handoff_item.element_id)
+
+        handoff_ids = {item.element_id for item in normalized_handoff}
+        repaired_new: list[VisualElementState] = []
+        for item in new_elements:
+            repaired_item = item
+            if item.element_id in handoff_ids:
+                if not item.required:
+                    repairs.append(f"边界交接元素 {item.element_id} 已标记为 required")
+                    repaired_item = item.model_copy(update={"required": True})
+            elif item.required:
+                repairs.append(f"场景内部元素 {item.element_id} 不参与边界交接，已标记为 optional")
+                repaired_item = item.model_copy(update={"required": False})
+            repaired_new.append(repaired_item)
+        new_elements = repaired_new
+
+    allowed_colors = set(bible.global_visual_state.colors)
+
+    def normalize_color(item: VisualElementState) -> VisualElementState:
+        if not item.color_key or item.color_key in allowed_colors:
+            return item
+        fallback = (
+            "primary" if "primary" in allowed_colors else next(iter(sorted(allowed_colors)), "")
+        )
+        repairs.append(f"元素 {item.element_id} 的未知颜色键 {item.color_key} 已映射为 {fallback}")
+        return item.model_copy(update={"color_key": fallback})
+
+    inherited = [normalize_color(item) for item in inherited]
+    removals = [normalize_color(item) for item in removals]
+    new_elements = [normalize_color(item) for item in new_elements]
+
+    updates: dict[str, object] = {}
+    if plan.global_visual_state != bible.global_visual_state:
+        updates["global_visual_state"] = bible.global_visual_state.model_copy(deep=True)
+        repairs.append("统一场景 global_visual_state 与连续性圣经")
+    if inherited != plan.inherited_elements:
+        updates["inherited_elements"] = inherited
+    if removals != plan.elements_to_remove:
+        updates["elements_to_remove"] = removals
+    if new_elements != plan.new_elements:
+        updates["new_elements"] = new_elements
+    if normalized_handoff != plan.handoff:
+        updates["handoff"] = normalized_handoff
+
+    return (plan.model_copy(update=updates) if updates else plan), repairs
 
 
 class ContinuityIssue(BaseModel):
@@ -398,6 +922,8 @@ CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查�
 7. inherited_elements、elements_to_remove、new_elements 的 element_id 是否稳定、唯一且可执行。
 8. 后一场景继承的元素是否确实由前一场景导出，是否存在未经计划的清空、重画或突兀消失。
 9. 所有场景的 global_visual_state 是否完全服从同一份全局颜色、字体、字号、线宽和布局配置。
+10. 涉及切割、碎片、旋转或拼接时，computation 是否给出了足以核验顶点、面积和覆盖关系的
+    数值；如果没有，要求改为面积标签或等式演示，不要继续规划“示意性无缝拼接”。
 
 ## 判定原则
 - 只报告会破坏观众理解或造成明显视觉跳变的问题。
@@ -482,6 +1008,29 @@ def deterministic_continuity_issues(
         inherited_ids = set(declared_groups["inherited_elements"])
         removal_ids = set(declared_groups["elements_to_remove"])
         new_ids = set(declared_groups["new_elements"])
+        allowed_colors = set(bible.global_visual_state.colors)
+        for group_name, group_items in (
+            ("inherited_elements", plan.inherited_elements),
+            ("elements_to_remove", plan.elements_to_remove),
+            ("new_elements", plan.new_elements),
+        ):
+            for item in group_items:
+                if item.color_key and item.color_key not in allowed_colors:
+                    issues.append(
+                        ContinuityIssue(
+                            scene_ids=[plan.scene_id],
+                            category="style",
+                            message=(
+                                f"{group_name} 中元素 {item.element_id} 使用未定义颜色键 "
+                                f"{item.color_key}。"
+                            ),
+                            fix_instruction=(
+                                "改用 global_visual_state.colors 中已有的颜色键，"
+                                "复合区域使用已有主色或拆分为多个已定义颜色区域。"
+                            ),
+                            target_fields=[group_name],
+                        )
+                    )
         # 一个元素同时出现在 inherited_elements 和 elements_to_remove 是合法的：
         # 它表示“接管后在本场景明确退出”。真正需要拦截的是同一组内部重复，
         # 或者 inherited/new 之间的冲突声明。
@@ -600,6 +1149,31 @@ def deterministic_continuity_issues(
                     fix_instruction="在前一场景的 new_elements/结束状态中保留这些 element_id。",
                 )
             )
+        previous_variable_by_id = {
+            item.element_id: item.variable_name
+            for item in (*plan.inherited_elements, *plan.new_elements)
+            if item.element_id not in removal_ids and item.variable_name
+        }
+        variable_drifts = [
+            f"{item.element_id}: {previous_variable_by_id[item.element_id]} -> {item.variable_name}"
+            for item in next_plan.inherited_elements
+            if item.element_id in previous_variable_by_id
+            and item.variable_name
+            and item.variable_name != previous_variable_by_id[item.element_id]
+        ]
+        if variable_drifts:
+            issues.append(
+                ContinuityIssue(
+                    scene_ids=[plan.scene_id, next_plan.scene_id],
+                    category="element_handoff",
+                    message=("相邻场景的继承元素变量名发生漂移：" + ", ".join(variable_drifts)),
+                    fix_instruction=(
+                        "保持 element_id 不变，并将后一场景 inherited_elements 的 "
+                        "variable_name 固定为前一场景最终导出的变量名。"
+                    ),
+                    target_fields=["inherited_elements"],
+                )
+            )
         if (
             plan.closing_state
             and next_plan.opening_state
@@ -693,6 +1267,34 @@ class ContinuityReviewerAgent(BaseAgent):
                     }
                     for item in data[key][:30]
                 ]
+        for key in ("timeline", "math_claims", "geometry_specs", "handoff"):
+            if isinstance(data.get(key), list):
+                data[key] = [
+                    {
+                        field: str(item.get(field, ""))[:1_500]
+                        for field in (
+                            "event_id",
+                            "start_seconds",
+                            "end_seconds",
+                            "action",
+                            "claim_id",
+                            "statement",
+                            "expression_before",
+                            "expression_after",
+                            "geometry_id",
+                            "shape",
+                            "vertices",
+                            "declared_area",
+                            "target_area",
+                            "element_id",
+                            "variable_name",
+                            "semantic_state",
+                            "transition",
+                        )
+                        if isinstance(item, dict) and field in item
+                    }
+                    for item in data[key][:30]
+                ]
         return data
 
     def review(
@@ -712,23 +1314,57 @@ class ContinuityReviewerAgent(BaseAgent):
         deterministic_context = [
             issue.model_dump(mode="json") for issue in (deterministic_issues or [])
         ]
-        return self.call_llm_json(
-            system_prompt=f"{CONTINUITY_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
-            user_message=(
+        sections = [
+            PromptSection(
+                "continuity_bible",
                 "<continuity_bible>\n"
                 f"{json.dumps(self._compact_bible(bible), ensure_ascii=False, indent=2)}\n"
-                "</continuity_bible>\n\n"
+                "</continuity_bible>",
+                required=True,
+                priority=110,
+                max_chars=25_000,
+            ),
+            PromptSection(
+                "scene_outlines",
                 "<scene_outlines>\n"
                 f"{json.dumps(outline_context, ensure_ascii=False, indent=2)}\n"
-                "</scene_outlines>\n\n"
+                "</scene_outlines>",
+                required=True,
+                priority=80,
+                max_chars=20_000,
+            ),
+            PromptSection(
+                "scene_plans",
                 "<scene_plans>\n"
                 f"{json.dumps(plan_context, ensure_ascii=False, indent=2)}\n"
-                "</scene_plans>\n\n"
+                "</scene_plans>",
+                required=True,
+                priority=110,
+                max_chars=70_000,
+            ),
+            PromptSection(
+                "deterministic_findings",
                 "<deterministic_findings>\n"
                 f"{json.dumps(deterministic_context, ensure_ascii=False, indent=2)}\n"
-                "</deterministic_findings>\n\n"
-                "请综合这些材料输出全片连续性审查 JSON。"
+                "</deterministic_findings>",
+                required=bool(deterministic_context),
+                priority=120,
+                max_chars=30_000,
             ),
+            PromptSection(
+                "输出要求",
+                "请综合这些材料输出全片连续性审查 JSON。",
+                required=True,
+                priority=110,
+            ),
+        ]
+        user_message = build_bounded_prompt(
+            sections,
+            max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+        )
+        return self.call_llm_json(
+            system_prompt=f"{CONTINUITY_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
+            user_message=user_message,
             response_model=ContinuityReviewResult,
             stream=stream,
             allow_truncated=True,

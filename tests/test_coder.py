@@ -9,6 +9,7 @@ import pytest
 
 from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, CoderAgent
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
+from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 
 
 @pytest.fixture
@@ -278,6 +279,25 @@ class TestScene(Scene):
         message = mock_call_llm.call_args.kwargs["user_message"]
         assert "RAG Reference Context" in message
         assert "Circle API documentation" in message
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_includes_technical_spec(self, mock_call_llm, coder_agent, sample_plan):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+        technical_spec = TechnicalSpec(
+            scene_id=1,
+            objects=[TechnicalObject(element_id="circle", variable_name="circle")],
+            export_element_ids=["circle"],
+        )
+
+        coder_agent.generate_code(sample_plan, technical_spec=technical_spec, stream=False)
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "TechnicalSpec" in message
+        assert '"export_element_ids"' in message
 
 
 class TestCodeExtraction:

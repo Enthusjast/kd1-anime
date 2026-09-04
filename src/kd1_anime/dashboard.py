@@ -75,8 +75,9 @@ def suppress_agent_logs() -> bool:
     return _state.active
 
 
-STAGES = ("分镜", "编码", "审查", "渲染")
+STAGES = ("分镜", "计划审查", "技术设计", "编码", "代码审查", "渲染")
 VISUAL_STAGE = "视觉"
+_DONE_STAGE_ALIASES = {"审查": "代码审查"}
 
 
 @dataclass
@@ -90,17 +91,31 @@ class SceneStatus:
     message: str = ""  # 最近事件摘要
     started_at: float = 0.0  # 当前阶段开始时间 (用于显示耗时)
     done: list[str] = field(default_factory=list)  # 已完成的流水线阶段
+    safe_fallback_used: bool = False  # 是否采用了保守教学方案
 
     def mark_done(self, stage_name: str) -> None:
         """记录一个阶段完成 (去重)。"""
-        if stage_name not in self.done:
-            self.done.append(stage_name)
+        stored_name = "审查" if stage_name == "代码审查" else stage_name
+        if stored_name not in self.done:
+            self.done.append(stored_name)
 
     def invalidate_from(self, stage_name: str, stages: tuple[str, ...] = STAGES) -> None:
         """重做某阶段时清除该阶段及所有下游的完成标记。"""
 
-        start = stages.index(stage_name)
-        self.done = [name for name in self.done if name in stages and stages.index(name) < start]
+        display_name = _DONE_STAGE_ALIASES.get(stage_name, stage_name)
+        if display_name not in stages:
+            display_name = stage_name
+        start = stages.index(display_name)
+
+        def stage_in_order(name: str) -> str:
+            candidate = _DONE_STAGE_ALIASES.get(name, name)
+            return candidate if candidate in stages else name
+
+        self.done = [
+            name
+            for name in self.done
+            if stage_in_order(name) in stages and stages.index(stage_in_order(name)) < start
+        ]
 
     @property
     def icon(self) -> str:
@@ -131,7 +146,8 @@ class SceneStatus:
         title = Text(self.title, style=self.color)
         pipeline = Text()
         for idx, name in enumerate(stages):
-            if name in self.done:
+            done_name = "审查" if name == "代码审查" else name
+            if done_name in self.done:
                 pipeline.append(f"{name}✓", style="green")
             elif name == self.stage and self.state == "running":
                 pipeline.append(f"{name}⟳", style="cyan")
@@ -143,6 +159,8 @@ class SceneStatus:
             pipeline.append("  ", style="dim")
             pipeline.append("修复⟳", style="cyan")
         message = self.message
+        if self.safe_fallback_used:
+            message = f"保守方案 · {message}" if message else "已采用保守方案"
         if self.state == "running" and self.started_at and self.stage:
             message = f"{message} · {int(time.time() - self.started_at)}s"
         msg = Text(message[:40], style="dim")
@@ -238,6 +256,7 @@ class SceneDashboard:
                 "planning": "场景概要",
                 "continuity": "全片连续性",
                 "detailing": "导演分镜",
+                "technical": "技术实现设计",
                 "coding": "代码生成",
                 "reviewing": "代码审查",
                 "dispatching": "提交渲染",
@@ -262,6 +281,15 @@ class SceneDashboard:
             if warning and self.rag_status == "degraded":
                 self.rag_models += " · degraded"
 
+        elif event == "scene_safe_fallback":
+            if status:
+                status.safe_fallback_used = True
+                status.message = "已切换为保守教学方案"
+                status.state = "warning"
+                status.invalidate_from("计划审查", self.stages)
+                status.stage = "计划审查"
+                status.started_at = 0.0
+
         elif event in ("continuity_bible_start", "continuity_reviewing"):
             self.stage = "continuity"
             self.stage_label = "全片连续性"
@@ -279,6 +307,12 @@ class SceneDashboard:
                 if status:
                     self._mark_running(status, "", "连续性修正中")
 
+        elif event == "continuity_contract_repaired":
+            self.stage = "continuity"
+            self.stage_label = "连续性合同已修复"
+            if status:
+                status.message = "连续性合同已自动修复"
+
         elif event == "continuity_pass":
             self.stage = "continuity"
             self.stage_label = "连续性通过"
@@ -294,6 +328,10 @@ class SceneDashboard:
                 if scene.state == "running" and not scene.stage:
                     scene.message = reason[:40] or "连续性存在提示"
 
+        elif event == "plan_reviewing":
+            self.stage = "plan_reviewing"
+            self.stage_label = "计划正确性审查"
+
         elif event == "plan_complete":
             scenes = data.get("scenes", [])
             self.visual_enabled = bool(data.get("visual_enabled", False))
@@ -305,6 +343,51 @@ class SceneDashboard:
                 self.scenes.setdefault(sid, SceneStatus(scene_id=sid))
                 self.scenes[sid].title = scene.title
 
+        elif event in ("scene_plan_reviewing",):
+            if status:
+                status.invalidate_from("计划审查", self.stages)
+                self._mark_running(status, "计划审查", "计划正确性审查中")
+
+        elif event == "scene_plan_review_pass":
+            if status:
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.mark_done("计划审查")
+                status.message = "计划审查通过"
+
+        elif event == "scene_plan_review_fail":
+            if status:
+                status.state = "failed"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = "计划审查失败"
+
+        elif event == "scene_plan_replanned":
+            if status:
+                status.invalidate_from("计划审查", self.stages)
+                status.message = "计划已重规划"
+
+        elif event == "scene_technical_planning":
+            if status:
+                status.invalidate_from("技术设计", self.stages)
+                self._mark_running(status, "技术设计", "生成技术实现合同")
+
+        elif event == "scene_technical_ready":
+            if status:
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.mark_done("技术设计")
+                status.message = "技术实现合同完成"
+
+        elif event == "scene_technical_failed":
+            if status:
+                status.state = "failed"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = "技术实现合同失败"
+
         elif event in (
             "scene_detailing",
             "scene_coding",
@@ -312,6 +395,7 @@ class SceneDashboard:
             "scene_reviewing",
             "scene_fixing",
             "scene_retrying",
+            "scene_smoke_rendering",
         ):
             if status:
                 if event == "scene_detailing":
@@ -326,13 +410,16 @@ class SceneDashboard:
                     self._mark_running(status, "编码", "修正代码中")
                 elif event == "scene_reviewing":
                     status.invalidate_from("审查", self.stages)
-                    self._mark_running(status, "审查", "代码审查中")
+                    self._mark_running(status, "代码审查", "代码审查中")
                 elif event == "scene_fixing":
                     status.invalidate_from("审查", self.stages)
                     self._mark_running(status, "修复", f"自动修复 #{data.get('attempt', 0)}")
                 elif event == "scene_retrying":
                     status.invalidate_from("渲染", self.stages)
                     self._mark_running(status, "渲染", "基础设施故障，重新排队")
+                elif event == "scene_smoke_rendering":
+                    status.invalidate_from("编码", self.stages)
+                    self._mark_running(status, "编码", "本地 Smoke Render")
 
         elif event in ("scene_detailed", "scene_coded"):
             if status:
@@ -347,6 +434,13 @@ class SceneDashboard:
                     status.mark_done("编码")
                     status.message = "代码就绪"
 
+        elif event == "scene_smoke_rendered":
+            if status:
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = "Smoke Render 通过"
+
         elif event in ("scene_review_pass", "scene_review_skipped"):
             if status:
                 status.state = "running"
@@ -357,7 +451,7 @@ class SceneDashboard:
 
         elif event == "scene_review_fail":
             if status:
-                self._mark_running(status, "审查", "需修正")
+                self._mark_running(status, "代码审查", "需修正")
 
         elif event == "scene_submitted":
             if status:
@@ -425,14 +519,34 @@ class SceneDashboard:
                 # 失败是终态，不应继续把失败前的阶段渲染成“运行中”。
                 status.stage = ""
                 status.started_at = 0.0
-                status.message = (data.get("reason", "") or "")[:40]
+                category_labels = {
+                    "planning": "分镜",
+                    "continuity": "连续性",
+                    "coding": "编码",
+                    "review": "审查",
+                    "render": "渲染",
+                    "infrastructure": "环境",
+                    "llm": "模型",
+                    "system": "系统",
+                }
+                category = category_labels.get(data.get("category", ""), "")
+                reason = (data.get("reason", "") or "").strip()
+                status.message = (f"[{category}] " if category else "") + reason[:40]
 
         elif event == "scene_give_up":
             if status:
                 status.state = "failed"
                 status.stage = ""
                 status.started_at = 0.0
-                status.message = "已放弃"
+                category = {
+                    "continuity": "连续性",
+                    "coding": "编码",
+                    "review": "审查",
+                    "render": "渲染",
+                    "infrastructure": "环境",
+                    "planning": "分镜",
+                }.get(data.get("category", ""), "")
+                status.message = f"已放弃（{category}）" if category else "已放弃"
 
         elif event == "merge_complete":
             self.stage = "merging"

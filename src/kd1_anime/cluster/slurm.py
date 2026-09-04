@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import getpass
+import json
 import re
 import shlex
 import shutil
@@ -519,7 +520,7 @@ class SlurmDispatcher:
         )
 
         quality = f"-q{profile.quality}"
-        manim_args = [
+        formal_args = [
             "manim",
             "render",
             f"--renderer={renderer}",
@@ -533,6 +534,16 @@ class SlurmDispatcher:
             str(python_file),
             scene_class_name,
         ]
+
+        def add_renderer_specific_args(args: list[str]) -> list[str]:
+            result = list(args)
+            if use_gpu:
+                # Manim 0.20 的 OpenGL 渲染器必须显式传 --write_to_movie；
+                # 否则动画可能正常执行但不产出最终 MP4。
+                result.insert(-2, "--write_to_movie")
+            return result
+
+        formal_args = add_renderer_specific_args(formal_args)
         if use_gpu:
             # Manim 0.20 在导入 mobject 类时就会根据 renderer 选择 Cairo
             # 或 OpenGL 继承树。虽然命令行参数会在大多数版本中触发切换，
@@ -540,9 +551,6 @@ class SlurmDispatcher:
             # 可让这类入口在导入前就得到一致的渲染器配置。
             lines.append(f"export MANIM_RENDERER={renderer}")
             lines.append(f"export PYOPENGL_PLATFORM={profile.opengl_platform}")
-            # manim 0.20 的 OpenGL 渲染器必须显式传 --write_to_movie 才会写视频文件；
-            # 否则动画照常"播放"、退出码为 0，但不会产出任何 mp4。
-            manim_args.insert(-2, "--write_to_movie")
 
         if container:
             image = str(Path(container).expanduser().resolve())
@@ -574,12 +582,85 @@ class SlurmDispatcher:
                 )
             if settings.SLURM_CONTAINER_DISABLE_NETWORK:
                 container_cmd.extend(["--net", "--network", "none"])
-            container_cmd.extend(["--bind", f"{run_root}:{run_root}", image, *manim_args])
-            lines.append(shlex.join(container_cmd))
+
+            def command_for(args: list[str]) -> str:
+                return shlex.join(
+                    [
+                        *container_cmd,
+                        "--bind",
+                        f"{run_root}:{run_root}",
+                        image,
+                        *args,
+                    ]
+                )
         else:
             lines.append('echo "Python: $(which python)"')
             lines.append("echo \"Manim: $(python -c 'import manim; print(manim.__version__)')\"")
-            lines.append(shlex.join(manim_args))
+
+            def command_for(args: list[str]) -> str:
+                return shlex.join(args)
+
+        smoke_marker = run_root / "artifacts" / f"smoke_scene_{scene_id}.json"
+
+        def marker_line(status: str) -> str:
+            payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "scene_id": scene_id,
+                    "status": status,
+                    **(
+                        {"renderer": renderer, "quality": settings.SMOKE_RENDER_QUALITY}
+                        if status == "passed"
+                        else {}
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            return "printf '%s\\n' " + shlex.quote(payload) + f" > {shlex.quote(str(smoke_marker))}"
+
+        if settings.SMOKE_RENDER_ENABLED:
+            smoke_dir = media_dir / "__smoke__"
+            smoke_width = max(16, (profile.pixel_width // 8) // 2 * 2)
+            smoke_height = max(16, (profile.pixel_height // 8) // 2 * 2)
+            smoke_args = [
+                "manim",
+                "render",
+                f"--renderer={renderer}",
+                f"-q{settings.SMOKE_RENDER_QUALITY}",
+                "--resolution",
+                f"{smoke_width},{smoke_height}",
+                "--fps",
+                str(min(profile.frame_rate, 15)),
+                "--disable_caching",
+                "--media_dir",
+                str(smoke_dir),
+                str(python_file),
+                scene_class_name,
+            ]
+            smoke_args = add_renderer_specific_args(smoke_args)
+            smoke_command = command_for(smoke_args)
+            lines.extend(
+                [
+                    'echo "[Smoke] 开始轻量运行时检查"',
+                    f"mkdir -p {shlex.quote(str(smoke_dir))}",
+                    (
+                        "if command -v timeout >/dev/null 2>&1; then "
+                        f"timeout {settings.SMOKE_RENDER_TIMEOUT}s {smoke_command}; "
+                        f"else {smoke_command}; fi"
+                    ),
+                    'echo "[Smoke] 运行时检查通过"',
+                    f"mkdir -p {shlex.quote(str(smoke_marker.parent))}",
+                    marker_line("passed"),
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"mkdir -p {shlex.quote(str(smoke_marker.parent))}",
+                    marker_line("disabled"),
+                ]
+            )
+        lines.append(command_for(formal_args))
 
         lines.extend(
             [
@@ -826,7 +907,7 @@ class SlurmDispatcher:
         try:
             paths = job.media_dir.rglob(f"{job.scene_class_name}.mp4")
             for path in paths:
-                if "partial_movie_files" in path.parts:
+                if "partial_movie_files" in path.parts or "__smoke__" in path.parts:
                     continue
                 try:
                     stat = path.stat()

@@ -15,6 +15,22 @@ def test_render_profile_digest_changes_with_output_settings(monkeypatch):
     assert original.digest() != changed.digest()
 
 
+def test_render_profile_digest_includes_tool_versions():
+    profile = RenderProfile(
+        renderer="cairo",
+        quality="h",
+        pixel_width=1920,
+        pixel_height=1080,
+        frame_rate=60,
+        manim_version="0.20.1",
+        ffmpeg_version="ffmpeg 8",
+        xelatex_version="TeX Live 2026",
+    )
+    changed = profile.model_copy(update={"manim_version": "0.20.2"})
+
+    assert profile.digest() != changed.digest()
+
+
 def test_render_profile_rejects_unsafe_script_values():
     with pytest.raises(ValueError):
         RenderProfile(

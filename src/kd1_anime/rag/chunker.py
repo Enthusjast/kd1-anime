@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +87,44 @@ def iter_source_files(
             seen.add(resolved)
             result.append((resolved, source_kind))
     return result
+
+
+def source_manifest_digest(
+    docs_dir: Path | None,
+    examples_dir: Path | None,
+) -> str | None:
+    """计算当前知识库源文件的摘要，用于发现索引过期。
+
+    摘要格式与 ``RagIndex`` 写入索引时使用的 source_sha256 集合一致。
+    没有配置任何源目录时返回 ``None``；目录已配置但为空时仍返回摘要，
+    这样删除全部源文件也会被识别为索引失效。
+    """
+
+    roots = {
+        "manim_doc": _safe_root(docs_dir),
+        "example": _safe_root(examples_dir),
+    }
+    if docs_dir is None and examples_dir is None:
+        return None
+
+    values: list[tuple[str, str]] = []
+    for path, source_kind in iter_source_files(docs_dir, examples_dir):
+        root = roots[source_kind]
+        if root is None:
+            continue
+        try:
+            text, source_sha256 = _read_source(path)
+        except (OSError, UnicodeError, ValueError):
+            # 与 build_index 一致：无法读取的文件不参与当前可检索源摘要。
+            continue
+        # 空文件或只包含被过滤凭据行的文件不会产生 chunk，不能让它们
+        # 造成一个永远无法与已构建索引匹配的摘要。
+        if not text:
+            continue
+        display_path = f"{source_kind}/{path.relative_to(root).as_posix()}"
+        values.append((display_path, source_sha256))
+    payload = json.dumps(sorted(set(values)), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _read_source(path: Path) -> tuple[str, str]:
