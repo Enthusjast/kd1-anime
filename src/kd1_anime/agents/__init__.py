@@ -1,6 +1,13 @@
 from kd1_anime.agents.api_linter import ApiLintResult, lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.base import BaseAgent
+from kd1_anime.agents.capability import (
+    CapabilityContract,
+    CapabilityValidationResult,
+    build_capability_contract,
+    recommended_renderer,
+    validate_capability_contract,
+)
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import ContinuityReviewerAgent, ContinuityReviewResult
 from kd1_anime.agents.failure_router import FailureRoute, classify_failure
@@ -65,6 +72,8 @@ __all__ = [
     "ApiLintResult",
     "AutoFixerAgent",
     "BaseAgent",
+    "CapabilityContract",
+    "CapabilityValidationResult",
     "CodeValidationResult",
     "CoderAgent",
     "ContinuityBible",
@@ -102,6 +111,7 @@ __all__ = [
     "apply_review_policy",
     "assess_scene_risk",
     "build_bounded_prompt",
+    "build_capability_contract",
     "classify_failure",
     "classify_plan_review_issues",
     "classify_progress",
@@ -112,10 +122,12 @@ __all__ = [
     "filter_verified_plan_issues",
     "lint_manim_api",
     "normalize_technical_spec_contract",
+    "recommended_renderer",
     "repair_obvious_math_contradictions",
     "repair_required_export_alias_lifecycle",
     "review_budget",
     "validate_animation_lifecycle",
+    "validate_capability_contract",
     "validate_manim_code",
     "validate_review_evidence",
     "verify_expression_samples",

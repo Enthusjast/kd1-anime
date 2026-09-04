@@ -26,6 +26,12 @@ from rich.prompt import Confirm
 
 from kd1_anime.agents.api_linter import lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
+from kd1_anime.agents.capability import (
+    CapabilityContract,
+    build_capability_contract,
+    recommended_renderer,
+    validate_capability_contract,
+)
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import (
     ContinuityIssue,
@@ -294,6 +300,8 @@ class SceneState:
     technical_input_sha256: str = ""
     technical_status: str = "pending"
     technical_error: str = ""
+    capability_contract: CapabilityContract | None = None
+    capability_status: str = "pending"
     resource_profile: RenderResourceProfile | None = None
     # 本地 Smoke Render 的恢复凭据；未通过或未完成时，恢复/AutoFix 后
     # 必须在 Reviewer 前重新执行，不能只依赖旧的内存状态。
@@ -471,6 +479,8 @@ class Orchestrator:
         state.technical_input_sha256 = ""
         state.technical_status = "pending"
         state.technical_error = ""
+        state.capability_contract = None
+        state.capability_status = "pending"
 
     def _cancel_unfinished_scene_job(self, state: SceneState, *, reason: str) -> None:
         """在丢弃场景代码/计划前取消仍可能执行的旧 Job。
@@ -873,6 +883,8 @@ class Orchestrator:
                     technical_input_sha256=scene.technical_input_sha256,
                     technical_status=scene.technical_status,
                     technical_error=scene.technical_error,
+                    capability_contract=scene.capability_contract,
+                    capability_status=scene.capability_status,
                     resource_profile=scene.resource_profile,
                     local_smoke_status=scene.local_smoke_status,
                     rewrite_feedback=scene.rewrite_feedback,
@@ -1167,6 +1179,8 @@ class Orchestrator:
                 technical_input_sha256=getattr(stored, "technical_input_sha256", ""),
                 technical_status=getattr(stored, "technical_status", "pending"),
                 technical_error=getattr(stored, "technical_error", ""),
+                capability_contract=getattr(stored, "capability_contract", None),
+                capability_status=getattr(stored, "capability_status", "pending"),
                 resource_profile=(
                     getattr(stored, "resource_profile", None)
                     or (getattr(job, "resource_profile", None) if job is not None else None)
@@ -3032,6 +3046,44 @@ class Orchestrator:
         }
         return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
+    def _adapt_renderer_for_plans(self, ctx: PipelineContext) -> None:
+        """在首次提交前为明确需要 Cairo 运镜的计划切换 renderer。"""
+
+        if ctx.render_profile.renderer != "opengl":
+            return
+        contracts = [
+            build_capability_contract(
+                state.plan,
+                renderer=ctx.render_profile.renderer,
+                render_profile=ctx.render_profile,
+                gpu_type=settings.SLURM_GPU_TYPE,
+            )
+            for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            if state.plan_ready and not state.failed and not state.give_up
+        ]
+        if not any(recommended_renderer(contract) == "cairo" for contract in contracts):
+            return
+        has_started_scene = any(
+            state.code or state.slurm_job is not None or state.rendered
+            for state in ctx.scene_states.values()
+        )
+        if has_started_scene:
+            ctx.continuity_warnings.append(
+                "当前运行已有场景代码/作业，无法安全自动切换 renderer；能力合同将阻止不兼容提交。"
+            )
+            return
+        previous = ctx.render_profile.renderer
+        ctx.render_profile = ctx.render_profile.model_copy(update={"renderer": "cairo"})
+        ctx.continuity_warnings.append(
+            f"能力合同检测到 Cairo 专用运镜，已在首次提交前将 renderer 从 {previous} 切换为 cairo。"
+        )
+        self._emit(
+            "renderer_auto_switched",
+            previous=previous,
+            current="cairo",
+            reason="场景能力合同需要 MovingCameraScene/camera.frame",
+        )
+
     def _run_scheduler(self, ctx: PipelineContext, *, planning_only: bool = False) -> None:
         """启动每个场景的独立流水线线程, 全部结束后返回。"""
         import threading
@@ -3066,6 +3118,7 @@ class Orchestrator:
             # 缺失断言会被错误归因到其它场景，既浪费 LLM 预算又掩盖真正根因。
             self._checkpoint(ctx, State.DETAILING)
             return
+        self._adapt_renderer_for_plans(ctx)
         self._normalize_pending_scene_contracts(ctx)
         self._compile_scene_plans(ctx)
         # 计划审查与全片连续性审查可能互相触发：连续性重规划后需要重新
@@ -3591,6 +3644,44 @@ class Orchestrator:
                 raise ValidationError(
                     "TechnicalSpec 未生成有效结果",
                     hint="请修正技术计划后再生成代码",
+                )
+            capability_contract = build_capability_contract(
+                state.plan,
+                spec,
+                renderer=ctx.render_profile.renderer,
+                render_profile=ctx.render_profile,
+                gpu_type=settings.SLURM_GPU_TYPE,
+            )
+            capability_result = validate_capability_contract(
+                capability_contract,
+                render_profile=ctx.render_profile,
+                gpu_type=settings.SLURM_GPU_TYPE,
+            )
+            if spec.renderer != ctx.render_profile.renderer:
+                capability_result = capability_result.model_copy(
+                    update={
+                        "is_valid": False,
+                        "errors": (
+                            *capability_result.errors,
+                            f"TechnicalSpec.renderer={spec.renderer} 与当前 renderer="
+                            f"{ctx.render_profile.renderer} 不一致",
+                        ),
+                    }
+                )
+            with self._state_lock:
+                state.capability_contract = capability_contract
+                state.capability_status = "passed" if capability_result.is_valid else "failed"
+                self._checkpoint(ctx, State.REVIEWING)
+            if not capability_result.is_valid:
+                raise ValidationError(
+                    "场景能力合同未通过：\n"
+                    + "\n".join(f"- {error}" for error in capability_result.errors),
+                    hint="请修正 renderer、Scene 基类或技术对象声明",
+                )
+            if capability_result.warnings:
+                ctx.continuity_warnings.extend(
+                    f"Scene {scene_id} 能力合同：{warning}"
+                    for warning in capability_result.warnings
                 )
         except Exception as exc:
             with self._state_lock:
@@ -6127,6 +6218,39 @@ class Orchestrator:
                     self._checkpoint(ctx, State.DISPATCHING)
                 self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
                 return
+        capability = state.capability_contract or build_capability_contract(
+            state.plan,
+            state.technical_spec,
+            renderer=ctx.render_profile.renderer,
+            render_profile=ctx.render_profile,
+            gpu_type=settings.SLURM_GPU_TYPE,
+        )
+        capability_result = validate_capability_contract(
+            capability,
+            render_profile=ctx.render_profile,
+            gpu_type=settings.SLURM_GPU_TYPE,
+            code=on_disk_code,
+        )
+        if not capability_result.is_valid:
+            with self._state_lock:
+                state.capability_contract = capability
+                state.capability_status = "failed"
+                self._mark_failed(
+                    state,
+                    "提交前场景能力合同校验失败：\n"
+                    + "\n".join(f"- {error}" for error in capability_result.errors),
+                    "renderer",
+                )
+                self._checkpoint(ctx, State.DISPATCHING)
+            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+            return
+        with self._state_lock:
+            state.capability_contract = capability
+            state.capability_status = "passed"
+        if capability_result.warnings:
+            ctx.continuity_warnings.extend(
+                f"Scene {scene_id} 能力合同：{warning}" for warning in capability_result.warnings
+            )
         state.class_name = validation.scene_classes[0]
         job: SlurmJob | None = None
         try:
