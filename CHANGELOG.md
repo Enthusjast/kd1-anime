@@ -12,6 +12,8 @@
   完整边界状态校验、风险自适应 Slurm 资源配置和结构化 `run_report.json`。
 - AutoFix 经验复用：确定性补丁优先、最多保留 3 个可信代码候选、停滞后自动回滚，
   并把脱敏修复摘要保存到本地失败案例库。
+- 模板化代码生成调整为实验性功能：默认使用普通 Python Coder；只有显式设置
+  `CODEGEN_MODE=hybrid` 或 `CODEGEN_MODE=ir` 才启用模板/Scene IR 路径。
 
 - TechnicalSpec 生命周期归一化和确定性编译增强：
   - 从 active 对象、依赖关系和事件说明中安全推断缺失的 Transform source；
