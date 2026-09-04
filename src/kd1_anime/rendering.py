@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import shutil
 import subprocess
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -82,6 +83,16 @@ class RenderProfile(BaseModel):
     def digest(self) -> str:
         payload = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def effective_transition_duration(durations: Iterable[float]) -> float:
+    """返回 FFmpeg xfade 实际会采用的统一转场时长。"""
+
+    values = [float(duration) for duration in durations]
+    if len(values) < 2:
+        return 0.0
+    shortest = min(values)
+    return min(settings.TRANSITION_DURATION, max(0.0, shortest / 2))
 
 
 class VideoMetadata(BaseModel):

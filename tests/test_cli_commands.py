@@ -1,8 +1,10 @@
+import json
+
 import pytest
 import typer
 from typer.testing import CliRunner
 
-from kd1_anime.agents.planner import ScenePlan
+from kd1_anime.agents.planner import LessonSpec, ScenePlan, TeachingGraph
 from kd1_anime.cli import _manifest_requires_generation_apis, _print_comparison, app
 from kd1_anime.config import settings
 from kd1_anime.eval.metrics import ComparisonResult, EvalResult
@@ -15,6 +17,13 @@ def test_cli_registers_all_public_commands():
     assert result.exit_code == 0, result.output
     for command in ("generate", "resume", "batch", "doctor", "evaluate", "test-llm", "rag"):
         assert command in result.output
+
+
+def test_version_uses_source_package_version():
+    result = CliRunner().invoke(app, ["version"])
+
+    assert result.exit_code == 0, result.output
+    assert "kd1-anime v0.4.0" in result.output
 
 
 def test_rag_status_is_read_only():
@@ -590,11 +599,66 @@ def test_plan_command_reviews_generated_plans(monkeypatch):
                 issues=[],
             )
 
+    class FakeContinuityReviewer:
+        def review(self, *args, **kwargs):
+            from kd1_anime.agents.continuity import ContinuityReviewResult
+
+            return ContinuityReviewResult(
+                is_valid=True,
+                severity="info",
+                summary="通过",
+                issues=[],
+            )
+
     monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", lambda **kwargs: None)
-    monkeypatch.setattr("kd1_anime.agents.planner.PlannerAgent", FakePlanner)
-    monkeypatch.setattr("kd1_anime.agents.plan_reviewer.PlanReviewerAgent", FakePlanReviewer)
+    # plan 命令现在复用 Orchestrator 的统一计划屏障，因此必须替换
+    # orchestrator 模块持有的依赖，而不是只替换定义模块中的类名。
+    monkeypatch.setattr("kd1_anime.orchestrator.PlannerAgent", FakePlanner)
+    monkeypatch.setattr("kd1_anime.orchestrator.PlanReviewerAgent", FakePlanReviewer)
+    monkeypatch.setattr("kd1_anime.orchestrator.ContinuityReviewerAgent", FakeContinuityReviewer)
     result = CliRunner().invoke(app, ["plan", "解释圆"])
 
     assert result.exit_code == 0, result.output
     assert "已完成计划审查" in result.output
     assert calls == [(1, [planned])]
+
+
+def test_plan_command_exports_structured_plan(monkeypatch, tmp_path):
+    plan = ScenePlan(
+        scene_id=1,
+        title="圆",
+        duration_seconds=10,
+        purpose="展示圆",
+        math_concept="圆的面积",
+        visual_design="统一背景",
+        camera_movement="固定机位",
+        visual_flow=["显示圆"],
+        key_moments=["停顿"],
+        computation="半径=1",
+    )
+
+    class FakeContext:
+        user_prompt = "解释圆"
+        lesson_spec = LessonSpec(topic="圆")
+        teaching_graph = TeachingGraph()
+        continuity_bible = None
+        paths = type("FakePaths", (), {"run_id": "20260829-120000-1234abcd"})()
+
+    class FakeOrchestrator:
+        def __init__(self):
+            self._ctx = FakeContext()
+
+        def plan_only(self, prompt, **kwargs):
+            return [plan]
+
+    monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", lambda **kwargs: None)
+    # cli 在命令函数内部导入 Orchestrator，因此替换其模块绑定。
+    monkeypatch.setattr("kd1_anime.orchestrator.Orchestrator", FakeOrchestrator)
+    output = tmp_path / "plan.json"
+
+    result = CliRunner().invoke(app, ["plan", "解释圆", "--output", str(output)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["items"][0]["title"] == "圆"

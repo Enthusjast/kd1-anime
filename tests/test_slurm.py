@@ -471,6 +471,19 @@ def test_gone_with_error_log_is_failed(monkeypatch, tmp_path):
     assert "依据日志判定为失败" in job.failure_reason
 
 
+def test_gone_with_normal_text_is_not_marked_failed(monkeypatch, tmp_path):
+    """普通课程输出中的 error/failed 单词不能代替真实失败证据。"""
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    job.log_out.write_text(
+        "Lesson: error handling is important; the failed example is explained.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda current: False)
+
+    assert dispatcher._classify_gone(job) is None
+
+
 def test_gone_without_artifacts_waits_for_streak(monkeypatch, tmp_path):
     """作业消失且无任何产物 → 不立即判死, 计数达到阈值后按失败交给修复。"""
     dispatcher = SlurmDispatcher()

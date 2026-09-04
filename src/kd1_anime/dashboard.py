@@ -388,6 +388,14 @@ class SceneDashboard:
                 status.started_at = 0.0
                 status.message = "技术实现合同失败"
 
+        elif event == "scene_waiting_for_dependency":
+            if status:
+                status.state = "pending"
+                status.stage = ""
+                status.started_at = 0.0
+                dependency = data.get("dependency_scene_id", "?")
+                status.message = f"等待 Scene {dependency} 完成"
+
         elif event in (
             "scene_detailing",
             "scene_coding",
@@ -457,6 +465,10 @@ class SceneDashboard:
             if status:
                 self._mark_running(status, "渲染", f"Job {data.get('job_id', '?')}")
 
+        elif event == "scene_artifact_invalid":
+            if status:
+                self._mark_running(status, "渲染", "渲染产物不可用，准备重新处理")
+
         elif event in ("scene_rendered", "scene_reused"):
             if status:
                 # 启用视觉门时，渲染完成只是中间态；只有视觉评估已接受
@@ -512,6 +524,36 @@ class SceneDashboard:
                     VISUAL_STAGE,
                     f"安排视觉修复 #{data.get('attempt', 0)}",
                 )
+
+        elif event == "scene_visual_plan_fixing":
+            self.stage = "plan_reviewing"
+            self.stage_label = "视觉反馈计划修正"
+            if status:
+                # 视觉评估发现的是数学/故事或交接问题，不能继续显示为
+                # “代码修复”；清除计划审查之后的完成标记，明确回退层级。
+                status.invalidate_from("计划审查", self.stages)
+                target = data.get("target", "计划")
+                self._mark_running(status, "计划审查", f"视觉反馈回到{target}层")
+
+        elif event == "scene_plan_repair_requested":
+            self.stage = "plan_reviewing"
+            self.stage_label = "代码审查反馈计划修正"
+            if status:
+                status.invalidate_from("计划审查", self.stages)
+                target = data.get("target", "计划")
+                self._mark_running(status, "计划审查", f"代码审查反馈回到{target}层")
+
+        elif event == "boundary_visual_pass":
+            self.stage = "visual_evaluating"
+            self.stage_label = "场景边界视觉通过"
+
+        elif event == "boundary_visual_warning":
+            self.stage = "visual_evaluating"
+            self.stage_label = "场景边界视觉提示"
+
+        elif event == "boundary_visual_unknown":
+            self.stage = "visual_evaluating"
+            self.stage_label = "场景边界视觉不可用"
 
         elif event == "scene_failed":
             if status:

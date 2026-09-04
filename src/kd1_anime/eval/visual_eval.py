@@ -32,6 +32,8 @@ class FrameSample(BaseModel):
 
     frame_id: str = Field(pattern=r"^F\d{2}$")
     path: Path
+    scene_id: int | None = Field(default=None, ge=1)
+    boundary_id: str = Field(default="", max_length=100)
     timestamp_seconds: float | None = Field(default=None, ge=0)
     image_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     role: Literal[
@@ -41,6 +43,8 @@ class FrameSample(BaseModel):
         "conclusion",
         "ending",
         "transition_boundary",
+        "boundary_start",
+        "boundary_end",
         "content",
     ] = "content"
 
@@ -77,7 +81,12 @@ class VisualIssue(BaseModel):
         "other",
     ]
     severity: Literal["info", "minor", "major"]
-    frame_ids: list[str] = Field(default_factory=list, max_length=MAX_FRAME_COUNT)
+    repair_target: Literal["planner", "continuity", "coder", "infrastructure", "unknown"] = (
+        "unknown"
+    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    frame_ids: list[str] = Field(min_length=1, max_length=MAX_FRAME_COUNT)
+    boundary_ids: list[str] = Field(default_factory=list, max_length=MAX_FRAME_COUNT)
     evidence: str = Field(min_length=1, max_length=2_000)
     recommendation: str = Field(min_length=1, max_length=2_000)
 
@@ -130,9 +139,9 @@ class VisualAnalysisResult:
                 f"- {name}: {data['score']}/5 — {data.get('comprehensive_evaluation', '')}"
             )
         for issue in self.issues:
-            frames = ", ".join(issue.frame_ids) or "未指定帧"
+            frames = ", ".join(issue.frame_ids)
             lines.append(
-                f"- [{issue.severity}/{issue.category}] {frames}: {issue.evidence}；"
+                f"- [{issue.severity}/{issue.category}/{issue.repair_target}] {frames}: {issue.evidence}；"
                 f"建议：{issue.recommendation}"
             )
         return "\n".join(lines)[:20_000]
@@ -270,6 +279,8 @@ class VisualEvaluator:
         manifest = [
             {
                 "frame_id": sample.frame_id,
+                "scene_id": sample.scene_id,
+                "boundary_id": sample.boundary_id,
                 "timestamp_seconds": sample.timestamp_seconds,
                 "role": sample.role,
                 "filename": sample.path.name,
@@ -329,6 +340,7 @@ class VisualEvaluator:
         samples: list[FrameSample],
     ) -> None:
         allowed = {sample.frame_id for sample in samples}
+        boundaries = {sample.boundary_id for sample in samples if sample.boundary_id}
         unknown = sorted(
             {
                 frame_id
@@ -339,6 +351,16 @@ class VisualEvaluator:
         )
         if unknown:
             raise ValueError(f"视觉评估引用了不存在的关键帧: {', '.join(unknown)}")
+        unknown_boundaries = sorted(
+            {
+                boundary_id
+                for issue in result.issues
+                for boundary_id in issue.boundary_ids
+                if boundary_id not in boundaries
+            }
+        )
+        if unknown_boundaries:
+            raise ValueError("视觉评估引用了不存在的场景边界: " + ", ".join(unknown_boundaries))
 
     @classmethod
     def _from_payload(

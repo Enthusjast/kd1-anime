@@ -68,15 +68,18 @@ def iter_source_files(
         for path in sorted(root.rglob("*")):
             try:
                 resolved = path.resolve(strict=True)
-                resolved.relative_to(root)
+                relative = resolved.relative_to(root)
             except (OSError, ValueError):
                 # 不索引指向知识库根目录之外的符号链接。
                 continue
             if (
-                not path.is_file()
+                not resolved.is_file()
                 or path.suffix.lower() not in ALLOWED_SUFFIXES
                 or resolved in seen
-                or any(part in EXCLUDED_PARTS for part in path.parts)
+                # 必须检查相对根目录的路径。若检查绝对路径，用户把知识库
+                # 放在 ``~/workspace/docs`` 下时，会因为父目录名 workspace
+                # 而把整个合法知识库误过滤掉。
+                or any(part in EXCLUDED_PARTS for part in relative.parts)
             ):
                 continue
             try:

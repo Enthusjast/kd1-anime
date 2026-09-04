@@ -96,6 +96,17 @@ def test_iter_source_files_excludes_runtime_and_unknown_files(tmp_path):
     ]
 
 
+def test_iter_source_files_allows_root_under_workspace_or_runs(tmp_path):
+    docs = tmp_path / "workspace" / "runs" / "knowledge"
+    docs.mkdir(parents=True)
+    source = docs / "api.md"
+    source.write_text("# API", encoding="utf-8")
+
+    files = iter_source_files(docs, None)
+
+    assert files == [(source.resolve(), "manim_doc")]
+
+
 def test_embedding_client_reorders_and_validates_batch(monkeypatch):
     from kd1_anime.rag import clients
 
@@ -154,6 +165,12 @@ def test_reranker_client_parses_cohere_response(monkeypatch):
     assert client.rerank("query", ["one", "two"], top_n=2) == [(1, 0.9), (0, 0.2)]
 
 
+def test_rag_error_endpoint_redaction_handles_malformed_url():
+    from kd1_anime.rag.clients import _safe_endpoint
+
+    assert _safe_endpoint("https://user:secret@[invalid") == "<invalid-endpoint>"
+
+
 def test_rag_index_builds_atomic_sqlite_index_and_searches(tmp_path):
     chunks = [_source_chunk("circle api", 0), _source_chunk("square api", 1)]
     path = tmp_path / "nested" / "index.sqlite3"
@@ -178,6 +195,19 @@ def test_rag_index_rejects_tampered_chunk(tmp_path):
         connection.commit()
 
     with pytest.raises(ValueError, match="哈希不一致"):
+        RagIndex(path).verify_integrity()
+
+
+def test_rag_index_rejects_chunk_dimension_mismatch(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "index.sqlite3"
+    RagIndex.build(path, [_source_chunk("original")], [[1, 0]], embedding_model="embed")
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE chunks SET embedding_dimension = 3")
+        connection.commit()
+
+    with pytest.raises(ValueError, match="维度与索引元数据不一致"):
         RagIndex(path).verify_integrity()
 
 
@@ -313,6 +343,26 @@ def test_rag_service_caches_active_query_result(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_rag_service_reuses_unchanged_index_without_reembedding(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.RAG_DOCS_DIR.mkdir()
+    (config.RAG_DOCS_DIR / "api.md").write_text("# API", encoding="utf-8")
+    service = RagService(config)
+    calls = []
+    monkeypatch.setattr(
+        service.embedding,
+        "embed",
+        lambda texts: calls.append(list(texts)) or [[1.0, 0.0] for _ in texts],
+    )
+    service.build_index(rebuild=True)
+    first_call_count = len(calls)
+
+    result = service.build_index()
+
+    assert result.chunk_count == 1
+    assert len(calls) == first_call_count
+
+
 def test_rag_service_rejects_index_from_different_embedding_model(tmp_path, monkeypatch):
     config = _config(tmp_path)
     service = RagService(config)
@@ -338,6 +388,28 @@ def test_disabled_rag_does_not_need_index_or_network(tmp_path):
 
     assert result.receipt.status == "disabled"
     assert result.context == ""
+
+
+def test_enabled_rag_requires_a_current_index(tmp_path):
+    config = _config(tmp_path)
+    service = RagService(config)
+
+    with pytest.raises(RagClientError, match="rag index"):
+        service.require_index()
+
+
+def test_enabled_rag_requires_both_service_profiles(tmp_path):
+    config = _config(tmp_path, RAG_RERANK_BASE_URL="", RAG_RERANK_MODEL="")
+    service = RagService(config)
+    RagIndex.build(
+        config.RAG_INDEX_PATH,
+        [_source_chunk("ready")],
+        [[1.0, 0.0]],
+        embedding_model=config.RAG_EMBEDDING_MODEL,
+    )
+
+    with pytest.raises(RagClientError, match="Reranker"):
+        service.require_ready()
 
 
 def test_rag_service_migrates_legacy_default_index(tmp_path, monkeypatch):

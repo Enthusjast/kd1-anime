@@ -173,6 +173,58 @@ def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():
     assert any("未通过计划审查" in error for error in manifest.integrity_errors())
 
 
+def test_manifest_validate_for_resume_rejects_semantic_corruption():
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        plan_review_status="passed",
+        scenes={1: StoredSceneState(plan=make_plan(), plan_ready=True)},
+    )
+
+    with pytest.raises(ValueError, match="完整性校验失败"):
+        manifest.validate_for_resume()
+
+
+def test_manifest_integrity_rejects_unverified_rendered_artifact():
+    profile = PipelineContext("prompt", paths=make_paths(Path("/tmp"))).render_profile
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    scene = StoredSceneState(
+        plan=make_plan(),
+        code_file="scenes/scene_1.py",
+        code_sha256=sha256_text(code),
+        class_name="Demo",
+        rendered=True,
+        artifact={
+            "origin": "rendered",
+            "source_run_id": RUN_ID,
+            "job_id": "123",
+            "scene_id": 1,
+            "scene_class_name": "Demo",
+            "code_sha256": sha256_text(code),
+            "render_profile_sha256": profile.digest(),
+            "video_path": "videos/scene_1/Demo.mp4",
+            "video_sha256": "a" * 64,
+            "metadata": {
+                "size_bytes": 1,
+                "duration_seconds": 1,
+                "width": profile.pixel_width,
+                "height": profile.pixel_height,
+                "frame_rate": profile.frame_rate,
+            },
+            "verified": False,
+        },
+    )
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        scenes={1: scene},
+    )
+
+    assert any("artifact 未验证" in error for error in manifest.integrity_errors())
+
+
 def test_resume_completed_run_rejects_tampered_final_video(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     paths = make_paths(workspace)
@@ -392,11 +444,50 @@ def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_current_manifest_uses_v4_schema():
+def test_current_manifest_uses_v5_schema():
     assert (
         RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
-        == 4
+        == 5
     )
+
+
+def test_v4_manifest_is_readable_but_read_only(tmp_path):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    raw = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="legacy",
+        output_path=str((root / "output.mp4").resolve()),
+    ).model_dump(mode="json")
+    raw["schema_version"] = 4
+    path = root / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = RunRepository(workspace).load(RUN_ID)
+
+    assert loaded.schema_version == 4
+    with pytest.raises(ValueError, match="仅支持只读查看"):
+        loaded.validate_for_resume()
+    with pytest.raises(ValueError, match="只允许写入 v5"):
+        write_manifest(path, loaded)
+
+
+def test_v5_manifest_must_persist_teaching_contract_fields(tmp_path):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    raw = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str((root / "output.mp4").resolve()),
+    ).model_dump(mode="json")
+    for field_name in ("lesson_spec", "teaching_graph", "state_ledger"):
+        raw.pop(field_name)
+    (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="v5 manifest 缺少必需字段"):
+        RunRepository(workspace).load(RUN_ID)
 
 
 def _write_v1_manifest(workspace: Path, *, reused_job: bool = False) -> Path:

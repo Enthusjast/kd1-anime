@@ -449,6 +449,31 @@ def test_escape_control_chars_in_json_keeps_valid_escapes():
     assert data["prompt"] == 'a\nb\t"c" \\d'
 
 
+def test_fix_latex_escapes_preserves_markdown_newlines_before_text():
+    raw = '{"prompt": "## 标题\\n中文正文\\n\\n## 下一节"}'
+
+    repaired = BaseAgent._fix_latex_escapes_in_json(raw)
+
+    assert json.loads(repaired)["prompt"] == "## 标题\n中文正文\n\n## 下一节"
+
+
+def test_fix_latex_escapes_repairs_ambiguous_latex_commands():
+    raw = r'{"formula": "\\not\\text{a}\\neq\\beta"}'
+
+    repaired = BaseAgent._fix_latex_escapes_in_json(raw)
+
+    assert json.loads(repaired)["formula"] == r"\not\text{a}\neq\beta"
+
+
+def test_json_repair_keeps_array_string_boundaries():
+    raw = r'{"items": ["\alpha", "beta"]}'
+
+    repaired = BaseAgent._escape_unescaped_quotes_in_json(raw)
+    repaired = BaseAgent._fix_latex_escapes_in_json(repaired)
+
+    assert json.loads(repaired)["items"] == [r"\alpha", "beta"]
+
+
 def test_escape_unescaped_quotes_in_json_keeps_markdown_text():
     raw = '{"text":"展示"展开",然后合并"}'
 

@@ -248,6 +248,12 @@ class RagIndex:
                     """
                 )
                 for row in rows:
+                    row_dimension = int(row[9])
+                    if row_dimension != info.embedding_dimension:
+                        raise ValueError(
+                            "分块 Embedding 维度与索引元数据不一致: "
+                            f"{row_dimension} != {info.embedding_dimension}"
+                        )
                     content_sha256 = hashlib.sha256(str(row[6]).encode("utf-8")).hexdigest()
                     if content_sha256 != row[4]:
                         raise ValueError("分块内容哈希不一致")
@@ -265,7 +271,7 @@ class RagIndex:
                             metadata=json.loads(row[7]),
                         )
                     )
-                    vectors.append(_pack_vector(_unpack_vector(row[8], int(row[9]))))
+                    vectors.append(_pack_vector(_unpack_vector(row[8], row_dimension)))
         except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError(f"RAG 索引完整性校验失败: {self.path}: {exc}") from exc
         if len(chunks) != info.chunk_count:
@@ -291,7 +297,56 @@ class RagIndex:
     ) -> list[RetrievedChunk]:
         if top_k < 1:
             raise ValueError("top_k 必须大于 0")
-        info = self.verify_integrity()
+        return self._search_verified(
+            query_embedding,
+            top_k=top_k,
+            source_kinds=source_kinds,
+            info=self.verify_integrity(),
+        )
+
+    def search_verified(
+        self,
+        query_embedding: Sequence[float],
+        *,
+        top_k: int,
+        source_kinds: set[str] | None = None,
+        info: RagIndexInfo,
+    ) -> list[RetrievedChunk]:
+        """使用调用方刚完成的完整性校验结果检索。"""
+
+        if top_k < 1:
+            raise ValueError("top_k 必须大于 0")
+        if Path(info.index_path).expanduser().resolve() != self.path:
+            raise ValueError("复用的 RAG 索引元数据与当前索引路径不一致")
+        # ``RagService`` 在进入这里前已经完成全量校验，但索引可以被另一个
+        # 进程通过 os.replace 原子重建。再次读取轻量 meta，避免把旧收据绑定
+        # 到已经替换的新文件；完整内容扫描只做一次。
+        current_info = self.info()
+        if (
+            current_info.index_sha256 != info.index_sha256
+            or current_info.source_sha256 != info.source_sha256
+            or current_info.embedding_model != info.embedding_model
+            or current_info.embedding_dimension != info.embedding_dimension
+            or current_info.chunk_count != info.chunk_count
+        ):
+            raise ValueError("RAG 索引在校验后发生变化，请重试检索")
+        return self._search_verified(
+            query_embedding,
+            top_k=top_k,
+            source_kinds=source_kinds,
+            info=info,
+        )
+
+    def _search_verified(
+        self,
+        query_embedding: Sequence[float],
+        *,
+        top_k: int,
+        source_kinds: set[str] | None,
+        info: RagIndexInfo,
+    ) -> list[RetrievedChunk]:
+        # RagService 在同一次查询前已经完成完整性校验；这里复用结果，避免
+        # 对较大的 SQLite 知识库重复扫描全部分块和向量。
         query = [float(value) for value in query_embedding]
         if len(query) != info.embedding_dimension:
             raise ValueError(f"查询向量维度不一致: {len(query)} != {info.embedding_dimension}")

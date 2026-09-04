@@ -1,12 +1,26 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
+from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    LessonSpec,
+    MathClaim,
+    PlanningDraft,
+    SceneHandoff,
+    SceneOutline,
+    ScenePlan,
+    TeachingGraph,
+    VisualElementState,
+)
 from kd1_anime.agents.reviewer import ReviewResult
 from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.config import settings
+from kd1_anime.eval.visual_eval import VisualAnalysisResult, VisualIssue
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import SceneArtifact, VideoMetadata, sha256_file
 from kd1_anime.run_store import RunManifest, StoredSceneState, sha256_text, write_manifest
@@ -54,6 +68,463 @@ def test_valid_review_after_rewrite_exits_review_loop(tmp_path):
     assert ctx.scene_states[1].review_round == 0
 
 
+def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    ctx = PipelineContext(
+        "direct",
+        paths=run_paths,
+        direct_render=True,
+        scenes=[state.plan],
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_technical_spec",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("direct render called LLM")),
+    )
+
+    orchestrator._run_code_review_barrier(ctx)
+
+
+def test_code_barrier_does_not_turn_downstream_missing_ledger_into_failure(monkeypatch, tmp_path):
+    """上游技术合同失败时，下游应等待而不是伪造继承状态错误。"""
+
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    inherited = VisualElementState(
+        element_id="previous_result",
+        variable_name="previous_result",
+        required=True,
+    )
+    first = plan().model_copy(
+        update={
+            "new_elements": [inherited],
+            "handoff": [
+                SceneHandoff(
+                    element_id="previous_result",
+                    variable_name="previous_result",
+                    action="keep",
+                )
+            ],
+        }
+    )
+    second = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [inherited],
+            "new_elements": [],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        plan_review_status="passed",
+        scene_states={
+            1: SceneState(plan=first, plan_ready=True),
+            2: SceneState(plan=second, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    events = []
+    orchestrator._callback = lambda event, data: events.append((event, data))
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    def fail_first(current_ctx, scene_state):
+        if scene_state.plan.scene_id == 1:
+            raise RuntimeError("TechnicalSpec invalid")
+
+    monkeypatch.setattr(orchestrator, "_ensure_technical_spec", fail_first)
+
+    orchestrator._run_code_review_barrier(ctx)
+
+    assert ctx.scene_states[1].failed is True
+    assert ctx.scene_states[2].failed is False
+    assert ctx.scene_states[2].give_up is False
+    assert any(
+        event == "scene_waiting_for_dependency" and data["scene_id"] == 2 for event, data in events
+    )
+
+
+def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp_path):
+    """重规划会重置单份计划的审查轮数，但不能重置总调用预算。"""
+
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    current_plan = plan()
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title=current_plan.title,
+                duration_seconds=current_plan.duration_seconds,
+                purpose=current_plan.purpose,
+                math_concept=current_plan.math_concept,
+            )
+        ],
+        scene_states={1: SceneState(plan=current_plan, plan_ready=True)},
+        plan_review_status="pending",
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+    monkeypatch.setattr(settings, "MAX_PLAN_REVIEW_ROUNDS", 2)
+    monkeypatch.setattr(settings, "MAX_PLAN_REPLAN_ATTEMPTS", 2)
+
+    class FakeReviewer:
+        def review(self, *args, **kwargs):
+            return PlanReviewResult(
+                is_valid=False,
+                severity="major",
+                issues=[
+                    PlanReviewIssue(
+                        category="feasibility",
+                        field="visual_flow",
+                        message="方案不可实现",
+                        fix_instruction="重新规划",
+                    )
+                ],
+            )
+
+    class FakePlanner:
+        calls = 0
+
+        def plan_detail(self, *args, **kwargs):
+            self.calls += 1
+            return current_plan
+
+    fake_planner = FakePlanner()
+    monkeypatch.setattr(module, "PlanReviewerAgent", FakeReviewer)
+    monkeypatch.setattr(module, "PlannerAgent", lambda: fake_planner)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert fake_planner.calls == 2
+    assert ctx.scene_states[1].failed is True
+    assert ctx.plan_review_status == "failed"
+    assert "达到最大次数" in ctx.scene_states[1].failure_reason
+
+
+def test_resume_migrates_claims_out_of_transition_scene(monkeypatch, tmp_path):
+    outlines = [
+        SceneOutline(
+            scene_id=1,
+            title="建立",
+            duration_seconds=10,
+            purpose="建立基础",
+            math_concept="基础",
+            claim_ids=["claim_1"],
+        ),
+        SceneOutline(
+            scene_id=2,
+            title="章节过渡",
+            duration_seconds=5,
+            purpose="分隔并提示观众切换",
+            math_concept="无",
+            claim_ids=["claim_2"],
+        ),
+        SceneOutline(
+            scene_id=3,
+            title="推导",
+            duration_seconds=10,
+            purpose="展示结论",
+            math_concept="结论",
+            claim_ids=["claim_2"],
+        ),
+    ]
+    states = {
+        index: SceneState(
+            plan=plan().model_copy(
+                update={"scene_id": index, "claim_ids": list(outline.claim_ids)}
+            ),
+            plan_ready=True,
+        )
+        for index, outline in enumerate(outlines, 1)
+    }
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        outlines=outlines,
+        teaching_graph=TeachingGraph(scene_claims={1: ["claim_1"], 2: ["claim_2"], 3: ["claim_2"]}),
+        scene_states=states,
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    assert orchestrator._normalize_transition_claim_contracts(ctx) is True
+    assert ctx.scene_states[2].plan.claim_ids == []
+    assert ctx.scene_states[3].plan.claim_ids == ["claim_2"]
+    assert ctx.teaching_graph.scene_claims == {1: ["claim_1"], 2: [], 3: ["claim_2"]}
+
+
+def test_plan_compile_drops_new_handoff_without_next_scene_consumer(tmp_path):
+    transition = VisualElementState(
+        element_id="transition_title",
+        variable_name="transition_title",
+        required=True,
+    )
+    first_plan = plan().model_copy(
+        update={
+            "new_elements": [transition],
+            "handoff": [
+                SceneHandoff(
+                    element_id="transition_title",
+                    variable_name="transition_title",
+                    action="keep",
+                )
+            ],
+        }
+    )
+    second_plan = plan().model_copy(update={"scene_id": 2})
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=first_plan, plan_ready=True),
+            2: SceneState(plan=second_plan, plan_ready=True),
+        },
+    )
+
+    assert Orchestrator()._normalize_dangling_handoffs(ctx) is True
+    assert ctx.scene_states[1].plan.handoff == []
+    assert ctx.scene_states[1].plan.new_elements[0].required is False
+
+
+def test_direct_render_flag_round_trips_in_manifest(tmp_path):
+    run_paths = paths(tmp_path)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    run_paths.scenes.mkdir(parents=True)
+    (run_paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    ctx = PipelineContext(
+        "direct",
+        paths=run_paths,
+        direct_render=True,
+        scenes=[state.plan],
+        scene_states={1: state},
+    )
+
+    orchestrator = Orchestrator()
+    orchestrator._checkpoint(ctx, State.DISPATCHING)
+
+    manifest = RunManifest.model_validate_json(
+        (run_paths.root / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest.direct_render is True
+    restored = orchestrator._context_from_manifest(manifest, run_paths.root)
+    assert restored.direct_render is True
+
+
+def test_direct_render_wait_does_not_call_any_generation_agent(monkeypatch, tmp_path):
+    from kd1_anime.cluster.slurm import SlurmJob
+    from kd1_anime.config import settings
+    from kd1_anime.rendering import VideoMetadata
+
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+
+    class FakeSlurm:
+        def submit_scene(self, scene_id, python_file, scene_class_name, **kwargs):
+            run_root = python_file.parent.parent
+            return SlurmJob(
+                job_id="123",
+                scene_id=scene_id,
+                script_path=python_file.parent / "render.sh",
+                log_out=run_root / "logs" / "scene.out",
+                log_err=run_root / "logs" / "scene.err",
+                media_dir=run_root / "videos" / f"scene_{scene_id}",
+                scene_class_name=scene_class_name,
+                submitted_at=1.0,
+                code_sha256=kwargs["code_sha256"],
+                render_profile=kwargs["render_profile"],
+            )
+
+        def poll_all_statuses(self, job_ids):
+            return {job_id: "COMPLETED" for job_id in job_ids}
+
+        def validate_completed_job(self, job):
+            job.output_path = job.media_dir / f"{job.scene_class_name}.mp4"
+            job.output_path.parent.mkdir(parents=True, exist_ok=True)
+            job.output_path.write_bytes(b"video")
+            job.output_metadata = VideoMetadata(
+                size_bytes=5,
+                duration_seconds=1,
+                width=job.render_profile.pixel_width,
+                height=job.render_profile.pixel_height,
+                frame_rate=job.render_profile.frame_rate,
+            )
+            job.output_sha256 = sha256_file(job.output_path)
+            return True
+
+        def _forward_log(self, job, positions):
+            return None
+
+        def cancel_job(self, job_id):
+            return True
+
+    class FakeMerger:
+        def merge(self, video_paths, output_path, **kwargs):
+            output_path = Path(output_path)
+            output_path.write_bytes(b"merged")
+            return output_path
+
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path / "workspace")
+    monkeypatch.setattr(settings, "ENABLE_AUTO_EVAL", False)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_preflight_environment",
+        staticmethod(lambda profile=None: None),
+    )
+    orchestrator = Orchestrator()
+    orchestrator.slurm = FakeSlurm()
+    orchestrator.merger = FakeMerger()
+    monkeypatch.setattr(
+        orchestrator,
+        "_ensure_technical_spec",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("direct render must not call TechnicalPlanner")
+        ),
+    )
+
+    _, final_video, _ = orchestrator.submit_existing_scene(code, "Demo", wait=True)
+
+    assert final_video is not None
+    assert final_video.read_bytes() == b"merged"
+
+
+def test_resume_requeues_rendered_scene_when_video_was_deleted(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    profile = PipelineContext("prompt", paths=run_paths).render_profile
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    code_path = run_paths.scenes / "scene_1.py"
+    code_path.parent.mkdir(parents=True)
+    code_path.write_text(code, encoding="utf-8")
+    artifact = SceneArtifact(
+        origin="rendered",
+        source_run_id=run_paths.run_id,
+        job_id="123",
+        scene_id=1,
+        scene_class_name="Demo",
+        code_sha256=sha256_text(code),
+        render_profile_sha256=profile.digest(),
+        video_path="videos/scene_1/Demo.mp4",
+        video_sha256="a" * 64,
+        metadata=VideoMetadata(
+            size_bytes=1,
+            duration_seconds=1,
+            width=profile.pixel_width,
+            height=profile.pixel_height,
+            frame_rate=profile.frame_rate,
+        ),
+    )
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        reviewed=True,
+        rendered=True,
+        artifact=artifact,
+    )
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    orchestrator._reconcile_rendered_artifacts(ctx)
+
+    assert state.rendered is False
+    assert state.artifact is None
+    assert ctx.final_video is None
+    assert "重新处理" in state.failure_reason
+
+
+def test_local_smoke_status_is_persisted_and_failed_smoke_is_not_passed(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext("prompt", paths=run_paths)
+    state = SceneState(plan=plan())
+    monkeypatch.setattr(settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_local_smoke_render_impl", lambda *args: None)
+
+    orchestrator._local_smoke_render(ctx, state)
+
+    assert state.local_smoke_status == "passed"
+
+    def fail(*args):
+        raise RuntimeError("smoke failed")
+
+    monkeypatch.setattr(orchestrator, "_local_smoke_render_impl", fail)
+    with pytest.raises(RuntimeError, match="smoke failed"):
+        orchestrator._local_smoke_render(ctx, state)
+    assert state.local_smoke_status == "failed"
+
+
+def test_failed_scene_phase_does_not_remain_visual_evaluating():
+    state = SceneState(plan=plan(), failed=True, visual_status="evaluating")
+
+    assert Orchestrator._scene_phase(state) == "failed"
+
+
+def test_scene_worker_clears_rendered_state_when_post_render_step_fails(monkeypatch, tmp_path):
+    from kd1_anime.cluster.slurm import SlurmJob
+
+    run_paths = paths(tmp_path)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+        class_name="Demo",
+        reviewed=True,
+        slurm_job=SlurmJob(
+            job_id="123",
+            scene_id=1,
+            script_path=run_paths.scenes / "render.sh",
+            log_out=run_paths.logs / "out",
+            log_err=run_paths.logs / "err",
+            media_dir=run_paths.videos / "scene_1",
+            scene_class_name="Demo",
+            submitted_at=1.0,
+        ),
+    )
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    orchestrator._slot_lock = threading.Lock()
+    orchestrator._in_flight = 1
+    orchestrator._reserved_existing_scenes = {1}
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    def fail_after_marking_rendered(_ctx, current_state):
+        current_state.rendered = True
+        raise RuntimeError("post-render failure")
+
+    monkeypatch.setattr(orchestrator, "_scene_wait_render", fail_after_marking_rendered)
+
+    orchestrator._scene_worker(ctx, 1, state)
+
+    assert state.failed is True
+    assert state.rendered is False
+    assert state.artifact is None
+
+
 def test_disabled_rag_retrieval_is_recorded_without_network(tmp_path):
     orchestrator = Orchestrator()
     ctx = PipelineContext("prompt", paths=paths(tmp_path))
@@ -67,6 +538,231 @@ def test_disabled_rag_retrieval_is_recorded_without_network(tmp_path):
 
     assert context == ""
     assert ctx.rag_receipts["scene:1:code"].status == "disabled"
+
+
+def test_visual_math_issue_routes_back_to_planner():
+    result = VisualAnalysisResult(
+        overall_analysis="公式不正确",
+        mathematical_accuracy={"score": 2, "comprehensive_evaluation": "公式错误"},
+        visual_relevance={"score": 4, "comprehensive_evaluation": "相关"},
+        visual_quality={"score": 4, "comprehensive_evaluation": "清晰"},
+        visual_consistency={"score": 4, "comprehensive_evaluation": "一致"},
+        element_layout={"score": 4, "comprehensive_evaluation": "整齐"},
+        issues=[
+            VisualIssue(
+                category="mathematics",
+                severity="major",
+                frame_ids=["F01"],
+                evidence="画面等式前后不等价",
+                recommendation="回到计划修正数学断言",
+            )
+        ],
+    )
+
+    assert Orchestrator._visual_repair_target(result) == "planner"
+
+
+def test_visual_boundary_issue_uses_boundary_start_scene_for_repair():
+    result = VisualAnalysisResult(
+        overall_analysis="边界突变",
+        mathematical_accuracy={"score": 4, "comprehensive_evaluation": "正确"},
+        visual_relevance={"score": 4, "comprehensive_evaluation": "相关"},
+        visual_quality={"score": 4, "comprehensive_evaluation": "清晰"},
+        visual_consistency={"score": 2, "comprehensive_evaluation": "突变"},
+        element_layout={"score": 4, "comprehensive_evaluation": "整齐"},
+        issues=[
+            VisualIssue(
+                category="consistency",
+                severity="major",
+                repair_target="continuity",
+                frame_ids=["F01", "F02"],
+                boundary_ids=["B02"],
+                evidence="Scene 2 开头丢失对象",
+                recommendation="恢复边界交接",
+            )
+        ],
+    )
+
+    assert Orchestrator._visual_repair_target(result) == "continuity"
+
+
+def test_visual_plan_feedback_survives_plan_compile(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    current_plan = plan()
+    state = SceneState(plan=current_plan, plan_ready=True)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title="demo",
+                duration_seconds=10,
+                purpose="test",
+                math_concept="circle",
+            )
+        ],
+        scenes=[current_plan],
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_request_continuity_rebuild", lambda *args, **kwargs: None)
+
+    orchestrator._schedule_visual_plan_repair(
+        ctx,
+        1,
+        state,
+        "画面中的数学关系不成立",
+        "planner",
+    )
+    orchestrator._compile_scene_plans(ctx)
+
+    assert any(issue.field == "visual_evaluation" for issue in ctx.plan_compile_issues[1])
+
+
+def test_plan_only_runs_new_teaching_contract_path(monkeypatch, tmp_path):
+    outline = SceneOutline(
+        scene_id=1,
+        title="公式",
+        duration_seconds=10,
+        purpose="展示公式",
+        math_concept="恒等式",
+        claim_ids=["claim_1"],
+    )
+    plan = ScenePlan(
+        **outline.model_dump(),
+        visual_design="固定画面",
+        camera_movement="固定",
+        visual_flow=["展示公式"],
+        key_moments=["结论定格"],
+        computation="a=a",
+        opening_state=["画面为空"],
+        closing_state=["公式保留"],
+        transition_in="从空画面建立公式",
+        transition_out="保留公式并收束",
+        timeline=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 10,
+                "action": "展示公式",
+                "math_claim_ids": ["claim_1"],
+            }
+        ],
+        math_claims=[
+            MathClaim(
+                claim_id="claim_1",
+                statement="a=a",
+                expression_before="a",
+                expression_after="a",
+                relation="equivalent",
+            )
+        ],
+    )
+
+    class FakePlanner:
+        def plan_draft(self, prompt, **kwargs):
+            return PlanningDraft(
+                lesson_spec=LessonSpec(
+                    topic="公式",
+                    claims=[MathClaim(claim_id="claim_1", statement="a=a", relation="definition")],
+                ),
+                teaching_graph=TeachingGraph(
+                    claim_order=["claim_1"],
+                    scene_claims={1: ["claim_1"]},
+                ),
+                items=[outline],
+            )
+
+        def plan_continuity_bible(self, prompt, outlines, **kwargs):
+            return ContinuityBible()
+
+        def plan_detail(self, *args, **kwargs):
+            return plan
+
+    class FakePlanReviewer:
+        def review(self, *args, **kwargs):
+            from kd1_anime.agents.plan_reviewer import PlanReviewResult
+
+            return PlanReviewResult(is_valid=True, severity="info", summary="通过")
+
+    class FakeContinuityReviewer:
+        def review(self, *args, **kwargs):
+            from kd1_anime.agents.continuity import ContinuityReviewResult
+
+            return ContinuityReviewResult(is_valid=True, summary="通过")
+
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(module, "PlannerAgent", FakePlanner)
+    monkeypatch.setattr(module, "PlanReviewerAgent", FakePlanReviewer)
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", FakeContinuityReviewer)
+
+    scenes = Orchestrator().plan_only("解释公式", preflight=False)
+
+    assert [scene.scene_id for scene in scenes] == [1]
+    assert scenes[0].claim_ids == ["claim_1"]
+
+
+def test_continuity_replan_snapshot_stays_within_prompt_section_budget(tmp_path):
+    run_paths = paths(tmp_path)
+    long_text = "连续性状态 " + "x" * 19_000
+    states = {}
+    for scene_id in (1, 2, 3):
+        scene_plan = plan().model_copy(
+            update={
+                "scene_id": scene_id,
+                "visual_design": long_text,
+                "computation": long_text,
+                "visual_flow": [long_text[:2_000]] * 10,
+            }
+        )
+        states[scene_id] = SceneState(plan=scene_plan, plan_ready=True)
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states=states)
+
+    snapshot = Orchestrator._continuity_plan_context(ctx, 2)
+
+    assert len(snapshot) <= 22_000
+
+
+def test_resume_reopens_plan_review_when_new_compiler_finds_old_plan_error(tmp_path):
+    run_paths = paths(tmp_path)
+    bad_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="formula", variable_name="formula", required=True)
+            ],
+            "handoff": [
+                SceneHandoff(element_id="formula", variable_name="formula", action="remove")
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title="公式",
+                duration_seconds=10,
+                purpose="展示",
+                math_concept="公式",
+            )
+        ],
+        scene_states={
+            1: SceneState(
+                plan=bad_plan,
+                plan_ready=True,
+                plan_reviewed=True,
+            )
+        },
+        plan_review_status="passed",
+    )
+    Orchestrator()._compile_scene_plans(ctx)
+
+    assert ctx.plan_review_status == "pending"
+    assert ctx.scene_states[1].plan_reviewed is False
 
 
 def test_scheduler_stops_when_checkpoint_persistence_fails(monkeypatch, tmp_path):

@@ -10,7 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.plan_compiler import expressions_are_equivalent
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    LessonSpec,
+    ScenePlan,
+    TeachingGraph,
+    compact_lesson_spec,
+    compact_teaching_graph,
+)
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
 from kd1_anime.config import settings
@@ -87,6 +94,8 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
    特别是 required=true 的 new_elements 未列入 handoff，或 handoff 的 create/keep 元素没有
    对应的结构化声明。
 6. 计划中的对象越界、明显重叠，或时间线无法覆盖场景时长并完成核心教学目标。
+7. 场景引用了未声明的数学断言、跳过断言前置依赖，或没有覆盖全片教学合同中的核心断言。
+8. 场景数量与 visual_unit/scene_policy 不一致，或扣除转场重叠后违反用户的总时长约束。
 
 ## 审查原则
 - 不因个人审美、命名风格或实现方式偏好打回计划。
@@ -97,6 +106,11 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
 - 每个问题必须定位字段，并给出可直接交给 Planner 的修改指令。
 - 以 handoff 作为场景边界的唯一对象清单：场景内临时步骤不要标记为 required=true，
   也不要要求 Coder 把已经淡出的中间对象导出到下一场景。
+- LessonSpec 是全片数学事实的唯一来源；ScenePlan 只能引用其中的 claim_id，不能在
+  computation 或 math_claims 中静默增加新的核心结论。
+- SceneOutline 中的 claim_ids 已经锁定当前场景负责的教学断言。若时间线没有证据，必须
+  要求补充 math_claims/timeline，而不能建议删除 claim_ids 来绕过教学合同；重新分配断言
+  只能回到全片概要阶段完成。
 - 没有阻断问题时返回 is_valid=true、severity=info、issues=[]。
 
 如果收到 `<safe_fallback_mode>true</safe_fallback_mode>`，说明该计划已经主动放弃
@@ -145,6 +159,8 @@ def filter_verified_plan_issues(
     new_ids = {item.element_id for item in plan.new_elements}
     removed_ids = {item.element_id for item in plan.elements_to_remove}
     declared_ids = inherited_ids | new_ids | removed_ids
+    handoff_ids = {item.element_id for item in plan.handoff}
+    required_new_ids = {item.element_id for item in plan.new_elements if item.required}
     role_lists_are_unique = all(
         len(elements) == len({item.element_id for item in elements})
         for elements in (
@@ -155,9 +171,11 @@ def filter_verified_plan_issues(
     )
     handoff_contract_valid = (
         role_lists_are_unique
+        and len(handoff_ids) == len(plan.handoff)
         and not inherited_ids & new_ids
         and not removed_ids & new_ids
         and removed_ids <= inherited_ids
+        and required_new_ids <= handoff_ids
         and all(
             item.element_id in declared_ids
             and item.action
@@ -173,8 +191,17 @@ def filter_verified_plan_issues(
     )
     filtered: list[PlanReviewIssue] = []
     for issue in issues:
+        issue_text = f"{issue.message}\n{issue.fix_instruction}"
+        # 模型有时会把“检查通过、无需修改”的说明误包装成一个默认
+        # severity=major 的 issue。它没有提出阻断事实，若照单处理会让
+        # Planner 在同一份合法计划上反复重规划。仅在文本同时明确表示
+        # 合规/无需修改时丢弃，不放宽真正带否定结论的数学或合同问题。
+        explicitly_non_blocking = ("无需修改" in issue_text or "无需修正" in issue_text) and any(
+            marker in issue_text for marker in ("合理", "符合要求", "不需要调整")
+        )
+        if explicitly_non_blocking:
+            continue
         if issue.category == "math" and issue.field.startswith("math_claims["):
-            issue_text = f"{issue.message}\n{issue.fix_instruction}"
             claim_id = issue.field.removeprefix("math_claims[").removesuffix("]")
             claim = claims.get(claim_id)
             if (
@@ -207,6 +234,43 @@ def filter_verified_plan_issues(
     return filtered
 
 
+def dedupe_plan_review_issues(
+    issues: list[PlanReviewIssue],
+) -> list[PlanReviewIssue]:
+    """按类别、字段和消息合并确定性检查与模型检查的重复结果。"""
+
+    unique: list[PlanReviewIssue] = []
+    seen: set[tuple[str, str, str]] = set()
+    for issue in issues:
+        key = (issue.category, issue.field, issue.message)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique
+
+
+def classify_plan_review_issues(
+    plan: ScenePlan,
+    *,
+    deterministic_issues: list[PlanReviewIssue],
+    result: PlanReviewResult,
+) -> tuple[list[PlanReviewIssue], list[PlanReviewIssue], list[PlanReviewIssue]]:
+    """统一执行计划审查结果的去重、误报过滤和阻断分级。
+
+    返回 ``(全部问题, 阻断问题, 非阻断提示)``。CLI 预览和正式流水线必须
+    共用这套策略，避免同一份计划在两个入口得到不同结论。
+    """
+
+    all_issues = dedupe_plan_review_issues(
+        [*deterministic_issues, *(result.issues if not result.is_valid else [])]
+    )
+    all_issues = filter_verified_plan_issues(plan, all_issues)
+    blocking = [issue for issue in all_issues if issue.severity == "major"]
+    non_blocking = [issue for issue in all_issues if issue.severity != "major"]
+    return all_issues, blocking, non_blocking
+
+
 PLAN_REVIEW_BATCH_PROMPT = (
     PLAN_REVIEW_PROMPT
     + r"""
@@ -225,6 +289,7 @@ def deterministic_plan_issues(
     bible: ContinuityBible | None = None,
     *,
     safe_fallback: bool = False,
+    lesson_spec: LessonSpec | None = None,
 ) -> list[PlanReviewIssue]:
     """先拦截无需 LLM 判断的计划错误和未验证几何声明。"""
 
@@ -351,7 +416,22 @@ def deterministic_plan_issues(
     # 检查由 Orchestrator 的 compile() 调用负责。
     from kd1_anime.agents.plan_compiler import PlanCompiler
 
-    for compiler_issue in PlanCompiler().compile_scene(plan, bible):
+    if lesson_spec is not None and lesson_spec.claims:
+        known_claim_ids = {claim.claim_id for claim in lesson_spec.claims}
+        unknown_claim_ids = (
+            set(plan.claim_ids) | {claim.claim_id for claim in plan.math_claims}
+        ) - known_claim_ids
+        if unknown_claim_ids:
+            issues.append(
+                PlanReviewIssue(
+                    category="math",
+                    field="claim_ids|math_claims",
+                    message="场景使用了教学合同中不存在的数学断言: "
+                    + ", ".join(sorted(unknown_claim_ids)),
+                    fix_instruction="删除未声明的 claim_id，或先更新全片 LessonSpec。",
+                )
+            )
+    for compiler_issue in PlanCompiler().compile_scene(plan, bible, lesson_spec):
         issues.append(
             PlanReviewIssue(
                 category=compiler_issue.category,
@@ -452,6 +532,8 @@ class PlanReviewerAgent(BaseAgent):
         deterministic_issues: list[PlanReviewIssue] | None = None,
         renderer: Literal["cairo", "opengl"] | None = None,
         safe_fallback: bool = False,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> PlanReviewResult:
         neighbors = []
         for item in sorted(all_plans or [plan], key=lambda item: item.scene_id):
@@ -513,6 +595,20 @@ class PlanReviewerAgent(BaseAgent):
                 max_chars=30_000,
             ),
             PromptSection(
+                "lesson_spec",
+                f"<lesson_spec>\n{compact_lesson_spec(lesson_spec, max_chars=18_000)}\n</lesson_spec>",
+                required=True,
+                priority=100,
+                max_chars=30_000,
+            ),
+            PromptSection(
+                "teaching_graph",
+                f"<teaching_graph>\n{compact_teaching_graph(teaching_graph, scene_id=plan.scene_id, max_chars=8_000)}\n</teaching_graph>",
+                required=True,
+                priority=100,
+                max_chars=20_000,
+            ),
+            PromptSection(
                 "deterministic_findings",
                 f"<deterministic_findings>\n{json.dumps(deterministic, ensure_ascii=False, indent=2)}\n"
                 "</deterministic_findings>",
@@ -546,6 +642,8 @@ class PlanReviewerAgent(BaseAgent):
         deterministic_by_scene: dict[int, list[PlanReviewIssue]] | None = None,
         renderer: Literal["cairo", "opengl"] | None = None,
         safe_fallback_scene_ids: set[int] | None = None,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> dict[int, PlanReviewResult]:
         """一次请求审查一批尚未编码的计划。
 
@@ -591,6 +689,20 @@ class PlanReviewerAgent(BaseAgent):
                 required=True,
                 priority=110,
                 max_chars=70_000,
+            ),
+            PromptSection(
+                "lesson_spec",
+                f"<lesson_spec>\n{compact_lesson_spec(lesson_spec, max_chars=18_000)}\n</lesson_spec>",
+                required=True,
+                priority=100,
+                max_chars=30_000,
+            ),
+            PromptSection(
+                "teaching_graph",
+                f"<teaching_graph>\n{compact_teaching_graph(teaching_graph, max_chars=8_000)}\n</teaching_graph>",
+                required=True,
+                priority=100,
+                max_chars=20_000,
             ),
             PromptSection(
                 "deterministic_findings",

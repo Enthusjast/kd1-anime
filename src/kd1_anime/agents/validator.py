@@ -444,9 +444,13 @@ class _SafetyVisitor(ast.NodeVisitor):
         ):
             self.error(node, f"禁止调用 {node.func.id}()")
         # 检查属性方法调用
-        elif isinstance(node.func, ast.Attribute) and (
-            node.func.attr in BANNED_ATTRIBUTE_NAMES
-            or (node.func.attr.startswith("__") and not self._is_super_init(node.func))
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and (
+                node.func.attr in BANNED_ATTRIBUTE_NAMES
+                or (node.func.attr.startswith("__") and not self._is_super_init(node.func))
+            )
+            and not self._is_scene_remove(node.func)
         ):
             self.error(node, f"禁止调用属性方法 {node.func.attr}()")
 
@@ -513,7 +517,7 @@ class _SafetyVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr in BANNED_ATTRIBUTE_NAMES:
+        if node.attr in BANNED_ATTRIBUTE_NAMES and not self._is_scene_remove(node):
             self.error(node, f"禁止引用危险属性 {node.attr!r}")
         if node.attr.startswith("__") and not self._is_super_init(node):
             self.error(node, f"禁止访问双下划线属性 {node.attr}")
@@ -548,6 +552,20 @@ class _SafetyVisitor(ast.NodeVisitor):
             and node.value.func.id == "super"
             and not node.value.args
             and not node.value.keywords
+        )
+
+    @staticmethod
+    def _is_scene_remove(node: ast.Attribute) -> bool:
+        """只放行 Manim 的 ``self.remove``，不放行任意对象的 remove。
+
+        ``remove`` 同时是容器和文件 API 的常见危险属性，因此仍保留在
+        全局黑名单中。Scene 的 remove 只会从当前 Manim 场景移除 Mobject，
+        且生命周期检查器需要理解这个操作；仅对明确的 ``self.remove`` 做
+        窄例外，避免把 ``some_path.remove`` 等能力放进生成代码。
+        """
+
+        return (
+            node.attr == "remove" and isinstance(node.value, ast.Name) and node.value.id == "self"
         )
 
     def visit_Assign(self, node: ast.Assign) -> None:

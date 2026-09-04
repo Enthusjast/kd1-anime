@@ -86,7 +86,7 @@ def cache_clear(
 def rag_index(
     docs_dir: Path | None = typer.Option(None, "--docs-dir", help="Manim 文档目录"),
     examples_dir: Path | None = typer.Option(None, "--examples-dir", help="Manim 示例目录"),
-    rebuild: bool = typer.Option(False, "--rebuild", help="显式重建整个索引"),
+    rebuild: bool = typer.Option(False, "--rebuild", help="忽略已有索引，强制重新计算 Embedding"),
 ):
     """索引 Manim 文档和示例。"""
 
@@ -100,7 +100,11 @@ def rag_index(
         raise typer.Exit(1)
     try:
         service = RagService()
-        result = service.build_index(docs_dir=docs_dir, examples_dir=examples_dir)
+        result = service.build_index(
+            docs_dir=docs_dir,
+            examples_dir=examples_dir,
+            rebuild=rebuild,
+        )
     except Exception as exc:
         console.print(f"[red]RAG 索引失败:[/] {exc}", markup=False)
         raise typer.Exit(1) from exc
@@ -134,7 +138,7 @@ def rag_status():
             f"分块: {index['chunk_count']}，维度: {index['embedding_dimension']}，"
             f"索引 SHA-256: {index['index_sha256']}"
         )
-    elif data["index_error"]:
+    if data["index_error"]:
         console.print(f"[yellow]索引错误:[/] {data['index_error']}", markup=False)
 
 
@@ -204,17 +208,21 @@ def _ensure_visual_llm_api_available(
 
 
 def _ensure_rag_apis_available() -> None:
-    """在启用 RAG 的生成入口前验证 Embedding 与 Reranker。"""
+    """在启用 RAG 的生成入口前验证索引、Embedding 与 Reranker。"""
 
     if not settings.RAG_ENABLED:
         return
     from kd1_anime.rag.service import RagService
 
     try:
-        RagService().probe()
+        service = RagService()
+        require_index = getattr(service, "require_index", None)
+        if callable(require_index):
+            require_index()
+        service.probe()
     except Exception as exc:
         console.print(
-            f"Embedding/Reranker API 不可用: {exc}",
+            f"RAG 不可用: {exc}",
             style="bold red",
             markup=False,
         )
@@ -367,12 +375,26 @@ def generate(
         dir_okay=False,
         readable=True,
     ),
+    plan_file: Path = typer.Option(
+        None,
+        "--plan",
+        help="从结构化计划 JSON 继续生成（不能与 prompt、--file、--resume、--incremental 混用）",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
 ):
     """直接生成模式 (无需求澄清)"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
-    if not prompt and not resume:
+    if plan_file and (prompt or file or resume or incremental):
+        console.print(
+            "[bold red]错误:[/] --plan 不能与 prompt、--file、--resume 或 --incremental 混用"
+        )
+        raise typer.Exit(1)
+    if not prompt and not resume and not plan_file:
         console.print(
             "[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助"
         )
@@ -428,6 +450,14 @@ def generate(
         if resume:
             console.print(f"[cyan]恢复运行[/] {resume}")
             final_video = orchestrator.resume(resume, interactive=True)
+        elif plan_file:
+            console.print(f"[cyan]从计划文件继续[/] {plan_file}")
+            final_video = orchestrator.run_from_plan(
+                plan_file,
+                dry_run=dry_run,
+                output_path=output,
+                approve_plan=approve_plan,
+            )
         elif incremental:
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
             final_video = orchestrator.run_incremental(prompt, incremental, dry_run=dry_run)
@@ -467,6 +497,12 @@ def plan(
         "--review/--no-review",
         help="生成计划后执行数学、可实现性和连续性合同审查（默认启用）",
     ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="额外导出结构化计划 JSON（运行清单始终写入 ~/.kd1-anime/workspace）",
+    ),
 ):
     """只生成场景规划，不执行渲染；默认同时审查计划。"""
     if file:
@@ -478,114 +514,35 @@ def plan(
         raise typer.Exit(1)
     _ensure_generation_apis(dry_run=True)
 
-    from kd1_anime.agents.planner import ContinuityBible, PlannerAgent
-
-    plan_review_failures: list[tuple[int, list[str]]] = []
-    contract_repairs: list[str] = []
-
     try:
-        from kd1_anime.agents.continuity import normalize_scene_plan_contract
-        from kd1_anime.agents.plan_compiler import PlanCompiler
-        from kd1_anime.agents.plan_reviewer import PlanReviewerAgent, deterministic_plan_issues
+        from kd1_anime.orchestrator import Orchestrator
 
-        planner = PlannerAgent()
-        rag_service = None
-        rag_context = ""
-        if settings.RAG_ENABLED:
-            from kd1_anime.rag.service import RagService
+        orchestrator = Orchestrator()
+        scenes = orchestrator.plan_only(
+            prompt,
+            interactive=False,
+            review=review,
+            preflight=False,
+        )
+        context = orchestrator._ctx
+        if output is not None and context is not None:
+            from kd1_anime.run_store import atomic_write_json
 
-            rag_service = RagService()
-            rag_result = rag_service.search(
-                prompt,
-                stage="outline",
-                source_kinds={"manim_doc", "example"},
-            )
-            rag_context = rag_result.context
-            if rag_result.receipt.warning:
-                console.print(
-                    f"[yellow]RAG 提示:[/] {rag_result.receipt.warning}",
-                    markup=False,
-                )
-        outlines = planner.plan_outline(prompt, rag_context=rag_context)
-        bible_context = ""
-        bible = None
-        if callable(getattr(planner, "plan_continuity_bible", None)):
-            if rag_service is not None:
-                bible_result = rag_service.search(
-                    prompt + "\n" + "\n".join(item.math_concept for item in outlines),
-                    stage="continuity",
-                    source_kinds={"manim_doc", "example"},
-                )
-                bible_context = bible_result.context
-            bible = planner.plan_continuity_bible(
-                prompt,
-                outlines,
-                stream=False,
-                rag_context=bible_context,
-            )
-        scenes = []
-        for outline in outlines:
-            detail_context = ""
-            if rag_service is not None:
-                detail_result = rag_service.search(
-                    f"{outline.title}\n{outline.purpose}\n{outline.math_concept}",
-                    stage="detail",
-                    source_kinds={"manim_doc", "example"},
-                )
-                detail_context = detail_result.context
-            scenes.append(
-                planner.plan_detail(
-                    outline,
-                    outlines,
-                    prompt,
-                    stream=False,
-                    continuity_bible=bible,
-                    rag_context=detail_context,
-                )
-            )
-        if review:
-            review_bible = bible or ContinuityBible()
-            normalized_scenes = []
-            for scene in scenes:
-                previous_plan = normalized_scenes[-1] if normalized_scenes else None
-                normalized, repairs = normalize_scene_plan_contract(
-                    scene,
-                    review_bible,
-                    previous_plan=previous_plan,
-                )
-                normalized_scenes.append(normalized)
-                if repairs:
-                    contract_repairs.extend(f"Scene {scene.scene_id}: {'；'.join(repairs)}")
-            scenes = normalized_scenes
-            compiler_result = PlanCompiler().compile(outlines, scenes, review_bible)
-            for issue in compiler_result.issues:
-                target_ids = issue.scene_ids or [scene.scene_id for scene in scenes]
-                for target_id in target_ids:
-                    plan_review_failures.append(
-                        (
-                            target_id,
-                            [
-                                f"[{issue.category}] {issue.message}",
-                                f"修正要求: {issue.fix_instruction}",
-                            ],
-                        )
-                    )
-            for scene in scenes:
-                deterministic = deterministic_plan_issues(scene, review_bible)
-                result = PlanReviewerAgent().review(
-                    scene,
-                    user_prompt=prompt,
-                    all_plans=scenes,
-                    continuity_bible=review_bible,
-                    deterministic_issues=deterministic,
-                    renderer=settings.MANIM_RENDERER,
-                )
-                issues = [*deterministic]
-                if not result.is_valid:
-                    issues.extend(result.issues)
-                unique_messages = list(dict.fromkeys(issue.message for issue in issues))
-                if unique_messages:
-                    plan_review_failures.append((scene.scene_id, unique_messages))
+            payload = {
+                "schema_version": 1,
+                "run_id": context.paths.run_id,
+                "user_prompt": context.user_prompt,
+                "lesson_spec": context.lesson_spec.model_dump(mode="json"),
+                "teaching_graph": context.teaching_graph.model_dump(mode="json"),
+                "continuity_bible": (
+                    context.continuity_bible.model_dump(mode="json")
+                    if context.continuity_bible is not None
+                    else None
+                ),
+                "items": [scene.model_dump(mode="json") for scene in scenes],
+            }
+            atomic_write_json(output.expanduser().resolve(), payload)
+            console.print(f"结构化计划已导出: {output.expanduser().resolve()}", markup=False)
     except KeyboardInterrupt as e:
         console.print("\n[yellow]用户中断[/]")
         raise typer.Exit(130) from e
@@ -603,15 +560,6 @@ def plan(
         console.print(f"  数学概念: {scene.math_concept}")
         console.print(f"  时长: {scene.duration_seconds}s")
         console.print(f"  目的: {scene.purpose}")
-    for repair in contract_repairs:
-        console.print("连续性合同自动修复:", repair, style="yellow", markup=False)
-    if plan_review_failures:
-        console.print("\n[bold red]计划审查未通过:[/]")
-        for scene_id, issues in plan_review_failures:
-            console.print(f"Scene {scene_id}:", markup=False)
-            for issue in issues:
-                console.print(f"  - {issue}", markup=False)
-        raise typer.Exit(1)
 
 
 @app.command()
@@ -677,13 +625,13 @@ def render(
 
 
 def _scene_status(scene) -> str:
-    if scene.rendered:
-        visual_status = getattr(scene, "visual_status", "skipped")
-        return "rendered" if visual_status == "skipped" else f"rendered/{visual_status}"
     if scene.failed:
         return "failed"
     if scene.give_up:
         return "give_up"
+    if scene.rendered:
+        visual_status = getattr(scene, "visual_status", "skipped")
+        return "rendered" if visual_status == "skipped" else f"rendered/{visual_status}"
     if scene.slurm_job:
         return scene.slurm_job.status.lower()
     if scene.code_file:
@@ -976,6 +924,7 @@ def clean(
                 # 候选列表生成与真正删除之间可能有很长的用户确认窗口；
                 # 加锁后重新读取，避免误删刚恢复/刚更新的运行。
                 current = repository.load(manifest.run_id)
+                current.validate_for_resume()
                 if current.updated_at > cutoff or (
                     not include_running and current.status == "running"
                 ):
@@ -1065,12 +1014,12 @@ def batch(
 @app.command(name="version")
 def version_cmd():
     """显示版本信息"""
-    try:
-        from importlib.metadata import version
+    # 使用源码包自己的版本常量，避免直接运行 ``python main.py`` 时被
+    # 环境中遗留的旧 editable-install 元数据误导；发布 wheel 时该常量
+    # 与 pyproject.toml 同步更新。
+    from kd1_anime import __version__
 
-        current_version = version("kd1-anime")
-    except Exception:
-        current_version = "0.4.0-dev"
+    current_version = __version__
     console.print(f"kd1-anime v{current_version}")
     console.print("AI Agent 驱动的 Manim 数学动画自动渲染流水线")
 
@@ -1198,8 +1147,14 @@ def doctor(
 
     # 检查 LLM 配置；默认只做本地配置检查，避免 doctor 在离线环境意外
     # 产生 API 请求。需要真实验证时显式使用 --probe-llm。
-    llm_ok = bool(settings.LLM_API_KEY and settings.LLM_MODEL)
-    llm_info = "已配置" if llm_ok else "未配置 (需要 LLM_API_KEY 和 LLM_MODEL)"
+    try:
+        settings.main_llm_profile().require()
+    except ValueError as exc:
+        llm_ok = False
+        llm_info = str(exc)
+    else:
+        llm_ok = True
+        llm_info = f"已配置模型 {settings.LLM_MODEL}"
     checks.append(("LLM 配置", llm_ok, llm_info))
     if probe_llm:
         if not llm_ok:
@@ -1257,17 +1212,21 @@ def doctor(
         rag_status["embedding_configured"]
         and rag_status["reranker_configured"]
         and (not settings.RAG_ENABLED or rag_status["index"] is not None)
+        and not rag_status["index_error"]
     )
+    rag_detail = (
+        f"{rag_status['status']}，Embedding={rag_status['embedding_model'] or '未配置'}，"
+        f"Reranker={rag_status['reranker_model'] or '未配置'}"
+        if rag_required
+        else "未启用（独立配置可留空）"
+    )
+    if rag_required and rag_status["index_error"]:
+        rag_detail += f"；{rag_status['index_error']}"
     checks.append(
         (
             "RAG 配置",
             rag_config_ok if rag_required else True,
-            (
-                f"{rag_status['status']}，Embedding={rag_status['embedding_model'] or '未配置'}，"
-                f"Reranker={rag_status['reranker_model'] or '未配置'}"
-                if rag_required
-                else "未启用（独立配置可留空）"
-            ),
+            rag_detail,
         )
     )
     if probe_rag:
@@ -1295,16 +1254,25 @@ def doctor(
                 ),
             )
         )
-    elif security_strict and not settings.SLURM_REQUIRE_CONTAINER:
+    else:
+        container_path = Path(settings.SLURM_CONTAINER_IMAGE).expanduser()
+        image_ok = container_path.is_file()
+        fail_closed_ok = not security_strict or settings.SLURM_REQUIRE_CONTAINER
+        isolation_ok = image_ok and apptainer_ok and fail_closed_ok
+        details: list[str] = []
+        if not image_ok:
+            details.append(f"镜像不存在: {container_path}")
+        if not apptainer_ok:
+            details.append("未找到 apptainer")
+        if not fail_closed_ok:
+            details.append("严格模式要求 SLURM_REQUIRE_CONTAINER=true")
         checks.append(
             (
                 "生成代码隔离",
-                False,
-                "已配置容器但 SLURM_REQUIRE_CONTAINER=false，严格模式要求 fail-closed",
+                isolation_ok,
+                "; ".join(details) if details else "Apptainer 镜像和命令均可用",
             )
         )
-    elif container_configured:
-        checks.append(("生成代码隔离", True, "Apptainer 镜像已配置"))
 
     # 显示结果
     table = Table(title="环境检查结果")
