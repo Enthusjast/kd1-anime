@@ -372,6 +372,28 @@ class TestPlannerAgent:
         assert "引言" in user_message or "Introduction" in user_message
         assert "圆的定义" in user_message
 
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_detail_includes_rag_context(self, mock_call_llm, planner, sample_outlines):
+        mock_call_llm.return_value = """{
+            "visual_design": "Test design",
+            "camera_movement": "Fixed",
+            "visual_flow": ["Step 1"],
+            "key_moments": ["Moment 1"],
+            "computation": "Test"
+        }"""
+
+        planner.plan_detail(
+            sample_outlines[0],
+            sample_outlines,
+            "Test prompt",
+            stream=False,
+            rag_context="<reference>Use Axes for coordinate systems.</reference>",
+        )
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert 'rag_context stage="detail"' in message
+        assert "Use Axes" in message
+
     def test_outline_prompt_structure(self):
         """测试概要提示结构。"""
         assert "JSON" in OUTLINE_PROMPT

@@ -28,6 +28,61 @@ def test_llm_config_accepts_generic_openai_compatible_provider():
     config.require_llm_key()
 
 
+def test_default_storage_is_under_private_application_home():
+    config = Settings(_env_file=None)
+
+    assert config_module.Path.home() / ".kd1-anime" == config_module.APP_HOME
+    assert config_module.USER_CONFIG_DIR == config_module.APP_HOME
+    assert config_module.USER_ENV_FILE == config_module.APP_HOME / ".env"
+    assert config.RAG_INDEX_PATH == config_module.DEFAULT_RAG_INDEX_PATH
+    assert config.RAG_DOCS_DIR == config_module.DEFAULT_RAG_DOCS_DIR
+    assert config.RAG_EXAMPLES_DIR == config_module.DEFAULT_RAG_EXAMPLES_DIR
+    assert config.WORKSPACE_DIR == config_module.DEFAULT_WORKSPACE_DIR
+    assert config.SCENES_DIR == config_module.DEFAULT_SCENES_DIR
+    assert config.LOGS_DIR == config_module.DEFAULT_LOGS_DIR
+    assert config.VIDEOS_DIR == config_module.DEFAULT_VIDEOS_DIR
+
+
+def test_legacy_user_config_is_migrated_without_overwriting_custom_paths(tmp_path):
+    legacy_dir = tmp_path / "legacy"
+    target_dir = tmp_path / "new"
+    legacy_dir.mkdir()
+    (legacy_dir / ".env").write_text(
+        "RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3\n"
+        "RAG_DOCS_DIR=\n"
+        "RAG_EXAMPLES_DIR=\n"
+        "WORKSPACE_DIR=workspace\n"
+        "SCENES_DIR=/srv/custom-scenes\n"
+        "LLM_MODEL=keep-this-model\n",
+        encoding="utf-8",
+    )
+    (legacy_dir / ".env.example").write_text(
+        "WORKSPACE_DIR=workspace\n",
+        encoding="utf-8",
+    )
+
+    migrated = config_module.migrate_legacy_user_config(legacy_dir, target_dir)
+
+    assert set(migrated) == {target_dir / ".env", target_dir / ".env.example"}
+    assert (target_dir / ".env").read_text(encoding="utf-8") == (
+        f"RAG_INDEX_PATH={config_module.DEFAULT_RAG_INDEX_PATH}\n"
+        f"RAG_DOCS_DIR={config_module.DEFAULT_RAG_DOCS_DIR}\n"
+        f"RAG_EXAMPLES_DIR={config_module.DEFAULT_RAG_EXAMPLES_DIR}\n"
+        f"WORKSPACE_DIR={config_module.DEFAULT_WORKSPACE_DIR}\n"
+        "SCENES_DIR=/srv/custom-scenes\n"
+        "LLM_MODEL=keep-this-model\n"
+    )
+    assert (target_dir / ".env").stat().st_mode & 0o777 == 0o600
+    assert (target_dir / ".env.example").read_text(encoding="utf-8") == (
+        f"WORKSPACE_DIR={config_module.DEFAULT_WORKSPACE_DIR}\n"
+    )
+
+    # 迁移是幂等且非覆盖的。
+    (target_dir / ".env").write_text("LLM_MODEL=edited\n", encoding="utf-8")
+    assert config_module.migrate_legacy_user_config(legacy_dir, target_dir) == ()
+    assert (target_dir / ".env").read_text(encoding="utf-8") == "LLM_MODEL=edited\n"
+
+
 def test_llm_base_url_is_normalized_and_rejects_unsafe_or_invalid_urls():
     config = Settings(_env_file=None, LLM_BASE_URL="https://example.invalid/v1/")
     assert config.LLM_BASE_URL == "https://example.invalid/v1"
@@ -178,3 +233,32 @@ def test_visual_llm_profile_uses_only_visual_endpoint_and_model_override():
     assert profile.base_url == "https://visual.invalid/v1"
     assert profile.model == "visual-override"
     assert profile.debug is False
+
+
+def test_rag_settings_normalize_empty_source_dirs_and_validate_urls(tmp_path):
+    config = Settings(
+        _env_file=None,
+        RAG_INDEX_PATH=tmp_path / "index.sqlite3",
+        RAG_DOCS_DIR="",
+        RAG_EXAMPLES_DIR="   ",
+        RAG_EMBEDDING_BASE_URL="https://embedding.invalid/v1/",
+        RAG_RERANK_BASE_URL="https://rerank.invalid/v1/",
+    )
+
+    assert config.RAG_DOCS_DIR is None
+    assert config.RAG_EXAMPLES_DIR is None
+    assert config.RAG_EMBEDDING_BASE_URL == "https://embedding.invalid/v1"
+    assert config.RAG_RERANK_BASE_URL == "https://rerank.invalid/v1"
+
+    default_path = Settings(_env_file=None, RAG_INDEX_PATH="").RAG_INDEX_PATH
+    assert default_path == config_module.DEFAULT_RAG_INDEX_PATH
+
+
+def test_rag_settings_reject_invalid_url_and_chunk_overlap():
+    with pytest.raises(ValueError, match="RAG 服务 URL"):
+        Settings(_env_file=None, RAG_EMBEDDING_BASE_URL="ftp://embedding.invalid")
+    with pytest.raises(ValueError, match="RAG_CHUNK_OVERLAP"):
+        Settings(_env_file=None, RAG_CHUNK_SIZE=100, RAG_CHUNK_OVERLAP=100)
+    config = Settings(_env_file=None)
+    with pytest.raises(ValueError, match="RAG_CHUNK_OVERLAP"):
+        config.RAG_CHUNK_SIZE = 100

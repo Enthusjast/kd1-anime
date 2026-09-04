@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import textwrap
 from collections.abc import Sequence
@@ -626,6 +627,74 @@ class ContinuityReviewerAgent(BaseAgent):
 
     name = "ContinuityReviewer"
 
+    @staticmethod
+    def _bounded(value: object, limit: int = 2_500) -> str:
+        text = str(value)
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}\n...[连续性审查上下文已截断]"
+
+    @classmethod
+    def _compact_bible(cls, bible: ContinuityBible) -> dict:
+        data = bible.model_dump(mode="json")
+        for key in (
+            "background",
+            "typography",
+            "layout",
+            "math_notation",
+            "camera_language",
+            "narrative_arc",
+        ):
+            if key in data:
+                data[key] = cls._bounded(data[key])
+        for key in ("palette", "persistent_elements", "transition_rules"):
+            if isinstance(data.get(key), list):
+                data[key] = [cls._bounded(item, 1_000) for item in data[key][:30]]
+        return data
+
+    @classmethod
+    def _compact_plan(cls, plan: ScenePlan) -> dict:
+        data = plan.model_dump(mode="json")
+        for key in (
+            "purpose",
+            "math_concept",
+            "visual_design",
+            "camera_movement",
+            "computation",
+            "transition_in",
+            "transition_out",
+        ):
+            if key in data:
+                data[key] = cls._bounded(data[key])
+        for key in (
+            "visual_flow",
+            "key_moments",
+            "persistent_elements",
+            "opening_state",
+            "closing_state",
+            "continuity_references",
+        ):
+            if isinstance(data.get(key), list):
+                data[key] = [cls._bounded(item, 1_000) for item in data[key][:30]]
+        for key in ("inherited_elements", "elements_to_remove", "new_elements"):
+            if isinstance(data.get(key), list):
+                data[key] = [
+                    {
+                        field: item.get(field, "")
+                        for field in (
+                            "element_id",
+                            "variable_name",
+                            "semantic_state",
+                            "color_key",
+                            "anchor",
+                            "required",
+                            "reason",
+                        )
+                    }
+                    for item in data[key][:30]
+                ]
+        return data
+
     def review(
         self,
         bible: ContinuityBible,
@@ -638,7 +707,7 @@ class ContinuityReviewerAgent(BaseAgent):
     ) -> ContinuityReviewResult:
         outline_context = [outline.model_dump(mode="json") for outline in outlines]
         plan_context = [
-            plan.model_dump(mode="json") for plan in sorted(plans, key=lambda p: p.scene_id)
+            self._compact_plan(plan) for plan in sorted(plans, key=lambda p: p.scene_id)
         ]
         deterministic_context = [
             issue.model_dump(mode="json") for issue in (deterministic_issues or [])
@@ -647,15 +716,20 @@ class ContinuityReviewerAgent(BaseAgent):
             system_prompt=f"{CONTINUITY_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=(
                 "<continuity_bible>\n"
-                f"{bible.model_dump_json(indent=2)}\n</continuity_bible>\n\n"
+                f"{json.dumps(self._compact_bible(bible), ensure_ascii=False, indent=2)}\n"
+                "</continuity_bible>\n\n"
                 "<scene_outlines>\n"
-                f"{outline_context}\n</scene_outlines>\n\n"
+                f"{json.dumps(outline_context, ensure_ascii=False, indent=2)}\n"
+                "</scene_outlines>\n\n"
                 "<scene_plans>\n"
-                f"{plan_context}\n</scene_plans>\n\n"
+                f"{json.dumps(plan_context, ensure_ascii=False, indent=2)}\n"
+                "</scene_plans>\n\n"
                 "<deterministic_findings>\n"
-                f"{deterministic_context}\n</deterministic_findings>\n\n"
+                f"{json.dumps(deterministic_context, ensure_ascii=False, indent=2)}\n"
+                "</deterministic_findings>\n\n"
                 "请综合这些材料输出全片连续性审查 JSON。"
             ),
             response_model=ContinuityReviewResult,
             stream=stream,
+            allow_truncated=True,
         )

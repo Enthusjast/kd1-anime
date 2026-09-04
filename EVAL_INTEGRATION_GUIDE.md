@@ -135,11 +135,11 @@ else:
 自动评估写入：
 
 ```text
-workspace/runs/<run-id>/eval_result.json
-workspace/runs/<run-id>/eval_frames/              # 关键帧及其哈希
-workspace/runs/<run-id>/eval_reports/scene_<n>/   # 场景每轮视觉报告
-workspace/runs/<run-id>/eval_reports/final_visual.json
-workspace/runs/<run-id>/visual_candidates/        # 可恢复的候选代码
+~/.kd1-anime/workspace/runs/<run-id>/eval_result.json
+~/.kd1-anime/workspace/runs/<run-id>/eval_frames/              # 关键帧及其哈希
+~/.kd1-anime/workspace/runs/<run-id>/eval_reports/scene_<n>/   # 场景每轮视觉报告
+~/.kd1-anime/workspace/runs/<run-id>/eval_reports/final_visual.json
+~/.kd1-anime/workspace/runs/<run-id>/visual_candidates/        # 可恢复的候选代码
 ```
 
 示例：

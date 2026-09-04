@@ -330,17 +330,25 @@ def test_show_banner_displays_main_and_visual_models(monkeypatch):
     monkeypatch.setattr(settings, "LLM_MODEL", "planner-model")
     monkeypatch.setattr(settings, "VISUAL_LLM_MODEL", "vision-model")
     monkeypatch.setattr(settings, "ENABLE_VISUAL_EVAL", True)
+    monkeypatch.setattr(settings, "RAG_EMBEDDING_MODEL", "embedding-model")
+    monkeypatch.setattr(settings, "RAG_RERANK_MODEL", "reranker-model")
+    monkeypatch.setattr(settings, "RAG_ENABLED", True)
 
     session = ChatSession()
     monkeypatch.setattr(session, "_check_interrupted_runs", lambda: False)
 
     assert session._show_banner() is False
     rendered = output.getvalue()
-    assert "对话模型:" in rendered
+    assert "主模型:" in rendered
+    assert "对话模型:" not in rendered
     assert "planner-model" in rendered
     assert "视觉模型:" in rendered
     assert "vision-model" in rendered
     assert "已启用" in rendered
+    assert "Embedding 模型:" in rendered
+    assert "embedding-model" in rendered
+    assert "Reranker 模型:" in rendered
+    assert "reranker-model" in rendered
 
 
 def test_run_exits_after_resume_instead_of_new_prompt(monkeypatch):

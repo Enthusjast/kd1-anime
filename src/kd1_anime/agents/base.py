@@ -157,6 +157,7 @@ class BaseAgent:
         json_mode: bool = False,
         messages: list[dict] | None = None,
         stream: bool = False,
+        allow_truncated: bool = False,
     ) -> str:
         """
         调用 LLM API,内置指数退避重试
@@ -169,6 +170,8 @@ class BaseAgent:
             json_mode: 是否要求 JSON 格式输出
             messages: 完整的消息列表,用于多轮对话. 提供时忽略 system_prompt 和 user_message
             stream: 是否流式输出 (边生成边打印, 避免长调用时界面冻结)
+            allow_truncated: 允许调用方自行校验 ``finish_reason=length`` 的非空内容。
+                仅适合有严格结构校验的响应，普通文本/代码默认拒绝截断结果。
 
         Returns:
             LLM 的文本响应
@@ -315,6 +318,8 @@ class BaseAgent:
                         time.sleep(delay)
                     continue
                 if finish_reason == "length":
+                    if allow_truncated:
+                        return content
                     if not max_tokens_boosted and not max_tokens_fallback_used:
                         current_limit = kwargs.get("max_tokens")
                         boost = self.profile.empty_retry_max_tokens
@@ -563,6 +568,7 @@ class BaseAgent:
         *,
         messages: list[dict] | None = None,
         max_tokens: int | None = None,
+        allow_truncated: bool = False,
     ) -> T:
         """
         调用 LLM 并将响应解析为 Pydantic 模型
@@ -585,13 +591,18 @@ class BaseAgent:
         current_messages = self._clone_messages(messages) if messages is not None else None
 
         for attempt in range(repair_attempts + 1):
+            call_kwargs = {
+                "system_prompt": system_prompt,
+                "user_message": current_message,
+                "temperature": temp,
+                "max_tokens": max_tokens,
+                "json_mode": True,
+                "messages": self._clone_messages(current_messages),
+            }
+            if allow_truncated:
+                call_kwargs["allow_truncated"] = True
             raw = self.call_llm(
-                system_prompt=system_prompt,
-                user_message=current_message,
-                temperature=temp,
-                max_tokens=max_tokens,
-                json_mode=True,
-                messages=self._clone_messages(current_messages),
+                **call_kwargs,
                 stream=stream,
             )
 

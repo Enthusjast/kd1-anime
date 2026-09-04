@@ -3,3 +3,4 @@
 *.py    text eol=lf
 *.txt   text eol=lf
 *.md    text eol=lf
+*.tar.gz binary

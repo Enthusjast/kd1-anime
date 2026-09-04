@@ -12,6 +12,7 @@ class ResourceCoordinator:
         llm_limit: int,
         slurm_limit: int,
         visual_llm_limit: int | None = None,
+        rag_limit: int | None = None,
     ) -> None:
         self.llm = threading.Semaphore(max(1, llm_limit))
         # 视觉模型使用独立端点和并发池。批处理中的多个 Orchestrator 共享
@@ -19,6 +20,9 @@ class ResourceCoordinator:
         if visual_llm_limit is None:
             visual_llm_limit = llm_limit
         self.visual_llm = threading.Semaphore(max(1, visual_llm_limit))
+        if rag_limit is None:
+            rag_limit = llm_limit
+        self.rag = threading.Semaphore(max(1, rag_limit))
         self._slurm_limit = max(0, slurm_limit)
         self._slurm_active = 0
         self._slurm_lock = threading.Lock()

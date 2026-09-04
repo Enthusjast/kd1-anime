@@ -36,7 +36,7 @@ Do not run a real LLM request, submit Slurm jobs, or execute generated code duri
 Settings are defined in `src/kd1_anime/config.py` and loaded in this order:
 
 ```text
-process environment > ./.env > ~/.config/kd1-anime/.env
+process environment > ./.env > ~/.kd1-anime/.env
 ```
 
 Never commit `.env` or print API keys. The API is provider-neutral: `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` must work with any OpenAI-compatible endpoint. Visual evaluation uses the separate `VISUAL_LLM_*` profile and must never silently inherit the main endpoint.
@@ -44,14 +44,14 @@ Never commit `.env` or print API keys. The API is provider-neutral: `LLM_API_KEY
 ## Pipeline
 
 ```text
-INIT → PLANNING → DETAILING → CODING → REVIEWING
+INIT → (主 LLM/RAG 可用性检查) → PLANNING → DETAILING → CODING → REVIEWING
      → DISPATCHING → MONITORING → (FIXING → REVIEWING)
      → VISUAL_EVALUATING → MERGING → EVALUATING → DONE
 ```
 
 Key invariants:
 
-1. Every run uses a unique `workspace/runs/<run-id>/` directory.
+1. Every run uses a unique `~/.kd1-anime/workspace/runs/<run-id>/` directory by default.
 2. Every generated file contains exactly one supported Scene class.
 3. All generated or auto-fixed code passes `validate_manim_code()` before submission.
 4. Any code change must be reviewed again.
@@ -106,7 +106,7 @@ Key invariants:
 
 ## Installation constraints
 
-`install.sh` must remain non-interactive and sudo-free. It should:
+`install.sh` must remain non-interactive and sudo-free by default (the model configuration wizard is opt-in in non-TTY environments). It should:
 
 - try the required Python/Miniconda modules;
 - create/reuse `manim_env`;

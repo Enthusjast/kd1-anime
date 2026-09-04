@@ -124,6 +124,7 @@ class BatchProcessor:
         self.resources = ResourceCoordinator(
             llm_limit=settings.LLM_PARALLEL_WORKERS,
             visual_llm_limit=settings.VISUAL_LLM_PARALLEL_WORKERS,
+            rag_limit=settings.RAG_PARALLEL_WORKERS,
             slurm_limit=settings.SLURM_MAX_IN_FLIGHT,
         )
         self._active_lock = threading.RLock()

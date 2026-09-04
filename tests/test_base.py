@@ -309,6 +309,35 @@ def test_nonempty_truncated_response_is_never_returned(monkeypatch):
     assert calls[1]["max_tokens"] >= settings.LLM_EMPTY_RETRY_MAX_TOKENS
 
 
+def test_structured_call_can_validate_nonempty_length_terminated_payload(monkeypatch):
+    class Payload(BaseModel):
+        complete: bool
+
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs.copy())
+            return iter([_chunk('{"complete": true}', finish="length")])
+
+    class CompatibleAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    result = CompatibleAgent().call_llm_json(
+        "system",
+        "user",
+        Payload,
+        allow_truncated=True,
+    )
+
+    assert result.complete is True
+    assert len(calls) == 1
+
+
 def test_persistent_nonempty_truncation_raises_specific_error(monkeypatch):
     monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
     monkeypatch.setattr(settings, "LLM_MODEL", "test-model")

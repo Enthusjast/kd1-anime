@@ -1,3 +1,4 @@
+import pytest
 import typer
 from typer.testing import CliRunner
 
@@ -10,8 +11,15 @@ def test_cli_registers_all_public_commands():
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0, result.output
-    for command in ("generate", "resume", "batch", "doctor", "evaluate", "test-llm"):
+    for command in ("generate", "resume", "batch", "doctor", "evaluate", "test-llm", "rag"):
         assert command in result.output
+
+
+def test_rag_status_is_read_only():
+    result = CliRunner().invoke(app, ["rag", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "状态: disabled" in result.output
 
 
 def test_default_startup_checks_llm_before_opening_chat(monkeypatch):
@@ -30,6 +38,41 @@ def test_default_startup_checks_llm_before_opening_chat(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert calls == [("healthcheck", False), ("chat", False)]
+
+
+def test_generation_startup_checks_rag_services_when_enabled(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: calls.append("llm"))
+    monkeypatch.setattr(settings, "RAG_ENABLED", True)
+
+    class FakeRagService:
+        def probe(self):
+            calls.append("rag")
+
+    monkeypatch.setattr("kd1_anime.rag.service.RagService", FakeRagService)
+
+    from kd1_anime.cli import _ensure_generation_apis
+
+    _ensure_generation_apis(dry_run=True)
+
+    assert calls == ["llm", "rag"]
+
+
+def test_generation_startup_stops_when_rag_service_is_unavailable(monkeypatch):
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
+    monkeypatch.setattr(settings, "RAG_ENABLED", True)
+
+    class FakeRagService:
+        def probe(self):
+            raise RuntimeError("embedding offline")
+
+    monkeypatch.setattr("kd1_anime.rag.service.RagService", FakeRagService)
+
+    from kd1_anime.cli import _ensure_generation_apis
+
+    with pytest.raises(typer.Exit):
+        _ensure_generation_apis(dry_run=True)
 
 
 def test_print_comparison_handles_unknown_scores():

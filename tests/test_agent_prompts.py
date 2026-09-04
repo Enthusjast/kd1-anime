@@ -42,6 +42,7 @@ def test_coder_prompt_has_continuity_contract():
     assert "closing_state" in CODER_SYSTEM_PROMPT
     assert "persistent_elements" in CODER_SYSTEM_PROMPT
     assert "transition_out" in CODER_SYSTEM_PROMPT
+    assert "RAG Reference Context" in CODER_SYSTEM_PROMPT
 
 
 def test_coder_forbids_custom_mobject_subclass_for_opengl(monkeypatch):
@@ -77,6 +78,7 @@ def test_auto_fixer_has_index_error_pattern():
     assert "下标越界" in AUTO_FIXER_SYSTEM_PROMPT
     assert "get_part_by_tex" in AUTO_FIXER_SYSTEM_PROMPT
     assert "ctex" in AUTO_FIXER_SYSTEM_PROMPT
+    assert "RAG" in AUTO_FIXER_SYSTEM_PROMPT
     assert AutoFixerAgent.is_infrastructure_error(
         "FileNotFoundError: No such file or directory: 'xelatex'"
     )

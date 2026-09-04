@@ -248,6 +248,24 @@ class TestScene(Scene):
         assert "ShowCreation" not in fixed_code
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_fix_includes_rag_context(self, mock_call_llm, fixer):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+
+        fixer.fix(
+            "from manim import *",
+            "NameError: Create",
+            rag_context="<reference>Use Create for standard mobjects.</reference>",
+        )
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "RAG Reference Context" in message
+        assert "Use Create" in message
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_fix_preserves_structure(self, mock_call_llm, fixer):
         """测试修复保持代码结构。"""
         mock_call_llm.return_value = """```python
