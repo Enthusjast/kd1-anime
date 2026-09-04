@@ -3,6 +3,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
+from kd1_anime.agents.base import TruncatedResponseError
 from kd1_anime.agents.plan_reviewer import (
     PLAN_REVIEW_PROMPT,
     PlanReviewerAgent,
@@ -169,6 +170,37 @@ def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():
     assert filtered == []
 
 
+def test_plan_review_accepts_next_scene_removal_after_current_create_handoff():
+    formula = VisualElementState(
+        element_id="formula_surface",
+        variable_name="formula_surface",
+        required=True,
+    )
+    plan = make_plan().model_copy(
+        update={
+            "new_elements": [formula],
+            "handoff": [
+                SceneHandoff(
+                    element_id="formula_surface",
+                    variable_name="formula_surface",
+                    action="create",
+                )
+            ],
+        }
+    )
+    issue = PlanReviewIssue(
+        category="contract",
+        field="handoff",
+        message=(
+            "场景2的 elements_to_remove 中移除了 formula_surface，"
+            "但场景1的 handoff 将其列为 create。"
+        ),
+        fix_instruction="将当前 handoff 改为 remove。",
+    )
+
+    assert filter_verified_plan_issues(plan, [issue]) == []
+
+
 def test_plan_review_only_major_issues_block():
     plan = make_plan()
     result = PlanReviewResult(
@@ -263,6 +295,56 @@ def test_plan_reviewer_sends_plan_and_deterministic_findings(mock_call_llm):
     assert "<current_scene_plan>" in message
     assert "<deterministic_findings>" in message
     assert "a²+b²=c²" in message
+
+
+def test_plan_reviewer_compresses_context_after_truncated_response(monkeypatch):
+    reviewer = PlanReviewerAgent()
+    calls = []
+
+    def fake_call_llm_json(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise TruncatedResponseError("truncated")
+        return PlanReviewResult(is_valid=True, severity="info")
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call_llm_json)
+
+    result = reviewer.review(
+        make_plan(),
+        user_prompt="用户原始需求" * 100,
+        all_plans=[make_plan(), make_plan().model_copy(update={"scene_id": 3})],
+        continuity_bible=ContinuityBible(),
+        lesson_spec=LessonSpec(
+            claims=[MathClaim(claim_id="claim_1", statement="a=a", relation="definition")]
+        ),
+        teaching_graph=TeachingGraph(claim_order=["claim_1"], scene_claims={2: ["claim_1"]}),
+    )
+
+    assert result.is_valid is True
+    assert len(calls) == 2
+    assert "<current_scene_plan>" in calls[1]["user_message"]
+    assert "<all_scene_plans>" not in calls[1]["user_message"]
+    assert "<continuity_bible>" not in calls[1]["user_message"]
+
+
+def test_plan_reviewer_uses_deterministic_findings_if_compact_retry_is_truncated(monkeypatch):
+    reviewer = PlanReviewerAgent()
+    issue = PlanReviewIssue(
+        category="geometry",
+        field="geometry_specs",
+        message="几何不可验证",
+        fix_instruction="改用基础图形",
+    )
+    monkeypatch.setattr(
+        reviewer,
+        "call_llm_json",
+        lambda **kwargs: (_ for _ in ()).throw(TruncatedResponseError("truncated")),
+    )
+
+    result = reviewer.review(make_plan(), deterministic_issues=[issue])
+
+    assert result.is_valid is False
+    assert result.issues == [issue]
 
 
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")

@@ -291,7 +291,8 @@ Planner、Coder 或 Reviewer。
 ```text
 ~/.kd1-anime/workspace/runs/<timestamp>-<uuid>/
 ├── prompt.md
-├── manifest.json         # schema v5：教学合同、状态账本、阶段、Job 与产物凭据
+├── manifest.json         # schema v6：教学合同、状态账本、阶段、Job 与发布配置
+├── events.jsonl          # 私有的阶段/检查点事件轨迹（诊断用）
 ├── scenes/              # 生成的 Python 和 sbatch 脚本
 ├── logs/                # Slurm stdout/stderr
 ├── videos/              # 当前 run 的 Manim 媒体目录
@@ -303,7 +304,7 @@ Planner、Coder 或 Reviewer。
 ```
 
 如设置 `OUTPUT_FILE=/path/to/final.mp4`，最终视频写到该路径；其余中间产物仍保留在独立 run 目录中。
-`manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。当前清单为 v5，包含全片教学合同和 StateLedger；v4 仅可查看，不能猜测迁移或继续修改，恢复时会给出明确错误，请重新生成。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
+`manifest.json`、`events.jsonl` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。当前清单为 v6，除全片教学合同和 StateLedger 外还固定最终合并配置；v4/v5 仅可查看，不能猜测迁移或继续修改，恢复时会给出明确错误，请重新生成。`events.jsonl` 只保存脱敏后的诊断事件，不保存 API Key。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
 增量运行复用的场景视频会复制到新 run 的私有目录，因此清理基准 run 不会破坏新 run 的恢复或重新拼接。
 
 ## 关键配置
@@ -315,6 +316,7 @@ Planner、Coder 或 Reviewer。
 | `LLM_HEALTHCHECK_TIMEOUT` | `15` | 进入会话/流水线前的最小 API 探测超时（秒）；探测失败立即退出 |
 | `LLM_PARALLEL_WORKERS` | `4` | 分镜/连续性审查等可并行 LLM 请求上限；代码交接阶段按场景顺序执行 |
 | `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
+| `LLM_TRUST_ENV` / `VISUAL_LLM_TRUST_ENV` | `true` | 是否读取 HTTP(S)_PROXY 等环境变量；不使用代理时设为 `false` |
 | `LLM_CACHE_ENABLED` | `true` | 是否缓存完整的非流式 LLM 响应；流式交互永不缓存 |
 | `LLM_CACHE_PATH` | 用户目录 cache/llm.sqlite3 | LLM 缓存 SQLite 路径 |
 | `LLM_CACHE_MAX_ENTRIES` | `512` | 缓存最大条目数，设为 `0` 等同关闭写入 |
@@ -330,6 +332,7 @@ Planner、Coder 或 Reviewer。
 | `RAG_INDEX_PATH` | `~/.kd1-anime/rag/index.sqlite3` | SQLite RAG 索引路径 |
 | `RAG_EMBEDDING_BASE_URL` / `RAG_EMBEDDING_MODEL` | 空 | 独立 Embedding 服务和模型 |
 | `RAG_RERANK_BASE_URL` / `RAG_RERANK_MODEL` | 空 | 独立 Reranker 服务和模型 |
+| `RAG_TRUST_ENV` | `true` | RAG HTTP 客户端是否读取 HTTP(S)_PROXY 等环境变量 |
 | `RAG_TOP_K` / `RAG_RERANK_TOP_N` | `8` / `4` | 向量初排和重排数量 |
 | `RAG_MAX_CONTEXT_CHARS` | `12000` | 注入单次 Agent 请求的最大检索上下文 |
 | `RAG_PARALLEL_WORKERS` | `2` | 跨批量任务共享的 RAG 请求并发上限 |
@@ -354,6 +357,7 @@ Planner、Coder 或 Reviewer。
 | `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外的运行时预检；默认关闭，dry-run 不执行 |
 | `LOCAL_SMOKE_RENDER_QUALITY` | `l` | 本地 Smoke Render 质量级别（`l`/`m`） |
 | `LOCAL_SMOKE_RENDER_TIMEOUT` | `180` | 本地 Smoke Render 最长秒数 |
+| `LOCAL_SMOKE_RENDER_MEMORY_MB` | `4096` | 本地 Smoke Render 地址空间上限（Linux 优先通过 `prlimit` 生效） |
 | `SLURM_CPUS_PER_TASK` | `4` | 每个场景作业的 CPU 数 |
 | `SLURM_GPU_TYPE` | 空 | OpenGL 模式必须设置；Cairo 模式不会申请 GPU |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |

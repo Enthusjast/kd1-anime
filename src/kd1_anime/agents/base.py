@@ -12,6 +12,7 @@ import random
 import re
 import time
 from contextlib import suppress
+from copy import deepcopy
 from typing import ClassVar, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -29,6 +30,7 @@ from rich.panel import Panel
 
 from kd1_anime.config import LLMRuntimeProfile, settings
 from kd1_anime.llm_cache import LLMResponseCache, make_cache_key
+from kd1_anime.security import redact_text
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -63,14 +65,25 @@ class BaseAgent:
         if self._client is None:
             import httpx
 
+            timeout = httpx.Timeout(
+                self.profile.timeout_read,
+                connect=self.profile.timeout_connect,
+                read=self.profile.timeout_read,
+            )
+            client_kwargs = {
+                "api_key": self.profile.api_key,
+                "base_url": self.profile.base_url,
+                "max_retries": 0,
+                "timeout": timeout,
+            }
+            if not self.profile.trust_env:
+                client_kwargs["http_client"] = httpx.Client(timeout=timeout, trust_env=False)
             self._client = OpenAI(
-                api_key=self.profile.api_key,
-                base_url=self.profile.base_url,
-                timeout=httpx.Timeout(
-                    self.profile.timeout_read,
-                    connect=self.profile.timeout_connect,
-                    read=self.profile.timeout_read,
-                ),
+                **client_kwargs,
+                # BaseAgent 已经在外层实现了带退避的重试。关闭 SDK 自带的
+                # 隐式重试，避免一次超时被 SDK 再重复发送，导致单个请求
+                # 实际阻塞数倍于 LLM_TIMEOUT_READ，表现为 dry-run 长时间
+                # 停在连续性审查且无法及时进入失败收敛路径。
             )
         return self._client
 
@@ -121,13 +134,16 @@ class BaseAgent:
     def _healthcheck_error(self, error: object) -> str:
         """生成不泄露 API Key 的启动探测错误。"""
 
-        detail = str(error).strip() or type(error).__name__
-        if self.profile.api_key:
-            detail = detail.replace(self.profile.api_key, "<redacted>")
+        detail = self._safe_error(error)
         return (
             f"{self.profile.label}API 不可用"
             f"（{self._safe_endpoint(self.profile.base_url)}，模型 {self.model}）：{detail}"
         )
+
+    def _safe_error(self, error: object) -> str:
+        """把 API 异常转换为可显示/持久化的脱敏文本。"""
+
+        return redact_text(str(error).strip() or type(error).__name__, (self.profile.api_key,))
 
     @staticmethod
     def _safe_endpoint(base_url: str) -> str:
@@ -224,6 +240,11 @@ class BaseAgent:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ]
+        else:
+            # 兼容性降级（去掉 response_format、追加 JSON 提示等）会在
+            # 重试过程中修改 messages。调用方可能复用同一个列表，甚至
+            # 在并发 worker 间共享它；必须在进入缓存和请求前断开引用。
+            messages = self._clone_messages(messages) or []
 
         # 只对调用方明确要求的非流式请求启用缓存。交互式流式输出包含
         # 用户取消、实时显示等语义，不能被缓存；静默流式传输仍属于可缓存的
@@ -467,11 +488,16 @@ class BaseAgent:
             except (RateLimitError, APITimeoutError, APIConnectionError) as e:
                 last_error = e
                 # 关闭 client 重建, 避免 httpx 连接池复用死连接
+                old_client = self._client
                 self._client = None
+                close = getattr(old_client, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        close()
                 if attempt < self.profile.max_retries:
                     delay = self._retry_delay(attempt, e)
                     self._log(
-                        f"API 限流/超时/连接错误, {delay:.1f}s 后重试... ({e})",
+                        f"API 限流/超时/连接错误, {delay:.1f}s 后重试... ({self._safe_error(e)})",
                         style="bold yellow",
                     )
                     time.sleep(delay)
@@ -517,7 +543,7 @@ class BaseAgent:
                     attempt -= 1  # 参数修复, 不消耗重试次数
                     continue
                 # 其他 400 直接失败, 不重试
-                raise RuntimeError(f"[{self.name}] 请求被拒绝 (400): {e}") from e
+                raise RuntimeError(f"[{self.name}] 请求被拒绝 (400): {self._safe_error(e)}") from e
 
             except APIError as e:
                 # 打印完整错误详情 (含 HTTP 状态码和响应体)
@@ -525,26 +551,31 @@ class BaseAgent:
                     "API 错误 "
                     f"(status={getattr(e, 'status_code', '?')}, "
                     f"type={getattr(e, 'type', type(e).__name__)}): "
-                    f"{getattr(e, 'message', str(e))}",
+                    f"{self._safe_error(getattr(e, 'message', str(e)))}",
                     style="bold yellow",
                 )
                 # 请求被拒绝 / 被封 — 不可重试
                 blocked_keywords = ["blocked", "rejected", "denied", "forbidden"]
                 msg_lower = str(e).lower()
                 if any(kw in msg_lower for kw in blocked_keywords):
-                    raise RuntimeError(f"[{self.name}] API 请求被拒绝 (不可重试): {e}") from e
+                    raise RuntimeError(
+                        f"[{self.name}] API 请求被拒绝 (不可重试): {self._safe_error(e)}"
+                    ) from e
                 last_error = e
                 if attempt < self.profile.max_retries:
                     delay = self._retry_delay(attempt, e)
                     time.sleep(delay)
 
             except Exception as e:
-                raise RuntimeError(f"[{self.name}] LLM 调用发生未知错误: {e}") from e
+                raise RuntimeError(
+                    f"[{self.name}] LLM 调用发生未知错误: {self._safe_error(e)}"
+                ) from e
 
         if isinstance(last_error, TruncatedResponseError):
             raise TruncatedResponseError(f"[{self.name}] LLM 输出在重试后仍被截断") from last_error
         raise RuntimeError(
-            f"[{self.name}] LLM 调用在 {self.profile.max_retries} 次重试后仍然失败: {last_error}"
+            f"[{self.name}] LLM 调用在 {self.profile.max_retries} 次重试后仍然失败: "
+            f"{self._safe_error(last_error)}"
         )
 
     def _retry_delay(self, attempt: int, error: Exception | None = None) -> float:
@@ -810,6 +841,7 @@ class BaseAgent:
         item_model: type[T],
         temperature: float | None = None,
         *,
+        max_tokens: int | None = None,
         allow_truncated: bool = False,
     ) -> list[T]:
         """
@@ -828,6 +860,7 @@ class BaseAgent:
                 "system_prompt": system_prompt,
                 "user_message": current_message,
                 "temperature": temp,
+                "max_tokens": max_tokens,
                 "json_mode": True,
             }
             if getattr(type(self), "call_llm", None) is BaseAgent.call_llm:
@@ -956,16 +989,9 @@ class BaseAgent:
 
         if messages is None:
             return None
-        cloned: list[dict] = []
-        for message in messages:
-            item = dict(message)
-            content = item.get("content")
-            if isinstance(content, list):
-                item["content"] = [
-                    dict(part) if isinstance(part, dict) else part for part in content
-                ]
-            cloned.append(item)
-        return cloned
+        # 多模态 content 内部还可能包含 image_url 等嵌套字典；浅复制不足以
+        # 隔离调用方在重试/兼容性路径中的修改。
+        return deepcopy(messages)
 
     @classmethod
     def _append_messages_repair_hint(cls, messages: list[dict], hint: str) -> list[dict]:

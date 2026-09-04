@@ -32,14 +32,15 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/auto_fixer.py    根据渲染日志修复代码
        ├── agents/render_context.py renderer 能力与对象生命周期约束
        ├── cluster/slurm.py        sbatch、状态查询、产物验证、超时取消
-       ├── rendering.py            RenderProfile、ffprobe、SceneArtifact
+       ├── rendering.py            RenderProfile/MergeProfile、ffprobe、SceneArtifact
        ├── resources.py            跨批量项目的进程级 LLM/RAG/Slurm 配额
        ├── media/merger.py         精确输入列表、FFmpeg xfade/acrossfade 原子合并
        ├── rag/                    SQLite 索引、独立 Embedding/Reranker 检索
        ├── eval/                   代码/效率评估与独立多模态视觉质量门
        ├── llm_cache.py            SQLite LLM 响应缓存与安全限额
        ├── agents/state_ledger.py  场景边界语义账本与渲染证据
-       └── run_store.py            Manifest v5、原子检查点、运行锁
+       ├── security.py             脱敏和 JSON-safe 诊断序列化
+       └── run_store.py            Manifest v6、原子检查点、运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
@@ -69,7 +70,7 @@ FSM 枚举同时用于清单检查点和 TUI 阶段提示。概要阶段一次�
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会确认索引存在且未过期，并探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
 
-`ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。
+`ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。顶层检查点使用显式转移表；并发 worker 或恢复入口产生的非典型回退只写入 `fsm_warnings`，不把可恢复的运行误判为失败。
 
 RAG 索引使用 SQLite 保存文本分块、元数据和 Embedding BLOB。Markdown 和 reStructuredText 按标题/段落切分，Python 按顶层定义切分；索引构建通过临时数据库原子替换。运行时先做本地余弦初排，再调用独立 Reranker；服务故障只记录 `degraded` 并继续原有流水线。Planner、Technical Planner、Coder 和 AutoFixer 收到的检索内容均标记为不可信资料，且每次注入都保存查询、索引和分块哈希收据。
 
@@ -144,7 +145,7 @@ run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信�
 
 `UNKNOWN` 达阈值时先取消；`scancel` 失败会进入 `CANCEL_FAILED` 并禁止自动重提。`GONE` 会依据当前 Job 的最终视频和日志分类，不会把查询故障等同于作业消失。被抢占退回排队后会重置运行计时，避免误触发 run timeout。
 
-Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算成功。每次提交都使用独立的 `attempt_<token>` 媒体目录；定位会递归适配 Manim 嵌套层级、排除 `partial_movie_files` 和早于本次提交的文件，不会把上一次修复的 MP4 当成当前产物。
+Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算成功。每次提交都使用独立的 `attempt_<token>` 媒体目录；定位会递归适配 Manim 嵌套层级、排除 `partial_movie_files`、符号链接和早于本次提交的文件，不会把上一次修复的 MP4 当成当前产物。正式作业完成后还会记录计算节点的 Python/Manim/FFmpeg/XeLaTeX/renderer 指纹；不一致时标记 warning，增量复用会拒绝带 warning 的旧产物。
 
 ### 3.4 FIXING
 
@@ -154,7 +155,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v5 包含单调 revision、LessonSpec、TeachingGraph、StateLedger、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
+Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v6 包含单调 revision、LessonSpec、TeachingGraph、StateLedger、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -163,7 +164,7 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v5 清单只接受当前教学合同、StateLedger、结构化计划、ElementManifest 和阶段状态；v4 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 非流式完整响应默认写入用户私有 SQLite 缓存；缓存键包含端点、模型、提示词、模式和生成参数，不含 API Key，条目数受 LLM_CACHE_MAX_ENTRIES 限制。
+v6 清单只接受当前教学合同、StateLedger、结构化计划、ElementManifest、阶段状态和最终合并配置；v4/v5 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 非流式完整响应默认写入用户私有 SQLite 缓存；缓存键包含端点、模型、提示词、模式、代理策略和生成参数，不含 API Key，条目数受 LLM_CACHE_MAX_ENTRIES 限制。
 
 `resume` 在持有 `.run.lock` 后读取清单：
 
@@ -221,6 +222,7 @@ VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifa
 ├── eval_reports/         # 每轮场景报告和成片报告
 ├── visual_candidates/   # 可恢复候选代码
 ├── artifacts/            # 教学合同、计划编译、TechnicalSpec、审查和状态账本
+├── events.jsonl          # 脱敏的阶段/检查点事件轨迹
 └── output_final.mp4
 ```
 
@@ -259,4 +261,4 @@ pytest -q
 python -m build --wheel
 ```
 
-测试覆盖结构化输出、教学合同/依赖图、截断重试、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v5 与 v4 只读恢复、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级、批量资源配额和 FFmpeg 原子输出。手动触发 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
+测试覆盖结构化输出、教学合同/依赖图、截断重试、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v6 与 v4/v5 只读恢复、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级、批量资源配额、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。

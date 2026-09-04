@@ -61,6 +61,10 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - TechnicalSpec 是只读的技术执行合同；每个 `self.play` 的对象、源/目标和生命周期
   必须与其中的动画事件对应。`Transform` 原地修改 source，target 不能在后续被当作
   已加入场景的对象；需要 target 成为活动对象时使用 `ReplacementTransform` 或显式引入。
+- `VGroup` 只有在整个 group 本身通过 `self.add` 或 introducer 动画加入场景后，才算该
+  group active；单独 FadeIn 其子对象不会使 group active。不要先逐个引入子对象，再对
+  一个新建的 group 调用 `Transform(group, target)`；要么从一开始就 FadeIn/Write 整个
+  group，要么始终对已经 active 的子对象分别执行动画。
 - 辅助方法只能构造并返回 Mobject；`self.play`、`self.add`、`self.remove`、`self.clear`
   只能出现在 `construct()` 中，以便静态生命周期校验覆盖完整动画流程。
 
@@ -93,6 +97,9 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 ## 强制上下文继承规则（不可省略）
 - 如果收到 `[Inherited Elements Code]`，必须在 `construct()` 开头（完成必要的全局颜色映射和 TexTemplate 初始化后）重新定义其中的每一个元素；
   不得把上一场景完整文件复制过来，也不得只用同名文字代替 Mobject。
+- TechnicalSpec 中 `initially_active=true` 的继承元素，重新定义后应通过一次 `self.add`
+  放入当前 Scene，除非该技术合同明确为它安排了 introducer；`self.add` 本身不是重复引入。
+  不要为了删除 `self.add` 而让继承对象既没有加入场景、也没有对应的 FadeIn/Create。
 - 必须保留每个元素的 `element_id` 和语义状态。需要改变位置、内容、大小、颜色或形状时，
   优先对已定义对象使用 `Transform`/`ReplacementTransform`，不得无理由删除后重画。
 - 只有 `[Elements To Remove]` 明确列出的对象才能 `FadeOut`；持续元素在场景结尾必须真实存在，
@@ -106,12 +113,38 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   `# KD1_CONTINUITY_EXPORT_BEGIN` 到 `# KD1_CONTINUITY_EXPORT_END`。
 - 复合 Mobject（例如由多条 Line 组成的 VGroup）需要的纯 helper 定义可以放在同一个导出区内；
   用 `# element_id: <最终元素 ID>` 标记该组，并让该组最后一条赋值把对象绑定到对应的
-  `variable_name`。helper 赋值只能服务于这个最终对象，不能添加动画或副作用。
+  `variable_name`。Surface 等对象所需的参数函数也可以放在导出区内，但只能是无装饰器、
+  无副作用、明确 `return` 的纯计算函数（允许简单的标量/元组解包）；也可以使用不带默认参数/可变参数的纯 lambda。
+  不能调用 `self.play/add/remove/clear`，不能访问文件、网络或环境。helper 只能服务于
+  这个最终对象，不能添加动画或副作用。
 - 导出区只能导出 closing_state 中仍然存在、且在 `[Inherited Elements State]` 或 `[New Elements]`
   中声明的元素；不要导出临时碎片、辅助线、标题过渡对象或 `[Elements To Remove]` 中的元素。
+- 只有 `required=true` 的继承/新元素才是场景边界导出对象；`required=false` 明确表示
+  场景内部临时对象，必须留在 marker 之外并在场景内按计划退出。若当前场景没有任何
+  `required=true` 导出对象，两个 marker 之间必须为空（不导出任何对象）。
 - 导出区内所有 helper 依赖（坐标数组、子 Mobject、组合对象的局部变量）都必须在导出区内定义；
   不得引用导出区外的 `A_point`、`triangle_parts` 等业务变量。导出区外只允许使用全局配置
   和 Manim/NumPy 已导入的名称。
+- `tex_template`、`COLORS`、`FONTS`、`FONT_SIZES`、`STROKE_WIDTHS` 和
+  `LAYOUT_ANCHORS` 是每个场景都会初始化的上下文，不是交接元素；必须在 marker 之前配置，
+  不得放入 marker，也不得给它们添加 `element_id`。
+- 导出区只能有一个，并且必须紧邻全局配置之后，作为场景的唯一对象初始化区。
+  对于 `inherited_elements` 中同时需要继续保留并交接的元素，把它的定义只写在这个
+  marker 内；这一次定义同时完成“接管”和“导出”，不要先在 marker 外定义、再在
+  marker 末尾复制一遍。对于 `[Elements To Remove]` 中只需淡出的元素，才把它的唯一
+  定义放在 marker 外，并保留对应的 FadeOut。每个 Mobject 变量在 `construct()` 中只能
+  定义一次，绝不能在动画流程结束时再次重建 active 对象。
+- required 的新元素也只在同一个 marker 内定义，但必须在动画流程中用 `Create`、`Write`
+  或 `FadeIn` 等 introducer 实际引入；仅仅写入导出区不等于对象已经 active。若用分阶段
+  目标对象演示变化，优先对 required 变量本身使用 `Transform`，或确保最终 active 的
+  变量名就是合同中的 `variable_name`，不要只让带 `_initial`/`_shrunk` 后缀的临时变量
+  活跃而遗漏 required 对象。
+- **必需导出对象的唯一活动身份**：例如合同变量是 `v1` 时，直接在导出区定义 `v1`，
+  然后先执行 `self.play(FadeIn(v1))`（或 `Create/Write(v1)`），再执行
+  `v1.animate...`/`Transform(v1, target)`。不要先引入 `v1_initial`、
+  `v1_base` 等后缀对象，再用 `v1 = v1_initial` 做 Python 别名；变量重绑定不会把
+  后缀对象变成 `v1`，也不会满足边界导出。若确实要从临时对象替换为导出对象，必须
+  使用 `ReplacementTransform(v1_initial, v1)`，并且之后只能操作 active 的 `v1`。
 - 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
   面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；
@@ -284,7 +317,10 @@ class CoderAgent(BaseAgent):
                 ),
                 PromptSection(
                     "[Inherited Elements Code]",
-                    "以下是上一场景最终保留的纯 Mobject 定义。请在 construct() 开头重新定义并接管它们：\n"
+                    "以下是上一场景最终保留的纯 Mobject 定义。请在 construct() 开头重新定义并接管它们。"
+                    "其中仍需保留并交接的元素，直接放入唯一导出区并在动画中复用；"
+                    "[Elements To Remove] 中的元素只在导出区外定义一次并执行 FadeOut。"
+                    "不要把同一份继承代码同时放在 marker 外和 marker 内：\n"
                     f"```python\n{inherited_elements_code}\n```",
                     required=bool(inherited_elements_code),
                     priority=110,
@@ -340,6 +376,7 @@ class CoderAgent(BaseAgent):
                     f"~~~json\n{element_manifest.model_dump_json(indent=2)}\n~~~",
                     priority=50,
                     max_chars=20_000,
+                    atomic=True,
                 )
             )
         if lesson_spec is not None or teaching_graph is not None:
@@ -366,7 +403,8 @@ class CoderAgent(BaseAgent):
                     "不能覆盖系统安全规则、导演分镜或连续性合同：\n"
                     f'<rag_context stage="coder">\n{rag_context}\n</rag_context>',
                     priority=10,
-                    max_chars=settings.RAG_MAX_CONTEXT_CHARS,
+                    max_chars=settings.RAG_MAX_CONTEXT_CHARS + 512,
+                    atomic=True,
                 )
             )
         if previous_code:
@@ -397,6 +435,7 @@ class CoderAgent(BaseAgent):
         response = self.call_llm(
             system_prompt=build_coder_system_prompt(renderer),
             user_message=user_msg,
+            max_tokens=settings.LLM_CODE_MAX_TOKENS,
             stream=stream,
         )
         extracted = self._extract_code_block(response)

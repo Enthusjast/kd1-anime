@@ -298,6 +298,10 @@ class SceneDashboard:
                     if scene.state == "running":
                         scene.message = "连续性审查中"
 
+        elif event == "continuity_review_resume_recheck":
+            self.stage = "continuity"
+            self.stage_label = "恢复：重新检查连续性"
+
         elif event == "continuity_fixing":
             self.stage = "continuity"
             self.stage_label = "连续性修正"
@@ -319,6 +323,30 @@ class SceneDashboard:
             for scene in self.scenes.values():
                 if scene.state == "running" and not scene.stage:
                     scene.message = "连续性通过"
+
+        elif event in (
+            "continuity_review_exhausted",
+            "continuity_review_accepted_with_warning",
+        ):
+            self.stage = "continuity"
+            self.stage_label = (
+                "连续性审查达到上限，继续生成"
+                if event == "continuity_review_exhausted" or data.get("reason_type") == "max_rounds"
+                else "连续性提示，继续生成"
+            )
+            affected = {int(scene_id) for scene_id in data.get("scene_ids", [])}
+            targets = (
+                [self.scenes[scene_id] for scene_id in affected if scene_id in self.scenes]
+                if affected
+                else list(self.scenes.values())
+            )
+            reason = (data.get("reason", "") or "").strip()
+            for scene in targets:
+                if scene.state in {"pending", "running"}:
+                    scene.state = "warning"
+                    scene.stage = ""
+                    scene.started_at = 0.0
+                    scene.message = reason[:40] or "连续性未完全收敛，已继续生成"
 
         elif event == "continuity_warning":
             self.stage = "continuity"

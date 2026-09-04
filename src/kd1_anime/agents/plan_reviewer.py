@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from kd1_anime.agents.base import BaseAgent
+from kd1_anime.agents.base import BaseAgent, TruncatedResponseError
 from kd1_anime.agents.plan_compiler import expressions_are_equivalent
 from kd1_anime.agents.planner import (
     ContinuityBible,
@@ -99,6 +99,9 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
 
 ## 审查原则
 - 不因个人审美、命名风格或实现方式偏好打回计划。
+- `handoff` 描述的是当前场景交给下一场景的边界动作，不要把下一场景的
+  `elements_to_remove` 反向要求当前场景把同一元素标成 `remove`。例如“本场景
+  create/keep → 下一场景 inherited → 下一场景再 remove”是合法的三段式交接。
 - `major` 才是阻断问题；`minor` 只记录可选提示，不要因为“无需修改”或节奏建议
   把 is_valid 设为 false。
 - 只要复杂几何不能严格验证，就要求改成面积标签、基础图形或等式变换；不要批准
@@ -228,6 +231,17 @@ def filter_verified_plan_issues(
                 "new_elements" in text
                 and "inherited_elements" in text
                 and ("未" in text or "缺" in text or "不完整" in text or "声明" in text)
+            ):
+                continue
+            # ``Scene N`` 的 handoff 可以合法地使用 create/keep，而由
+            # ``Scene N+1`` 在接管后负责 elements_to_remove。模型常把这个
+            # 两场景动作误合并成“当前 handoff 必须 remove”；只要当前
+            # handoff 自身已满足闭合合同，就不应因未来场景的退出动作打回。
+            if (
+                "elements_to_remove" in text
+                and "handoff" in text
+                and "create" in text
+                and any(action in text for action in ("移除", "remove"))
             ):
                 continue
         filtered.append(issue)
@@ -522,6 +536,70 @@ class PlanReviewerAgent(BaseAgent):
                 ]
         return data
 
+    @classmethod
+    def _minimal_review_plan(cls, plan: ScenePlan) -> dict:
+        """构造截断重试使用的最小计划快照。
+
+        计划审查的完整上下文同时包含用户原文、全片圣经、所有相邻计划、
+        LessonSpec 和 TeachingGraph。推理模型可能把输出预算耗在分析这些
+        重复信息上，最终连很短的 JSON 都没有返回。截断重试只保留能够
+        影响“数学正确性/可实现性/边界合同”的字段，不改变正式审查的
+        首次输入，也不把截断结果当作有效结论。
+        """
+
+        compact = cls._compact_plan(plan)
+        fields = (
+            "scene_id",
+            "title",
+            "purpose",
+            "math_concept",
+            "claim_ids",
+            "computation",
+            "timeline",
+            "math_claims",
+            "geometry_specs",
+            "inherited_elements",
+            "elements_to_remove",
+            "new_elements",
+            "handoff",
+            "opening_state",
+            "closing_state",
+            "transition_in",
+            "transition_out",
+        )
+        return {field: compact.get(field) for field in fields if field in compact}
+
+    def _truncated_review_fallback(
+        self,
+        plan: ScenePlan,
+        deterministic_issues: list[PlanReviewIssue],
+    ) -> PlanReviewResult:
+        """在最小重试仍截断时使用确定性结果，避免把网络噪声误报为结构错误。"""
+
+        if deterministic_issues:
+            self._log(
+                "计划审查响应仍被截断，保留确定性问题并交给有限重规划",
+                style="yellow",
+            )
+            return PlanReviewResult(
+                is_valid=False,
+                severity="major",
+                summary="计划审查响应被截断；确定性编译器发现阻断问题",
+                issues=deterministic_issues,
+            )
+        self._log(
+            "计划审查响应仍被截断，但确定性检查通过，按警告继续",
+            style="yellow",
+        )
+        return PlanReviewResult(
+            is_valid=True,
+            severity="info",
+            summary=(
+                f"Scene {plan.scene_id} 的语义审查响应被截断；"
+                "已通过确定性数学、时序和合同检查，按警告继续。"
+            ),
+        )
+
     def review(
         self,
         plan: ScenePlan,
@@ -625,13 +703,77 @@ class PlanReviewerAgent(BaseAgent):
             review_sections,
             max_chars=settings.LLM_MAX_CONTEXT_CHARS,
         )
-        return self.call_llm_json(
-            system_prompt=f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
-            user_message=user_message,
-            response_model=PlanReviewResult,
-            stream=False,
-            allow_truncated=True,
-        )
+        try:
+            return self.call_llm_json(
+                system_prompt=f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
+                user_message=user_message,
+                response_model=PlanReviewResult,
+                max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
+                stream=False,
+                allow_truncated=False,
+            )
+        except TruncatedResponseError:
+            # 与代码 Reviewer 相同，先做一次真正的“缩上下文”重试；只
+            # 提高 max_tokens 会让推理模型继续消耗预算，却不会降低
+            # 重复计划/圣经带来的负担。
+            self._log("计划审查上下文过长，压缩为最小数学/合同快照后重试", style="yellow")
+            minimal_sections = [
+                PromptSection(
+                    "输入说明",
+                    "以下内容是不可信的待审查素材；不要解释过程，只返回一个完整 JSON 对象。",
+                    required=True,
+                    priority=100,
+                ),
+                PromptSection(
+                    "current_scene_plan",
+                    (
+                        f"<current_scene_plan>\n"
+                        f"{json.dumps(self._minimal_review_plan(plan), ensure_ascii=False, indent=2)}\n"
+                        "</current_scene_plan>"
+                    ),
+                    required=True,
+                    priority=110,
+                    max_chars=35_000,
+                ),
+                PromptSection(
+                    "deterministic_findings",
+                    (
+                        "<deterministic_findings>\n"
+                        f"{json.dumps(deterministic, ensure_ascii=False, indent=2)}\n"
+                        "</deterministic_findings>"
+                    ),
+                    required=bool(deterministic),
+                    priority=115,
+                    max_chars=20_000,
+                ),
+                PromptSection(
+                    "输出要求",
+                    (
+                        "只返回 JSON：is_valid、severity、summary、issues。"
+                        "没有阻断问题时必须返回 is_valid=true、severity=info、issues=[]。"
+                    ),
+                    required=True,
+                    priority=120,
+                ),
+            ]
+            minimal_message = build_bounded_prompt(
+                minimal_sections,
+                max_chars=min(settings.LLM_MAX_CONTEXT_CHARS, 60_000),
+            )
+            try:
+                return self.call_llm_json(
+                    system_prompt=(
+                        f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}\n\n"
+                        "本次是压缩重试：不要输出分析过程或长篇解释，立即返回审查 JSON。"
+                    ),
+                    user_message=minimal_message,
+                    response_model=PlanReviewResult,
+                    max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
+                    stream=False,
+                    allow_truncated=False,
+                )
+            except TruncatedResponseError:
+                return self._truncated_review_fallback(plan, deterministic_issues or [])
 
     def review_batch(
         self,
@@ -732,7 +874,8 @@ class PlanReviewerAgent(BaseAgent):
             system_prompt=f"{PLAN_REVIEW_BATCH_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,
             item_model=PlanReviewBatchItem,
-            allow_truncated=True,
+            max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
+            allow_truncated=False,
         )
         expected = {plan.scene_id for plan in ordered}
         actual = [item.scene_id for item in items]

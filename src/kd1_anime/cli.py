@@ -924,12 +924,23 @@ def clean(
                 # 候选列表生成与真正删除之间可能有很长的用户确认窗口；
                 # 加锁后重新读取，避免误删刚恢复/刚更新的运行。
                 current = repository.load(manifest.run_id)
-                current.validate_for_resume()
                 if current.updated_at > cutoff or (
                     not include_running and current.status == "running"
                 ):
                     skipped += 1
                     continue
+                # 清理的安全边界是“持锁 + 确认并取消远端作业”，不应因为
+                # 某个旧版本的瞬时字段不完整而跳过取消，留下孤儿 Job。
+                # 清单完整性问题仍展示给用户，但不会被当成删除许可；下面
+                # 的作业状态核对失败时依然会保留整个 run 目录。
+                integrity_errors = current.integrity_errors()
+                if integrity_errors:
+                    console.print(
+                        f"{manifest.run_id} 清单存在 {len(integrity_errors)} 个一致性提示，"
+                        "清理前仍会先核对并取消远端作业",
+                        markup=False,
+                        style="yellow",
+                    )
                 _cancel_jobs_before_clean(current)
                 shutil.rmtree(root)
             removed += 1

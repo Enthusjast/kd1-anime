@@ -13,16 +13,20 @@ from kd1_anime.agents.continuity import (
     apply_deterministic_continuity_repairs,
     deterministic_continuity_issues,
     extract_continuity_elements,
+    extract_scene_continuity_elements,
     normalize_scene_plan_contract,
+    strip_redundant_optional_export_block,
     validate_export_contract,
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
+    GeometrySpec,
     GlobalVisualState,
     SceneHandoff,
     SceneOutline,
     ScenePlan,
+    TimelineEvent,
     VisualElementState,
 )
 from kd1_anime.agents.safe_fallback import (
@@ -264,13 +268,15 @@ def test_extract_continuity_elements_without_marker_uses_safe_fallback():
 from manim import *
 class Demo(Scene):
     def construct(self):
-        formula = MathTex(r"x^2")
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        formula = MathTex(r"x^2", tex_template=tex_template)
         self.play(Write(formula))
 """
 
     exported_code, elements = extract_continuity_elements(code)
 
     assert "formula = MathTex" in exported_code
+    assert "tex_template =" not in exported_code
     assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
 
 
@@ -300,6 +306,97 @@ class Demo(Scene):
     ]
 
 
+def test_extract_continuity_elements_keeps_named_root_with_child_helpers():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: axes_3d
+        axes_3d = ThreeDAxes()
+        x_label = MathTex(r"x")
+        y_label = MathTex(r"y")
+        axes_3d.add(x_label, y_label)
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("axes_3d", "axes_3d")]
+
+
+def test_extract_continuity_elements_accepts_pure_surface_parameter_helper():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        def paraboloid(u, v):
+            x, y = u, v
+            z = x**2 + y**2
+            return np.array([x, y, z])
+        surface = Surface(paraboloid, u_range=[-1, 1], v_range=[-1, 1])
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("surface", "surface")]
+    assert "def paraboloid" in elements[0].code
+
+
+def test_extract_continuity_elements_accepts_surface_style_mutation():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        def paraboloid(u, v):
+            return np.array([u, v, u**2 + v**2])
+        surface = Surface(paraboloid)
+        surface.set_style(fill_opacity=0.6, stroke_color=BLUE)
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("surface", "surface")]
+    assert "surface.set_style" in elements[0].code
+
+
+def test_extract_continuity_elements_accepts_pure_surface_lambda():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        surface = Surface(lambda u, v: np.array([u, v, u**2 + v**2]))
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [("surface", "surface")]
+
+
+def test_extract_continuity_elements_rejects_lambda_defaults():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: surface
+        surface = Surface(lambda u, v=0: np.array([u, v, u**2 + v**2]))
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    with pytest.raises(ValueError, match="lambda helper"):
+        extract_continuity_elements(code)
+
+
 def test_extract_continuity_elements_accepts_local_styling_and_safe_aliases():
     code = """
 from manim import *
@@ -323,6 +420,165 @@ class Demo(Scene):
     assert 'A_BLUE = "#123456"' in exported_code
     assert elements[0].element_id == "title"
     assert "title.to_edge(UP)" in elements[0].code
+
+
+def test_extract_continuity_elements_accepts_tex_subpart_styling():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = MathTex(r"a+b")
+        formula.get_part_by_tex("a").set_color(BLUE)
+        formula.get_part_by_tex("b").set_color(RED)
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    exported_code, elements = extract_continuity_elements(code)
+
+    assert "get_part_by_tex" in exported_code
+    assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
+
+
+def test_extract_continuity_elements_accepts_axes_coordinate_mapping():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: axes_3d
+        axes_3d = ThreeDAxes()
+        # element_id: point
+        point = Dot(axes_3d.c2p(1, 1, 2))
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    _, elements = extract_continuity_elements(code)
+
+    assert [(item.element_id, item.variable_name) for item in elements] == [
+        ("axes_3d", "axes_3d"),
+        ("point", "point"),
+    ]
+
+
+def test_extract_continuity_elements_drops_context_assignments_from_marker():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        COLORS = {"primary": "#123456"}
+        # element_id: formula
+        formula = MathTex(r"x^2", tex_template=tex_template, color=COLORS["primary"])
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    exported_code, elements = extract_continuity_elements(code)
+
+    assert "tex_template =" not in exported_code
+    assert "COLORS =" not in exported_code
+    assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
+
+
+def test_extract_scene_continuity_elements_ignores_unmarked_internal_objects_without_exports():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_formula",
+                    variable_name="temporary_formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        temporary_formula = MathTex(r"x^2", tex_template=tex_template)
+        self.play(Write(temporary_formula))
+"""
+
+    exported_code, elements = extract_scene_continuity_elements(code, plan)
+
+    assert exported_code == ""
+    assert elements == []
+
+
+def test_extract_scene_continuity_elements_drops_declared_optional_marker_objects():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_formula",
+                    variable_name="temporary_formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: temporary_formula
+        temporary_formula = MathTex(r"x^2")
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    exported_code, elements = extract_scene_continuity_elements(code, plan)
+
+    assert exported_code == ""
+    assert elements == []
+
+
+def test_extract_scene_continuity_elements_keeps_legacy_fallback_without_contract():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x^2")
+"""
+
+    exported_code, elements = extract_scene_continuity_elements(code, make_plan(1))
+
+    assert "formula = MathTex" in exported_code
+    assert [(item.element_id, item.variable_name) for item in elements] == [("formula", "formula")]
+
+
+def test_strip_redundant_optional_export_block_removes_duplicate_definitions():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x^2")
+        self.play(Write(formula))
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = MathTex(r"x^2")
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    stripped = strip_redundant_optional_export_block(code, plan)
+
+    assert "KD1_CONTINUITY_EXPORT_BEGIN" not in stripped
+    assert stripped.count('formula = MathTex(r"x^2")') == 1
 
 
 def test_extract_continuity_elements_rejects_non_whitelisted_local_method():
@@ -607,6 +863,73 @@ def test_normalize_scene_plan_contract_drops_stale_handoff_for_unexported_previo
     assert any("过期 handoff" in repair for repair in repairs)
 
 
+def test_normalize_scene_plan_contract_drops_unknown_remove_handoff():
+    current = make_plan(2).model_copy(
+        update={
+            "handoff": [
+                SceneHandoff(
+                    element_id="stale_element",
+                    variable_name="stale_element",
+                    action="remove",
+                )
+            ]
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(current, ContinuityBible())
+
+    assert normalized.handoff == []
+    assert normalized.new_elements == []
+    assert any("未声明的过期 handoff" in repair for repair in repairs)
+
+
+def test_normalize_scene_plan_contract_aligns_handoff_action_with_removal():
+    inherited = VisualElementState(element_id="old", variable_name="old")
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [inherited],
+            "elements_to_remove": [inherited],
+            "handoff": [SceneHandoff(element_id="old", variable_name="old", action="keep")],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(current, ContinuityBible())
+
+    assert normalized.handoff[0].action == "remove"
+    assert any("动作已规范为 remove" in repair for repair in repairs)
+
+
+def test_normalize_scene_plan_contract_syncs_timeline_fadeout_for_inherited_elements():
+    inherited = VisualElementState(element_id="grid", variable_name="grid", required=True)
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [inherited],
+            "handoff": [SceneHandoff(element_id="grid", variable_name="grid", action="keep")],
+            "timeline": [
+                TimelineEvent(
+                    event_id="fade_grid",
+                    start_seconds=0,
+                    end_seconds=2,
+                    action="网格淡出",
+                    element_ids=["grid"],
+                ),
+                TimelineEvent(
+                    event_id="hold_formula",
+                    start_seconds=2,
+                    end_seconds=10,
+                    action="保持公式",
+                ),
+            ],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(current, ContinuityBible())
+
+    assert [item.element_id for item in normalized.elements_to_remove] == ["grid"]
+    assert normalized.handoff[0].action == "remove"
+    assert any("时间线退出动作" in repair for repair in repairs)
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={
@@ -835,3 +1158,27 @@ def test_safe_fallback_detects_geometry_feedback_for_square_plan():
         plan,
         "[geometry] 正方形顶点位置错误，几何关系不一致",
     )
+
+
+def test_safe_fallback_removes_invalid_geometry_and_rebuilds_timeline():
+    plan = make_plan(2).model_copy(
+        update={
+            "duration_seconds": 90,
+            "geometry_specs": [
+                GeometrySpec(
+                    geometry_id="bad_polygon",
+                    shape="polygon",
+                    vertices=[[0, 0], [2, 0], [0, 2]],
+                    declared_area=99,
+                    target_area=99,
+                )
+            ],
+        }
+    )
+
+    fallback = build_safe_fallback_plan(plan, ContinuityBible(), reason="几何无法验证")
+
+    assert fallback.duration_seconds == 75
+    assert fallback.geometry_specs == []
+    assert fallback.timeline[0].start_seconds == 0
+    assert fallback.timeline[-1].end_seconds == 75

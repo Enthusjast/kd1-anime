@@ -347,6 +347,7 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
     """从 computation 中提取足够短的符号等式，忽略变量赋值。"""
 
     pairs: list[tuple[str, str]] = []
+    simple_symbol = re.compile(r"^[+-]?[A-Za-z_]\w*$")
     pattern = re.compile(
         r"(?<![A-Za-z0-9_])([A-Za-z0-9_()+\-−*/^²³.·×⋅\\]{1,80})\s*(?:=|→|⟶)\s*"
         r"([A-Za-z0-9_()+\-−*/^²³.·×⋅\\]{1,80})(?![A-Za-z0-9_])"
@@ -359,6 +360,12 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
             and not re.fullmatch(r"[A-Za-z]", left)
             and set(re.findall(r"[A-Za-z]", left)) == set(re.findall(r"[A-Za-z]", right))
         ):
+            # ``v1 = -v2``、``u_x = u_y`` 通常是求解特征向量/几何
+            # 约束得到的分量关系，而不是声称两个自由符号在所有取值
+            # 下恒等。把它交给多项式恒等式检查会产生 ``v1 ≠ -v2``
+            # 这样的误报；真正的 MathClaim 等式仍由上层独立校验。
+            if simple_symbol.fullmatch(left) and simple_symbol.fullmatch(right):
+                continue
             pairs.append((left, right))
     return pairs
 
@@ -638,6 +645,57 @@ class PlanCompiler:
             if geometry.shape == "circle":
                 # GeometrySpec 没有圆心/半径字段，不能把圆的离散辅助点
                 # 当作多边形用鞋带公式计算面积；圆的语义审查交给 LLM。
+                continue
+            geometry_field = f"geometry_specs[{geometry.geometry_id}].vertices"
+            dimensions = {len(point) for point in geometry.vertices}
+            if any(dimension < 2 for dimension in dimensions):
+                issues.append(
+                    PlanCompilerIssue(
+                        category="geometry",
+                        field=geometry_field,
+                        scene_ids=scene_ids,
+                        message="几何顶点必须至少包含 x、y 坐标。",
+                        fix_instruction="为每个顶点提供二维或三维坐标。",
+                    )
+                )
+                continue
+            is_3d = any(dimension > 2 for dimension in dimensions)
+            if is_3d and any(dimension != 3 for dimension in dimensions):
+                issues.append(
+                    PlanCompilerIssue(
+                        category="geometry",
+                        field=geometry_field,
+                        scene_ids=scene_ids,
+                        message="三维几何的每个顶点都必须包含 x、y、z 三个坐标。",
+                        fix_instruction="补齐 z 坐标，或将该几何规格改为二维顶点。",
+                    )
+                )
+                continue
+            if geometry.shape == "point":
+                # 点不应被当作多边形计算面积。
+                continue
+            if is_3d or geometry.shape in {"surface", "plane"}:
+                if len(geometry.vertices) < 3 and geometry.shape != "surface":
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="geometry",
+                            field=geometry_field,
+                            scene_ids=scene_ids,
+                            message="平面或三维区域至少需要三个顶点。",
+                            fix_instruction="补充完整的三维顶点，或改用文字/公式描述不可核验的曲面。",
+                        )
+                    )
+                    continue
+                if any(abs(point[0]) > 7.2 or abs(point[1]) > 4.2 for point in geometry.vertices):
+                    issues.append(
+                        PlanCompilerIssue(
+                            category="feasibility",
+                            field=geometry_field,
+                            scene_ids=scene_ids,
+                            message="几何顶点超出默认 16:9 安全画布范围。",
+                            fix_instruction="将顶点调整到约 x∈[-7,7]、y∈[-4,4] 的安全区，或明确镜头移动。",
+                        )
+                    )
                 continue
             if geometry.shape == "line":
                 if len(geometry.vertices) < 2:

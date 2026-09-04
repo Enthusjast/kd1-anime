@@ -215,9 +215,12 @@ def _normalise_technical_lifecycle(
     """
 
     active = {item.element_id for item in spec.objects if item.initially_active}
+    object_by_id = {item.element_id: item for item in spec.objects}
     normalized_events: dict[int, TechnicalAnimation] = {}
+    synthetic_events: dict[int, list[TechnicalAnimation]] = {}
     repairs: list[str] = []
     changed = False
+    existing_event_ids = {event.event_id for event in spec.animations}
     ordered_events = sorted(
         enumerate(spec.animations),
         key=lambda pair: (pair[1].start_seconds, pair[1].event_id, pair[0]),
@@ -226,6 +229,240 @@ def _normalise_technical_lifecycle(
         event = original
         target_ids = set(event.target_element_ids)
         create_ids = set(event.create_element_ids)
+
+        if (
+            event.operation in {"transform", "replacement_transform"}
+            and not event.source_element_ids
+        ):
+            inferred_sources = target_ids & active
+            if not inferred_sources:
+                inferred_sources = {
+                    dependency
+                    for target_id in target_ids
+                    for dependency in (
+                        object_by_id[target_id].dependencies if target_id in object_by_id else []
+                    )
+                    if dependency in active
+                }
+            if not inferred_sources:
+                inferred_sources = {
+                    candidate
+                    for target_id in target_ids
+                    for candidate in active
+                    if target_id.startswith(f"{candidate}_")
+                }
+            if not inferred_sources:
+                mentioned_ids = {
+                    element_id
+                    for element_id in object_by_id
+                    if re.search(
+                        rf"(?<![A-Za-z0-9_.-]){re.escape(element_id)}(?![A-Za-z0-9_.-])",
+                        event.api_notes,
+                    )
+                }
+                inferred_sources = mentioned_ids & active
+                if not target_ids and mentioned_ids:
+                    target_ids = mentioned_ids
+                    event = event.model_copy(update={"target_element_ids": sorted(mentioned_ids)})
+            if not inferred_sources and target_ids:
+                # source 仍然缺失且 target 全部是已声明对象时，原始
+                # TechnicalSpec 已经无法表达一次真实的“从 A 到 B”变换。
+                # 不要让无 source 的 transform 把整个场景挡死：将其
+                # 降级为明确的首次引入。若 target 当前 active，下面的
+                # introducer 规范会进一步收敛为 animate；若 inactive，
+                # 则由 fade_in 正确建立对象状态。
+                known_targets = target_ids & set(object_by_id)
+                if known_targets == target_ids:
+                    event = event.model_copy(
+                        update={
+                            "operation": "fade_in",
+                            "source_element_ids": [],
+                            "target_element_ids": sorted(target_ids),
+                            "create_element_ids": sorted(target_ids),
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "缺少可确定的 transform source，按保守首次引入处理",
+                            ),
+                        }
+                    )
+                    create_ids = set(target_ids)
+                    repairs.append(
+                        f"事件 {event.event_id} 缺少 source，降级为 fade_in: "
+                        + ", ".join(sorted(target_ids))
+                    )
+                    changed = True
+            if inferred_sources:
+                event = event.model_copy(
+                    update={
+                        "source_element_ids": sorted(inferred_sources),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "缺少 source_element_ids，已从 active target/依赖关系推断",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 补齐 source_element_ids: "
+                    + ", ".join(sorted(inferred_sources))
+                )
+                changed = True
+
+        if (
+            event.operation in {"transform", "replacement_transform"}
+            and not event.source_element_ids
+        ):
+            # 没有任何可确定的 source 时，继续保留 transform 只会让
+            # 编译器在同一错误上重试。它既没有可执行的动画源，也不应
+            # 让 Coder 猜测一个对象；降级为空操作并保留时间线区间，
+            # 由其它事件继续完成场景。若 target 已被上面的安全路径
+            # 转成 fade_in，这里不会触发。
+            event = event.model_copy(
+                update={
+                    "operation": "wait",
+                    "source_element_ids": [],
+                    "target_element_ids": [],
+                    "create_element_ids": [],
+                    "remove_element_ids": [],
+                    "api_notes": _append_api_repair_note(
+                        event.api_notes,
+                        "缺少可确定的 source，按空操作处理，避免让 Coder 猜测对象",
+                    ),
+                }
+            )
+            target_ids = set()
+            create_ids = set()
+            repairs.append(f"事件 {event.event_id} 缺少 source，按 wait 处理")
+            changed = True
+
+        if event.operation in {"transform", "replacement_transform"}:
+            inactive_sources = set(event.source_element_ids) - active
+            removable_sources = inactive_sources & (target_ids | create_ids)
+            if removable_sources:
+                # 模型有时把“新网格/新标签”同时写进
+                # source、target、create。新对象还没有 active 状态，
+                # 不能作为 Transform source；它应由 target/create
+                # 负责引入，而已有 active source 继续完成变换。
+                remaining_sources = [
+                    item for item in event.source_element_ids if item not in removable_sources
+                ]
+                event = event.model_copy(
+                    update={
+                        "source_element_ids": remaining_sources,
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "已移除同时作为新 target/create 的 inactive source",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 删除 inactive source: "
+                    + ", ".join(sorted(removable_sources))
+                )
+                changed = True
+
+        if event.operation in {"transform", "replacement_transform"}:
+            # Transform 的 create_element_ids 不能依附在同一个
+            # Transform 上：Manim 只会变换 source，target 是快照，
+            # 其它 create 对象不会自动进入 Scene。模型常把“同步淡入
+            # 特征向量”写进 apply_transform 事件，随后在 highlight
+            # 阶段引用一个从未 active 的对象。拆成一条明确的 fade_in
+            # 事件，保留原变换事件的 source/target 语义。
+            extra_create_ids = create_ids - target_ids
+            if extra_create_ids:
+                base_event_id = f"{event.event_id}_create"[:100]
+                synthetic_id = base_event_id
+                suffix = 2
+                while synthetic_id in existing_event_ids:
+                    suffix_text = f"_{suffix}"
+                    synthetic_id = f"{base_event_id[: 100 - len(suffix_text)]}{suffix_text}"
+                    suffix += 1
+                existing_event_ids.add(synthetic_id)
+                synthetic_events[index] = [
+                    TechnicalAnimation(
+                        event_id=synthetic_id,
+                        start_seconds=event.start_seconds,
+                        end_seconds=event.end_seconds,
+                        operation="fade_in",
+                        target_element_ids=sorted(extra_create_ids),
+                        create_element_ids=sorted(extra_create_ids),
+                        claim_ids=list(event.claim_ids),
+                        api_notes=(
+                            "从复合 transform 事件拆出的新对象引入："
+                            + ", ".join(sorted(extra_create_ids))
+                        ),
+                    )
+                ]
+                event = event.model_copy(
+                    update={
+                        "create_element_ids": sorted(create_ids - extra_create_ids),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "新对象已拆分为独立 fade_in 事件",
+                        ),
+                    }
+                )
+                target_ids = set(event.target_element_ids)
+                create_ids = set(event.create_element_ids)
+                repairs.append(
+                    f"事件 {event.event_id} 拆分新对象引入: " + ", ".join(sorted(extra_create_ids))
+                )
+                changed = True
+
+        # 模型有时把已经处于 active 的继承对象误填到一个 ``create``
+        # 事件的 target 中（例如“绘制切线”却把 point_P 当成目标）。
+        # 这不是重新创建对象；按现有对象执行 animate 才符合生命周期，
+        # 否则编译器会在不涉及新对象的事件上报重复创建。
+        if event.operation in {"create", "write", "fade_in", "add"}:
+            introduced = target_ids | create_ids
+            duplicate_active = introduced & active
+            if duplicate_active:
+                remaining_targets = target_ids - duplicate_active
+                remaining_creates = create_ids - duplicate_active
+                source_ids = list(
+                    dict.fromkeys([*event.source_element_ids, *sorted(duplicate_active)])
+                )
+                if remaining_targets or remaining_creates:
+                    event = event.model_copy(
+                        update={
+                            "target_element_ids": sorted(remaining_targets),
+                            "create_element_ids": sorted(remaining_creates),
+                            "source_element_ids": source_ids,
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "已移除 introducer 中重复的 active 对象",
+                            ),
+                        }
+                    )
+                elif source_ids:
+                    event = event.model_copy(
+                        update={
+                            "operation": "animate",
+                            "source_element_ids": source_ids,
+                            "target_element_ids": [],
+                            "create_element_ids": [],
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "目标对象已 active，按 animate 处理而非重复创建",
+                            ),
+                        }
+                    )
+                else:
+                    event = event.model_copy(
+                        update={
+                            "operation": "wait",
+                            "target_element_ids": [],
+                            "create_element_ids": [],
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "目标对象已 active 且没有新增对象，按空操作处理",
+                            ),
+                        }
+                    )
+                repairs.append(
+                    f"事件 {event.event_id} 删除重复 active 对象: "
+                    + ", ".join(sorted(duplicate_active))
+                )
+                changed = True
 
         # ``create_element_ids`` 是 target 变成后续 active 对象的明确声明；
         # 对 transform 来说，这等价于 ReplacementTransform，而不是原地
@@ -249,6 +486,32 @@ def _normalise_technical_lifecycle(
             )
             repairs.append(f"事件 {event.event_id} 的 transform 已规范为 replacement_transform")
             changed = True
+        elif event.operation == "replacement_transform" and (
+            (set(event.source_element_ids) & required_boundary_ids) - target_ids
+        ):
+            # 如果一个 ReplacementTransform 的 source 是场景边界必须
+            # 继续交接的对象，而 target 却只是临时展示对象（例如
+            # ``j_hat -> j_hat_transformed``），替换语义会把 source 从
+            # Scene 中移除，导致最终导出缺失。边界对象的身份优先于模型
+            # 对“替换”的措辞：改为原地 Transform，让 target 只作为
+            # 目标快照，保留 source 的 active 身份。
+            preserved_sources = (set(event.source_element_ids) & required_boundary_ids) - target_ids
+            if preserved_sources:
+                event = event.model_copy(
+                    update={
+                        "operation": "transform",
+                        "create_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "边界导出对象必须保留原身份，已将 replacement_transform 规范为原地 transform",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 保留必需边界对象: "
+                    + ", ".join(sorted(preserved_sources))
+                )
+                changed = True
         elif event.operation == "replacement_transform" and create_ids:
             event = event.model_copy(
                 update={
@@ -262,10 +525,53 @@ def _normalise_technical_lifecycle(
             repairs.append(f"事件 {event.event_id} 删除了重复的 create_element_ids")
             changed = True
 
+        if event.operation in {"animate", "keep"} and not event.source_element_ids:
+            inactive_targets = target_ids - active
+            if inactive_targets:
+                # 模型有时把“显示/高亮一个新元素”写成没有 source
+                # 的 animate/keep。对于没有 source 的事件，唯一可执行
+                # 的语义就是首次引入；将其规范为 fade_in，避免在编译
+                # 时把一个从未 active 的对象当作已存在对象使用。
+                event = event.model_copy(
+                    update={
+                        "operation": "fade_in",
+                        "target_element_ids": sorted(inactive_targets),
+                        "create_element_ids": sorted(inactive_targets),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "无 source 的新对象按首次 fade_in 引入",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 将 inactive target 规范为 fade_in: "
+                    + ", ".join(sorted(inactive_targets))
+                )
+                changed = True
+
         if event.operation in {"fade_out", "uncreate", "remove"}:
             source_ids = set(event.source_element_ids)
             remove_ids = set(event.remove_element_ids)
             referenced_exit_ids = source_ids | remove_ids
+            if not referenced_exit_ids:
+                event = event.model_copy(
+                    update={
+                        "operation": "wait",
+                        "target_element_ids": [],
+                        "create_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "退出事件没有对象引用，按空操作处理",
+                        ),
+                    }
+                )
+                repairs.append(f"事件 {event.event_id} 的空退出操作已规范为 wait")
+                changed = True
+                # 空退出事件不改变 active 集合，直接进入后续统一的事件
+                # 规范化和状态模拟。
+                source_ids = set()
+                remove_ids = set()
+                referenced_exit_ids = set()
             inactive = referenced_exit_ids - active
             protected = referenced_exit_ids & required_boundary_ids
             optional_inactive = inactive - required_boundary_ids
@@ -344,16 +650,119 @@ def _normalise_technical_lifecycle(
         elif event.operation in {"fade_out", "uncreate", "remove"}:
             active.difference_update(set(event.source_element_ids) or set(event.remove_element_ids))
         active.difference_update(event.remove_element_ids)
+        for synthetic in synthetic_events.get(index, []):
+            active.update(set(synthetic.target_element_ids) | set(synthetic.create_element_ids))
 
     if not changed:
         return spec, ()
     # ``ordered_events`` 只影响状态模拟，不改变模型输出的原始事件顺序；
     # 使用原始下标而不是 event_id，避免错误的重复 ID 被兼容层悄悄合并，
     # 让后续确定性编译器仍能报告重复事件。
-    animations = [
-        normalized_events.get(index, event) for index, event in enumerate(spec.animations)
-    ]
+    animations: list[TechnicalAnimation] = []
+    for index, event in enumerate(spec.animations):
+        animations.extend(synthetic_events.get(index, []))
+        animations.append(normalized_events.get(index, event))
     return spec.model_copy(update={"animations": animations}), tuple(repairs)
+
+
+def _ensure_planned_removals_exit(
+    spec: TechnicalSpec,
+    removed_ids: set[str],
+    *,
+    duration_seconds: float,
+) -> tuple[TechnicalSpec, tuple[str, ...]]:
+    """为计划明确要求退出、但 Technical Planner 漏写的对象补退出事件。
+
+    ``elements_to_remove`` 是场景边界合同，不应因为模型漏填一个
+    ``fade_out`` 事件而把对象错误地带到场景末尾。这里仅补机械上确定的
+    inherited 对象；非法的移除声明仍交给编译器报告，避免掩盖计划错误。
+    """
+
+    if not removed_ids:
+        return spec, ()
+    object_ids = {item.element_id for item in spec.objects}
+    initially_active = {item.element_id for item in spec.objects if item.initially_active}
+    removable_ids = removed_ids & object_ids & initially_active
+    if not removable_ids:
+        return spec, ()
+    exited_ids = {
+        element_id
+        for event in spec.animations
+        if event.operation in {"fade_out", "uncreate", "remove"}
+        for element_id in {*event.source_element_ids, *event.remove_element_ids}
+    }
+    missing = removable_ids - exited_ids
+    if not missing:
+        return spec, ()
+
+    event_ids = {event.event_id for event in spec.animations}
+    event_id = "remove_planned_elements"
+    suffix = 2
+    while event_id in event_ids:
+        event_id = f"remove_planned_elements_{suffix}"
+        suffix += 1
+    tail = min(1.0, max(0.1, duration_seconds * 0.1))
+    end_seconds = max(tail, duration_seconds)
+    event = TechnicalAnimation(
+        event_id=event_id,
+        start_seconds=max(0.0, end_seconds - tail),
+        end_seconds=end_seconds,
+        operation="fade_out",
+        source_element_ids=sorted(missing),
+        remove_element_ids=sorted(missing),
+        api_notes="根据 ScenePlan.elements_to_remove 补齐 inherited 对象的退出动画",
+    )
+    return (
+        spec.model_copy(update={"animations": [*spec.animations, event]}),
+        ("为计划移除但未声明退出事件的元素补齐 fade_out: " + ", ".join(sorted(missing)),),
+    )
+
+
+def _ensure_required_export_introductions(
+    spec: TechnicalSpec,
+    *,
+    required_exports: set[str],
+    inherited_ids: set[str],
+    duration_seconds: float,
+) -> tuple[TechnicalSpec, tuple[str, ...]]:
+    """为遗漏 introducer 的必需新元素补一条最小淡入事件。
+
+    ``export_element_ids`` 是场景边界合同。模型偶尔会把必需的新元素列入
+    objects/export，却完全忘记在 animations 中引入它，导致生命周期编译器
+    在最终状态报告“没有保留导出元素”。元素本身和其导出资格都来自
+    ScenePlan，因此补一条 ``fade_in`` 只是在恢复同一合同的确定性动作，
+    不会创造新的教学对象或数学内容。
+    """
+
+    introduced: set[str] = set()
+    for event in spec.animations:
+        if event.operation in {"create", "write", "fade_in", "add"}:
+            introduced.update(event.target_element_ids)
+            introduced.update(event.create_element_ids)
+        elif event.operation == "replacement_transform":
+            introduced.update(event.target_element_ids)
+    missing = required_exports - inherited_ids - introduced
+    if not missing:
+        return spec, ()
+    existing_ids = {event.event_id for event in spec.animations}
+    event_id = "ensure_required_exports"
+    suffix = 1
+    while event_id in existing_ids:
+        suffix += 1
+        event_id = f"ensure_required_exports_{suffix}"
+    event = TechnicalAnimation(
+        event_id=event_id,
+        start_seconds=0.0,
+        end_seconds=min(2.0, max(0.1, duration_seconds)),
+        operation="fade_in",
+        target_element_ids=sorted(missing),
+        create_element_ids=sorted(missing),
+        api_notes="根据 ScenePlan 必需导出合同补齐遗漏的元素引入",
+    )
+    return (
+        spec.model_copy(update={"animations": [event, *spec.animations]}),
+        ("为必需导出元素补齐 fade_in: " + ", ".join(sorted(missing)),),
+    )
 
 
 def normalize_technical_spec_contract(
@@ -379,6 +788,82 @@ def normalize_technical_spec_contract(
         repairs.append("removed_element_ids 已与 ScenePlan.elements_to_remove 对齐")
 
     inherited_ids = {item.element_id for item in plan.inherited_elements}
+    declared_object_ids = (
+        inherited_ids | {item.element_id for item in plan.new_elements} | set(expected_removed)
+    )
+    has_structured_contract = bool(
+        plan.inherited_elements or plan.new_elements or plan.elements_to_remove or plan.handoff
+    )
+    unknown_object_ids = (
+        {item.element_id for item in spec.objects} - declared_object_ids
+        if has_structured_contract
+        else set()
+    )
+    normalized_objects = list(spec.objects)
+    if unknown_object_ids:
+        normalized_objects = []
+        dropped_dependencies = False
+        for item in spec.objects:
+            if item.element_id in unknown_object_ids:
+                continue
+            dependencies = [
+                dependency
+                for dependency in item.dependencies
+                if dependency not in unknown_object_ids
+            ]
+            normalized_item = item
+            if dependencies != item.dependencies:
+                normalized_item = item.model_copy(update={"dependencies": dependencies})
+                dropped_dependencies = True
+            normalized_objects.append(normalized_item)
+        updates["objects"] = normalized_objects
+        repairs.append(
+            "删除 TechnicalSpec 中未在 ScenePlan 声明的对象: "
+            + ", ".join(sorted(unknown_object_ids))
+        )
+        if dropped_dependencies:
+            repairs.append("删除对象依赖中的过期 element_id")
+
+        normalized_animations = []
+        for event in spec.animations:
+            event_updates: dict[str, object] = {}
+            for field_name in (
+                "source_element_ids",
+                "target_element_ids",
+                "create_element_ids",
+                "remove_element_ids",
+            ):
+                values = getattr(event, field_name)
+                filtered = [value for value in values if value not in unknown_object_ids]
+                if filtered != values:
+                    event_updates[field_name] = filtered
+            normalized_event = event.model_copy(update=event_updates) if event_updates else event
+            referenced_ids = {
+                element_id
+                for field_name in (
+                    "source_element_ids",
+                    "target_element_ids",
+                    "create_element_ids",
+                    "remove_element_ids",
+                )
+                for element_id in getattr(normalized_event, field_name)
+            }
+            if event_updates and not referenced_ids and normalized_event.operation != "wait":
+                normalized_event = normalized_event.model_copy(
+                    update={
+                        "operation": "wait",
+                        "api_notes": _append_api_repair_note(
+                            normalized_event.api_notes,
+                            "过期对象已移除，该事件按空操作处理",
+                        ),
+                    }
+                )
+            if event_updates:
+                repairs.append(f"事件 {event.event_id} 删除过期对象引用")
+            normalized_animations.append(normalized_event)
+        updates["animations"] = normalized_animations
+
+    objects_to_normalize = normalized_objects
     normalized_objects = []
     object_changed = False
     expected_exports = [
@@ -389,7 +874,7 @@ def normalize_technical_spec_contract(
     if spec.export_element_ids != expected_exports:
         updates["export_element_ids"] = expected_exports
         repairs.append("export_element_ids 已与计划中的必需边界元素对齐")
-    for item in spec.objects:
+    for item in objects_to_normalize:
         expected_active = item.element_id in inherited_ids
         expected_exported = item.element_id in expected_exports
         item_updates: dict[str, object] = {}
@@ -403,14 +888,59 @@ def normalize_technical_spec_contract(
         else:
             normalized_item = item
         normalized_objects.append(normalized_item)
-    if object_changed:
+    if object_changed or unknown_object_ids:
         updates["objects"] = normalized_objects
         repairs.append("对象的 initially_active/exported 已与场景边界合同对齐")
+    allowed_claim_ids = set(plan.claim_ids)
+    normalized_animations = list(
+        (
+            event.model_copy(
+                update={
+                    "claim_ids": [
+                        claim_id for claim_id in event.claim_ids if claim_id in allowed_claim_ids
+                    ]
+                }
+            )
+            if any(claim_id not in allowed_claim_ids for claim_id in event.claim_ids)
+            else event
+        )
+        for event in spec.animations
+    )
+    if normalized_animations != list(spec.animations):
+        updates["animations"] = normalized_animations
+        repairs.append("TechnicalSpec 动画断言已与 ScenePlan.claim_ids 对齐")
+    if allowed_claim_ids and normalized_animations:
+        covered_claim_ids = {
+            claim_id for event in normalized_animations for claim_id in event.claim_ids
+        }
+        missing_claim_ids = allowed_claim_ids - covered_claim_ids
+        if missing_claim_ids:
+            target_index = max(
+                range(len(normalized_animations)),
+                key=lambda index: (
+                    normalized_animations[index].operation != "wait",
+                    normalized_animations[index].end_seconds,
+                ),
+            )
+            target = normalized_animations[target_index]
+            normalized_animations[target_index] = target.model_copy(
+                update={"claim_ids": [*target.claim_ids, *sorted(missing_claim_ids)]}
+            )
+            updates["animations"] = normalized_animations
+            repairs.append(
+                "为技术动画补齐当前场景数学断言: " + ", ".join(sorted(missing_claim_ids))
+            )
     if renderer is not None and spec.renderer != renderer:
         updates["renderer"] = renderer
         repairs.append(f"TechnicalSpec.renderer 已固定为 {renderer}")
 
     normalized_spec = spec.model_copy(update=updates) if updates else spec
+    normalized_spec, removal_repairs = _ensure_planned_removals_exit(
+        normalized_spec,
+        set(expected_removed),
+        duration_seconds=plan.duration_seconds,
+    )
+    repairs.extend(removal_repairs)
     required_boundary_ids = {
         item.element_id
         for item in [*plan.inherited_elements, *plan.new_elements]
@@ -421,6 +951,13 @@ def normalize_technical_spec_contract(
         required_boundary_ids=required_boundary_ids,
     )
     repairs.extend(lifecycle_repairs)
+    normalized_spec, introduction_repairs = _ensure_required_export_introductions(
+        normalized_spec,
+        required_exports=set(expected_exports),
+        inherited_ids=inherited_ids,
+        duration_seconds=plan.duration_seconds,
+    )
+    repairs.extend(introduction_repairs)
     if normalized_spec is spec and not repairs:
         return spec, ()
     return normalized_spec, tuple(repairs)
@@ -472,6 +1009,17 @@ def compile_technical_spec(
             + ", ".join(sorted(invalid_removed))
         )
     declared = (inherited | _ids(plan.new_elements)) - removed
+    has_structured_contract = bool(
+        plan.inherited_elements or plan.new_elements or plan.elements_to_remove or plan.handoff
+    )
+    unknown_object_declarations = (
+        object_id_set - (declared | removed) if has_structured_contract else set()
+    )
+    if unknown_object_declarations:
+        errors.append(
+            "TechnicalSpec.objects 包含未在 ScenePlan 声明的对象: "
+            + ", ".join(sorted(unknown_object_declarations))
+        )
     missing_object_declarations = (declared | removed) - object_id_set
     if missing_object_declarations:
         errors.append(
@@ -571,6 +1119,7 @@ def compile_technical_spec(
             errors.append("OpenGL TechnicalSpec 不能要求 camera.frame 或 MovingCameraScene")
 
     active: set[str] = {item.element_id for item in spec.objects if item.initially_active}
+    exited: set[str] = set()
     undeclared_initial = active - inherited
     if undeclared_initial:
         errors.append(
@@ -593,10 +1142,12 @@ def compile_technical_spec(
         targets = set(event.target_element_ids)
         creates = set(event.create_element_ids)
         removes = set(event.remove_element_ids)
-        if creates & removed:
+        reintroduced_removed = creates & removed & exited
+        invalid_removed_creates = (creates & removed) - reintroduced_removed
+        if invalid_removed_creates:
             errors.append(
                 f"事件 {event.event_id} 重新创建了计划移除元素: "
-                + ", ".join(sorted(creates & removed))
+                + ", ".join(sorted(invalid_removed_creates))
             )
         if removes & exports:
             errors.append(
@@ -623,6 +1174,7 @@ def compile_technical_spec(
                 )
             if event.operation == "replacement_transform":
                 active.difference_update(sources)
+                exited.update(sources)
                 active.update(targets)
             # Transform 会原地改变 source Mobject；target 只是目标快照，
             # 不会自动成为 Scene 中可继续操作的对象。
@@ -636,6 +1188,7 @@ def compile_technical_spec(
                     + ", ".join(sorted(exit_ids - active))
                 )
             active.difference_update(exit_ids)
+            exited.update(exit_ids)
         elif event.operation in {"animate", "keep"}:
             if sources - active:
                 errors.append(
@@ -681,10 +1234,14 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
 1. 所有对象使用稳定的 element_id 和 variable_name；继承对象设置 initially_active=true；
    临时步骤也要列入 objects，但 exported=false。
    同时填写 visual_role、z_index 和可估算的宽高，供布局审查使用。
+   `objects[].element_id` 必须严格来自当前 ScenePlan 的 inherited_elements、new_elements
+   或 elements_to_remove；计划重规划后不得保留上一版的旧标题、旧对象或其他过期 ID。
 2. export_element_ids 只能包含场景结束时仍存在、且 ScenePlan 合同要求交接的对象。
    removed_element_ids 必须逐项对应 ScenePlan.elements_to_remove；不能自行推断、遗漏或新增。
 3. 每个动画事件必须明确 source_element_ids、target_element_ids、create_element_ids 和
    remove_element_ids；Transform/ReplacementTransform 不能引用不存在或尚未出现的对象。
+   新对象不能同时出现在 Transform 的 source 中；若要在同一时间段引入新对象，
+   请另建一个 fade_in/create 事件，或只把它放在 target/create 字段。
 4. 已经 FadeOut、Uncreate 或 ReplacementTransform 移除的对象不能在后续事件中继续使用。
    Transform 是原地变换：source 仍然是 active 对象，target 只是目标快照；只有
    ReplacementTransform 才会让 target 成为后续可操作对象。使用 ReplacementTransform
@@ -834,7 +1391,8 @@ class TechnicalPlannerAgent(BaseAgent):
                 "RAG Reference Context",
                 f'<rag_context stage="technical">\n{rag_context}\n</rag_context>',
                 priority=10,
-                max_chars=settings.RAG_MAX_CONTEXT_CHARS,
+                max_chars=settings.RAG_MAX_CONTEXT_CHARS + 512,
+                atomic=True,
             ),
             PromptSection(
                 "输出要求",
@@ -860,6 +1418,7 @@ class TechnicalPlannerAgent(BaseAgent):
             system_prompt=f"{TECHNICAL_PLANNER_SYSTEM_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,
             response_model=TechnicalSpec,
+            max_tokens=settings.LLM_TECHNICAL_MAX_TOKENS,
             stream=stream,
         )
         if renderer is not None and spec.renderer != renderer:

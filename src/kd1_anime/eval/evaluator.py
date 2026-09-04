@@ -10,6 +10,7 @@ from datetime import datetime
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.eval.code_eval import CodeEvaluator
@@ -420,9 +421,29 @@ class Evaluator:
             run_id=run_id,
             metadata={"run_dir": str(run_dir), "description": description},
         )
-        code_files = sorted((run_dir / "scenes").glob("scene_*.py"))
-        if not code_files:
-            code_files = sorted(run_dir.glob("scene_*.py"))
+        if manifest is not None:
+            # 运行评估必须绑定清单中的确切代码身份，不能扫描当前目录中
+            # 可能由用户后来放入的 scene_*.py。
+            code_files: list[Path] = []
+            for scene_id, scene in sorted(manifest.scenes.items()):
+                if not scene.code_file or not scene.code_sha256:
+                    result.add_error(f"code:scene_{scene_id}", "清单缺少场景代码路径或哈希")
+                    continue
+                try:
+                    code_file = restore_run_path(run_dir, scene.code_file)
+                    expected = (run_dir / "scenes" / f"scene_{scene_id}.py").resolve()
+                    if code_file != expected or code_file.is_symlink() or not code_file.is_file():
+                        raise ValueError("清单代码路径不是可信的规范场景文件")
+                    if sha256_file(code_file) != scene.code_sha256:
+                        raise ValueError("场景代码哈希与清单不一致")
+                except (OSError, ValueError) as exc:
+                    result.add_error(f"code:scene_{scene_id}", str(exc))
+                    continue
+                code_files.append(code_file)
+        else:
+            code_files = sorted((run_dir / "scenes").glob("scene_*.py"))
+            if not code_files:
+                code_files = sorted(run_dir.glob("scene_*.py"))
         for code_file in code_files:
             try:
                 for score in self.code_evaluator.evaluate(
@@ -438,41 +459,66 @@ class Evaluator:
             final_video = None
             manifest_video_rejected = False
             if manifest and manifest.final_video:
-                candidate = Path(manifest.final_video).expanduser().resolve()
-                run_root = run_dir.resolve()
-                allowed_external = Path(manifest.output_path).expanduser().resolve()
-                try:
-                    candidate.relative_to(run_root)
-                    is_allowed = True
-                except ValueError:
-                    is_allowed = candidate == allowed_external
-                if not is_allowed:
+                raw_candidate = Path(manifest.final_video).expanduser()
+                if raw_candidate.is_symlink():
                     manifest_video_rejected = True
-                    result.add_error("visual", "清单中的最终视频路径不在允许范围内")
-                elif not candidate.is_file():
-                    manifest_video_rejected = True
-                    result.add_error("visual", f"清单中的最终视频不存在: {candidate}")
+                    result.add_error("visual", "清单中的最终视频不能是符号链接")
                 else:
+                    candidate = raw_candidate.resolve()
+                    run_root = run_dir.resolve()
+                    allowed_external = Path(manifest.output_path).expanduser().resolve()
                     try:
-                        hash_matches = not manifest.final_video_sha256 or (
-                            sha256_file(candidate) == manifest.final_video_sha256
-                        )
-                    except OSError as exc:
-                        hash_matches = False
+                        candidate.relative_to(run_root)
+                        is_allowed = True
+                    except ValueError:
+                        is_allowed = candidate == allowed_external
+                    if not is_allowed:
                         manifest_video_rejected = True
-                        result.add_error("visual", f"读取最终视频失败，拒绝视觉评估: {exc}")
-                    if not hash_matches and "visual" not in result.errors:
+                        result.add_error("visual", "清单中的最终视频路径不在允许范围内")
+                    elif not candidate.is_file():
                         manifest_video_rejected = True
-                        result.add_error("visual", "清单中的最终视频哈希不匹配，拒绝视觉评估")
-                    if hash_matches:
-                        final_video = candidate
+                        result.add_error("visual", f"清单中的最终视频不存在: {candidate}")
+                    else:
+                        try:
+                            hash_matches = not manifest.final_video_sha256 or (
+                                sha256_file(candidate) == manifest.final_video_sha256
+                            )
+                        except OSError as exc:
+                            hash_matches = False
+                            manifest_video_rejected = True
+                            result.add_error("visual", f"读取最终视频失败，拒绝视觉评估: {exc}")
+                        if not hash_matches and "visual" not in result.errors:
+                            manifest_video_rejected = True
+                            result.add_error("visual", "清单中的最终视频哈希不匹配，拒绝视觉评估")
+                        if hash_matches:
+                            final_video = candidate
             if final_video is None and not manifest_video_rejected:
                 candidate = run_dir / "output_final.mp4"
-                if candidate.is_file():
-                    final_video = candidate
+                if candidate.is_symlink():
+                    result.add_error("visual", "fallback 最终视频不能是符号链接")
+                    manifest_video_rejected = True
+                elif candidate.is_file():
+                    try:
+                        candidate_hash = sha256_file(candidate)
+                    except OSError as exc:
+                        result.add_error("visual", f"读取 fallback 最终视频失败: {exc}")
+                        manifest_video_rejected = True
+                    else:
+                        if manifest is not None and not manifest.final_video_sha256:
+                            result.add_error("visual", "清单没有最终视频哈希，拒绝未绑定产物")
+                            manifest_video_rejected = True
+                        elif manifest is not None and candidate_hash != manifest.final_video_sha256:
+                            result.add_error("visual", "fallback 最终视频哈希与清单不一致")
+                            manifest_video_rejected = True
+                        else:
+                            final_video = candidate
             if final_video:
                 try:
-                    frames = self.extract_video_frames(final_video, run_dir / "eval_frames")
+                    video_hash = sha256_file(final_video)
+                    samples_dir = (
+                        run_dir / "eval_frames" / f"manual_{video_hash[:12]}_{uuid4().hex[:8]}"
+                    )
+                    frames = self.extract_video_frames(final_video, samples_dir)
                     visual_description = description or (manifest.user_prompt if manifest else "")
                     scene_context = (
                         json.dumps(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -20,6 +21,7 @@ from kd1_anime.config import (
     settings,
 )
 from kd1_anime.rag.chunker import (
+    CHUNKER_VERSION,
     SourceChunk,
     chunk_file,
     iter_source_files,
@@ -34,7 +36,8 @@ from kd1_anime.rag.models import (
     RagStatus,
     RetrievedChunk,
 )
-from kd1_anime.rag.store import RagIndex
+from kd1_anime.rag.store import RagIndex, VerifiedIndexSnapshot
+from kd1_anime.security import redact_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,18 +102,45 @@ class RagService:
             base_url=self.config.RAG_EMBEDDING_BASE_URL,
             model=self.config.RAG_EMBEDDING_MODEL,
             timeout=self.config.RAG_EMBEDDING_TIMEOUT,
+            trust_env=self.config.RAG_TRUST_ENV,
         )
         self.reranker = RerankerClient(
             api_key=self.config.RAG_RERANK_API_KEY,
             base_url=self.config.RAG_RERANK_BASE_URL,
             model=self.config.RAG_RERANK_MODEL,
             timeout=self.config.RAG_RERANK_TIMEOUT,
+            trust_env=self.config.RAG_TRUST_ENV,
         )
         self._semaphore = rag_semaphore or threading.BoundedSemaphore(
             max(1, self.config.RAG_PARALLEL_WORKERS)
         )
         self._cache_lock = threading.Lock()
         self._query_cache: dict[tuple[object, ...], RagSearchResult] = {}
+        self._verified_snapshot: tuple[tuple[int, int, int], VerifiedIndexSnapshot] | None = None
+
+    def _load_verified_snapshot(self, index: RagIndex) -> VerifiedIndexSnapshot:
+        """按 SQLite 文件身份缓存完整校验结果和解包向量。"""
+
+        try:
+            stat = index.path.stat()
+        except OSError:
+            raise
+        identity = (int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+        with self._cache_lock:
+            cached = self._verified_snapshot
+            if cached is not None and cached[0] == identity:
+                return cached[1]
+        snapshot = index.load_verified()
+        try:
+            after = index.path.stat()
+            after_identity = (int(after.st_ino), int(after.st_size), int(after.st_mtime_ns))
+        except OSError:
+            raise
+        if after_identity != identity:
+            raise ValueError("RAG 索引在完整性校验期间发生变化，请重试")
+        with self._cache_lock:
+            self._verified_snapshot = (identity, snapshot)
+        return snapshot
 
     def _migrate_legacy_index(self) -> None:
         """把旧默认索引复制到新的应用目录；显式路径不受影响。"""
@@ -181,7 +211,7 @@ class RagService:
         current_source_sha256: str | None = None
         try:
             if self.index_path.is_file():
-                info = RagIndex(self.index_path).verify_integrity()
+                info = self._load_verified_snapshot(RagIndex(self.index_path)).info
                 if (
                     self.embedding_configured
                     and info.embedding_model != self.config.RAG_EMBEDDING_MODEL
@@ -194,6 +224,13 @@ class RagService:
                 ):
                     index_stale = True
                     index_error = "知识库源文件已变化，请重新建立 RAG 索引"
+                if (
+                    info.chunker_version != CHUNKER_VERSION
+                    or info.chunk_size != self.config.RAG_CHUNK_SIZE
+                    or info.chunk_overlap != self.config.RAG_CHUNK_OVERLAP
+                ):
+                    index_stale = True
+                    index_error = "RAG 索引分块配置已变化，请重新建立 RAG 索引"
         except (OSError, ValueError) as exc:
             index_error = str(exc)
             index_stale = "索引来源目录" in index_error
@@ -280,6 +317,17 @@ class RagService:
             ),
         )
 
+    def _safe_error(self, error: object) -> str:
+        """把外部 Embedding/Reranker 异常转换为可写入收据的文本。"""
+
+        return redact_text(
+            str(error).strip() or type(error).__name__,
+            (
+                self.config.RAG_EMBEDDING_API_KEY,
+                self.config.RAG_RERANK_API_KEY,
+            ),
+        )
+
     def search(
         self,
         query: str,
@@ -317,9 +365,16 @@ class RagService:
 
         try:
             index = RagIndex(self.index_path)
-            info = index.verify_integrity()
+            snapshot = self._load_verified_snapshot(index)
+            info = snapshot.info
             if info.embedding_model != self.config.RAG_EMBEDDING_MODEL:
                 raise ValueError("RAG 索引使用了不同的 Embedding 模型，请重新建立索引")
+            if (
+                info.chunker_version != CHUNKER_VERSION
+                or info.chunk_size != self.config.RAG_CHUNK_SIZE
+                or info.chunk_overlap != self.config.RAG_CHUNK_OVERLAP
+            ):
+                raise ValueError("RAG 索引分块配置已变化，请重新建立索引")
             current_source_sha256 = self._source_digest_for_index(info)
             if current_source_sha256 is not None and current_source_sha256 != info.source_sha256:
                 raise ValueError("RAG 索引已过期：知识库源文件已变化，请重新建立索引")
@@ -345,13 +400,14 @@ class RagService:
                 top_k=effective_top_k,
                 source_kinds=source_kinds,
                 info=info,
+                snapshot=snapshot,
             )
         except (OSError, ValueError, RagClientError) as exc:
             return self._empty_result(
                 query,
                 stage,
                 "degraded",
-                f"Embedding/索引检索失败，已跳过 RAG: {exc}",
+                f"Embedding/索引检索失败，已跳过 RAG: {self._safe_error(exc)}",
                 code_sha256=code_sha256,
                 inherited_elements_sha256=inherited_elements_sha256,
             )
@@ -371,7 +427,9 @@ class RagService:
                     for index, score in reranked
                 ]
             except (ValueError, RagClientError) as exc:
-                warnings.append(f"Reranker 不可用，已使用 Embedding 初排结果: {exc}")
+                warnings.append(
+                    "Reranker 不可用，已使用 Embedding 初排结果: " + self._safe_error(exc)
+                )
         elif not self.reranker_configured:
             warnings.append("Reranker 服务未配置，已使用 Embedding 初排结果")
 
@@ -416,16 +474,25 @@ class RagService:
         used = 0
         limit = self.config.RAG_MAX_CONTEXT_CHARS
         for index, item in enumerate(chunks, start=1):
+            # 使用 JSON 记录边界，避免 source_path 或文档正文中的引号、
+            # ``</reference>`` 等内容破坏 Prompt 标记。每个 reference
+            # 必须完整加入，不能从中间截断。
             block = (
-                f'<reference index="{index}" source="{item.chunk.source_path}" '
-                f'score="{item.rerank_score if item.rerank_score is not None else item.score:.4f}">\n'
-                f"{item.chunk.text}\n"
-                "</reference>"
+                json.dumps(
+                    {
+                        "index": index,
+                        "source": item.chunk.source_path,
+                        "score": item.rerank_score if item.rerank_score is not None else item.score,
+                        "text": item.chunk.text,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                .replace("<", r"\u003c")
+                .replace(">", r"\u003e")
+                .replace("&", r"\u0026")
             )
             if used + len(block) + 2 > limit:
-                remaining = limit - used - 2
-                if remaining > 80:
-                    blocks.append(block[:remaining])
                 break
             blocks.append(block)
             used += len(block) + 2
@@ -495,6 +562,9 @@ class RagService:
             embedding_model=self.config.RAG_EMBEDDING_MODEL,
             source_docs_dir=docs_root,
             source_examples_dir=examples_root,
+            chunker_version=CHUNKER_VERSION,
+            chunk_size=self.config.RAG_CHUNK_SIZE,
+            chunk_overlap=self.config.RAG_CHUNK_OVERLAP,
         )
         return RagIndexBuildResult(
             info=info,
@@ -511,8 +581,14 @@ class RagService:
         """返回与当前源目录、Embedding 模型完全匹配的已有索引。"""
 
         try:
-            info = RagIndex(self.index_path).verify_integrity()
+            info = self._load_verified_snapshot(RagIndex(self.index_path)).info
             if info.embedding_model != self.config.RAG_EMBEDDING_MODEL:
+                return None
+            if (
+                info.chunker_version != CHUNKER_VERSION
+                or info.chunk_size != self.config.RAG_CHUNK_SIZE
+                or info.chunk_overlap != self.config.RAG_CHUNK_OVERLAP
+            ):
                 return None
             if not info.source_docs_dir and not info.source_examples_dir:
                 # 没有源目录元数据的旧索引无法判断外部文件是否变化；只有

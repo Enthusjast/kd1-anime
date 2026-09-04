@@ -14,6 +14,7 @@ from kd1_anime.agents.planner import (
     OUTLINE_DRAFT_PROMPT,
     OUTLINE_PROMPT,
     ContinuityBible,
+    GeometrySpec,
     LessonSpec,
     MathClaim,
     PlannerAgent,
@@ -51,6 +52,25 @@ def sample_outlines():
             math_concept="圆的面积公式",
         ),
     ]
+
+
+def test_geometry_spec_normalizes_legacy_3d_region_fields():
+    geometry = GeometrySpec.model_validate(
+        {
+            "element_id": "error_region",
+            "type": "region",
+            "vertices": [[1, 1, 2], [1.5, 1, 2.5], [1.5, 1.5, 4.5]],
+            "area": 0.5,
+            "description": "曲面与切平面之间的误差区域",
+        }
+    )
+
+    assert geometry.geometry_id == "error_region"
+    assert geometry.shape == "region"
+    assert geometry.coordinate_system == "3d"
+    assert geometry.declared_area is None
+    assert "误差区域" in geometry.target_description
+    assert "三维几何面积" in geometry.target_description
 
 
 class TestSceneOutline:

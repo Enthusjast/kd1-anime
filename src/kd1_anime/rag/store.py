@@ -10,12 +10,19 @@ import sqlite3
 import struct
 import tempfile
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
-from kd1_anime.rag.chunker import SourceChunk, to_rag_chunk
+from kd1_anime.rag.chunker import (
+    CHUNKER_VERSION,
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    SourceChunk,
+    to_rag_chunk,
+)
 from kd1_anime.rag.models import RagChunk, RagIndexInfo, RetrievedChunk
 
-INDEX_SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 2
 _SCHEMA = """
 CREATE TABLE meta (
     key TEXT PRIMARY KEY NOT NULL,
@@ -76,11 +83,17 @@ def _index_digest(
     *,
     embedding_model: str,
     dimension: int,
+    chunker_version: str = CHUNKER_VERSION,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> str:
     pairs = sorted(zip(chunks, vectors, strict=True), key=lambda item: item[0].chunk_id)
     digest = hashlib.sha256()
     digest.update(embedding_model.encode())
     digest.update(str(dimension).encode("ascii"))
+    digest.update(chunker_version.encode("utf-8"))
+    digest.update(str(chunk_size).encode("ascii"))
+    digest.update(str(chunk_overlap).encode("ascii"))
     for chunk, vector in pairs:
         digest.update(chunk.chunk_id.encode("ascii"))
         digest.update(chunk.content_sha256.encode("ascii"))
@@ -97,6 +110,15 @@ def _chunk_id(source_sha256: str, source_kind: str, ordinal: int, content_sha256
     return hashlib.sha256(
         f"{source_sha256}:{source_kind}:{ordinal}:{content_sha256}".encode()
     ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedIndexSnapshot:
+    """完成完整性校验后可复用的文本块和解包向量。"""
+
+    info: RagIndexInfo
+    chunks: tuple[RagChunk, ...]
+    vectors: tuple[tuple[float, ...], ...]
 
 
 class RagIndex:
@@ -119,6 +141,9 @@ class RagIndex:
         embedding_model: str,
         source_docs_dir: Path | None = None,
         source_examples_dir: Path | None = None,
+        chunker_version: str = CHUNKER_VERSION,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> RagIndexInfo:
         if not chunks:
             raise ValueError("没有可写入索引的知识库分块")
@@ -126,6 +151,13 @@ class RagIndex:
             raise ValueError("没有可写入索引的 Embedding")
         if not embedding_model.strip():
             raise ValueError("Embedding 模型名不能为空")
+        if (
+            not chunker_version.strip()
+            or chunk_size < 100
+            or chunk_overlap < 0
+            or chunk_overlap >= chunk_size
+        ):
+            raise ValueError("RAG chunker 配置无效")
         if len(chunks) != len(embeddings):
             raise ValueError("知识库分块数量与 Embedding 数量不一致")
         rag_chunks = [to_rag_chunk(chunk) for chunk in chunks]
@@ -139,6 +171,9 @@ class RagIndex:
             vectors,
             embedding_model=embedding_model,
             dimension=dimension,
+            chunker_version=chunker_version,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
         )
 
         destination = path.expanduser().resolve()
@@ -161,6 +196,9 @@ class RagIndex:
                     "chunk_count": str(len(rag_chunks)),
                     "source_docs_dir": str(source_docs_dir or ""),
                     "source_examples_dir": str(source_examples_dir or ""),
+                    "chunker_version": chunker_version,
+                    "chunk_size": str(chunk_size),
+                    "chunk_overlap": str(chunk_overlap),
                 }
                 connection.executemany(
                     "INSERT INTO meta(key, value) VALUES (?, ?)", metadata.items()
@@ -223,12 +261,15 @@ class RagIndex:
                 chunk_count=int(rows["chunk_count"]),
                 source_docs_dir=rows.get("source_docs_dir", ""),
                 source_examples_dir=rows.get("source_examples_dir", ""),
+                chunker_version=rows.get("chunker_version", ""),
+                chunk_size=int(rows.get("chunk_size", 0)),
+                chunk_overlap=int(rows.get("chunk_overlap", 0)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"RAG 索引元数据不完整: {self.path}") from exc
 
-    def verify_integrity(self) -> RagIndexInfo:
-        """校验元数据和所有分块/向量内容，拒绝被修改的索引。"""
+    def load_verified(self) -> VerifiedIndexSnapshot:
+        """校验并加载索引，返回可复用的文本块和解包向量。"""
 
         info = self.info()
         if info.schema_version != INDEX_SCHEMA_VERSION:
@@ -237,6 +278,7 @@ class RagIndex:
             )
         chunks: list[RagChunk] = []
         vectors: list[bytes] = []
+        decoded_vectors: list[tuple[float, ...]] = []
         try:
             with sqlite3.connect(self.path) as connection:
                 rows = connection.execute(
@@ -271,7 +313,9 @@ class RagIndex:
                             metadata=json.loads(row[7]),
                         )
                     )
-                    vectors.append(_pack_vector(_unpack_vector(row[8], row_dimension)))
+                    vector = _unpack_vector(row[8], row_dimension)
+                    vectors.append(_pack_vector(vector))
+                    decoded_vectors.append(vector)
         except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError(f"RAG 索引完整性校验失败: {self.path}: {exc}") from exc
         if len(chunks) != info.chunk_count:
@@ -283,10 +327,22 @@ class RagIndex:
             vectors,
             embedding_model=info.embedding_model,
             dimension=info.embedding_dimension,
+            chunker_version=info.chunker_version,
+            chunk_size=info.chunk_size,
+            chunk_overlap=info.chunk_overlap,
         )
         if actual_digest != info.index_sha256:
             raise ValueError("RAG 索引内容哈希不一致")
-        return info
+        return VerifiedIndexSnapshot(
+            info=info,
+            chunks=tuple(chunks),
+            vectors=tuple(decoded_vectors),
+        )
+
+    def verify_integrity(self) -> RagIndexInfo:
+        """校验元数据和所有分块/向量内容，拒绝被修改的索引。"""
+
+        return self.load_verified().info
 
     def search(
         self,
@@ -297,11 +353,13 @@ class RagIndex:
     ) -> list[RetrievedChunk]:
         if top_k < 1:
             raise ValueError("top_k 必须大于 0")
+        snapshot = self.load_verified()
         return self._search_verified(
             query_embedding,
             top_k=top_k,
             source_kinds=source_kinds,
-            info=self.verify_integrity(),
+            info=snapshot.info,
+            snapshot=snapshot,
         )
 
     def search_verified(
@@ -311,6 +369,7 @@ class RagIndex:
         top_k: int,
         source_kinds: set[str] | None = None,
         info: RagIndexInfo,
+        snapshot: VerifiedIndexSnapshot | None = None,
     ) -> list[RetrievedChunk]:
         """使用调用方刚完成的完整性校验结果检索。"""
 
@@ -328,6 +387,9 @@ class RagIndex:
             or current_info.embedding_model != info.embedding_model
             or current_info.embedding_dimension != info.embedding_dimension
             or current_info.chunk_count != info.chunk_count
+            or current_info.chunker_version != info.chunker_version
+            or current_info.chunk_size != info.chunk_size
+            or current_info.chunk_overlap != info.chunk_overlap
         ):
             raise ValueError("RAG 索引在校验后发生变化，请重试检索")
         return self._search_verified(
@@ -335,6 +397,7 @@ class RagIndex:
             top_k=top_k,
             source_kinds=source_kinds,
             info=info,
+            snapshot=snapshot,
         )
 
     def _search_verified(
@@ -344,6 +407,7 @@ class RagIndex:
         top_k: int,
         source_kinds: set[str] | None,
         info: RagIndexInfo,
+        snapshot: VerifiedIndexSnapshot | None = None,
     ) -> list[RetrievedChunk]:
         # RagService 在同一次查询前已经完成完整性校验；这里复用结果，避免
         # 对较大的 SQLite 知识库重复扫描全部分块和向量。
@@ -353,33 +417,41 @@ class RagIndex:
         if any(not math.isfinite(value) for value in query):
             raise ValueError("查询向量包含非有限数值")
         candidates: list[RetrievedChunk] = []
+
+        def append_candidate(chunk: RagChunk, vector: Sequence[float]) -> None:
+            if source_kinds is not None and chunk.source_kind not in source_kinds:
+                return
+            candidates.append(RetrievedChunk(chunk=chunk, score=_cosine_similarity(query, vector)))
+
         try:
-            with sqlite3.connect(self.path) as connection:
-                rows = connection.execute(
-                    """
-                    SELECT chunk_id, source_path, source_kind, source_sha256,
-                           content_sha256, ordinal, text, metadata_json,
-                           embedding, embedding_dimension
-                    FROM chunks
-                    """
-                )
-                for row in rows:
-                    if source_kinds is not None and row[2] not in source_kinds:
-                        continue
-                    vector = _unpack_vector(row[8], int(row[9]))
-                    chunk = RagChunk(
-                        chunk_id=row[0],
-                        source_path=row[1],
-                        source_kind=row[2],
-                        source_sha256=row[3],
-                        content_sha256=row[4],
-                        ordinal=int(row[5]),
-                        text=row[6],
-                        metadata=json.loads(row[7]),
+            if snapshot is not None:
+                if snapshot.info.index_sha256 != info.index_sha256:
+                    raise ValueError("RAG 索引快照与元数据不一致")
+                for chunk, vector in zip(snapshot.chunks, snapshot.vectors, strict=True):
+                    append_candidate(chunk, vector)
+            else:
+                with sqlite3.connect(self.path) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT chunk_id, source_path, source_kind, source_sha256,
+                               content_sha256, ordinal, text, metadata_json,
+                               embedding, embedding_dimension
+                        FROM chunks
+                        """
                     )
-                    candidates.append(
-                        RetrievedChunk(chunk=chunk, score=_cosine_similarity(query, vector))
-                    )
+                    for row in rows:
+                        vector = _unpack_vector(row[8], int(row[9]))
+                        chunk = RagChunk(
+                            chunk_id=row[0],
+                            source_path=row[1],
+                            source_kind=row[2],
+                            source_sha256=row[3],
+                            content_sha256=row[4],
+                            ordinal=int(row[5]),
+                            text=row[6],
+                            metadata=json.loads(row[7]),
+                        )
+                        append_candidate(chunk, vector)
         except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
             if isinstance(exc, ValueError) and "维度" in str(exc):
                 raise

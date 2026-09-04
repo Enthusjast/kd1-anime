@@ -80,6 +80,27 @@ def test_healthcheck_failure_redacts_api_key(monkeypatch):
     assert "<redacted>" in str(exc_info.value)
 
 
+def test_default_client_disables_sdk_retries(monkeypatch):
+    """外层重试策略不能与 OpenAI SDK 的隐式重试叠加。"""
+
+    from kd1_anime.agents import base
+
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(base, "OpenAI", FakeClient)
+
+    _ = BaseAgent().client
+
+    assert captured["max_retries"] == 0
+
+
 class PositiveResult(BaseModel):
     value: int
 
@@ -92,6 +113,23 @@ class StubListAgent(BaseAgent):
 def test_json_list_rejects_partially_invalid_output():
     with pytest.raises(RuntimeError, match="拒绝使用残缺结果"):
         StubListAgent().call_llm_json_list("system", "user", PositiveResult)
+
+
+def test_json_list_forwards_stage_token_budget():
+    class CaptureListAgent(BaseAgent):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def call_llm(self, **kwargs):
+            self.calls.append(kwargs)
+            return '{"items":[{"value":1}]}'
+
+    agent = CaptureListAgent()
+    result = agent.call_llm_json_list("system", "user", PositiveResult, max_tokens=1234)
+
+    assert result[0].value == 1
+    assert agent.calls[0]["max_tokens"] == 1234
 
 
 def test_stream_is_closed_when_iteration_fails():
@@ -164,6 +202,43 @@ def test_empty_json_mode_response_falls_back_to_prompt_only(monkeypatch):
     assert calls[0]["stream"] is True
     assert calls[0]["response_format"] == {"type": "json_object"}
     assert "response_format" not in calls[1]
+
+
+def test_call_llm_does_not_mutate_caller_messages_on_compatibility_fallback(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    messages = [
+        {"role": "system", "content": "Return JSON."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "question"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+        },
+    ]
+    original = json.loads(json.dumps(messages))
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if "response_format" in kwargs:
+                return iter([_chunk(finish="stop")])
+            return iter([_chunk('{"ok": true}', finish="stop")])
+
+    completions = FakeCompletions()
+
+    class CompatibleAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    assert CompatibleAgent().call_llm(messages=messages, json_mode=True) == '{"ok": true}'
+    assert messages == original
 
 
 def test_empty_stream_response_gets_max_tokens_boost(monkeypatch):

@@ -143,7 +143,13 @@ class CodeEvaluator:
 
             # 检查危险函数调用
             elif isinstance(node, ast.Call):
-                func_name = node.func.id if isinstance(node.func, ast.Name) else None
+                func_name = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else None
+                )
                 if func_name in self.DANGEROUS_CALLS:
                     result.security_issues.append(
                         f"Line {node.lineno}: Dangerous function call '{func_name}'"

@@ -169,6 +169,7 @@ class LLMRuntimeProfile:
     json_repair_attempts: int
     use_json_mode: bool
     debug: bool
+    trust_env: bool = True
 
     def require(self) -> None:
         """验证端点凭据，不把 secret 写入异常文本。"""
@@ -221,6 +222,13 @@ class Settings(BaseSettings):
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int | None = Field(default=32768, ge=1, le=1_000_000)
+    # 不同阶段的输出复杂度差异很大。默认使用较小的阶段预算，避免计划
+    # 审查/连续性审查为极短 JSON 消耗与代码生成相同的长推理预算；用户
+    # 仍可按模型能力覆盖这些值，LLM_MAX_TOKENS 保留为总配置兼容项。
+    LLM_PLANNING_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
+    LLM_TECHNICAL_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
+    LLM_CODE_MAX_TOKENS: int = Field(default=24576, ge=4096, le=1_000_000)
+    LLM_REVIEW_MAX_TOKENS: int = Field(default=8192, ge=2048, le=1_000_000)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     # 单次 LLM 请求的连接/读取超时(秒)。读取超时对非流式是"等待完整响应"，
     # 对流式是"等待下一个 chunk"——静默流式下 600s 只是兜底，不会拖慢任何请求。
@@ -261,6 +269,10 @@ class Settings(BaseSettings):
         parsed = urlparse(value.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("LLM_BASE_URL 必须是带 http/https scheme 的 URL")
+        if parsed.username or parsed.password:
+            raise ValueError("LLM_BASE_URL 不能把凭据写在 URL 中，请使用 API_KEY")
+        if parsed.fragment:
+            raise ValueError("LLM_BASE_URL 不能包含 URL fragment")
         if any(char in value for char in "\r\n"):
             raise ValueError("LLM_BASE_URL 不能包含换行")
         return value.strip().rstrip("/")
@@ -268,6 +280,10 @@ class Settings(BaseSettings):
     LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
     LLM_PARALLEL_WORKERS: int = Field(default=4, ge=1, le=16)
     LLM_DEBUG: bool = False
+    LLM_TRUST_ENV: bool = Field(
+        default=True,
+        description="是否让 HTTP 客户端读取 HTTP(S)_PROXY 等环境变量",
+    )
     LLM_USE_JSON_MODE: bool = Field(
         default=True,
         description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级",
@@ -305,6 +321,10 @@ class Settings(BaseSettings):
     VISUAL_LLM_USE_JSON_MODE: bool = True
     VISUAL_LLM_PARALLEL_WORKERS: int = Field(default=2, ge=1, le=16)
     VISUAL_LLM_DEBUG: bool = False
+    VISUAL_LLM_TRUST_ENV: bool = Field(
+        default=True,
+        description="视觉 LLM 是否读取 HTTP(S)_PROXY 等环境变量",
+    )
 
     @field_validator("VISUAL_LLM_BASE_URL")
     @classmethod
@@ -317,6 +337,10 @@ class Settings(BaseSettings):
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("VISUAL_LLM_BASE_URL 必须是带 http/https scheme 的 URL")
+        if parsed.username or parsed.password:
+            raise ValueError("VISUAL_LLM_BASE_URL 不能把凭据写在 URL 中，请使用 API_KEY")
+        if parsed.fragment:
+            raise ValueError("VISUAL_LLM_BASE_URL 不能包含 URL fragment")
         if any(char in value for char in "\r\n"):
             raise ValueError("VISUAL_LLM_BASE_URL 不能包含换行")
         return value.rstrip("/")
@@ -345,6 +369,10 @@ class Settings(BaseSettings):
     RAG_RERANK_BASE_URL: str = ""
     RAG_RERANK_MODEL: str = ""
     RAG_RERANK_TIMEOUT: float = Field(default=60.0, ge=1.0, le=3_600.0)
+    RAG_TRUST_ENV: bool = Field(
+        default=True,
+        description="RAG HTTP 客户端是否读取 HTTP(S)_PROXY 等环境变量",
+    )
     RAG_TOP_K: int = Field(default=8, ge=1, le=100)
     RAG_RERANK_TOP_N: int = Field(default=4, ge=1, le=100)
     RAG_MAX_CONTEXT_CHARS: int = Field(default=12_000, ge=500, le=50_000)
@@ -381,6 +409,10 @@ class Settings(BaseSettings):
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("RAG 服务 URL 必须是带 http/https scheme 的 URL")
+        if parsed.username or parsed.password:
+            raise ValueError("RAG 服务 URL 不能把凭据写在 URL 中，请使用独立 API_KEY")
+        if parsed.fragment:
+            raise ValueError("RAG 服务 URL 不能包含 URL fragment")
         if any(char in value for char in "\r\n"):
             raise ValueError("RAG 服务 URL 不能包含换行")
         return value.rstrip("/")
@@ -441,6 +473,7 @@ class Settings(BaseSettings):
     LOCAL_SMOKE_RENDER_ENABLED: bool = False
     LOCAL_SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     LOCAL_SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
+    LOCAL_SMOKE_RENDER_MEMORY_MB: int = Field(default=4_096, ge=256, le=65_536)
     ALLOW_PARTIAL_OUTPUT: bool = False
     OVERWRITE_OUTPUT: bool = False
     TRANSITION_TYPE: Literal["fade"] = "fade"
@@ -670,6 +703,7 @@ class Settings(BaseSettings):
             json_repair_attempts=self.LLM_JSON_REPAIR_ATTEMPTS,
             use_json_mode=self.LLM_USE_JSON_MODE,
             debug=self.LLM_DEBUG,
+            trust_env=self.LLM_TRUST_ENV,
         )
 
     def visual_llm_profile(self, *, model_override: str | None = None) -> LLMRuntimeProfile:
@@ -696,6 +730,7 @@ class Settings(BaseSettings):
             json_repair_attempts=self.VISUAL_LLM_JSON_REPAIR_ATTEMPTS,
             use_json_mode=self.VISUAL_LLM_USE_JSON_MODE,
             debug=self.VISUAL_LLM_DEBUG,
+            trust_env=self.VISUAL_LLM_TRUST_ENV,
         )
 
 

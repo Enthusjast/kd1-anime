@@ -234,6 +234,25 @@ BANNED_ATTRIBUTE_NAMES = {
 }
 
 SCENE_BASES = {"Scene", "ThreeDScene", "MovingCameraScene"}
+# 这些类需要三维场景的相机/渲染上下文。OpenGL 下把它们放进普通
+# ``Scene`` 是一个确定的类型错误；不要等到远端渲染才由 Reviewer 猜测。
+THREE_D_CONSTRUCTORS = {
+    "Arrow3D",
+    "Cone",
+    "Cube",
+    "Cylinder",
+    "DashedLine3D",
+    "Dot3D",
+    "Line3D",
+    "ParametricSurface",
+    "Polyhedron",
+    "Prism",
+    "Sphere",
+    "Surface",
+    "Tetrahedron",
+    "ThreeDAxes",
+    "Torus",
+}
 # mobject 继承树的根类: manim 只对"子类的基类"做 OpenGL 转换, Mobject/VMobject
 # 这两个根类本身始终是 Cairo 版。场景文件里自定义这些根类的子类, 在 OpenGL
 # 渲染下会得到缺少 should_render 的 Cairo 对象, 渲染时直接 AttributeError。
@@ -443,16 +462,18 @@ class _SafetyVisitor(ast.NodeVisitor):
             node.func.id in BANNED_CALLS or node.func.id in self.dangerous_aliases
         ):
             self.error(node, f"禁止调用 {node.func.id}()")
-        # 检查属性方法调用
-        elif (
-            isinstance(node.func, ast.Attribute)
-            and (
+        # 检查属性方法/模块限定调用。此前这里只检查了
+        # ``os.system`` 这类危险属性，却漏掉了 ``manim.ImageMobject``、
+        # ``manim.SVGMobject`` 和 ``manim.SceneFileWriter`` 等以属性形式
+        # 出现的危险对象；模块别名会让这类调用绕过直接名称黑名单。
+        elif isinstance(node.func, ast.Attribute):
+            if node.func.attr in BANNED_CALLS:
+                self.error(node, f"禁止调用危险对象 {node.func.attr}()")
+            elif (
                 node.func.attr in BANNED_ATTRIBUTE_NAMES
                 or (node.func.attr.startswith("__") and not self._is_super_init(node.func))
-            )
-            and not self._is_scene_remove(node.func)
-        ):
-            self.error(node, f"禁止调用属性方法 {node.func.attr}()")
+            ) and not self._is_scene_remove(node.func):
+                self.error(node, f"禁止调用属性方法 {node.func.attr}()")
 
         # 检查 add_to_preamble 调用并提取模板变量名
         if isinstance(node.func, ast.Attribute) and node.func.attr == "add_to_preamble":
@@ -511,12 +532,45 @@ class _SafetyVisitor(ast.NodeVisitor):
             self.error(node, f"禁止引用危险能力 {node.id!r}")
         self.generic_visit(node)
 
+    def visit_While(self, node: ast.While) -> None:
+        """拒绝最明显的无界循环；运行时资源限制仍是最终防线。"""
+
+        if isinstance(node.test, ast.Constant) and node.test.value is True:
+
+            def has_direct_break(parent: ast.AST) -> bool:
+                for child in ast.iter_child_nodes(parent):
+                    if isinstance(child, ast.Break):
+                        return True
+                    if isinstance(
+                        child,
+                        (
+                            ast.For,
+                            ast.While,
+                            ast.AsyncFor,
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.ClassDef,
+                            ast.Lambda,
+                        ),
+                    ):
+                        continue
+                    if has_direct_break(child):
+                        return True
+                return False
+
+            has_break = has_direct_break(node)
+            if not has_break:
+                self.error(node, "禁止没有 break 的 while True 无界循环")
+        self.generic_visit(node)
+
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if isinstance(node.value, ast.Name) and node.value.id in {"__builtins__", "builtins"}:
             self.error(node, "禁止通过 builtins 下标访问运行时能力")
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in BANNED_CALLS:
+            self.error(node, f"禁止引用危险能力 {node.attr!r}")
         if node.attr in BANNED_ATTRIBUTE_NAMES and not self._is_scene_remove(node):
             self.error(node, f"禁止引用危险属性 {node.attr!r}")
         if node.attr.startswith("__") and not self._is_super_init(node):
@@ -712,6 +766,36 @@ class _SafetyVisitor(ast.NodeVisitor):
             )
             if construct is None:
                 self.error(node, f"Scene 类 {node.name!r} 缺少 construct() 方法")
+            if "ThreeDScene" not in bases:
+                if self.renderer == "opengl":
+                    for call in ast.walk(node):
+                        constructor = (
+                            call.func.id
+                            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                            else call.func.attr
+                            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                            else ""
+                        )
+                        if constructor in THREE_D_CONSTRUCTORS:
+                            self.error(
+                                call,
+                                f"OpenGL 场景使用 {constructor}() 等三维对象时必须继承 "
+                                "ThreeDScene；请将当前场景基类改为 ThreeDScene，"
+                                "不要在普通 Scene 中创建三维对象",
+                            )
+                for call in ast.walk(node):
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self"
+                        and call.func.attr == "set_camera_orientation"
+                    ):
+                        self.error(
+                            call,
+                            "self.set_camera_orientation() 只适用于 ThreeDScene；"
+                            "请将场景继承改为 ThreeDScene 或删除三维相机设置",
+                        )
             # self.camera.frame 检查: 扫描整个类体 (含辅助方法, 不只是 construct)。
             # - OpenGL 渲染器固定使用 OpenGLCamera (没有 frame 属性), 继承
             #   MovingCameraScene 也无效 → 一律禁止相机运镜, 必须删除。
