@@ -34,6 +34,15 @@ class FrameSample(BaseModel):
     path: Path
     timestamp_seconds: float | None = Field(default=None, ge=0)
     image_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    role: Literal[
+        "opening",
+        "first_math_state",
+        "middle",
+        "conclusion",
+        "ending",
+        "transition_boundary",
+        "content",
+    ] = "content"
 
 
 class _Dimension(BaseModel):
@@ -262,6 +271,7 @@ class VisualEvaluator:
             {
                 "frame_id": sample.frame_id,
                 "timestamp_seconds": sample.timestamp_seconds,
+                "role": sample.role,
                 "filename": sample.path.name,
             }
             for sample in samples

@@ -79,6 +79,34 @@ def test_merge_jobs_rejects_unverified_job_without_output_path(tmp_path):
         raise AssertionError("expected RuntimeError")
 
 
+def test_merge_jobs_rejects_duplicate_scene_ids(tmp_path):
+    jobs = [
+        SlurmJob(
+            "1",
+            1,
+            tmp_path / "x1.sh",
+            tmp_path / "o1",
+            tmp_path / "e1",
+            tmp_path / "media1",
+            "Demo1",
+            time.time(),
+        ),
+        SlurmJob(
+            "2",
+            1,
+            tmp_path / "x2.sh",
+            tmp_path / "o2",
+            tmp_path / "e2",
+            tmp_path / "media2",
+            "Demo2",
+            time.time(),
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="重复的 scene_id"):
+        VideoMerger().merge_jobs(jobs, output_path=tmp_path / "output.mp4")
+
+
 def test_existing_output_requires_force(monkeypatch, tmp_path):
     from kd1_anime.config import settings
 

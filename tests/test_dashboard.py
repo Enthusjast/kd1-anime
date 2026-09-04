@@ -18,6 +18,13 @@ class TestSceneStatus:
         assert SceneStatus(scene_id=1, state="completed").color == "green"
         assert SceneStatus(scene_id=1, state="failed").color == "red"
 
+    def test_invalidate_keeps_legacy_code_review_stage_alias(self):
+        status = SceneStatus(scene_id=1, done=["分镜", "编码", "审查", "渲染"])
+
+        status.invalidate_from("审查", ("分镜", "编码", "审查", "渲染"))
+
+        assert status.done == ["分镜", "编码"]
+
 
 class TestSceneDashboard:
     def test_event_mapping(self):
@@ -80,6 +87,32 @@ class TestSceneDashboard:
         assert dash.scenes[1].state == "completed"
         assert dash.scenes[1].done == ["分镜", "编码", "审查", "渲染"]
 
+    def test_plan_review_and_code_review_are_distinct_stages(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("plan_reviewing", {"scene_count": 1})
+        assert dash.stage_label == "计划正确性审查"
+        dash.on_event("scene_detailed", {"scene_id": 1})
+        dash.on_event("scene_plan_reviewing", {"scene_id": 1})
+        assert dash.scenes[1].stage == "计划审查"
+        assert "计划审查⟳" in str(dash.scenes[1].render_row()[2])
+
+        dash.on_event("scene_plan_review_pass", {"scene_id": 1})
+        assert "计划审查" in dash.scenes[1].done
+        dash.on_event("stage_start", {"stage": "technical"})
+        assert dash.stage_label == "技术实现设计"
+        dash.on_event("scene_technical_planning", {"scene_id": 1})
+        assert dash.scenes[1].stage == "技术设计"
+        assert "技术设计⟳" in str(dash.scenes[1].render_row()[2])
+        dash.on_event("scene_technical_ready", {"scene_id": 1})
+        assert "技术设计" in dash.scenes[1].done
+        dash.on_event("scene_coding", {"scene_id": 1})
+        dash.on_event("scene_coded", {"scene_id": 1})
+        dash.on_event("scene_reviewing", {"scene_id": 1})
+        assert dash.scenes[1].stage == "代码审查"
+        assert "代码审查⟳" in str(dash.scenes[1].render_row()[2])
+
     def test_visual_enabled_scene_stays_in_progress_until_visual_gate_accepts(self):
         dash = SceneDashboard()
         dash.live = MagicMock()
@@ -118,6 +151,24 @@ class TestSceneDashboard:
         assert dash.scenes[1].state == "warning"
         assert dash.scenes[1].icon == "⚠"
         assert "未知" in dash.scenes[1].message
+
+    def test_safe_fallback_is_visible_without_marking_scene_complete(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_safe_fallback",
+            {"scene_id": 1, "reason": "几何方案无法验证"},
+        )
+
+        assert dash.scenes[1].safe_fallback_used is True
+        assert dash.scenes[1].state == "warning"
+        assert dash.scenes[1].icon == "⚠"
+        assert "保守方案" in dash.scenes[1].render_row()[3].plain
+
+        dash.on_event("scene_coding", {"scene_id": 1})
+        assert dash.scenes[1].state == "running"
+        assert "保守方案" in dash.scenes[1].render_row()[3].plain
 
     def test_pipeline_row_shows_done_and_current_stages(self):
         dash = SceneDashboard()

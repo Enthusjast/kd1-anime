@@ -227,7 +227,8 @@ class Clarifier:
         except json.JSONDecodeError:
             # LLM 常在长中文 JSON 里输出未转义的原始换行 (Invalid control character),
             # 先修复再解析一次, 否则 READY 会被误判为普通提问而卡在澄清循环。
-            repaired = self.agent._escape_control_chars_in_json(json_str)
+            repaired = self.agent._escape_unescaped_quotes_in_json(json_str)
+            repaired = self.agent._escape_control_chars_in_json(repaired)
             repaired = self.agent._fix_latex_escapes_in_json(repaired)
             repaired = self.agent._close_truncated_json(repaired)
             try:
@@ -332,10 +333,9 @@ class ChatSession:
 
         _setup_terminal()
         try:
-            # 用户选择了"恢复运行"时 _show_banner 返回 True:
-            # 恢复结束 (成功或失败) 后直接退出会话, 不要落入"描述你的需求"新提示。
-            if self._show_banner():
-                return self.exit_code
+            # 恢复运行是显式的 `kd1-anime resume <run-id>` 命令；交互启动
+            # 只显示横幅，不扫描历史运行。
+            self._show_banner()
 
             # 在构造 Agent 前检查完整的 OpenAI-compatible 配置。
             try:
@@ -389,8 +389,12 @@ class ChatSession:
             self.exit_code = 130
             return self.exit_code
 
-    def _show_banner(self) -> bool:
-        """显示欢迎横幅; 返回 True 表示用户选择了恢复运行 (会话应结束)。"""
+    def _show_banner(self) -> None:
+        """显示欢迎横幅并进入新会话。
+
+        恢复运行是显式操作，使用 ``kd1-anime resume <run-id>``；启动交互
+        会话时不扫描历史 manifest，避免旧运行阻塞当前需求输入。
+        """
         banner = Text()
         banner.append("  ╔═══════════════════════════════════════╗\n", style="bold cyan")
         banner.append("  ║       ", style="bold cyan")
@@ -414,134 +418,9 @@ class ChatSession:
         console.print(f"  Embedding 模型: [dim]{embedding_model_name}[/] ([dim]{rag_state}[/])")
         console.print(f"  Reranker 模型: [dim]{reranker_model_name}[/] ([dim]{rag_state}[/])")
 
-        # 检查是否有可恢复的中断运行
-        resumed = self._check_interrupted_runs()
-        if resumed:
-            return True
-
         console.print(
             "\n  输入你想制作的数学动画描述,我会帮你生成.\n  输入 [bold cyan]quit[/] 退出.\n",
         )
-        return False
-
-    def _check_interrupted_runs(self) -> bool:
-        """检查并提示恢复中断的运行; 返回是否选择了恢复 (调用方据此结束会话)。"""
-        try:
-            from kd1_anime.run_store import RunRepository
-
-            repository = RunRepository(settings.WORKSPACE_DIR)
-            manifests = repository.list()
-            if repository.list_errors:
-                console.print(
-                    f"[yellow]警告: 有 {len(repository.list_errors)} 个运行清单无法读取，"
-                    "请使用 kd1-anime status <run-id> 检查。[/]"
-                )
-
-            resumable = []
-            for manifest in manifests:
-                if manifest.status == "interrupted":
-                    resumable.append(manifest)
-                elif manifest.status == "failed":
-                    rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
-                    if manifest.scenes and rendered < len(manifest.scenes):
-                        resumable.append(manifest)
-            resumable = resumable[:10]
-
-            if not resumable:
-                return False
-
-            console.print()
-            console.print(Rule("发现中断的运行", style="yellow"))
-
-            table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
-            table.add_column("#", style="cyan", justify="center")
-            table.add_column("Run ID", style="dim")
-            table.add_column("时间", style="dim")
-            table.add_column("状态", style="yellow")
-            table.add_column("进度", style="green")
-
-            for i, manifest in enumerate(resumable, 1):
-                rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
-                total = len(manifest.scenes)
-                updated = manifest.updated_at.astimezone().strftime("%m-%d %H:%M")
-                status_color = "yellow" if manifest.status == "interrupted" else "red"
-
-                table.add_row(
-                    str(i),
-                    manifest.run_id[:16] + "...",
-                    updated,
-                    f"[{status_color}]{manifest.status}[/]",
-                    f"{rendered}/{total} 场景",
-                )
-
-            console.print(table)
-            console.print()
-
-            choice = input("  输入编号恢复运行 (直接回车跳过): ").strip()
-            if choice.isdigit() and 1 <= int(choice) <= len(resumable):
-                selected = resumable[int(choice) - 1]
-                console.print(f"\n  [cyan]正在恢复运行 {selected.run_id}...[/]")
-                self._resume_run(selected.run_id)
-                return True
-            return False
-        except Exception as e:
-            # 历史清单读取失败不应被当成“没有可恢复运行”，否则用户会
-            # 被静默带入新 Prompt，原运行状态也无法修复。
-            self.exit_code = 1
-            console.print(f"[bold red]检查历史运行失败:[/] {e}", markup=False)
-            return True
-
-    def _resume_run(self, run_id: str) -> bool:
-        """恢复指定的运行 (与 _run_pipeline 一样带 Live 场景仪表盘)"""
-        from kd1_anime.dashboard import SceneDashboard
-        from kd1_anime.orchestrator import Orchestrator
-        from kd1_anime.run_store import RESUME_LLM_STATES, RunRepository
-
-        dashboard = None
-        dashboard_active = False
-        try:
-            # 欢迎页会在检查 LLM 配置之前提供恢复选项；已经进入渲染/合并的
-            # 运行不应因为当前没有 API Key 而无法继续，但仍需 LLM 的阶段要
-            # 在启动 Live 前给出明确的配置错误。
-            manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
-            if manifest.state in RESUME_LLM_STATES:
-                settings.require_llm_key()
-            if manifest.visual_eval_profile.enabled and manifest.status not in {
-                "completed",
-                "dry_run_complete",
-            }:
-                settings.visual_llm_profile(
-                    model_override=manifest.visual_eval_profile.model
-                ).require()
-
-            dashboard = SceneDashboard()
-            dashboard_active = dashboard.start()
-
-            def callback(event: str, data: dict) -> None:
-                if dashboard_active:
-                    dashboard.on_event(event, data)
-                else:
-                    self._pipeline_callback(event, data)
-
-            orchestrator = Orchestrator()
-            final_video = orchestrator.resume(run_id, callback=callback, interactive=True)
-            self._show_completion(final_video)
-            self.exit_code = 0
-            return True
-
-        except KeyboardInterrupt:
-            console.print("\n[yellow]用户中断[/]")
-            self.exit_code = 130
-            return False
-        except Exception as e:
-            console.print(f"\n[bold red]恢复失败:[/] {e}", markup=False)
-            if settings.LLM_DEBUG:
-                console.print_exception()
-            self.exit_code = 1
-            return False
-        finally:
-            if dashboard is not None and dashboard_active:
-                dashboard.stop()
 
     def _get_initial_prompt(self) -> str | None:
         """获取用户的初始需求描述
@@ -787,6 +666,13 @@ class ChatSession:
                 console.print(table)
                 console.print()
 
+            case "plan_reviewing":
+                console.print(Rule("[bold magenta]计划正确性审查[/]", style="magenta"))
+
+            case "continuity_contract_repaired":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]连续性合同已自动修复[/]")
+
             case "scene_detailing":
                 scene_id = data.get("scene_id", "?")
                 title = data.get("title", "")
@@ -795,6 +681,30 @@ class ChatSession:
             case "scene_detailed":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]分镜完成 ✓[/]")
+
+            case "scene_plan_reviewing":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]计划正确性审查中[/]")
+
+            case "scene_plan_review_pass":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]计划审查通过 ✓[/]")
+
+            case "scene_plan_replanned":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]计划已重规划[/]")
+
+            case "scene_plan_review_fail":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]计划审查失败 ✗[/]")
+
+            case "scene_safe_fallback":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]切换为保守教学方案[/]{suffix}"
+                )
 
             case "scene_coding":
                 scene_id = data.get("scene_id", "?")
@@ -872,7 +782,17 @@ class ChatSession:
 
             case "scene_failed":
                 scene_id = data.get("scene_id", "?")
-                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]渲染失败 ✗[/]")
+                category = {
+                    "planning": "计划",
+                    "continuity": "连续性",
+                    "coding": "编码",
+                    "review": "代码审查",
+                    "render": "渲染",
+                    "infrastructure": "环境",
+                    "llm": "模型",
+                    "system": "系统",
+                }.get(data.get("category", ""), "流水线")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]{category}失败 ✗[/]")
 
             case "scene_fixing":
                 scene_id = data.get("scene_id", "?")

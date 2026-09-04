@@ -6,7 +6,12 @@ import pytest
 
 from kd1_anime.config import Settings
 from kd1_anime.rag import RagService
-from kd1_anime.rag.chunker import SourceChunk, chunk_file, iter_source_files
+from kd1_anime.rag.chunker import (
+    SourceChunk,
+    chunk_file,
+    iter_source_files,
+    source_manifest_digest,
+)
 from kd1_anime.rag.clients import EmbeddingClient, RagClientError, RerankerClient
 from kd1_anime.rag.store import RagIndex
 
@@ -194,6 +199,59 @@ def test_rag_service_returns_context_and_receipt(tmp_path, monkeypatch):
     assert "Circle API" in result.context
     assert str(config.RAG_DOCS_DIR) not in result.context
     assert result.receipt.chunks[0].content_sha256
+
+
+def test_source_manifest_digest_matches_index_source_digest(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "api.md").write_text("# Circle API\nUse Circle().", encoding="utf-8")
+
+    chunks = chunk_file(docs / "api.md", "manim_doc", display_path="manim_doc/api.md")
+    info = RagIndex.build(
+        tmp_path / "index.sqlite3",
+        chunks,
+        [[1.0, 0.0] for _ in chunks],
+        embedding_model="embed-test",
+    )
+
+    assert source_manifest_digest(docs, None) == info.source_sha256
+
+
+def test_rag_service_rejects_stale_index_after_source_change(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.RAG_DOCS_DIR.mkdir()
+    source = config.RAG_DOCS_DIR / "api.md"
+    source.write_text("# Original API\nUse Circle().", encoding="utf-8")
+    service = RagService(config)
+    monkeypatch.setattr(service.embedding, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(service.reranker, "rerank", lambda *args, **kwargs: [(0, 0.9)])
+    service.build_index()
+
+    source.write_text("# Changed API\nUse Square().", encoding="utf-8")
+
+    status = service.runtime_status()
+    result = service.search("API", stage="code")
+
+    assert status["index_stale"] is True
+    assert status["status"] == "degraded"
+    assert result.receipt.status == "degraded"
+    assert "过期" in result.receipt.warning
+
+
+def test_rag_service_rejects_index_built_from_different_source_roots(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    indexed_docs = tmp_path / "indexed-docs"
+    indexed_docs.mkdir()
+    (indexed_docs / "api.md").write_text("# Indexed API", encoding="utf-8")
+    service = RagService(config)
+    monkeypatch.setattr(service.embedding, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    service.build_index(docs_dir=indexed_docs, examples_dir=None)
+
+    status = service.runtime_status()
+
+    assert status["status"] == "degraded"
+    assert status["index_stale"] is True
+    assert "来源目录" in status["index_error"]
 
 
 def test_rag_service_accepts_relative_source_directory(tmp_path, monkeypatch):

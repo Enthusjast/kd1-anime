@@ -13,6 +13,7 @@ from kd1_anime.agents.validator import (
     ALLOWED_IMPORT_ROOTS,
     BANNED_ATTRIBUTE_NAMES,
     BANNED_CALLS,
+    validate_manim_code,
 )
 
 from .metrics import EvalMetric, QualityScore
@@ -24,6 +25,7 @@ class CodeAnalysisResult:
 
     syntax_valid: bool
     syntax_errors: list[str]
+    validation_errors: list[str]
     import_count: int
     class_count: int
     function_count: int
@@ -55,6 +57,7 @@ class CodeEvaluator:
         result = CodeAnalysisResult(
             syntax_valid=True,
             syntax_errors=[],
+            validation_errors=[],
             import_count=0,
             class_count=0,
             function_count=0,
@@ -88,6 +91,11 @@ class CodeEvaluator:
 
         # 计算复杂度
         result.complexity_score = self._calculate_complexity(tree)
+
+        # 评估结果必须和真正的提交前安全校验保持一致；仅凭 AST 统计
+        # 可能把缺少 Scene、非法 renderer API 或危险能力的代码评为高分。
+        validation = validate_manim_code(code)
+        result.validation_errors = validation.errors
 
         return result
 
@@ -195,16 +203,21 @@ class CodeEvaluator:
         scores = []
 
         # 语法正确性评分
-        syntax_score = 5 if analysis.syntax_valid else 1
+        syntax_score = 5 if analysis.syntax_valid and not analysis.validation_errors else 1
         syntax_justification = (
-            "Code has valid syntax" if analysis.syntax_valid else "; ".join(analysis.syntax_errors)
+            "Code passed syntax and deterministic validation"
+            if analysis.syntax_valid and not analysis.validation_errors
+            else "; ".join([*analysis.syntax_errors, *analysis.validation_errors])
         )
         scores.append(
             QualityScore(
                 metric=EvalMetric.CODE_SYNTAX,
                 score=syntax_score,
                 justification=syntax_justification,
-                details={"errors": analysis.syntax_errors},
+                details={
+                    "syntax_errors": analysis.syntax_errors,
+                    "validation_errors": analysis.validation_errors,
+                },
             )
         )
 

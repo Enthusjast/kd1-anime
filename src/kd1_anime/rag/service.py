@@ -19,7 +19,12 @@ from kd1_anime.config import (
     resolve_runtime_path,
     settings,
 )
-from kd1_anime.rag.chunker import SourceChunk, chunk_file, iter_source_files
+from kd1_anime.rag.chunker import (
+    SourceChunk,
+    chunk_file,
+    iter_source_files,
+    source_manifest_digest,
+)
 from kd1_anime.rag.clients import EmbeddingClient, RagClientError, RerankerClient
 from kd1_anime.rag.models import (
     RagChunkRef,
@@ -128,11 +133,52 @@ class RagService:
     def reranker_configured(self) -> bool:
         return self.reranker.configured
 
+    def _configured_source_roots(self) -> tuple[Path | None, Path | None]:
+        """返回当前配置实际使用的源目录。"""
+
+        docs = (
+            resolve_runtime_path(self.config.RAG_DOCS_DIR)
+            if self.config.RAG_DOCS_DIR is not None
+            else None
+        )
+        examples = (
+            resolve_runtime_path(self.config.RAG_EXAMPLES_DIR)
+            if self.config.RAG_EXAMPLES_DIR is not None
+            else None
+        )
+        return docs, examples
+
+    def _source_digest_for_index(self, info: RagIndexInfo) -> str | None:
+        """校验索引来源目录，并计算这些目录当前的源文件摘要。"""
+
+        # 旧版/直接调用 RagIndex.build() 的索引没有记录源目录，无法可靠
+        # 判断文件是否变化；保持兼容，不把这类已有索引误判为过期。
+        if not info.source_docs_dir and not info.source_examples_dir:
+            return None
+        configured_docs, configured_examples = self._configured_source_roots()
+        indexed_docs = (
+            Path(info.source_docs_dir).expanduser().resolve()
+            if info.source_docs_dir
+            else configured_docs
+        )
+        indexed_examples = (
+            Path(info.source_examples_dir).expanduser().resolve()
+            if info.source_examples_dir
+            else configured_examples
+        )
+        if (info.source_docs_dir or info.source_examples_dir) and (
+            indexed_docs != configured_docs or indexed_examples != configured_examples
+        ):
+            raise ValueError("RAG 索引来源目录与当前配置不一致，请使用当前目录重新建立索引")
+        return source_manifest_digest(indexed_docs, indexed_examples)
+
     def runtime_status(self) -> dict[str, Any]:
         """返回可直接展示的状态，不包含 API Key。"""
 
         info: RagIndexInfo | None = None
         index_error = ""
+        index_stale = False
+        current_source_sha256: str | None = None
         try:
             if self.index_path.is_file():
                 info = RagIndex(self.index_path).verify_integrity()
@@ -141,11 +187,24 @@ class RagService:
                     and info.embedding_model != self.config.RAG_EMBEDDING_MODEL
                 ):
                     raise ValueError("RAG 索引使用了不同的 Embedding 模型，请重新建立索引")
+                current_source_sha256 = self._source_digest_for_index(info)
+                if (
+                    current_source_sha256 is not None
+                    and current_source_sha256 != info.source_sha256
+                ):
+                    index_stale = True
+                    index_error = "知识库源文件已变化，请重新建立 RAG 索引"
         except (OSError, ValueError) as exc:
             index_error = str(exc)
+            index_stale = "索引来源目录" in index_error
         if not self.enabled:
             status: RagStatus = "disabled"
-        elif not self.embedding_configured or info is None or not self.reranker_configured:
+        elif (
+            not self.embedding_configured
+            or info is None
+            or not self.reranker_configured
+            or bool(index_error)
+        ):
             status = "degraded"
         else:
             status = "active"
@@ -165,6 +224,8 @@ class RagService:
             ),
             "index": info.model_dump(mode="json") if info is not None else None,
             "index_error": index_error,
+            "index_stale": index_stale,
+            "current_source_sha256": current_source_sha256 or "",
             "embedding_model": self.config.RAG_EMBEDDING_MODEL,
             "embedding_configured": self.embedding_configured,
             "reranker_model": self.config.RAG_RERANK_MODEL,
@@ -234,6 +295,9 @@ class RagService:
             info = index.verify_integrity()
             if info.embedding_model != self.config.RAG_EMBEDDING_MODEL:
                 raise ValueError("RAG 索引使用了不同的 Embedding 模型，请重新建立索引")
+            current_source_sha256 = self._source_digest_for_index(info)
+            if current_source_sha256 is not None and current_source_sha256 != info.source_sha256:
+                raise ValueError("RAG 索引已过期：知识库源文件已变化，请重新建立索引")
             cache_key = (
                 stage,
                 query,
@@ -394,6 +458,8 @@ class RagService:
             chunks,
             embeddings,
             embedding_model=self.config.RAG_EMBEDDING_MODEL,
+            source_docs_dir=docs_root,
+            source_examples_dir=examples_root,
         )
         return RagIndexBuildResult(
             info=info,

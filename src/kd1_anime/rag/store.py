@@ -117,6 +117,8 @@ class RagIndex:
         embeddings: Sequence[Sequence[float]],
         *,
         embedding_model: str,
+        source_docs_dir: Path | None = None,
+        source_examples_dir: Path | None = None,
     ) -> RagIndexInfo:
         if not chunks:
             raise ValueError("没有可写入索引的知识库分块")
@@ -157,6 +159,8 @@ class RagIndex:
                     "embedding_model": embedding_model,
                     "embedding_dimension": str(dimension),
                     "chunk_count": str(len(rag_chunks)),
+                    "source_docs_dir": str(source_docs_dir or ""),
+                    "source_examples_dir": str(source_examples_dir or ""),
                 }
                 connection.executemany(
                     "INSERT INTO meta(key, value) VALUES (?, ?)", metadata.items()
@@ -217,6 +221,8 @@ class RagIndex:
                 embedding_model=rows["embedding_model"],
                 embedding_dimension=int(rows["embedding_dimension"]),
                 chunk_count=int(rows["chunk_count"]),
+                source_docs_dir=rows.get("source_docs_dir", ""),
+                source_examples_dir=rows.get("source_examples_dir", ""),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"RAG 索引元数据不完整: {self.path}") from exc
@@ -225,6 +231,10 @@ class RagIndex:
         """校验元数据和所有分块/向量内容，拒绝被修改的索引。"""
 
         info = self.info()
+        if info.schema_version != INDEX_SCHEMA_VERSION:
+            raise ValueError(
+                f"RAG 索引 schema 版本不兼容: {info.schema_version} != {INDEX_SCHEMA_VERSION}"
+            )
         chunks: list[RagChunk] = []
         vectors: list[bytes] = []
         try:

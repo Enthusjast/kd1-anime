@@ -241,6 +241,22 @@ class GoodScene(Scene):
         security_score = next(s for s in scores if s.metric == EvalMetric.CODE_SECURITY)
         assert security_score.score == 5
 
+    def test_evaluate_uses_submission_validator_for_code_correctness(self):
+        evaluator = CodeEvaluator()
+        code = """
+from manim import *
+
+class InvalidScene(Scene):
+    def construct(self):
+        self.camera.frame.scale(1.1)
+"""
+
+        scores = evaluator.evaluate(code)
+
+        syntax_score = next(s for s in scores if s.metric == EvalMetric.CODE_SYNTAX)
+        assert syntax_score.score == 1
+        assert evaluator.analyze_code(code).validation_errors
+
     def test_get_scene_complexity(self):
         """测试场景复杂度评估"""
         evaluator = CodeEvaluator()
