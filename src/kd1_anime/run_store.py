@@ -24,6 +24,7 @@ from kd1_anime.agents.planner import (
 )
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
+from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.rendering import (
     RenderProfile,
     SceneArtifact,
@@ -229,6 +230,9 @@ class RunManifest(BaseModel):
     eval_round: int = Field(default=0, ge=0)
     continuity_rebuild_required: bool = False
     visual_eval_profile: VisualEvalProfile = Field(default_factory=VisualEvalProfile)
+    rag_profile: RagRuntimeProfile = Field(default_factory=RagRuntimeProfile)
+    rag_receipts: dict[str, RagReceipt] = Field(default_factory=dict, max_length=256)
+    rag_warnings: list[str] = Field(default_factory=list, max_length=100)
 
     @field_validator("run_id")
     @classmethod
@@ -294,6 +298,10 @@ class RunManifest(BaseModel):
                     errors.append(f"Scene {scene_id} 的最佳视觉候选代码哈希不一致")
                 if candidate.slurm_job and candidate.slurm_job.code_sha256 != candidate.code_sha256:
                     errors.append(f"Scene {scene_id} 的最佳视觉候选 Job 代码哈希不一致")
+        if self.rag_profile.index_sha256:
+            for receipt_key, receipt in self.rag_receipts.items():
+                if receipt.index_sha256 and receipt.index_sha256 != self.rag_profile.index_sha256:
+                    errors.append(f"RAG 收据 {receipt_key} 的索引哈希与运行配置不一致")
         if self.status == "completed" and not self.final_video:
             errors.append("运行标记为 completed 但缺少 final_video")
         return errors
@@ -429,7 +437,7 @@ class RunRepository:
         if candidate.exists() and (
             candidate.is_symlink() or candidate.resolve().parent != self.runs_root
         ):
-            raise ValueError("运行目录不是 workspace/runs 下的真实目录")
+            raise ValueError("运行目录不是配置的 workspace/runs 下的真实目录")
         return candidate
 
     def manifest_path(self, run_id: str) -> Path:
@@ -513,7 +521,7 @@ def get_reusable_video_path(
         source_root = old_root
         if artifact.source_run_id != old_manifest.run_id:
             source_root = old_root.parent / artifact.source_run_id
-            # 跨 run 复用只能访问 workspace/runs 下的真实兄弟目录，不能让
+            # 跨 run 复用只能访问配置的 runs 目录下的真实兄弟目录，不能让
             # 清单中的合法 run-id 通过符号链接逃逸到 workspace 之外。
             if (
                 source_root.is_symlink()

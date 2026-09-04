@@ -11,6 +11,17 @@ info() { echo -e "${CYAN}[→]${NC} $*"; }
 
 ENV_NAME="${KD1_ANIME_ENV_NAME:-manim_env}"
 MANIM_SPEC="${KD1_ANIME_MANIM_SPEC:-manim>=0.20,<0.21}"
+MANIM_KNOWLEDGE_VERSION="0.20.1"
+MANIM_KNOWLEDGE_ARCHIVE="resources/manim-0.20.1-knowledge.tar.gz"
+MANIM_KNOWLEDGE_ARCHIVE_SHA256="e202d20612f443a40c54b50e5a1e0d27b142e93f606939b04d0db38022c02372"
+CONFIGURE_MODE="${KD1_ANIME_CONFIGURE_MODE:-auto}"
+case "$CONFIGURE_MODE" in
+    auto|interactive|never) ;;
+    *)
+        err "KD1_ANIME_CONFIGURE_MODE 只能是 auto、interactive 或 never"
+        exit 1
+        ;;
+esac
 KNOWN_CONDA_BASE="${KD1_ANIME_CONDA_BASE:-}"
 LIVE_REPO="https://mirrors.ustc.edu.cn/CTAN/systems/texlive/tlnet"
 TEXLIVE_HOME="$HOME/texlive"
@@ -27,8 +38,11 @@ if [[ ! "$TEXLIVE_PLATFORM" =~ ^[A-Za-z0-9_-]+$ ]]; then
     err "KD1_ANIME_TEXLIVE_PLATFORM 包含不安全字符: $TEXLIVE_PLATFORM"
     exit 1
 fi
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kd1-anime"
+CONFIG_DIR="$HOME/.kd1-anime"
 CONFIG_FILE="$CONFIG_DIR/.env"
+LEGACY_CONFIG_DIR="$HOME/.config/kd1-anime"
+LEGACY_CONFIG_FILE="$LEGACY_CONFIG_DIR/.env"
+LEGACY_CONFIG_EXAMPLE_FILE="$LEGACY_CONFIG_DIR/.env.example"
 USER_BIN_DIR="${KD1_ANIME_USER_BIN_DIR:-$HOME/.local/bin}"
 REQUIRE_CHECKSUM="${KD1_ANIME_REQUIRE_CHECKSUM:-0}"
 case "$REQUIRE_CHECKSUM" in
@@ -394,11 +408,43 @@ install_python_package() {
     fi
 }
 
+rewrite_legacy_storage_defaults() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    sed -i \
+        -e 's|^RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3$|RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3|' \
+        -e 's|^RAG_DOCS_DIR=$|RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs|' \
+        -e 's|^RAG_EXAMPLES_DIR=$|RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples|' \
+        -e 's|^WORKSPACE_DIR=workspace$|WORKSPACE_DIR=~/.kd1-anime/workspace|' \
+        -e 's|^SCENES_DIR=workspace/scenes$|SCENES_DIR=~/.kd1-anime/workspace/scenes|' \
+        -e 's|^LOGS_DIR=workspace/logs$|LOGS_DIR=~/.kd1-anime/workspace/logs|' \
+        -e 's|^VIDEOS_DIR=workspace/videos$|VIDEOS_DIR=~/.kd1-anime/workspace/videos|' \
+        "$file"
+}
+
 write_user_config() {
-    mkdir -p "$CONFIG_DIR"
+    mkdir -p \
+        "$CONFIG_DIR" \
+        "$CONFIG_DIR/knowledge/docs" \
+        "$CONFIG_DIR/knowledge/examples" \
+        "$CONFIG_DIR/rag" \
+        "$CONFIG_DIR/workspace"
     chmod 700 "$CONFIG_DIR"
     if [ -f "$CONFIG_FILE" ]; then
+        chmod 600 "$CONFIG_FILE"
         warn "用户配置已存在，未覆盖: $CONFIG_FILE"
+        return
+    fi
+    if [ -f "$LEGACY_CONFIG_FILE" ]; then
+        cp "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
+        rewrite_legacy_storage_defaults "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        if [ -f "$LEGACY_CONFIG_EXAMPLE_FILE" ] && [ ! -f "$CONFIG_DIR/.env.example" ]; then
+            cp "$LEGACY_CONFIG_EXAMPLE_FILE" "$CONFIG_DIR/.env.example"
+            rewrite_legacy_storage_defaults "$CONFIG_DIR/.env.example"
+            chmod 600 "$CONFIG_DIR/.env.example"
+        fi
+        warn "已将旧用户配置迁移到: $CONFIG_FILE（旧文件未删除）"
         return
     fi
     cat > "$CONFIG_DIR/.env.example" <<EOF
@@ -433,6 +479,25 @@ VISUAL_LLM_JSON_REPAIR_ATTEMPTS=1
 VISUAL_LLM_USE_JSON_MODE=true
 VISUAL_LLM_PARALLEL_WORKERS=2
 VISUAL_LLM_DEBUG=false
+RAG_ENABLED=false
+RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
+RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
+RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
+RAG_EMBEDDING_API_KEY=
+RAG_EMBEDDING_BASE_URL=
+RAG_EMBEDDING_MODEL=
+RAG_EMBEDDING_TIMEOUT=60.0
+RAG_EMBEDDING_BATCH_SIZE=32
+RAG_RERANK_API_KEY=
+RAG_RERANK_BASE_URL=
+RAG_RERANK_MODEL=
+RAG_RERANK_TIMEOUT=60.0
+RAG_TOP_K=8
+RAG_RERANK_TOP_N=4
+RAG_MAX_CONTEXT_CHARS=12000
+RAG_CHUNK_SIZE=1800
+RAG_CHUNK_OVERLAP=200
+RAG_PARALLEL_WORKERS=2
 SLURM_PARTITION=
 SLURM_QOS=
 SLURM_ACCOUNT=
@@ -491,13 +556,324 @@ MAX_EVAL_ROUNDS=2
 VISUAL_EVAL_FRAME_COUNT=6
 VISUAL_EVAL_THRESHOLD=3.5
 MAX_VISUAL_FIX_ATTEMPTS=2
-WORKSPACE_DIR=workspace
+WORKSPACE_DIR=~/.kd1-anime/workspace
 OUTPUT_FILE=output_final.mp4
 EOF
     cp "$CONFIG_DIR/.env.example" "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
     log "已创建用户配置: $CONFIG_FILE"
     warn "首次运行前请编辑该文件并填写 LLM_API_KEY、LLM_BASE_URL 和 LLM_MODEL"
+}
+
+install_manim_knowledge() {
+    local archive ref archive_url expected actual tmp extract source_root source relative target
+    archive="$SCRIPT_DIR/$MANIM_KNOWLEDGE_ARCHIVE"
+    if [ ! -f "$archive" ]; then
+        ref="${KD1_ANIME_REF:-main}"
+        if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$ref" == *".."* ]] || [[ "$ref" == /* ]]; then
+            err "KD1_ANIME_REF 包含不安全字符: $ref"
+            return 1
+        fi
+        tmp="$(mktemp -d)"
+        cleanup_dirs+=("$tmp")
+        archive="$tmp/manim-knowledge.tar.gz"
+        archive_url="https://raw.githubusercontent.com/Enthusjast/kd1-anime/${ref}/${MANIM_KNOWLEDGE_ARCHIVE}"
+        info "下载 Manim ${MANIM_KNOWLEDGE_VERSION} 文档和示例包"
+        download "$archive_url" "$archive"
+    fi
+
+    expected="${KD1_ANIME_KNOWLEDGE_ARCHIVE_SHA256:-$MANIM_KNOWLEDGE_ARCHIVE_SHA256}"
+    expected="${expected,,}"
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        err "KD1_ANIME_KNOWLEDGE_ARCHIVE_SHA256 必须是 64 位十六进制 SHA-256"
+        return 1
+    fi
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+    if [ "$actual" != "$expected" ]; then
+        err "Manim 知识包 SHA-256 不匹配"
+        err "expected: $expected"
+        err "actual:   $actual"
+        return 1
+    fi
+
+    local entries
+    entries="$(tar -tzf "$archive")" || {
+        err "无法读取 Manim 知识包: $archive"
+        return 1
+    }
+    while IFS= read -r relative; do
+        [ -n "$relative" ] || continue
+        if [[ "$relative" == /* || "$relative" == *".."* ]]; then
+            err "Manim 知识包包含不安全路径: $relative"
+            return 1
+        fi
+        case "$relative" in
+            knowledge/|knowledge/docs/|knowledge/docs/manim-${MANIM_KNOWLEDGE_VERSION}/|\
+            knowledge/docs/manim-${MANIM_KNOWLEDGE_VERSION}/*|knowledge/examples/|\
+            knowledge/examples/manim-${MANIM_KNOWLEDGE_VERSION}/|\
+            knowledge/examples/manim-${MANIM_KNOWLEDGE_VERSION}/*.py) ;;
+            *)
+                err "Manim 知识包包含未允许的路径: $relative"
+                return 1
+                ;;
+        esac
+    done <<< "$entries"
+
+    extract="$(mktemp -d)"
+    cleanup_dirs+=("$extract")
+    tar -xzf "$archive" -C "$extract" --no-same-owner --no-same-permissions
+    source_root="$extract/knowledge"
+    [ -d "$source_root/docs/manim-${MANIM_KNOWLEDGE_VERSION}" ] || {
+        err "Manim 知识包缺少文档目录"
+        return 1
+    }
+    [ -d "$source_root/examples/manim-${MANIM_KNOWLEDGE_VERSION}" ] || {
+        err "Manim 知识包缺少示例目录"
+        return 1
+    }
+    if find "$source_root" -type l -print -quit | grep -q .; then
+        err "Manim 知识包不允许包含符号链接"
+        return 1
+    fi
+
+    mkdir -p "$CONFIG_DIR/knowledge"
+    chmod 700 "$CONFIG_DIR/knowledge"
+    while IFS= read -r -d '' source; do
+        relative="${source#"$source_root/"}"
+        case "$relative" in
+            docs/manim-${MANIM_KNOWLEDGE_VERSION}/*.md|\
+            docs/manim-${MANIM_KNOWLEDGE_VERSION}/*.rst|\
+            examples/manim-${MANIM_KNOWLEDGE_VERSION}/*.py) ;;
+            *)
+                err "Manim 知识包包含未允许的文件: $relative"
+                return 1
+                ;;
+        esac
+        target="$CONFIG_DIR/knowledge/$relative"
+        mkdir -p "$(dirname "$target")"
+        chmod 700 "$(dirname "$target")"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            if [ -f "$target" ] && cmp -s "$source" "$target"; then
+                continue
+            fi
+            warn "知识库文件已存在，保留用户版本: $target"
+            continue
+        fi
+        cp "$source" "$target"
+        chmod 600 "$target"
+    done < <(find "$source_root" -type f -print0 | sort -z)
+    log "Manim ${MANIM_KNOWLEDGE_VERSION} 文档和示例已安装到 $CONFIG_DIR/knowledge"
+}
+
+config_value() {
+    local key="$1" line value
+    line="$(grep -E "^${key}=" "$CONFIG_FILE" | tail -n 1 || true)"
+    value="${line#*=}"
+    value="${value%$'\r'}"
+    if [ "${#value}" -ge 2 ] && [ "${value:0:1}" = '"' ] && [ "${value: -1}" = '"' ]; then
+        value="${value:1:${#value}-2}"
+    elif [ "${#value}" -ge 2 ] && [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ]; then
+        value="${value:1:${#value}-2}"
+    fi
+    CONFIG_VALUE="$value"
+}
+
+write_config_value() {
+    local key="$1" value="$2" temporary
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || [[ "$value" == *$'\n'* ]] || [[ "$value" == *$'\r'* ]]; then
+        err "配置项或配置值包含不安全字符: $key"
+        return 1
+    fi
+    temporary="$(mktemp "$CONFIG_DIR/.env.configure.XXXXXX")"
+    cleanup_dirs+=("$temporary")
+    if grep -qE "^${key}=" "$CONFIG_FILE"; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [[ "$line" == "$key="* ]]; then
+                printf '%s=%s\n' "$key" "$value"
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$CONFIG_FILE" > "$temporary"
+    else
+        cat "$CONFIG_FILE" > "$temporary"
+        printf '%s=%s\n' "$key" "$value" >> "$temporary"
+    fi
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$CONFIG_FILE"
+}
+
+prompt_yes_no() {
+    local prompt="$1" default="${2:-n}" answer
+    while true; do
+        if ! IFS= read -r -p "$prompt" answer; then
+            printf '\n'
+            return 1
+        fi
+        answer="${answer,,}"
+        if [ -z "$answer" ]; then
+            answer="$default"
+        fi
+        case "$answer" in
+            y|yes) return 0 ;;
+            n|no) return 1 ;;
+            *) warn "请输入 y 或 n" ;;
+        esac
+    done
+}
+
+prompt_url() {
+    local label="$1" default="$2" value
+    while true; do
+        if ! IFS= read -r -p "$label Base URL [${default:-必填}]: " value; then
+            printf '\n'
+            return 1
+        fi
+        value="${value:-$default}"
+        if [[ "$value" =~ ^https?://[^[:space:]]+$ ]]; then
+            CONFIG_VALUE="$value"
+            return 0
+        fi
+        warn "Base URL 必须以 http:// 或 https:// 开头，且不能包含空格"
+    done
+}
+
+prompt_api_key() {
+    local label="$1" default="$2" value prompt
+    if [ -n "$default" ]; then
+        prompt="${label} API Key（回车保留当前值，输入 - 清空）: "
+    else
+        prompt="${label} API Key（无鉴权可直接回车）: "
+    fi
+    if ! IFS= read -r -s -p "$prompt" value; then
+        printf '\n'
+        return 1
+    fi
+    printf '\n'
+    if [ "$value" = "-" ]; then
+        CONFIG_VALUE=""
+    elif [ -z "$value" ]; then
+        CONFIG_VALUE="$default"
+    else
+        CONFIG_VALUE="$value"
+    fi
+}
+
+prompt_model() {
+    local label="$1" default="$2" value
+    while true; do
+        if ! IFS= read -r -p "$label 模型名 [${default:-必填}]: " value; then
+            printf '\n'
+            return 1
+        fi
+        value="${value:-$default}"
+        if [ -n "$value" ] && [ "$value" != "your-model-name" ]; then
+            CONFIG_VALUE="$value"
+            return 0
+        fi
+        warn "模型名不能为空"
+    done
+}
+
+configure_model_profile() {
+    local prefix="$1" label="$2" api_required="${3:-false}" default_url default_key default_model
+    config_value "${prefix}_BASE_URL"
+    default_url="$CONFIG_VALUE"
+    config_value "${prefix}_API_KEY"
+    default_key="$CONFIG_VALUE"
+    config_value "${prefix}_MODEL"
+    default_model="$CONFIG_VALUE"
+    case "$default_key" in
+        sk-your-key-here|your-api-key) default_key="" ;;
+    esac
+
+    prompt_url "$label" "$default_url" || return 1
+    write_config_value "${prefix}_BASE_URL" "$CONFIG_VALUE" || return 1
+    prompt_api_key "$label" "$default_key" || return 1
+    if [ "$api_required" = true ] && [ -z "$CONFIG_VALUE" ]; then
+        warn "$label API Key 不能为空"
+        return 1
+    fi
+    write_config_value "${prefix}_API_KEY" "$CONFIG_VALUE" || return 1
+    prompt_model "$label" "$default_model" || return 1
+    write_config_value "${prefix}_MODEL" "$CONFIG_VALUE" || return 1
+}
+
+build_rag_index_from_installer() {
+    if [ -z "${CONDA_ENV_DIR:-}" ] || [ ! -x "$CONDA_ENV_DIR/bin/kd1-anime" ]; then
+        warn "找不到已安装的 kd1-anime 命令，稍后请手动执行: kd1-anime rag index"
+        return 0
+    fi
+    info "正在构建 Manim 0.20.1 RAG 索引（可能产生 Embedding 请求）"
+    if "$CONDA_ENV_DIR/bin/kd1-anime" rag index; then
+        log "RAG 索引构建完成"
+    else
+        warn "RAG 索引构建失败；安装仍继续，稍后可执行: kd1-anime rag index"
+    fi
+}
+
+configure_user_models() {
+    if [ "$CONFIGURE_MODE" = never ] || { [ "$CONFIGURE_MODE" = auto ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; }; then
+        info "非交互安装，跳过模型配置；需要引导配置时请在终端运行: KD1_ANIME_CONFIGURE_MODE=interactive bash install.sh"
+        return 0
+    fi
+
+    printf '\n'
+    printf '%b模型配置向导%b\n' "$CYAN" "$NC"
+    printf '%s\n' "按顺序配置 Base URL、API Key 和模型名；API Key 输入时不会回显。"
+    printf '%s\n\n' "可选服务选择“否”时会保留已有凭据，但不会启用该功能。"
+
+    info "配置主模型"
+    configure_model_profile "LLM" "主模型" true || return 1
+
+    config_value ENABLE_VISUAL_EVAL
+    local visual_default="n"
+    case "${CONFIG_VALUE,,}" in
+        true|1|yes|y|on) visual_default="y" ;;
+    esac
+    if prompt_yes_no "是否启用视觉模型/视觉评估？[y/N] " "$visual_default"; then
+        write_config_value ENABLE_VISUAL_EVAL true || return 1
+        info "配置视觉模型"
+        configure_model_profile "VISUAL_LLM" "视觉模型" true || return 1
+    else
+        write_config_value ENABLE_VISUAL_EVAL false || return 1
+        log "已跳过视觉模型"
+    fi
+
+    config_value RAG_ENABLED
+    local rag_default="n"
+    case "${CONFIG_VALUE,,}" in
+        true|1|yes|y|on) rag_default="y" ;;
+    esac
+    local embedding_enabled=0 reranker_enabled=0
+    if prompt_yes_no "是否启用 Embedding 模型？[y/N] " "$rag_default"; then
+        embedding_enabled=1
+        info "配置 Embedding 模型"
+        configure_model_profile "RAG_EMBEDDING" "Embedding 模型" false || return 1
+        if prompt_yes_no "是否现在构建 RAG 索引？[y/N] " "n"; then
+            build_rag_index_from_installer
+        else
+            info "已跳过索引构建；稍后可执行: kd1-anime rag index"
+        fi
+    else
+        log "已跳过 Embedding 模型"
+    fi
+
+    if prompt_yes_no "是否启用 Reranker 模型？[y/N] " "$rag_default"; then
+        reranker_enabled=1
+        info "配置 Reranker 模型"
+        configure_model_profile "RAG_RERANK" "Reranker 模型" false || return 1
+    else
+        log "已跳过 Reranker 模型"
+    fi
+
+    if [ "$embedding_enabled" -eq 1 ] && [ "$reranker_enabled" -eq 1 ]; then
+        write_config_value RAG_ENABLED true || return 1
+        log "RAG 已启用"
+    else
+        write_config_value RAG_ENABLED false || return 1
+        warn "Embedding 和 Reranker 未同时启用，RAG 已保持关闭"
+    fi
+    log "模型配置已保存: $CONFIG_FILE"
 }
 
 install_command_wrappers() {
@@ -655,6 +1031,8 @@ if [ -f "$HOME/.zshrc" ] || command -v zsh >/dev/null 2>&1; then
 fi
 
 write_user_config
+install_manim_knowledge
+configure_user_models
 
 info "最终验证"
 env_python -c 'from manim import *; print("Python + Manim: OK")'

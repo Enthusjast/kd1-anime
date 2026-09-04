@@ -240,6 +240,34 @@ class TestSceneDashboardEvents:
         assert "编码×1" in text
         assert "完成 1/2" in text
 
+    def test_active_rag_with_historical_warning_is_not_displayed_as_degraded(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event(
+            "rag_status",
+            {
+                "status": "active",
+                "warning": "恢复运行：RAG 索引或模型已变化，将重新检索",
+                "embedding_model": "embedding",
+                "reranker_model": "reranker",
+            },
+        )
+
+        assert dash.rag_status == "active"
+        assert dash.rag_models == "E:embedding R:reranker"
+        assert "degraded" not in str(dash._render())
+
+        dash.on_event(
+            "rag_status",
+            {
+                "status": "degraded",
+                "warning": "索引不存在",
+                "embedding_model": "embedding",
+                "reranker_model": "reranker",
+            },
+        )
+        assert "degraded" in dash.rag_models
+
     def test_rendering_scene_shows_elapsed(self):
         import time
 

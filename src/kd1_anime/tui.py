@@ -401,13 +401,18 @@ class ChatSession:
         banner.append("  ╚═══════════════════════════════════════╝", style="bold cyan")
         console.print(banner)
 
-        # 启动时同时展示主模型和独立视觉模型；视觉评估未启用时仍展示
-        # 已配置的模型名，便于确认当前配置是否生效。
+        # 启动时展示所有会参与流水线的模型；即使某个可选能力未启用，
+        # 也显示已配置的模型名，便于确认当前配置是否生效。
         model_name = settings.LLM_MODEL or "未配置"
         visual_model_name = settings.visual_llm_profile().model or "未配置"
+        rag_state = "已启用" if settings.RAG_ENABLED else "未启用"
+        embedding_model_name = settings.RAG_EMBEDDING_MODEL or "未配置"
+        reranker_model_name = settings.RAG_RERANK_MODEL or "未配置"
         visual_state = "已启用" if settings.ENABLE_VISUAL_EVAL else "未启用"
-        console.print(f"  对话模型: [dim]{model_name}[/]")
+        console.print(f"  主模型: [dim]{model_name}[/]")
         console.print(f"  视觉模型: [dim]{visual_model_name}[/] ([dim]{visual_state}[/])")
+        console.print(f"  Embedding 模型: [dim]{embedding_model_name}[/] ([dim]{rag_state}[/])")
+        console.print(f"  Reranker 模型: [dim]{reranker_model_name}[/] ([dim]{rag_state}[/])")
 
         # 检查是否有可恢复的中断运行
         resumed = self._check_interrupted_runs()
@@ -757,6 +762,11 @@ class ChatSession:
 
             case "security_warning":
                 console.print(f"[bold yellow]安全警告:[/] {esc(data.get('message', ''))}")
+
+            case "rag_status":
+                status = esc(data.get("status", "disabled"))
+                warning = esc(data.get("warning", ""))
+                console.print(f"  [dim]RAG:[/] {status}" + (f" — {warning}" if warning else ""))
 
             case "plan_complete":
                 scenes = data.get("scenes", [])

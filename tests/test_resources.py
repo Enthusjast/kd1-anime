@@ -46,3 +46,13 @@ def test_visual_limit_defaults_to_main_llm_limit_for_compatibility():
     assert resources.visual_llm.acquire(blocking=False) is False
     resources.visual_llm.release()
     resources.visual_llm.release()
+
+
+def test_rag_limit_is_independent_from_visual_limit():
+    resources = ResourceCoordinator(llm_limit=1, visual_llm_limit=1, rag_limit=2, slurm_limit=0)
+
+    assert resources.rag.acquire(blocking=False) is True
+    assert resources.rag.acquire(blocking=False) is True
+    assert resources.rag.acquire(blocking=False) is False
+    resources.rag.release()
+    resources.rag.release()
