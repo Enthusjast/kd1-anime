@@ -1033,6 +1033,7 @@ class ReviewerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_message=user_message,
                 response_model=ReviewResult,
+                temperature=settings.LLM_REVIEW_TEMPERATURE,
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 # 审查结果必须是完整 JSON；不能把被截断的 feedback 当成
                 # 可消费结果，否则长反馈会在引号中断后直接导致场景失败。
@@ -1055,6 +1056,7 @@ class ReviewerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_message=user_message,
                 response_model=ReviewResult,
+                temperature=settings.LLM_REVIEW_TEMPERATURE,
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 allow_truncated=False,
             )
@@ -1099,6 +1101,7 @@ class ReviewerAgent(BaseAgent):
                 system_prompt=system_prompt,
                 user_message=user_message,
                 response_model=ReviewResult,
+                temperature=settings.LLM_REVIEW_TEMPERATURE,
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 allow_truncated=False,
             )

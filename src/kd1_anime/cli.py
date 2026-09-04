@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -86,6 +87,7 @@ def cache_clear(
 def rag_index(
     docs_dir: Path | None = typer.Option(None, "--docs-dir", help="Manim 文档目录"),
     examples_dir: Path | None = typer.Option(None, "--examples-dir", help="Manim 示例目录"),
+    recipes_dir: Path | None = typer.Option(None, "--recipes-dir", help="Manim Recipe 目录"),
     rebuild: bool = typer.Option(False, "--rebuild", help="忽略已有索引，强制重新计算 Embedding"),
 ):
     """索引 Manim 文档和示例。"""
@@ -98,11 +100,15 @@ def rag_index(
     if examples_dir is not None and not examples_dir.is_dir():
         console.print(f"[red]示例目录不存在: {examples_dir}[/]", markup=False)
         raise typer.Exit(1)
+    if recipes_dir is not None and not recipes_dir.is_dir():
+        console.print(f"[red]Recipe 目录不存在: {recipes_dir}[/]", markup=False)
+        raise typer.Exit(1)
     try:
         service = RagService()
         result = service.build_index(
             docs_dir=docs_dir,
             examples_dir=examples_dir,
+            recipes_dir=recipes_dir,
             rebuild=rebuild,
         )
     except Exception as exc:
@@ -130,6 +136,7 @@ def rag_status():
     console.print(f"索引: {data['index_path']}")
     console.print(f"文档目录: {data['docs_dir'] or '未配置'}")
     console.print(f"示例目录: {data['examples_dir'] or '未配置'}")
+    console.print(f"Recipe 目录: {data.get('recipes_dir') or '未配置'}")
     console.print(f"Embedding: {data['embedding_model'] or '未配置'}")
     console.print(f"Reranker: {data['reranker_model'] or '未配置'}")
     if data["index"]:
@@ -728,6 +735,63 @@ def status(
             f"{rendered}/{len(manifest.scenes)}",
         )
     console.print(table)
+
+
+@app.command()
+def stats(
+    run_id: str = typer.Argument(None, help="运行 ID；省略时汇总最近运行"),
+    limit: int = typer.Option(20, "--limit", min=1, max=200, help="最多汇总的运行数"),
+    json_output: bool = typer.Option(False, "--json", help="以机器可读 JSON 输出"),
+):
+    """查看离线生成统计，不调用 LLM 或 Slurm。"""
+
+    from kd1_anime.stats import collect_stats
+
+    try:
+        report = collect_stats(settings.WORKSPACE_DIR, run_id, limit=limit)
+    except Exception as exc:
+        console.print(f"[bold red]统计失败:[/] {exc}", markup=False)
+        raise typer.Exit(1) from exc
+    if json_output:
+        console.print_json(json.dumps(report, ensure_ascii=False))
+        return
+    runs = report["runs"]
+    if not runs:
+        console.print("没有可用的运行记录")
+        return
+    table = Table(title="Pipeline statistics")
+    for column in (
+        "Run ID",
+        "Status",
+        "Scenes",
+        "Plan reviews",
+        "Code reviews",
+        "Fixes",
+        "Fallbacks",
+    ):
+        table.add_column(column)
+    for item in runs:
+        scenes = item["scenes"]
+        table.add_row(
+            item["run_id"],
+            item["status"],
+            f"{scenes['rendered']}/{item['scene_count']}",
+            str(item["plan_review_attempts"]),
+            str(item["review_attempts"]),
+            str(item["fix_attempts"]),
+            str(scenes["safe_fallback"]),
+        )
+    console.print(table)
+    category_counts = Counter()
+    for item in runs:
+        category_counts.update(item["failure_categories"])
+    if category_counts:
+        console.print(
+            "失败分类: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(category_counts.items()))
+        )
+    if report["read_errors"]:
+        console.print(f"[yellow]有 {len(report['read_errors'])} 个运行清单读取失败[/]")
 
 
 @app.command()

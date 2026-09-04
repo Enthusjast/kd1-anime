@@ -54,6 +54,20 @@ def test_equivalent_polynomials_are_checked_without_external_cas():
     assert expressions_are_equivalent("a^2-ab+ab-b^2", "a^2-b^2") is True
 
 
+def test_numeric_matrix_equivalence_is_checked_safely():
+    assert expressions_are_equivalent("[[1, 2], [3, 4]]", "[[1,2],[3,4]]") is True
+    assert expressions_are_equivalent("[[1, 2], [3, 4]]", "[[1,2],[4,3]]") is False
+    assert expressions_are_equivalent("[[1, 2]]", "[[1, 2], [3, 4]]") is False
+
+
+def test_compiler_reports_non_equivalent_matrix_in_computation():
+    plan = make_plan(computation="矩阵变换结果 [[1,2],[3,4]] = [[1,2],[4,3]]")
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert any("矩阵等式" in issue.message for issue in result)
+
+
 def test_compiler_checks_simple_equations_in_free_form_computation():
     plan = make_plan(computation="展开得到 (a+b)^2 = a^2+b^2")
 

@@ -41,6 +41,11 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_MODEL | 空 | 主模型名；必填 |
 | LLM_SEND_MAX_TOKENS | true | 是否向端点发送 max_tokens |
 | LLM_TEMPERATURE | 0.3 | 温度，范围 0–2 |
+| LLM_PLANNING_TEMPERATURE | 0.2 | Planner/Clarifier 温度 |
+| LLM_TECHNICAL_TEMPERATURE | 0.0 | TechnicalSpec 温度 |
+| LLM_CODE_TEMPERATURE | 0.2 | Coder 温度 |
+| LLM_REVIEW_TEMPERATURE | 0.0 | Plan/Code/Continuity Review 温度 |
+| LLM_FIX_TEMPERATURE | 0.1 | AutoFix 温度 |
 | LLM_MAX_TOKENS | 32768 | 全局/兼容输出上限；阶段配置优先 |
 | LLM_PLANNING_MAX_TOKENS | 16384 | 规划、澄清和计划审查预算 |
 | LLM_TECHNICAL_MAX_TOKENS | 16384 | TechnicalSpec 输出预算 |
@@ -114,6 +119,7 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | RAG_INDEX_PATH | ~/.kd1-anime/rag/index.sqlite3 | SQLite 索引路径 |
 | RAG_DOCS_DIR | ~/.kd1-anime/knowledge/docs | 文档源目录 |
 | RAG_EXAMPLES_DIR | ~/.kd1-anime/knowledge/examples | 示例源目录 |
+| RAG_RECIPES_DIR | ~/.kd1-anime/knowledge/recipes | 版本化 Manim Recipe 目录 |
 | RAG_EMBEDDING_API_KEY | 空 | Embedding API Key |
 | RAG_EMBEDDING_BASE_URL | 空 | OpenAI-compatible Embedding 端点 |
 | RAG_EMBEDDING_MODEL | 空 | Embedding 模型名 |
@@ -174,9 +180,11 @@ Cairo 不申请 GPU；只有 MANIM_RENDERER=opengl 时才使用 GPU 配置。所
 | MANIM_FRAME_RATE | 60 | 输出帧率 |
 | MANIM_OPENGL_PLATFORM | egl | OpenGL 后端：egl 或 glx |
 | SMOKE_RENDER_ENABLED | true | 正式 Slurm 渲染前执行轻量探针 |
+| SMOKE_RENDER_MODE | frame | 预检模式：frame、video 或 both |
 | SMOKE_RENDER_QUALITY | l | Smoke Render 质量：l 或 m |
 | SMOKE_RENDER_TIMEOUT | 180 | 远端 Smoke Render 超时秒数 |
 | LOCAL_SMOKE_RENDER_ENABLED | false | 是否在本地做额外运行时预检 |
+| LOCAL_SMOKE_RENDER_MODE | frame | 本地预检模式：frame、video 或 both |
 | LOCAL_SMOKE_RENDER_QUALITY | l | 本地预检质量 |
 | LOCAL_SMOKE_RENDER_TIMEOUT | 180 | 本地预检超时秒数 |
 | LOCAL_SMOKE_RENDER_MEMORY_MB | 4096 | 本地预检地址空间上限 |
@@ -201,6 +209,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MAX_PLAN_REVIEW_ROUNDS | 2 | 单场景计划审查轮数 |
 | MAX_PLAN_REPLAN_ATTEMPTS | 3 | 计划反馈后的 Planner 总重调用次数 |
 | MAX_CONTINUITY_FIX_ROUNDS | 2 | 连续性局部重规划次数；耗尽后 warning 放行 |
+| CONTINUITY_CONTEXT_MODE | minimal | 跨场景代码上下文范围：minimal、full 或 stateless |
 | SKIP_REVIEW | false | 是否跳过语义代码审查；确定性校验仍保留 |
 | SAFE_FALLBACK_ENABLED | true | 高风险几何失败后是否切换保守方案 |
 | MAX_IDENTICAL_REVIEW_ATTEMPTS | 2 | 相同代码/反馈重复次数上限 |

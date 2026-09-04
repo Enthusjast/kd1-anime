@@ -33,7 +33,9 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/prompt_context.py 有界 Prompt 区块构造
        ├── agents/continuity.py    全片连续性审查与局部重规划
        ├── agents/coder.py         ManimCE 代码生成/重写
+       ├── agents/scene_templates.py 稳定场景骨架与无 LLM 安全代码降级
        ├── agents/reviewer.py      结构化语义审查
+       ├── agents/failure_router.py 确定性失败分类与修复路径
        ├── agents/validator.py     AST 确定性校验
        ├── agents/auto_fixer.py    根据渲染日志修复代码
        ├── agents/render_context.py renderer 能力与对象生命周期约束
@@ -44,6 +46,7 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── rag/                    SQLite 索引、独立 Embedding/Reranker 检索
        ├── eval/                   代码/效率评估与独立多模态视觉质量门
        ├── llm_cache.py            SQLite LLM 响应缓存与安全限额
+       ├── stats.py                清单/事件日志离线统计
        ├── agents/state_ledger.py  场景边界语义账本与渲染证据
        ├── security.py             脱敏和 JSON-safe 诊断序列化
        └── run_store.py            Manifest v6、原子检查点、运行锁
@@ -149,6 +152,10 @@ Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder �
 run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信息的阶段快照，失败直接阻断该场景，
 不会把本地 Smoke Render 产物当作正式视频。
 
+正式 Slurm 作业内部还会先执行独立的低质量 Canary：除了检查命令退出码，还必须找到非空的
+最终 MP4 并通过 ffprobe；Canary 失败时不会开始高清正式渲染。容器模式下 ffprobe 也在同一
+容器环境中执行，避免登录节点与计算节点依赖不一致。
+
 ### 3.3 DISPATCHING / MONITORING
 
 `cluster/slurm.py` 直接构建 sbatch 脚本，并对所有 directive 值使用配置层单行校验和 shell quoting。
@@ -174,11 +181,18 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 失败场景只读取精确 Job 的 stderr 尾部，并受 `LOG_TAIL_LINES` 和 `MAX_LOG_CHARS` 限制。环境、conda、容器、Slurm、显示服务和字体错误不会交给 LLM 重写业务代码。
 
-其余错误交给 AutoFixer，结果再次通过 AST 校验；不通过时由 Coder 根据校验反馈和原始错误重写。修复后的代码强制复审。修复次数和连续相同错误次数都有上限。
+其余错误先经过确定性失败路由：LaTeX、renderer、生命周期和旧 API 优先尝试唯一匹配的
+局部补丁；数学问题回到计划层，连续性问题回到连续性审查，Slurm/依赖/资源问题只走基础
+设施重试，合并错误只重试 FFmpeg。补丁应用后再次通过 AST、连续性和生命周期校验；无法
+唯一定位时才交给 AutoFixer，结果再次通过全部校验并强制复审。Coder 输出为空、截断或
+连续无效时可使用不依赖 LLM 的最小安全场景作为最后保险。修复次数和连续相同错误次数都有上限。
 
 如果高风险几何方案在计划或代码修复预算内仍无法稳定验证，且
 `SAFE_FALLBACK_ENABLED=true`，系统会将该场景降级为保守的基础图形/等式教学方案，清空
 受影响的下游交接并重新经过计划审查，而不是无限重复同一套几何修复。
+
+`kd1-anime stats` 从 manifest 和 `events.jsonl` 离线计算各阶段耗时、审查/修复次数、
+安全降级次数和失败分类，不发起 LLM 或 Slurm 请求，便于根据真实运行数据调整提示词和配置。
 
 ### 3.5 持久化与恢复
 

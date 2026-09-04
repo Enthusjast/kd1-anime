@@ -46,6 +46,7 @@ def test_default_storage_is_under_private_application_home():
     assert config.RAG_INDEX_PATH == config_module.DEFAULT_RAG_INDEX_PATH
     assert config.RAG_DOCS_DIR == config_module.DEFAULT_RAG_DOCS_DIR
     assert config.RAG_EXAMPLES_DIR == config_module.DEFAULT_RAG_EXAMPLES_DIR
+    assert config.RAG_RECIPES_DIR == config_module.DEFAULT_RAG_RECIPES_DIR
     assert config.WORKSPACE_DIR == config_module.DEFAULT_WORKSPACE_DIR
     assert config.SCENES_DIR == config_module.DEFAULT_SCENES_DIR
     assert config.LOGS_DIR == config_module.DEFAULT_LOGS_DIR
@@ -177,6 +178,11 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_SILENT_STREAM is True
     assert config.LLM_HEALTHCHECK_TIMEOUT == 15.0
     assert config.LLM_MAX_TOKENS == 32768
+    assert config.LLM_PLANNING_TEMPERATURE == 0.2
+    assert config.LLM_TECHNICAL_TEMPERATURE == 0.0
+    assert config.LLM_CODE_TEMPERATURE == 0.2
+    assert config.LLM_REVIEW_TEMPERATURE == 0.0
+    assert config.LLM_FIX_TEMPERATURE == 0.1
     assert config.LLM_PLANNING_MAX_TOKENS == 16384
     assert config.LLM_TECHNICAL_MAX_TOKENS == 16384
     assert config.LLM_CODE_MAX_TOKENS == 24576
@@ -191,8 +197,10 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.MAX_TECHNICAL_SPEC_ATTEMPTS == 3
     assert config.MAX_PLAN_REPLAN_ATTEMPTS == 3
     assert config.SMOKE_RENDER_ENABLED is True
+    assert config.SMOKE_RENDER_MODE == "frame"
     assert config.SMOKE_RENDER_QUALITY == "l"
     assert config.LOCAL_SMOKE_RENDER_ENABLED is False
+    assert config.LOCAL_SMOKE_RENDER_MODE == "frame"
 
 
 def test_llm_timeout_and_silent_stream_validation():

@@ -43,6 +43,22 @@ def _source_chunk(text: str, ordinal: int = 0) -> SourceChunk:
     )
 
 
+def test_recipe_chunks_carry_manimce_version_and_topic_metadata(tmp_path):
+    source = tmp_path / "transform.md"
+    source.write_text("# Transform recipe\nUse ReplacementTransform.", encoding="utf-8")
+
+    chunks = chunk_file(
+        source,
+        "recipe",
+        display_path="recipe/manim-0.20.1/transform.md",
+    )
+
+    assert chunks[0].metadata["framework"] == "manimce"
+    assert chunks[0].metadata["version"] == "0.20.1"
+    assert chunks[0].metadata["topic"] == "transform"
+    assert chunks[0].metadata["renderer"] == "both"
+
+
 def test_chunker_splits_python_and_removes_sensitive_lines(tmp_path):
     source = tmp_path / "example.py"
     source.write_text(
@@ -95,6 +111,16 @@ def test_iter_source_files_excludes_runtime_and_unknown_files(tmp_path):
         ("api.md", "manim_doc"),
         ("guide.rst", "manim_doc"),
     ]
+
+
+def test_iter_source_files_includes_recipes_as_separate_source_kind(tmp_path):
+    recipes = tmp_path / "recipes"
+    recipes.mkdir()
+    (recipes / "formula.md").write_text("# Formula", encoding="utf-8")
+
+    files = iter_source_files(None, None, recipes)
+
+    assert files == [(recipes / "formula.md", "recipe")]
 
 
 def test_iter_source_files_allows_root_under_workspace_or_runs(tmp_path):
@@ -351,6 +377,91 @@ def test_rag_service_returns_context_and_receipt(tmp_path, monkeypatch):
     assert "Circle API" in result.context
     assert str(config.RAG_DOCS_DIR) not in result.context
     assert result.receipt.chunks[0].content_sha256
+
+
+def test_rag_service_indexes_recipe_source_root(tmp_path, monkeypatch):
+    config = _config(tmp_path, RAG_DOCS_DIR=None, RAG_EXAMPLES_DIR=None)
+    config.RAG_RECIPES_DIR = tmp_path / "recipes"
+    config.RAG_RECIPES_DIR.mkdir()
+    (config.RAG_RECIPES_DIR / "transform.md").write_text(
+        "# Transform\nUse ReplacementTransform.", encoding="utf-8"
+    )
+    service = RagService(config)
+    monkeypatch.setattr(service.embedding, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+
+    result = service.build_index()
+
+    assert result.info.source_recipes_dir == str(config.RAG_RECIPES_DIR.resolve())
+    assert result.chunk_count == 1
+
+
+def test_rag_service_can_prefer_recipe_candidates(tmp_path, monkeypatch):
+    config = _config(tmp_path, RAG_DOCS_DIR=None, RAG_EXAMPLES_DIR=None)
+    service = RagService(config)
+    document = SourceChunk(
+        path=Path("doc.md"),
+        source_kind="manim_doc",
+        source_sha256="a" * 64,
+        ordinal=0,
+        text="general API reference",
+        metadata={"suffix": ".md"},
+    )
+    recipe = SourceChunk(
+        path=Path("recipe.md"),
+        source_kind="recipe",
+        source_sha256="b" * 64,
+        ordinal=1,
+        text="canonical Transform recipe",
+        metadata={"suffix": ".md", "framework": "manimce"},
+    )
+    RagIndex.build(
+        config.RAG_INDEX_PATH,
+        [document, recipe],
+        [[1.0, 0.0], [0.9, 0.0]],
+        embedding_model=config.RAG_EMBEDDING_MODEL,
+    )
+    monkeypatch.setattr(service.embedding, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(service.reranker, "rerank", lambda query, texts, top_n: [(0, 0.5)])
+
+    result = service.search(
+        "Transform",
+        stage="code",
+        source_kinds={"manim_doc", "recipe"},
+        preferred_source_kinds={"recipe"},
+    )
+
+    assert result.chunks[0].chunk.source_kind == "recipe"
+
+
+def test_rag_service_excludes_manimgl_framework_by_default(tmp_path, monkeypatch):
+    config = _config(tmp_path, RAG_DOCS_DIR=None, RAG_EXAMPLES_DIR=None)
+    service = RagService(config)
+    ce = SourceChunk(
+        path=Path("ce.md"),
+        source_kind="manim_doc",
+        source_sha256="a" * 64,
+        ordinal=0,
+        text="ManimCE Create",
+        metadata={"framework": "manimce"},
+    )
+    gl = SourceChunk(
+        path=Path("gl.md"),
+        source_kind="manim_doc",
+        source_sha256="b" * 64,
+        ordinal=1,
+        text="ManimGL ShowCreation",
+        metadata={"framework": "manimgl"},
+    )
+    RagIndex.build(
+        config.RAG_INDEX_PATH, [ce, gl], [[1.0, 0.0], [1.0, 0.0]], embedding_model="embed-test"
+    )
+    monkeypatch.setattr(service.embedding, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+    monkeypatch.setattr(service.reranker, "rerank", lambda query, texts, top_n: [(0, 0.9)])
+
+    result = service.search("Create", stage="code")
+
+    assert result.chunks
+    assert all(item.chunk.metadata.get("framework") != "manimgl" for item in result.chunks)
 
 
 def test_rag_context_uses_complete_json_reference_blocks(tmp_path):

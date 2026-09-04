@@ -22,7 +22,7 @@ from kd1_anime.rag.chunker import (
 )
 from kd1_anime.rag.models import RagChunk, RagIndexInfo, RetrievedChunk
 
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 _SCHEMA = """
 CREATE TABLE meta (
     key TEXT PRIMARY KEY NOT NULL,
@@ -141,6 +141,7 @@ class RagIndex:
         embedding_model: str,
         source_docs_dir: Path | None = None,
         source_examples_dir: Path | None = None,
+        source_recipes_dir: Path | None = None,
         chunker_version: str = CHUNKER_VERSION,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
@@ -196,6 +197,7 @@ class RagIndex:
                     "chunk_count": str(len(rag_chunks)),
                     "source_docs_dir": str(source_docs_dir or ""),
                     "source_examples_dir": str(source_examples_dir or ""),
+                    "source_recipes_dir": str(source_recipes_dir or ""),
                     "chunker_version": chunker_version,
                     "chunk_size": str(chunk_size),
                     "chunk_overlap": str(chunk_overlap),
@@ -261,6 +263,7 @@ class RagIndex:
                 chunk_count=int(rows["chunk_count"]),
                 source_docs_dir=rows.get("source_docs_dir", ""),
                 source_examples_dir=rows.get("source_examples_dir", ""),
+                source_recipes_dir=rows.get("source_recipes_dir", ""),
                 chunker_version=rows.get("chunker_version", ""),
                 chunk_size=int(rows.get("chunk_size", 0)),
                 chunk_overlap=int(rows.get("chunk_overlap", 0)),
@@ -350,6 +353,7 @@ class RagIndex:
         *,
         top_k: int,
         source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
     ) -> list[RetrievedChunk]:
         if top_k < 1:
             raise ValueError("top_k 必须大于 0")
@@ -358,6 +362,7 @@ class RagIndex:
             query_embedding,
             top_k=top_k,
             source_kinds=source_kinds,
+            exclude_frameworks=exclude_frameworks,
             info=snapshot.info,
             snapshot=snapshot,
         )
@@ -368,6 +373,7 @@ class RagIndex:
         *,
         top_k: int,
         source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
         info: RagIndexInfo,
         snapshot: VerifiedIndexSnapshot | None = None,
     ) -> list[RetrievedChunk]:
@@ -396,6 +402,7 @@ class RagIndex:
             query_embedding,
             top_k=top_k,
             source_kinds=source_kinds,
+            exclude_frameworks=exclude_frameworks,
             info=info,
             snapshot=snapshot,
         )
@@ -406,6 +413,7 @@ class RagIndex:
         *,
         top_k: int,
         source_kinds: set[str] | None,
+        exclude_frameworks: set[str] | None,
         info: RagIndexInfo,
         snapshot: VerifiedIndexSnapshot | None = None,
     ) -> list[RetrievedChunk]:
@@ -420,6 +428,11 @@ class RagIndex:
 
         def append_candidate(chunk: RagChunk, vector: Sequence[float]) -> None:
             if source_kinds is not None and chunk.source_kind not in source_kinds:
+                return
+            if (
+                exclude_frameworks is not None
+                and chunk.metadata.get("framework", "") in exclude_frameworks
+            ):
                 return
             candidates.append(RetrievedChunk(chunk=chunk, score=_cosine_similarity(query, vector)))
 

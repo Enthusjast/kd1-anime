@@ -29,6 +29,7 @@ LEGACY_RAG_INDEX_PATH = Path.home() / ".cache" / "kd1-anime" / "rag" / "index.sq
 DEFAULT_KNOWLEDGE_DIR = APP_HOME / "knowledge"
 DEFAULT_RAG_DOCS_DIR = DEFAULT_KNOWLEDGE_DIR / "docs"
 DEFAULT_RAG_EXAMPLES_DIR = DEFAULT_KNOWLEDGE_DIR / "examples"
+DEFAULT_RAG_RECIPES_DIR = DEFAULT_KNOWLEDGE_DIR / "recipes"
 DEFAULT_WORKSPACE_DIR = APP_HOME / "workspace"
 DEFAULT_SCENES_DIR = DEFAULT_WORKSPACE_DIR / "scenes"
 DEFAULT_LOGS_DIR = DEFAULT_WORKSPACE_DIR / "logs"
@@ -38,6 +39,7 @@ _LEGACY_STORAGE_DEFAULTS = {
     "RAG_INDEX_PATH": ("~/.cache/kd1-anime/rag/index.sqlite3", str(DEFAULT_RAG_INDEX_PATH)),
     "RAG_DOCS_DIR": ("", str(DEFAULT_RAG_DOCS_DIR)),
     "RAG_EXAMPLES_DIR": ("", str(DEFAULT_RAG_EXAMPLES_DIR)),
+    "RAG_RECIPES_DIR": ("", str(DEFAULT_RAG_RECIPES_DIR)),
     "WORKSPACE_DIR": ("workspace", str(DEFAULT_WORKSPACE_DIR)),
     "SCENES_DIR": ("workspace/scenes", str(DEFAULT_SCENES_DIR)),
     "LOGS_DIR": ("workspace/logs", str(DEFAULT_LOGS_DIR)),
@@ -221,6 +223,12 @@ class Settings(BaseSettings):
     LLM_MODEL: str = ""
     LLM_SEND_MAX_TOKENS: bool = True
     LLM_TEMPERATURE: float = Field(default=0.3, ge=0.0, le=2.0)
+    # 阶段级温度：结构化合同保持确定性，代码创作保留少量探索空间。
+    LLM_PLANNING_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
+    LLM_TECHNICAL_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
+    LLM_CODE_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
+    LLM_REVIEW_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
+    LLM_FIX_TEMPERATURE: float = Field(default=0.1, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int | None = Field(default=32768, ge=1, le=1_000_000)
     # 不同阶段的输出复杂度差异很大。默认使用较小的阶段预算，避免计划
     # 审查/连续性审查为极短 JSON 消耗与代码生成相同的长推理预算；用户
@@ -360,6 +368,7 @@ class Settings(BaseSettings):
     # 知识库源文件也有固定的用户目录；用户仍可用绝对路径接入其它文档。
     RAG_DOCS_DIR: Path | None = DEFAULT_RAG_DOCS_DIR
     RAG_EXAMPLES_DIR: Path | None = DEFAULT_RAG_EXAMPLES_DIR
+    RAG_RECIPES_DIR: Path | None = DEFAULT_RAG_RECIPES_DIR
     RAG_EMBEDDING_API_KEY: str = ""
     RAG_EMBEDDING_BASE_URL: str = ""
     RAG_EMBEDDING_MODEL: str = ""
@@ -380,7 +389,7 @@ class Settings(BaseSettings):
     RAG_CHUNK_OVERLAP: int = Field(default=200, ge=0, le=20_000)
     RAG_PARALLEL_WORKERS: int = Field(default=2, ge=1, le=16)
 
-    @field_validator("RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", mode="before")
+    @field_validator("RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", "RAG_RECIPES_DIR", mode="before")
     @classmethod
     def normalize_rag_source_dir(cls, value):
         """空的 RAG 源目录必须保持为 None，不能变成 Path('.')。"""
@@ -466,11 +475,16 @@ class Settings(BaseSettings):
         default=True,
         description="正式渲染前是否执行轻量 Smoke Render",
     )
+    SMOKE_RENDER_MODE: Literal["frame", "video", "both"] = Field(
+        default="frame",
+        description="Smoke Render 模式：最后一帧、MP4 或两者",
+    )
     SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
     # 本地生成/无 Slurm 环境的可选运行时预检；默认关闭，避免在 dry-run
     # 或共享登录节点上执行不可信生成代码。
     LOCAL_SMOKE_RENDER_ENABLED: bool = False
+    LOCAL_SMOKE_RENDER_MODE: Literal["frame", "video", "both"] = "frame"
     LOCAL_SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     LOCAL_SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
     LOCAL_SMOKE_RENDER_MEMORY_MB: int = Field(default=4_096, ge=256, le=65_536)
@@ -509,6 +523,10 @@ class Settings(BaseSettings):
     MAX_PLAN_REPLAN_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     # 全片分镜连续性审查发现冲突后的最大局部重规划轮数。
     MAX_CONTINUITY_FIX_ROUNDS: int = Field(default=2, ge=0, le=10)
+    CONTINUITY_CONTEXT_MODE: Literal["minimal", "full", "stateless"] = Field(
+        default="minimal",
+        description="Coder 接收的跨场景上下文范围；默认只传递当前场景需要的元素",
+    )
     SKIP_REVIEW: bool = Field(default=False, description="是否跳过代码审查阶段")
     SAFE_FALLBACK_ENABLED: bool = Field(
         default=True,
