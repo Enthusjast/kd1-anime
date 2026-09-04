@@ -803,6 +803,7 @@ class PlanReviewerAgent(BaseAgent):
                 system_prompt=f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
                 user_message=user_message,
                 response_model=PlanReviewResult,
+                temperature=settings.LLM_REVIEW_TEMPERATURE,
                 max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                 stream=False,
                 allow_truncated=False,
@@ -863,6 +864,7 @@ class PlanReviewerAgent(BaseAgent):
                     ),
                     user_message=minimal_message,
                     response_model=PlanReviewResult,
+                    temperature=settings.LLM_REVIEW_TEMPERATURE,
                     max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
                     stream=False,
                     allow_truncated=False,
@@ -969,6 +971,7 @@ class PlanReviewerAgent(BaseAgent):
             system_prompt=f"{PLAN_REVIEW_BATCH_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,
             item_model=PlanReviewBatchItem,
+            temperature=settings.LLM_REVIEW_TEMPERATURE,
             max_tokens=settings.LLM_REVIEW_MAX_TOKENS,
             allow_truncated=False,
         )

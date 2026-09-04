@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
+from kd1_anime.agents.api_linter import lint_manim_api
+from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
     ContinuityBible,
@@ -41,6 +43,101 @@ def plan():
         key_moments=["pause"],
         computation="radius=1",
     )
+
+
+def test_failure_router_prioritizes_infrastructure_over_code_rewrite():
+    route = classify_failure(
+        "FileNotFoundError: No such file or directory: 'xelatex'",
+        phase="render",
+    )
+    assert route.category == "infrastructure"
+    assert route.handler == "infra_retry"
+    assert classify_failure("render boom", phase="render").category == "render"
+
+
+def test_failure_router_separates_plan_math_from_runtime_api_errors():
+    assert classify_failure("数学断言不等价", phase="review").handler == "plan_review"
+    assert (
+        classify_failure("AttributeError: OpenGLCamera has no frame", phase="render").handler
+        == "code_patch"
+    )
+
+
+def test_api_linter_rejects_deprecated_manim_api():
+    result = lint_manim_api(
+        "from manim import *\nclass Demo(Scene):\n"
+        "    def construct(self): self.play(ShowCreation(Circle()))"
+    )
+    assert result.is_valid is False
+    assert any("ShowCreation" in error for error in result.errors)
+
+
+def test_api_linter_warns_about_unbounded_graph_and_updater():
+    result = lint_manim_api(
+        "from manim import *\nclass Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        axes = Axes()\n"
+        "        graph = axes.plot(lambda x: x**2)\n"
+        "        dot = always_redraw(lambda: Dot())\n"
+    )
+    assert result.is_valid is True
+    assert any("x_range" in warning for warning in result.warnings)
+    assert any("clear_updaters" in warning for warning in result.warnings)
+
+
+def test_continuity_context_mode_defaults_to_only_requested_exports(monkeypatch, tmp_path):
+    previous_plan = plan()
+    previous_plan = previous_plan.model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="kept", variable_name="kept"),
+                VisualElementState(element_id="other", variable_name="other"),
+            ]
+        }
+    )
+    current_plan = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [VisualElementState(element_id="kept", variable_name="kept")],
+        }
+    )
+    previous = SceneState(
+        plan=previous_plan,
+        exported_elements_code="kept = Circle()\n\nother = Square()",
+        exported_elements=[
+            ExtractedElement(element_id="kept", variable_name="kept", code="kept = Circle()"),
+            ExtractedElement(element_id="other", variable_name="other", code="other = Square()"),
+        ],
+    )
+    state = SceneState(plan=current_plan)
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={1: previous, 2: state},
+    )
+    orchestrator = Orchestrator()
+
+    monkeypatch.setattr(settings, "CONTINUITY_CONTEXT_MODE", "minimal")
+    orchestrator._prepare_inherited_context(ctx, 2, state)
+    assert state.inherited_elements_code == "kept = Circle()"
+
+    monkeypatch.setattr(settings, "CONTINUITY_CONTEXT_MODE", "full")
+    orchestrator._prepare_inherited_context(ctx, 2, state)
+    assert "other = Square()" in state.inherited_elements_code
+
+
+def test_stateless_mode_does_not_inject_unrequested_legacy_exports(monkeypatch, tmp_path):
+    previous = SceneState(
+        plan=plan(),
+        exported_elements_code="old = Circle()",
+    )
+    current = SceneState(plan=plan().model_copy(update={"scene_id": 2}))
+    ctx = PipelineContext("prompt", paths=paths(tmp_path), scene_states={1: previous, 2: current})
+    monkeypatch.setattr(settings, "CONTINUITY_CONTEXT_MODE", "stateless")
+
+    Orchestrator()._prepare_inherited_context(ctx, 2, current)
+
+    assert current.inherited_elements_code == ""
 
 
 def paths(tmp_path: Path):
@@ -98,6 +195,28 @@ def test_review_warning_is_accepted_without_rewrite(monkeypatch, tmp_path):
     assert state.rewrite_feedback == ""
     assert any(event == "scene_review_warning" for event, _ in events)
     assert any("标题位置" in warning for warning in ctx.continuity_warnings)
+
+
+def test_coder_failure_uses_validated_safe_code_fallback(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    state = SceneState(plan=plan(), plan_ready=True)
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        orchestrator,
+        "_generate_validated_code",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("模拟 Coder 截断")),
+    )
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_local_smoke_render", lambda *args, **kwargs: None)
+
+    orchestrator._scene_code(ctx, 1, state)
+
+    assert state.code.startswith("from manim import *")
+    assert state.safe_fallback_used is True
+    assert "最小安全代码降级" in state.safe_fallback_reason
 
 
 def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
@@ -1289,6 +1408,7 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     state = SceneState(plan=plan(), class_name="Demo")
     orchestrator = Orchestrator()
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "video")
 
     def successful_run(command, **kwargs):
         media_index = command.index("--media_dir") + 1
@@ -1307,6 +1427,34 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_run_limited_process", failed_run)
     with pytest.raises(RuntimeError, match="Smoke Render 失败"):
         orchestrator._local_smoke_render(ctx, state)
+
+
+def test_local_frame_canary_checks_last_frame(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    source = run_paths.scenes / "scene_1.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n")
+    ctx = PipelineContext("x", paths=run_paths, dry_run=False)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "frame")
+    captured = {}
+
+    def successful_run(command, **kwargs):
+        captured["command"] = command
+        media_dir = Path(command[command.index("--media_dir") + 1])
+        output = media_dir / "nested" / "Demo.png"
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"frame")
+        return module.subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module, "_run_limited_process", successful_run)
+    orchestrator._local_smoke_render(ctx, state)
+
+    assert "--format" in captured["command"]
+    assert "png" in captured["command"]
+    assert "--save_last_frame" in captured["command"]
 
 
 def test_minor_review_applies_unique_fix_before_round_limit(monkeypatch, tmp_path):

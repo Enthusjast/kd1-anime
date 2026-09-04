@@ -2,6 +2,7 @@ import hashlib
 import os
 import shlex
 import subprocess
+import tarfile
 from pathlib import Path
 
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
@@ -80,6 +81,28 @@ def test_installer_pins_documented_manim_version(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "manim==0.20.1"
+
+
+def test_recipe_archive_is_versioned_and_contains_only_markdown_recipes():
+    archive = INSTALLER.parent / "resources" / "manim-0.20.1-recipes.tar.gz"
+    assert archive.is_file()
+    with tarfile.open(archive, "r:gz") as handle:
+        names = handle.getnames()
+        assert names
+        assert all(
+            name
+            in {
+                "knowledge/",
+                "knowledge/recipes/",
+                "knowledge/recipes/manim-0.20.1/",
+                "knowledge",
+                "knowledge/recipes",
+                "knowledge/recipes/manim-0.20.1",
+            }
+            or (name.startswith("knowledge/recipes/manim-0.20.1/") and name.endswith(".md"))
+            for name in names
+        )
+        assert not any(member.issym() or member.islnk() for member in handle.getmembers())
 
 
 def test_remote_archive_checksum_is_verified_before_pip(tmp_path):

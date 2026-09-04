@@ -1,7 +1,9 @@
+from kd1_anime.agents.api_linter import ApiLintResult, lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import ContinuityReviewerAgent, ContinuityReviewResult
+from kd1_anime.agents.failure_router import FailureRoute, classify_failure
 from kd1_anime.agents.lifecycle import (
     LifecycleValidationResult,
     repair_required_export_alias_lifecycle,
@@ -55,6 +57,7 @@ from kd1_anime.agents.technical_planner import (
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
 
 __all__ = [
+    "ApiLintResult",
     "AutoFixerAgent",
     "BaseAgent",
     "CodeValidationResult",
@@ -62,6 +65,7 @@ __all__ = [
     "ContinuityBible",
     "ContinuityReviewResult",
     "ContinuityReviewerAgent",
+    "FailureRoute",
     "LearningObjective",
     "LedgerElement",
     "LessonSpec",
@@ -87,11 +91,13 @@ __all__ = [
     "TechnicalValidationResult",
     "apply_review_policy",
     "build_bounded_prompt",
+    "classify_failure",
     "classify_plan_review_issues",
     "compile_technical_spec",
     "dedupe_plan_review_issues",
     "deterministic_plan_issues",
     "filter_verified_plan_issues",
+    "lint_manim_api",
     "normalize_technical_spec_contract",
     "repair_obvious_math_contradictions",
     "repair_required_export_alias_lifecycle",

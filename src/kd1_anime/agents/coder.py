@@ -20,6 +20,7 @@ from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
     renderer_guidance,
 )
+from kd1_anime.agents.scene_templates import build_scene_template
 from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.config import settings
 
@@ -279,6 +280,13 @@ class CoderAgent(BaseAgent):
                 required=True,
                 priority=100,
             ),
+            PromptSection(
+                "稳定代码骨架",
+                build_scene_template(scene_plan, technical_spec, renderer=renderer),
+                required=True,
+                priority=108,
+                max_chars=12_000,
+            ),
         ]
         if technical_contract:
             sections.append(
@@ -435,6 +443,7 @@ class CoderAgent(BaseAgent):
         response = self.call_llm(
             system_prompt=build_coder_system_prompt(renderer),
             user_message=user_msg,
+            temperature=settings.LLM_CODE_TEMPERATURE,
             max_tokens=settings.LLM_CODE_MAX_TOKENS,
             stream=stream,
         )

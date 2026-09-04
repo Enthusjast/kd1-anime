@@ -97,6 +97,7 @@ def test_cairo_script_does_not_pass_write_to_movie(monkeypatch, tmp_path):
 def test_script_runs_same_renderer_smoke_before_formal_render(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
     monkeypatch.setattr(settings, "SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(settings, "SMOKE_RENDER_MODE", "video")
     monkeypatch.setattr(settings, "SMOKE_RENDER_QUALITY", "l")
     monkeypatch.setattr(settings, "SMOKE_RENDER_TIMEOUT", 42)
 
@@ -113,6 +114,33 @@ def test_script_runs_same_renderer_smoke_before_formal_render(monkeypatch, tmp_p
     assert script.index("[Smoke]") < script.index("manim render --renderer=cairo -qh")
     assert "timeout 42s" in script
     assert "smoke_scene_1.json" in script
+    assert "未生成有效最终 MP4" in script
+    assert "ffprobe -v error" in script
+    assert "partial_movie_files" in script
+    assert '"$smoke_video"' in script
+
+
+def test_script_can_run_fast_frame_canary_without_video_probe(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(settings, "SMOKE_RENDER_MODE", "frame")
+
+    script = SlurmDispatcher()._build_script(
+        1,
+        tmp_path / "scene.py",
+        "Demo",
+        tmp_path / "media",
+        tmp_path / "out",
+        tmp_path / "err",
+        run_root=tmp_path,
+    )
+
+    assert "--format png" in script
+    assert "--save_last_frame" in script
+    assert "-name 'Demo_*.png'" in script
+    assert "未生成有效最后一帧 PNG" in script
+    assert "smoke_video=$(find" not in script
+    assert "ffprobe -v error" not in script
 
 
 def test_script_can_disable_smoke_render(monkeypatch, tmp_path):

@@ -212,6 +212,23 @@ AttributeError: 'NoneType' object has no attribute 'play'
         assert fixer.is_infrastructure_error(error_log) is False
 
 
+def test_deterministic_patches_only_return_unique_known_api_replacements():
+    code = "self.play(ShowCreation(circle))\nlabel.setColor(BLUE)"
+    patches = AutoFixerAgent.deterministic_patches(
+        code,
+        "NameError: name 'ShowCreation' is not defined; AttributeError: setColor",
+    )
+    assert [(item.find, item.replace) for item in patches] == [
+        ("ShowCreation", "Create"),
+        (".setColor(", ".set_color("),
+    ]
+
+
+def test_deterministic_patches_skip_non_unique_matches():
+    code = "ShowCreation(a)\nShowCreation(b)"
+    assert AutoFixerAgent.deterministic_patches(code, "ShowCreation is not defined") == []
+
+
 class TestAutoFixerFix:
     """修复逻辑测试。"""
 

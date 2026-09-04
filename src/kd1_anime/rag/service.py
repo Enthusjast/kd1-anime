@@ -163,7 +163,7 @@ class RagService:
     def reranker_configured(self) -> bool:
         return self.reranker.configured
 
-    def _configured_source_roots(self) -> tuple[Path | None, Path | None]:
+    def _configured_source_roots(self) -> tuple[Path | None, Path | None, Path | None]:
         """返回当前配置实际使用的源目录。"""
 
         docs = (
@@ -176,16 +176,25 @@ class RagService:
             if self.config.RAG_EXAMPLES_DIR is not None
             else None
         )
-        return docs, examples
+        recipes = (
+            resolve_runtime_path(self.config.RAG_RECIPES_DIR)
+            if self.config.RAG_RECIPES_DIR is not None
+            else None
+        )
+        return docs, examples, recipes
 
     def _source_digest_for_index(self, info: RagIndexInfo) -> str | None:
         """校验索引来源目录，并计算这些目录当前的源文件摘要。"""
 
         # 旧版/直接调用 RagIndex.build() 的索引没有记录源目录，无法可靠
         # 判断文件是否变化；保持兼容，不把这类已有索引误判为过期。
-        if not info.source_docs_dir and not info.source_examples_dir:
+        if (
+            not info.source_docs_dir
+            and not info.source_examples_dir
+            and not info.source_recipes_dir
+        ):
             return None
-        configured_docs, configured_examples = self._configured_source_roots()
+        configured_docs, configured_examples, configured_recipes = self._configured_source_roots()
         indexed_docs = (
             Path(info.source_docs_dir).expanduser().resolve()
             if info.source_docs_dir
@@ -196,11 +205,18 @@ class RagService:
             if info.source_examples_dir
             else configured_examples
         )
-        if (info.source_docs_dir or info.source_examples_dir) and (
-            indexed_docs != configured_docs or indexed_examples != configured_examples
+        indexed_recipes = (
+            Path(info.source_recipes_dir).expanduser().resolve()
+            if info.source_recipes_dir
+            else configured_recipes
+        )
+        if (info.source_docs_dir or info.source_examples_dir or info.source_recipes_dir) and (
+            indexed_docs != configured_docs
+            or indexed_examples != configured_examples
+            or indexed_recipes != configured_recipes
         ):
             raise ValueError("RAG 索引来源目录与当前配置不一致，请使用当前目录重新建立索引")
-        return source_manifest_digest(indexed_docs, indexed_examples)
+        return source_manifest_digest(indexed_docs, indexed_examples, indexed_recipes)
 
     def runtime_status(self) -> dict[str, Any]:
         """返回可直接展示的状态，不包含 API Key。"""
@@ -257,6 +273,11 @@ class RagService:
             "examples_dir": (
                 str(resolve_runtime_path(self.config.RAG_EXAMPLES_DIR))
                 if self.config.RAG_EXAMPLES_DIR is not None
+                else ""
+            ),
+            "recipes_dir": (
+                str(resolve_runtime_path(self.config.RAG_RECIPES_DIR))
+                if self.config.RAG_RECIPES_DIR is not None
                 else ""
             ),
             "index": info.model_dump(mode="json") if info is not None else None,
@@ -334,6 +355,8 @@ class RagService:
         *,
         stage: str,
         source_kinds: set[str] | None = None,
+        preferred_source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
         top_k: int | None = None,
         code_sha256: str = "",
         inherited_elements_sha256: str = "",
@@ -342,6 +365,9 @@ class RagService:
 
         if not isinstance(query, str) or not query.strip():
             raise ValueError("RAG query 必须是非空字符串")
+        effective_exclude_frameworks = (
+            {"manimgl"} if exclude_frameworks is None else set(exclude_frameworks)
+        )
         effective_top_k = self.config.RAG_TOP_K if top_k is None else top_k
         if effective_top_k < 1:
             raise ValueError("RAG top_k 必须大于 0")
@@ -382,6 +408,10 @@ class RagService:
                 stage,
                 query,
                 tuple(sorted(source_kinds)) if source_kinds is not None else None,
+                tuple(sorted(preferred_source_kinds))
+                if preferred_source_kinds is not None
+                else None,
+                tuple(sorted(effective_exclude_frameworks)),
                 effective_top_k,
                 self.config.RAG_RERANK_TOP_N,
                 self.config.RAG_RERANK_MODEL,
@@ -397,11 +427,23 @@ class RagService:
                 vector = self.embedding.embed([query])[0]
             candidates = index.search_verified(
                 vector,
-                top_k=effective_top_k,
+                # 多取一层候选，便于把相关 Recipe 提升到最终候选，而
+                # 不会因为普通文档的向量分数略高而完全遮蔽配方。
+                top_k=(effective_top_k * 2 if preferred_source_kinds else effective_top_k),
                 source_kinds=source_kinds,
+                exclude_frameworks=effective_exclude_frameworks,
                 info=info,
                 snapshot=snapshot,
             )
+            if preferred_source_kinds:
+                candidates.sort(
+                    key=lambda item: (
+                        item.chunk.source_kind in preferred_source_kinds,
+                        item.score,
+                    ),
+                    reverse=True,
+                )
+                candidates = candidates[:effective_top_k]
         except (OSError, ValueError, RagClientError) as exc:
             return self._empty_result(
                 query,
@@ -482,6 +524,7 @@ class RagService:
                     {
                         "index": index,
                         "source": item.chunk.source_path,
+                        "metadata": item.chunk.metadata,
                         "score": item.rerank_score if item.rerank_score is not None else item.score,
                         "text": item.chunk.text,
                     },
@@ -503,6 +546,7 @@ class RagService:
         *,
         docs_dir: Path | None = None,
         examples_dir: Path | None = None,
+        recipes_dir: Path | None = None,
         rebuild: bool = False,
     ) -> RagIndexBuildResult:
         """构建本地索引；未变化时复用，``rebuild`` 强制重新 Embedding。"""
@@ -510,15 +554,15 @@ class RagService:
         self.embedding.require()
         docs_root = docs_dir if docs_dir is not None else self.config.RAG_DOCS_DIR
         examples_root = examples_dir if examples_dir is not None else self.config.RAG_EXAMPLES_DIR
+        recipes_root = recipes_dir if recipes_dir is not None else self.config.RAG_RECIPES_DIR
         docs_root = docs_root.expanduser().resolve() if docs_root is not None else None
         examples_root = examples_root.expanduser().resolve() if examples_root is not None else None
-        sources = iter_source_files(docs_root, examples_root)
+        recipes_root = recipes_root.expanduser().resolve() if recipes_root is not None else None
+        sources = iter_source_files(docs_root, examples_root, recipes_root)
         if not sources:
-            raise ValueError(
-                "没有找到可索引的 .md/.rst/.py 文档或示例，请配置 RAG_DOCS_DIR/RAG_EXAMPLES_DIR"
-            )
+            raise ValueError("没有找到可索引的 .md/.rst/.py 文档、示例或 Recipe，请配置 RAG_*_DIR")
         if not rebuild:
-            reusable = self._reusable_index_info(docs_root, examples_root)
+            reusable = self._reusable_index_info(docs_root, examples_root, recipes_root)
             if reusable is not None:
                 return RagIndexBuildResult(
                     info=reusable,
@@ -529,7 +573,11 @@ class RagService:
         skipped: list[str] = []
         for path, source_kind in sources:
             try:
-                root = docs_root if source_kind == "manim_doc" else examples_root
+                root = {
+                    "manim_doc": docs_root,
+                    "example": examples_root,
+                    "recipe": recipes_root,
+                }[source_kind]
                 display_path = (
                     f"{source_kind}/{path.relative_to(root).as_posix()}"
                     if root is not None
@@ -562,6 +610,7 @@ class RagService:
             embedding_model=self.config.RAG_EMBEDDING_MODEL,
             source_docs_dir=docs_root,
             source_examples_dir=examples_root,
+            source_recipes_dir=recipes_root,
             chunker_version=CHUNKER_VERSION,
             chunk_size=self.config.RAG_CHUNK_SIZE,
             chunk_overlap=self.config.RAG_CHUNK_OVERLAP,
@@ -577,6 +626,7 @@ class RagService:
         self,
         docs_root: Path | None,
         examples_root: Path | None,
+        recipes_root: Path | None,
     ) -> RagIndexInfo | None:
         """返回与当前源目录、Embedding 模型完全匹配的已有索引。"""
 
@@ -590,11 +640,19 @@ class RagService:
                 or info.chunk_overlap != self.config.RAG_CHUNK_OVERLAP
             ):
                 return None
-            if not info.source_docs_dir and not info.source_examples_dir:
+            if (
+                not info.source_docs_dir
+                and not info.source_examples_dir
+                and not info.source_recipes_dir
+            ):
                 # 没有源目录元数据的旧索引无法判断外部文件是否变化；只有
                 # 当前调用也明确没有配置源目录时才可以安全复用。若当前
                 # 配置有源目录，必须重建并写入新的来源身份。
-                return info if docs_root is None and examples_root is None else None
+                return (
+                    info
+                    if docs_root is None and examples_root is None and recipes_root is None
+                    else None
+                )
             indexed_docs = (
                 Path(info.source_docs_dir).expanduser().resolve()
                 if info.source_docs_dir
@@ -605,9 +663,18 @@ class RagService:
                 if info.source_examples_dir
                 else examples_root
             )
-            if indexed_docs != docs_root or indexed_examples != examples_root:
+            indexed_recipes = (
+                Path(info.source_recipes_dir).expanduser().resolve()
+                if info.source_recipes_dir
+                else recipes_root
+            )
+            if (
+                indexed_docs != docs_root
+                or indexed_examples != examples_root
+                or indexed_recipes != recipes_root
+            ):
                 return None
-            current_source_sha256 = source_manifest_digest(docs_root, examples_root)
+            current_source_sha256 = source_manifest_digest(docs_root, examples_root, recipes_root)
             if current_source_sha256 != info.source_sha256:
                 return None
             return info

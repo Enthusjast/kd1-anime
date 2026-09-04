@@ -24,6 +24,7 @@ from uuid import uuid4
 from rich.console import Console
 from rich.prompt import Confirm
 
+from kd1_anime.agents.api_linter import lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import (
@@ -35,6 +36,7 @@ from kd1_anime.agents.continuity import (
     normalize_scene_plan_contract,
     strip_redundant_optional_export_block,
 )
+from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
     repair_required_export_alias_lifecycle,
     validate_animation_lifecycle,
@@ -69,6 +71,7 @@ from kd1_anime.agents.safe_fallback import (
     fallback_reason_summary,
     is_high_confidence_geometry_conflict,
 )
+from kd1_anime.agents.scene_templates import build_safe_scene_code
 from kd1_anime.agents.state_ledger import LedgerElement, StateLedger
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
@@ -602,6 +605,8 @@ class Orchestrator:
         receipt_key: str,
         stage: str,
         source_kinds: set[str] | None = None,
+        preferred_source_kinds: set[str] | None = None,
+        exclude_frameworks: set[str] | None = None,
         code_sha256: str = "",
         inherited_elements_sha256: str = "",
     ) -> str:
@@ -612,6 +617,8 @@ class Orchestrator:
                 query[:50_000],
                 stage=stage,
                 source_kinds=source_kinds,
+                preferred_source_kinds=preferred_source_kinds,
+                exclude_frameworks=exclude_frameworks,
                 code_sha256=code_sha256,
                 inherited_elements_sha256=inherited_elements_sha256,
             )
@@ -1253,6 +1260,7 @@ class Orchestrator:
         last_validation: CodeValidationResult | None = None
         last_continuity_error = ""
         last_lifecycle_error = ""
+        last_api_errors: tuple[str, ...] = ()
         if technical_spec is not None:
             technical_result = compile_technical_spec(
                 plan,
@@ -1318,6 +1326,7 @@ class Orchestrator:
             code = strip_redundant_optional_export_block(code, plan)
 
             validation = self._validate(code, renderer=renderer)
+            api_result = lint_manim_api(code, renderer=renderer, scene_plan=plan)
             continuity_error = ""
             try:
                 extract_scene_continuity_elements(code, plan)
@@ -1332,9 +1341,15 @@ class Orchestrator:
                 )
                 if not lifecycle_result.is_valid:
                     lifecycle_error = "\n".join(lifecycle_result.errors)
-            if validation.is_valid and not continuity_error and not lifecycle_error:
+            if (
+                validation.is_valid
+                and api_result.is_valid
+                and not continuity_error
+                and not lifecycle_error
+            ):
                 return code, validation.scene_classes[0]
             last_validation = validation
+            last_api_errors = api_result.errors
             last_continuity_error = continuity_error
             last_lifecycle_error = lifecycle_error
             # 提供详细的修复指导
@@ -1344,6 +1359,10 @@ class Orchestrator:
                 "次修复。不得原样返回上一候选代码，必须针对下面的确定性错误做最小修改：\n"
                 f"{validation.feedback}"
             ]
+            if api_result.errors:
+                feedback_parts.append(
+                    "\nManim API 静态检查未通过，必须先修复：\n- " + "\n- ".join(api_result.errors)
+                )
             if current_previous and code == current_previous:
                 feedback_parts.append(
                     "\n上一候选代码与本次输出完全相同，说明上一次修复没有生效；"
@@ -1433,6 +1452,9 @@ class Orchestrator:
                         if last_continuity_error
                         else "",
                         f"动画生命周期错误: {last_lifecycle_error}" if last_lifecycle_error else "",
+                        "Manim API 静态检查错误: " + "; ".join(last_api_errors)
+                        if last_api_errors
+                        else "",
                     )
                     if part
                 )
@@ -2152,7 +2174,17 @@ class Orchestrator:
                         self._stop_event.clear()
                     self._checkpoint(ctx, State.CODING)
                     continue
-                self._merge(ctx)
+                try:
+                    self._merge(ctx)
+                except Exception as exc:
+                    route = classify_failure(str(exc), phase="merge")
+                    self._emit(
+                        "failure_routed",
+                        category=route.category,
+                        handler=route.handler,
+                        reason=route.reason,
+                    )
+                    raise RuntimeError(f"视频合并失败（{route.category}）：{exc}") from exc
                 self._final_visual_report(ctx)
                 improve = self._eval(ctx)
 
@@ -2305,7 +2337,59 @@ class Orchestrator:
             env["MANIM_RENDERER"] = ctx.render_profile.renderer
             if ctx.render_profile.renderer == "opengl":
                 env["PYOPENGL_PLATFORM"] = ctx.render_profile.opengl_platform
-            manim_command = [
+            image = settings.SLURM_CONTAINER_IMAGE
+
+            def run_smoke(manim_command: list[str], *, write_video: bool = False) -> None:
+                command_args = list(manim_command)
+                if write_video and ctx.render_profile.renderer == "opengl":
+                    command_args.insert(-2, "--write_to_movie")
+                if image:
+                    command = [
+                        "apptainer",
+                        "exec",
+                        "--containall",
+                        "--cleanenv",
+                        "--no-home",
+                    ]
+                    if ctx.render_profile.renderer == "opengl":
+                        command.append("--nv")
+                    command.extend(["--env", f"MANIM_RENDERER={ctx.render_profile.renderer}"])
+                    if ctx.render_profile.renderer == "opengl":
+                        command.extend(
+                            [
+                                "--env",
+                                f"PYOPENGL_PLATFORM={ctx.render_profile.opengl_platform}",
+                            ]
+                        )
+                    if settings.SLURM_CONTAINER_DISABLE_NETWORK:
+                        command.extend(["--net", "--network", "none"])
+                    command.extend(
+                        [
+                            "--bind",
+                            f"{ctx.paths.root.resolve()}:{ctx.paths.root.resolve()}",
+                            str(Path(image).expanduser().resolve()),
+                            *command_args,
+                        ]
+                    )
+                else:
+                    command = [sys.executable, "-m", *command_args]
+                try:
+                    result = _run_limited_process(
+                        command,
+                        timeout=settings.LOCAL_SMOKE_RENDER_TIMEOUT,
+                        memory_mb=settings.LOCAL_SMOKE_RENDER_MEMORY_MB,
+                        env=env,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError("本地 Smoke Render 超时") from exc
+                except OSError as exc:
+                    raise RuntimeError(f"本地 Smoke Render 无法启动: {exc}") from exc
+                if result.returncode != 0:
+                    output = (result.stderr or result.stdout or "").strip()
+                    detail = output[-10_000:] if output else f"退出码 {result.returncode}"
+                    raise RuntimeError("本地 Smoke Render 失败:\n" + detail)
+
+            common_args = [
                 "manim",
                 "render",
                 f"--renderer={ctx.render_profile.renderer}",
@@ -2315,71 +2399,54 @@ class Orchestrator:
                 "--fps",
                 str(smoke_fps),
                 "--disable_caching",
-                "--media_dir",
-                str(media_dir),
-                str(source),
-                state.class_name,
             ]
-            if ctx.render_profile.renderer == "opengl":
-                manim_command.insert(-2, "--write_to_movie")
-            image = settings.SLURM_CONTAINER_IMAGE
-            if image:
-                command = [
-                    "apptainer",
-                    "exec",
-                    "--containall",
-                    "--cleanenv",
-                    "--no-home",
-                ]
-                if ctx.render_profile.renderer == "opengl":
-                    command.append("--nv")
-                command.extend(
+            if settings.LOCAL_SMOKE_RENDER_MODE in {"frame", "both"}:
+                frame_dir = media_dir / "__frame_smoke__"
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                run_smoke(
                     [
-                        "--env",
-                        f"MANIM_RENDERER={ctx.render_profile.renderer}",
+                        *common_args,
+                        "--format",
+                        "png",
+                        "--save_last_frame",
+                        "--media_dir",
+                        str(frame_dir),
+                        str(source),
+                        state.class_name,
                     ]
                 )
-                if ctx.render_profile.renderer == "opengl":
-                    command.extend(
-                        [
-                            "--env",
-                            f"PYOPENGL_PLATFORM={ctx.render_profile.opengl_platform}",
-                        ]
+                frames = [
+                    path
+                    for path in frame_dir.rglob("*.png")
+                    if path.is_file()
+                    and path.stat().st_size > 0
+                    and (
+                        path.stem == state.class_name
+                        or path.stem.startswith(f"{state.class_name}_")
                     )
-                if settings.SLURM_CONTAINER_DISABLE_NETWORK:
-                    command.extend(["--net", "--network", "none"])
-                command.extend(
+                ]
+                if not frames:
+                    raise RuntimeError("本地 Frame Canary 完成但没有生成最后一帧 PNG")
+            if settings.LOCAL_SMOKE_RENDER_MODE in {"video", "both"}:
+                video_dir = media_dir / "__smoke__"
+                video_dir.mkdir(parents=True, exist_ok=True)
+                run_smoke(
                     [
-                        "--bind",
-                        f"{ctx.paths.root.resolve()}:{ctx.paths.root.resolve()}",
-                        str(Path(image).expanduser().resolve()),
-                        *manim_command,
-                    ]
+                        *common_args,
+                        "--media_dir",
+                        str(video_dir),
+                        str(source),
+                        state.class_name,
+                    ],
+                    write_video=True,
                 )
-            else:
-                command = [sys.executable, "-m", *manim_command]
-            try:
-                result = _run_limited_process(
-                    command,
-                    timeout=settings.LOCAL_SMOKE_RENDER_TIMEOUT,
-                    memory_mb=settings.LOCAL_SMOKE_RENDER_MEMORY_MB,
-                    env=env,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError("本地 Smoke Render 超时") from exc
-            except OSError as exc:
-                raise RuntimeError(f"本地 Smoke Render 无法启动: {exc}") from exc
-            if result.returncode != 0:
-                output = (result.stderr or result.stdout or "").strip()
-                detail = output[-10_000:] if output else f"退出码 {result.returncode}"
-                raise RuntimeError("本地 Smoke Render 失败:\n" + detail)
-            videos = [
-                path
-                for path in media_dir.rglob(f"{state.class_name}.mp4")
-                if path.is_file() and path.stat().st_size > 0
-            ]
-            if not videos:
-                raise RuntimeError("本地 Smoke Render 完成但没有生成最终 MP4")
+                videos = [
+                    path
+                    for path in video_dir.rglob(f"{state.class_name}.mp4")
+                    if path.is_file() and path.stat().st_size > 0
+                ]
+                if not videos:
+                    raise RuntimeError("本地 Video Canary 完成但没有生成最终 MP4")
         self._write_stage_artifact(
             ctx,
             f"smoke_scene_{state.plan.scene_id}_local.json",
@@ -2389,6 +2456,7 @@ class Orchestrator:
                 "status": "passed",
                 "renderer": ctx.render_profile.renderer,
                 "quality": settings.LOCAL_SMOKE_RENDER_QUALITY,
+                "mode": settings.LOCAL_SMOKE_RENDER_MODE,
                 "resolution": [smoke_width, smoke_height],
                 "frame_rate": smoke_fps,
                 "container": bool(settings.SLURM_CONTAINER_IMAGE),
@@ -2522,7 +2590,7 @@ class Orchestrator:
                     ctx.user_prompt,
                     receipt_key="outline",
                     stage="outline",
-                    source_kinds={"manim_doc", "example"},
+                    source_kinds={"manim_doc", "example", "recipe"},
                 )
                 draft_method = getattr(self.planner, "plan_draft", None)
                 if callable(draft_method):
@@ -2637,7 +2705,7 @@ class Orchestrator:
                 + "\n".join(f"{item.title}: {item.math_concept}" for item in ctx.outlines),
                 receipt_key="continuity",
                 stage="continuity",
-                source_kinds={"manim_doc", "example"},
+                source_kinds={"manim_doc", "example", "recipe"},
             )
             bible_kwargs: dict[str, object] = {
                 "stream": False,
@@ -3204,8 +3272,16 @@ class Orchestrator:
             except Exception as exc:
                 if self._activate_safe_fallback(ctx, scene_id, state, str(exc)):
                     continue
+                route = classify_failure(str(exc), phase="coding")
+                self._emit(
+                    "failure_routed",
+                    scene_id=scene_id,
+                    category=route.category,
+                    handler=route.handler,
+                    reason=route.reason,
+                )
                 with self._state_lock:
-                    category = "continuity" if "连续性" in str(exc) else "coding"
+                    category = route.category if route.category != "unknown" else "coding"
                     self._mark_failed(
                         state,
                         f"Scene {scene_id} 编码/审查失败: {exc}",
@@ -3389,7 +3465,8 @@ class Orchestrator:
             ),
             receipt_key=f"scene:{scene_id}:technical",
             stage="technical",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
+            preferred_source_kinds={"recipe"},
             inherited_elements_sha256=sha256_text(state.inherited_elements_code)
             if state.inherited_elements_code
             else "",
@@ -5368,7 +5445,7 @@ class Orchestrator:
             f"{state.plan.title}\n{state.plan.purpose}\n{state.plan.math_concept}",
             receipt_key=f"scene:{scene_id}:detail",
             stage="detail",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
         )
         with self._llm_sem:
             outline = next(o for o in ctx.outlines if o.scene_id == scene_id)
@@ -5466,6 +5543,7 @@ class Orchestrator:
                 for item in exported_elements
             ]
         inherited_ids = {item.element_id for item in state.plan.inherited_elements}
+        context_mode = settings.CONTINUITY_CONTEXT_MODE
         if inherited_ids and previous.exported_elements:
             selected = [
                 item.code for item in previous.exported_elements if item.element_id in inherited_ids
@@ -5481,7 +5559,9 @@ class Orchestrator:
                     f"Scene {scene_id} 所需继承元素未由 Scene {scene_id - 1} 导出: "
                     + ", ".join(sorted(missing_ids))
                 )
-            state.inherited_elements_code = "\n\n".join(selected)
+            state.inherited_elements_code = (
+                previous.exported_elements_code if context_mode == "full" else "\n\n".join(selected)
+            )
         elif inherited_ids:
             selected_entries = ctx.element_manifest.for_elements(inherited_ids)
             selected_ids = {entry.element_id for entry in selected_entries}
@@ -5491,14 +5571,19 @@ class Orchestrator:
                     f"Scene {scene_id} 所需继承元素没有可验证的状态账本记录: "
                     + ", ".join(sorted(missing_ids))
                 )
-            state.inherited_elements_code = "\n\n".join(
-                entry.source_code for entry in selected_entries
+            state.inherited_elements_code = (
+                "\n\n".join(entry.source_code for entry in ctx.element_manifest.entries)
+                if context_mode == "full"
+                else "\n\n".join(entry.source_code for entry in selected_entries)
             )
             if not state.inherited_elements_code.strip():
                 raise ValueError(f"Scene {scene_id} 的继承元素记录为空，禁止继续编码")
         else:
-            # 旧计划没有结构化 inherited_elements 时保留原有交接行为。
-            state.inherited_elements_code = previous.exported_elements_code
+            # 没有结构化继承合同的旧计划保留历史交接行为；只有显式
+            # stateless 才关闭它，避免升级后破坏旧清单的跨场景动画。
+            state.inherited_elements_code = (
+                "" if context_mode == "stateless" else previous.exported_elements_code
+            )
 
     @staticmethod
     def _refresh_scene_export(state: SceneState) -> None:
@@ -5677,38 +5762,95 @@ class Orchestrator:
             ),
             receipt_key=f"scene:{scene_id}:code",
             stage="code",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
+            preferred_source_kinds={"recipe"},
             code_sha256=sha256_text(state.code) if state.code else "",
             inherited_elements_sha256=sha256_text(state.inherited_elements_code)
             if state.inherited_elements_code
             else "",
         )
-        with self._llm_sem:
-            code, class_name = self._generate_validated_code(
-                state.plan,
-                feedback=state.rewrite_feedback or "",
-                previous_code=state.code if state.rewrite_feedback else "",
-                stream=False,
+        code_fallback_used = False
+        code_fallback_reason = ""
+        try:
+            with self._llm_sem:
+                code, class_name = self._generate_validated_code(
+                    state.plan,
+                    feedback=state.rewrite_feedback or "",
+                    previous_code=state.code if state.rewrite_feedback else "",
+                    stream=False,
+                    renderer=ctx.render_profile.renderer,
+                    continuity_bible=ctx.continuity_bible,
+                    inherited_elements_code=state.inherited_elements_code,
+                    inherited_elements=state.plan.inherited_elements,
+                    elements_to_remove=state.plan.elements_to_remove,
+                    element_manifest=(
+                        ctx.element_manifest.model_copy(
+                            update={
+                                "entries": ctx.element_manifest.for_elements(
+                                    {item.element_id for item in state.plan.inherited_elements}
+                                )
+                            }
+                        )
+                        if state.plan.inherited_elements
+                        else None
+                    ),
+                    technical_spec=state.technical_spec,
+                    rag_context=rag_context,
+                    lesson_spec=ctx.lesson_spec,
+                    teaching_graph=ctx.teaching_graph,
+                )
+        except Exception as exc:
+            # Coder 的网络/截断/结构化输出故障不应直接把一个已经通过
+            # Plan/TechnicalSpec 的场景判死。使用不依赖 LLM 的最小代码
+            # 作为最后保险；它仍必须通过与正常候选完全相同的校验链。
+            fallback_code = build_safe_scene_code(state.plan, state.technical_spec)
+            fallback_validation = self._validate(
+                fallback_code,
                 renderer=ctx.render_profile.renderer,
-                continuity_bible=ctx.continuity_bible,
-                inherited_elements_code=state.inherited_elements_code,
-                inherited_elements=state.plan.inherited_elements,
-                elements_to_remove=state.plan.elements_to_remove,
-                element_manifest=(
-                    ctx.element_manifest.model_copy(
-                        update={
-                            "entries": ctx.element_manifest.for_elements(
-                                {item.element_id for item in state.plan.inherited_elements}
-                            )
-                        }
+            )
+            fallback_continuity_error = ""
+            try:
+                extract_scene_continuity_elements(fallback_code, state.plan)
+            except ValueError as fallback_exc:
+                fallback_continuity_error = str(fallback_exc)
+            fallback_lifecycle_error = ""
+            if (
+                state.technical_spec is not None
+                and fallback_validation.is_valid
+                and not fallback_continuity_error
+            ):
+                lifecycle_result = validate_animation_lifecycle(
+                    fallback_code,
+                    state.technical_spec,
+                    renderer=ctx.render_profile.renderer,
+                )
+                if not lifecycle_result.is_valid:
+                    fallback_lifecycle_error = "; ".join(lifecycle_result.errors)
+            if (
+                not fallback_validation.is_valid
+                or fallback_continuity_error
+                or fallback_lifecycle_error
+            ):
+                raise RuntimeError(
+                    "Coder 生成失败，且安全代码降级未通过确定性校验："
+                    + "；".join(
+                        part
+                        for part in (
+                            "; ".join(fallback_validation.errors),
+                            fallback_continuity_error,
+                            fallback_lifecycle_error,
+                        )
+                        if part
                     )
-                    if state.plan.inherited_elements
-                    else None
-                ),
-                technical_spec=state.technical_spec,
-                rag_context=rag_context,
-                lesson_spec=ctx.lesson_spec,
-                teaching_graph=ctx.teaching_graph,
+                ) from exc
+            code = fallback_code
+            class_name = fallback_validation.scene_classes[0]
+            code_fallback_used = True
+            code_fallback_reason = str(exc)[:5_000]
+            self._emit(
+                "scene_code_fallback",
+                scene_id=scene_id,
+                reason=code_fallback_reason,
             )
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
@@ -5725,10 +5867,22 @@ class Orchestrator:
             state.exported_elements_code = ""
             state.exported_elements = []
             state.local_smoke_status = "pending"
+            if code_fallback_used:
+                state.safe_fallback_used = True
+                state.safe_fallback_reason = (
+                    "Coder 输出不可用，已使用最小安全代码降级：" + code_fallback_reason
+                )[:5_000]
             self._remove_element_manifest_scene(ctx, scene_id)
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.CODING)
         self._local_smoke_render(ctx, state)
+        api_result = lint_manim_api(
+            code,
+            renderer=ctx.render_profile.renderer,
+            scene_plan=state.plan,
+        )
+        if api_result.warnings:
+            self._emit("scene_api_warning", scene_id=scene_id, warnings=list(api_result.warnings))
         self._emit("scene_coded", scene_id=scene_id, file_path=str(path))
 
     def _scene_review(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
@@ -5834,6 +5988,23 @@ class Orchestrator:
                 self._checkpoint(ctx, State.DISPATCHING)
             self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
             return
+        api_result = lint_manim_api(
+            on_disk_code,
+            renderer=ctx.render_profile.renderer,
+            scene_plan=state.plan,
+        )
+        if not api_result.is_valid:
+            with self._state_lock:
+                self._mark_failed(
+                    state,
+                    "提交前 Manim API 静态检查失败:\n" + "\n".join(api_result.errors),
+                    "coding",
+                )
+                self._checkpoint(ctx, State.DISPATCHING)
+            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+            return
+        if api_result.warnings:
+            self._emit("scene_api_warning", scene_id=scene_id, warnings=list(api_result.warnings))
         if state.technical_spec is not None:
             lifecycle_result = validate_animation_lifecycle(
                 on_disk_code,
@@ -6160,7 +6331,15 @@ class Orchestrator:
                 self._checkpoint(ctx, State.FIXING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
-        if fixer.is_infrastructure_error(error_log):
+        route = classify_failure(error_log, phase="render", status=job.status)
+        self._emit(
+            "failure_routed",
+            scene_id=scene_id,
+            category=route.category,
+            handler=route.handler,
+            reason=route.reason,
+        )
+        if route.category == "infrastructure" or fixer.is_infrastructure_error(error_log):
             with self._state_lock:
                 state.give_up = True
                 state.failure_category = "infrastructure"
@@ -6170,6 +6349,31 @@ class Orchestrator:
                 self._checkpoint(ctx, State.FIXING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
+        patch_builder = getattr(fixer, "deterministic_patches", None)
+        deterministic_patches = (
+            patch_builder(state.code, error_log) if callable(patch_builder) else []
+        )
+        if deterministic_patches:
+            patch_result = ReviewResult(
+                is_valid=False,
+                severity="minor",
+                feedback="根据渲染日志发现可唯一定位的旧 API 调用",
+                fixes=deterministic_patches,
+            )
+            if self._apply_precise_review_fixes(ctx, scene_id, state, patch_result):
+                # 当前失败 Job 已经结束；补丁产生新代码后必须清除旧
+                # Job，避免渲染循环再次轮询同一个已结束作业。
+                with self._state_lock:
+                    state.slurm_job = None
+                    self._checkpoint(ctx, State.FIXING)
+                self._request_continuity_rebuild(
+                    ctx,
+                    scene_id,
+                    preserve_visual_candidates=state.visual_best_candidate is not None,
+                    include_failed=True,
+                )
+                self._emit("scene_render_patch_applied", scene_id=scene_id)
+                return
         # 连续相同错误 → 判定为环境/配置问题, 提前放弃, 不再浪费修复次数
         fp = self._error_fingerprint(error_log)
         with self._state_lock:
@@ -6220,7 +6424,8 @@ class Orchestrator:
             ),
             receipt_key=f"scene:{scene_id}:fix:{attempt}",
             stage="fix",
-            source_kinds={"manim_doc", "example"},
+            source_kinds={"manim_doc", "example", "recipe"},
+            preferred_source_kinds={"recipe"},
             code_sha256=sha256_text(state.code) if state.code else "",
             inherited_elements_sha256=sha256_text(state.inherited_elements_code)
             if state.inherited_elements_code

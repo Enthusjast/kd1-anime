@@ -659,6 +659,7 @@ class SlurmDispatcher:
                     "schema_version": 1,
                     "scene_id": scene_id,
                     "status": status,
+                    "mode": settings.SMOKE_RENDER_MODE,
                     **(
                         {"renderer": renderer, "quality": settings.SMOKE_RENDER_QUALITY}
                         if status == "passed"
@@ -670,35 +671,122 @@ class SlurmDispatcher:
             return "printf '%s\\n' " + shlex.quote(payload) + f" > {shlex.quote(str(smoke_marker))}"
 
         if settings.SMOKE_RENDER_ENABLED:
-            smoke_dir = media_dir / "__smoke__"
             smoke_width = max(16, (profile.pixel_width // 8) // 2 * 2)
             smoke_height = max(16, (profile.pixel_height // 8) // 2 * 2)
-            smoke_args = [
-                "manim",
-                "render",
-                f"--renderer={renderer}",
-                f"-q{settings.SMOKE_RENDER_QUALITY}",
-                "--resolution",
-                f"{smoke_width},{smoke_height}",
-                "--fps",
-                str(min(profile.frame_rate, 15)),
-                "--disable_caching",
-                "--media_dir",
-                str(smoke_dir),
-                str(python_file),
-                scene_class_name,
-            ]
-            smoke_args = add_renderer_specific_args(smoke_args)
-            smoke_command = command_for(smoke_args)
+            smoke_fps = min(profile.frame_rate, 15)
+
+            def smoke_failure(message: str) -> list[str]:
+                return [
+                    f"echo {shlex.quote('[Smoke] ' + message)} >&2",
+                    f"mkdir -p {shlex.quote(str(smoke_marker.parent))}",
+                    marker_line("failed"),
+                    "exit 1",
+                ]
+
+            def smoke_run(command: str) -> str:
+                return (
+                    "if command -v timeout >/dev/null 2>&1; then "
+                    f"timeout {settings.SMOKE_RENDER_TIMEOUT}s {command}; "
+                    f"else {command}; fi"
+                )
+
+            lines.append('echo "[Smoke] 开始轻量运行时检查"')
+            if settings.SMOKE_RENDER_MODE in {"frame", "both"}:
+                frame_dir = media_dir / "__frame_smoke__"
+                frame_args = [
+                    "manim",
+                    "render",
+                    f"--renderer={renderer}",
+                    f"-q{settings.SMOKE_RENDER_QUALITY}",
+                    "--resolution",
+                    f"{smoke_width},{smoke_height}",
+                    "--fps",
+                    str(smoke_fps),
+                    "--disable_caching",
+                    "--format",
+                    "png",
+                    "--save_last_frame",
+                    "--media_dir",
+                    str(frame_dir),
+                    str(python_file),
+                    scene_class_name,
+                ]
+                frame_dir_q = shlex.quote(str(frame_dir))
+                frame_class_q = shlex.quote(f"{scene_class_name}.png")
+                frame_versioned_class_q = shlex.quote(f"{scene_class_name}_*.png")
+                frame_command = command_for(frame_args)
+                lines.extend(
+                    [
+                        f"mkdir -p {frame_dir_q}",
+                        smoke_run(frame_command),
+                        f"smoke_frame=$(find {frame_dir_q} -type f \\( -name {frame_class_q} "
+                        f"-o -name {frame_versioned_class_q} \\) "
+                        "! -path '*/partial_movie_files/*' -print -quit)",
+                        'if [ -z "$smoke_frame" ] || [ ! -s "$smoke_frame" ]; then',
+                        *smoke_failure("未生成有效最后一帧 PNG"),
+                        "fi",
+                        'echo "[Smoke] 最后一帧检查通过"',
+                    ]
+                )
+            if settings.SMOKE_RENDER_MODE in {"video", "both"}:
+                smoke_dir = media_dir / "__smoke__"
+                smoke_args = [
+                    "manim",
+                    "render",
+                    f"--renderer={renderer}",
+                    f"-q{settings.SMOKE_RENDER_QUALITY}",
+                    "--resolution",
+                    f"{smoke_width},{smoke_height}",
+                    "--fps",
+                    str(smoke_fps),
+                    "--disable_caching",
+                    "--media_dir",
+                    str(smoke_dir),
+                    str(python_file),
+                    scene_class_name,
+                ]
+                smoke_args = add_renderer_specific_args(smoke_args)
+                smoke_command = command_for(smoke_args)
+                smoke_dir_q = shlex.quote(str(smoke_dir))
+                smoke_class_q = shlex.quote(f"{scene_class_name}.mp4")
+                smoke_video_q = shlex.quote(str(smoke_dir / "__smoke_video_path.txt"))
+                # 通过位置参数把宿主 shell 中的路径传入 probe 子进程；不能
+                # 只依赖未 export 的 smoke_video，尤其是 Apptainer --cleanenv
+                # 会清除普通环境变量。
+                smoke_probe_command = command_for(
+                    [
+                        "sh",
+                        "-c",
+                        "ffprobe -v error -show_entries format=duration "
+                        '-of default=noprint_wrappers=1:nokey=1 "$1" >/dev/null',
+                        "kd1-smoke-probe",
+                        "__KD1_SMOKE_VIDEO__",
+                    ]
+                ).replace("__KD1_SMOKE_VIDEO__", '"$smoke_video"')
+                lines.extend(
+                    [
+                        f"rm -f {smoke_video_q}",
+                        f"mkdir -p {smoke_dir_q}",
+                        smoke_run(smoke_command),
+                        # Manim 的退出码为 0 并不保证 OpenGL 已经写出最终
+                        # MP4（例如缺少 --write_to_movie 时）。必须把产物
+                        # 存在性作为 canary 的第二个独立成功条件。
+                        f"smoke_video=$(find {smoke_dir_q} -type f -name {smoke_class_q} "
+                        "! -path '*/partial_movie_files/*' -print -quit)",
+                        'if [ -z "$smoke_video" ] || [ ! -s "$smoke_video" ]; then',
+                        *smoke_failure("未生成有效最终 MP4"),
+                        "fi",
+                        # 读取一项元数据，尽早捕获空文件/损坏容器，而不是
+                        # 让正式高清渲染完成后才在合并阶段失败。
+                        f"if ! {smoke_probe_command}; then",
+                        *smoke_failure("MP4 容器无法通过 ffprobe 校验"),
+                        "fi",
+                        f"printf '%s\\n' \"$smoke_video\" > {smoke_video_q}",
+                        'echo "[Smoke] MP4 检查通过"',
+                    ]
+                )
             lines.extend(
                 [
-                    'echo "[Smoke] 开始轻量运行时检查"',
-                    f"mkdir -p {shlex.quote(str(smoke_dir))}",
-                    (
-                        "if command -v timeout >/dev/null 2>&1; then "
-                        f"timeout {settings.SMOKE_RENDER_TIMEOUT}s {smoke_command}; "
-                        f"else {smoke_command}; fi"
-                    ),
                     'echo "[Smoke] 运行时检查通过"',
                     f"mkdir -p {shlex.quote(str(smoke_marker.parent))}",
                     marker_line("passed"),

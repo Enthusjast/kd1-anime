@@ -51,10 +51,36 @@ jobs:
           ffprobe -v error \
             -show_entries stream=width,height,avg_frame_rate \
             -of default=nw=1 "$video"
+      - name: Run Manim health check and recipe corpus
+        run: |
+          manim checkhealth
+          declare -a recipes=(
+            "formula.py FormulaRecipe"
+            "graph.py GraphRecipe"
+            "geometry.py GeometryRecipe"
+            "three_d.py ThreeDRecipe"
+            "updater.py UpdaterRecipe"
+            "camera.py CameraRecipe"
+          )
+          for recipe in "${recipes[@]}"; do
+            read -r file scene <<< "$recipe"
+            out="$RUNNER_TEMP/kd1-anime-recipes/${file%.py}"
+            rm -rf "$out"
+            mkdir -p "$out"
+            python -m manim render \
+              --renderer=cairo -ql --disable_caching \
+              --format png --save_last_frame \
+              --media_dir "$out" \
+              "tests/fixtures/recipe_corpus/$file" "$scene"
+            image="$(find "$out" -type f \( -name "$scene.png" -o -name "${scene}_*.png" \) -print -quit)"
+            test -n "$image"
+            test -s "$image"
+          done
       - name: Validate installer and release resources
         run: |
           bash -n install.sh
           test -s resources/manim-0.20.1-knowledge.tar.gz
+          test -s resources/manim-0.20.1-recipes.tar.gz
           python -m build --sdist
           archive="$(find dist -maxdepth 1 -name 'kd1_anime-*.tar.gz' -print -quit)"
           test -n "$archive"

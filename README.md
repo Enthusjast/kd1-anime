@@ -258,6 +258,10 @@ kd1-anime resume <run-id>
 # 只重试某个失败场景
 kd1-anime retry <run-id> --scene-id 2
 
+# 查看离线成功率、审查/修复次数和失败分类；不会调用 LLM 或 Slurm
+kd1-anime stats
+kd1-anime stats <run-id> --json
+
 # 清理 30 天前的已结束运行
 kd1-anime clean --older-than 30d --yes
 ```
@@ -312,7 +316,9 @@ kd1-anime cache clear --yes
 | `MANIM_FRAME_RATE` | `60` | 输出帧率 |
 | `MANIM_OPENGL_PLATFORM` | `egl` | OpenGL 上下文后端；无显示的 HPC 通常使用 `egl` |
 | `SMOKE_RENDER_ENABLED` | `true` | 正式 Slurm 渲染前执行同 renderer 的轻量探针 |
+| `SMOKE_RENDER_MODE` | `frame` | 预检模式：最后一帧、MP4 或两者 |
 | `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外运行时预检 |
+| `LOCAL_SMOKE_RENDER_MODE` | `frame` | 本地预检模式：最后一帧、MP4 或两者 |
 | `MAX_SCENES` | `12` | 单次规划的最大场景数 |
 | `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
 | `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 计划反馈后的 Planner 总重调用次数 |
@@ -350,6 +356,7 @@ RAG_ENABLED=true
 RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
 RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
 RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
+RAG_RECIPES_DIR=~/.kd1-anime/knowledge/recipes
 RAG_EMBEDDING_API_KEY=your-embedding-key
 RAG_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 RAG_EMBEDDING_MODEL=your-embedding-model
@@ -367,10 +374,11 @@ RAG_RERANK_MODEL=your-reranker-model
 ```text
 ~/.kd1-anime/knowledge/
 ├── docs/manim-0.20.1/       # Markdown/reStructuredText 文档
-└── examples/manim-0.20.1/   # Python 示例
+├── examples/manim-0.20.1/   # Python 示例
+└── recipes/manim-0.20.1/    # 带 renderer/风险标签的可信 API 配方
 ```
 
-索引只读取 `.md`、`.rst` 和 `.py`，并将源目录、源文件哈希、分块参数和 Embedding 模型写入 SQLite 索引。修改知识库文件、分块参数或 Embedding 模型后，旧索引会被标记为过期：
+索引只读取 `.md`、`.rst` 和 `.py`，并将源目录、源文件哈希、分块参数和 Embedding 模型写入 SQLite 索引。Recipe 会额外带有 ManimCE、版本、renderer、主题和风险标签，供 Coder 选择相关 API 配方。修改知识库文件、分块参数或 Embedding 模型后，旧索引会被标记为过期：
 
 ```bash
 # 使用配置中的默认目录建立或复用索引
