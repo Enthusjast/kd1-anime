@@ -68,6 +68,14 @@ def test_compiler_reports_non_equivalent_matrix_in_computation():
     assert any("矩阵等式" in issue.message for issue in result)
 
 
+def test_compiler_checks_numeric_matrix_product_in_computation():
+    plan = make_plan(computation="矩阵乘法 [[1,2]] * [[3],[4]] = [[8]]")
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert any("矩阵乘法" in issue.message for issue in result)
+
+
 def test_compiler_checks_simple_equations_in_free_form_computation():
     plan = make_plan(computation="展开得到 (a+b)^2 = a^2+b^2")
 

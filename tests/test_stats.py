@@ -1,5 +1,5 @@
 from kd1_anime.run_store import RunManifest, StoredSceneState, write_manifest
-from kd1_anime.stats import collect_stats, summarize_manifest
+from kd1_anime.stats import collect_stats, summarize_manifest, write_run_report
 
 
 def test_summarize_manifest_counts_scene_outcomes(tmp_path):
@@ -54,3 +54,19 @@ def test_collect_stats_reads_event_stage_durations(tmp_path):
     report = collect_stats(tmp_path)
     assert report["runs"][0]["run_id"] == manifest.run_id
     assert "coding" in report["runs"][0]["stage_durations_seconds"]
+
+
+def test_write_run_report_persists_scene_diagnostics(tmp_path):
+    manifest = RunManifest(
+        run_id="20260728-120000-1234abcd",
+        status="completed",
+        state="DONE",
+        user_prompt="prompt",
+        output_path=str(tmp_path / "output.mp4"),
+    )
+
+    report_path = write_run_report(manifest, tmp_path)
+
+    assert report_path == tmp_path / "run_report.json"
+    payload = report_path.read_text(encoding="utf-8")
+    assert '"run_id": "20260728-120000-1234abcd"' in payload

@@ -12,8 +12,8 @@ def test_coder_requires_xelatex_xdv_and_ctex_template():
 
 
 def test_coder_prompt_has_scene_skeleton_and_spatial_rules():
-    assert "代码骨架模板" in CODER_SYSTEM_PROMPT
-    assert "class Scene1(Scene)" in CODER_SYSTEM_PROMPT
+    assert "实验性代码模板" not in CODER_SYSTEM_PROMPT
+    assert "一个继承" in CODER_SYSTEM_PROMPT
     assert "空间布局约束" in CODER_SYSTEM_PROMPT
     assert "next_to" in CODER_SYSTEM_PROMPT
     assert "不得越界" in CODER_SYSTEM_PROMPT
@@ -50,6 +50,14 @@ def test_coder_prompt_has_continuity_contract():
     assert "单独 FadeIn 其子对象不会使 group active" in CODER_SYSTEM_PROMPT
     assert "initially_active=true" in CODER_SYSTEM_PROMPT
     assert "未经验证的碎片移动" in CODER_SYSTEM_PROMPT
+
+
+def test_experimental_template_prompt_is_opt_in(monkeypatch):
+    monkeypatch.setattr(settings, "CODEGEN_MODE", "hybrid")
+
+    prompt = build_coder_system_prompt()
+
+    assert "实验性代码模板" in prompt
 
 
 def test_coder_forbids_custom_mobject_subclass_for_opengl(monkeypatch):

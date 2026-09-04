@@ -191,7 +191,7 @@ INIT
 - **审查分级**：确定性校验或带源码/合同证据的高置信度核心错误才是 hard blocker；可唯一匹配的局部替换先自动修复；风格建议、一般节奏和不确定的“可能问题”作为 warning 放行。
 - **Render Fix** 只处理渲染日志暴露的代码问题；环境、Slurm、字体和显示服务错误不会盲目交给模型重写。
 - **Continuity Review** 只处理跨场景边界。达到 `MAX_CONTINUITY_FIX_ROUNDS` 后会记录 warning 并沿用当时的可验证计划继续，不会因为连续性审查耗尽而阻断整条流水线。
-- **可靠性回退**：确定性 Scene IR、稳定场景模板、精确 traceback 证据和修复停滞检测共同限制重复生成；复杂场景可按风险尝试有限的备选实现。
+- **可靠性回退**：精确 traceback 证据和修复停滞检测默认启用；确定性 Scene IR、稳定场景模板等模板化生成路径属于实验性功能，只有设置 `CODEGEN_MODE=hybrid/ir` 才启用。
 
 ### 场景粒度与并行
 
@@ -270,7 +270,7 @@ kd1-anime stats <run-id> --json
 kd1-anime clean --older-than 30d --yes
 ```
 
-启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v6；v4/v5 可以只读查看，但不能安全继续修改。
+启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v7；v4–v6 可以只读查看，但不能安全继续修改。
 
 ### 环境和模型诊断
 
@@ -321,10 +321,10 @@ kd1-anime cache clear --yes
 | `MANIM_FRAME_RATE` | `60` | 输出帧率 |
 | `MANIM_OPENGL_PLATFORM` | `egl` | OpenGL 上下文后端；无显示的 HPC 通常使用 `egl` |
 | `SMOKE_RENDER_ENABLED` | `true` | 正式 Slurm 渲染前执行同 renderer 的轻量探针 |
-| `SMOKE_RENDER_MODE` | `frame` | 预检模式：最后一帧、MP4 或两者 |
+| `SMOKE_RENDER_MODE` | `both` | 预检模式：frame、短视频或两者 |
 | `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外运行时预检 |
 | `LOCAL_SMOKE_RENDER_MODE` | `frame` | 本地预检模式：最后一帧、MP4 或两者 |
-| `CODEGEN_MODE` | `hybrid` | 代码模式：Python、IR，或 Python 失败时 IR 回退 |
+| `CODEGEN_MODE` | `python` | 普通 Python 生成；`hybrid/ir` 为实验性模板化路径 |
 | `MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH` | `1/2/3` | 按场景风险允许的备选实现策略数 |
 | `MAX_SCENES` | `12` | 单次规划的最大场景数 |
 | `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
@@ -336,7 +336,7 @@ kd1-anime cache clear --yes
 | `MAX_FIX_ATTEMPTS` | `5` | 渲染失败后的代码修复次数 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
-| `AUTO_RESOURCE_ESTIMATION` | `false` | 是否按场景复杂度只向上增加 Slurm 资源 |
+| `AUTO_RESOURCE_ESTIMATION` | `true` | 是否按场景复杂度只向上增加 Slurm 资源 |
 | `MONITOR_QUEUE_TIMEOUT` / `RUN_TIMEOUT` | `3600/3600` | 排队/运行超时（秒） |
 | `MONITOR_UNKNOWN_TIMEOUT` | `300` | 控制面不可查询时的最短等待时间 |
 | `MONITOR_ARTIFACT_GRACE` | `60` | Slurm 完成后等待共享文件系统同步产物的时间 |
@@ -447,16 +447,18 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 ├── knowledge/                   # Manim 文档和示例
 ├── rag/index.sqlite3            # 本地知识索引
 ├── cache/llm.sqlite3            # LLM 完整响应缓存
+├── diagnostics/failure_cases.sqlite3 # 脱敏渲染失败案例
 └── workspace/
     ├── eval_results/            # 独立 evaluate 命令的报告
     └── runs/<run-id>/
         ├── prompt.md            # 需求文件；不是 prompt.txt
-        ├── manifest.json        # 当前为 schema v6
+        ├── manifest.json        # 当前为 schema v7
         ├── events.jsonl         # 脱敏事件轨迹
         ├── scenes/              # Python Scene 与 sbatch 脚本
         ├── logs/                # stdout/stderr
         ├── videos/              # 当前 run 的媒体目录
         ├── artifacts/            # 计划、合同、审查和账本快照
+        ├── run_report.json       # 结构化运行统计与失败诊断
         ├── eval_frames/          # 视觉评估关键帧
         ├── eval_reports/         # 场景/成片视觉报告
         ├── visual_candidates/    # 视觉修复候选
@@ -520,7 +522,9 @@ kd1-anime batch prompts.json --dry-run
 - `MANIM_RENDERER=cairo` 是默认 CPU 渲染器；`MANIM_RENDERER=opengl` 需要有效 GPU。只有 OpenGL 模式才会申请 `SLURM_GPU_TYPE`。
 - `MANIM_OPENGL_PLATFORM` 只决定 PyOpenGL 上下文后端：`egl` 适合无显示的 headless 节点，`glx` 需要可用显示服务。它不等同于选择 Cairo/OpenGL 渲染器。
 - OpenGL 不支持 `self.camera.frame`/`MovingCameraScene` 这类 Cairo 运镜 API；3D 场景应使用专用相机 API。遇到 `OpenGLCamera ... frame` 错误，应修改代码或切换 Cairo，而不是只重复提交任务。
-- 正式渲染前默认执行同 renderer 的 Smoke Render；本地预检需要显式设置 `LOCAL_SMOKE_RENDER_ENABLED=true`，且 dry-run 永不执行生成代码。
+- 正式渲染前默认执行 import-only、frame 和风险自适应的短视频 Smoke Render；本地预检需要显式设置 `LOCAL_SMOKE_RENDER_ENABLED=true` 或使用 `--smoke`，且 dry-run 默认永不执行生成代码。
+- 复杂场景默认只向上调整 Slurm CPU、内存和时间资源；可通过 `AUTO_RESOURCE_ESTIMATION=false` 恢复固定资源。
+- AutoFix 会优先使用唯一可匹配补丁，并保存最多 3 个经过验证的代码候选；连续无进展时优先回滚到可信版本。
 - 多场景默认使用 FFmpeg `xfade=transition=fade`，转场时长为 `TRANSITION_DURATION=0.5` 秒；有音频时同步使用 `acrossfade`。
 - 合并写入临时文件，ffprobe 验证通过后才原子替换最终输出。默认拒绝覆盖自定义输出，使用 `--force` 或配置 `OVERWRITE_OUTPUT=true` 才允许覆盖。
 

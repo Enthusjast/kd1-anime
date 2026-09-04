@@ -1,4 +1,7 @@
-from kd1_anime.agents.math_verifier import verify_expression_samples
+from kd1_anime.agents.math_verifier import (
+    verify_expression_samples,
+    verify_numeric_matrix_product,
+)
 
 
 def test_sampled_verification_is_reproducible_for_equivalent_non_polynomials():
@@ -29,3 +32,19 @@ def test_sampled_verification_skips_undefined_samples():
 
     assert result.status == "unknown"
     assert result.valid_samples == 0
+
+
+def test_numeric_matrix_product_checks_dimensions_and_elements():
+    assert (
+        verify_numeric_matrix_product("[[1,2],[3,4]]", "[[1],[2]]", "[[5],[11]]").status == "proved"
+    )
+    result = verify_numeric_matrix_product("[[1,2]]", "[[1,2]]", "[[1,2]]")
+    assert result.status == "counterexample"
+    assert "维度" in result.reason
+
+
+def test_numeric_matrix_product_reports_wrong_result():
+    result = verify_numeric_matrix_product("[[1,2]]", "[[3],[4]]", "[[8]]")
+
+    assert result.status == "counterexample"
+    assert result.counterexample == {"row": 0.0, "column": 0.0}

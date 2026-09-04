@@ -67,12 +67,14 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_CACHE_ENABLED | true | 是否启用完整非流式响应缓存 |
 | LLM_CACHE_PATH | ~/.kd1-anime/cache/llm.sqlite3 | 缓存数据库路径 |
 | LLM_CACHE_MAX_ENTRIES | 512 | 最大缓存条目数；0 等同关闭写入 |
+| FAILURE_CASES_PATH | ~/.kd1-anime/diagnostics/failure_cases.sqlite3 | 脱敏失败案例库路径 |
+| FAILURE_CASE_MAX_PER_CATEGORY | 100 | 每类失败案例最大保存数 |
 | LLM_MAX_CONTEXT_CHARS | 120000 | Agent 输入总字符预算 |
 | LLM_MAX_CODE_CONTEXT_CHARS | 60000 | 代码、继承定义和修复上下文预算 |
 | LLM_MAX_REVIEW_CONTEXT_CHARS | 90000 | Reviewer 输入预算 |
 | LLM_MAX_TECHNICAL_SPEC_CHARS | 30000 | TechnicalSpec 注入预算 |
 | MAX_TECHNICAL_SPEC_ATTEMPTS | 3 | TechnicalSpec 编译失败后的重生成次数 |
-| CODEGEN_MODE | hybrid | 代码模式：hybrid、python 或 ir |
+| CODEGEN_MODE | python | 普通 Python 生成；hybrid/ir 为实验性模板化路径 |
 
 阶段预算独立设置，可以减少推理模型把输出预算耗在分析过程而导致 JSON 或代码
 截断。若模型能力或输出复杂度不同，可以只调整对应阶段。
@@ -161,7 +163,7 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | SLURM_MEM_GB | 空 | 可选内存约束，如 32G |
 | SLURM_GPU_TYPE | 空 | OpenGL 作业的 GPU 类型 |
 | SLURM_GPU_COUNT | 1 | OpenGL GPU 数 |
-| AUTO_RESOURCE_ESTIMATION | false | 是否按场景复杂度自动增加资源（只向上调整） |
+| AUTO_RESOURCE_ESTIMATION | true | 是否按场景复杂度自动增加资源（只向上调整） |
 | SLURM_MAX_IN_FLIGHT | 0 | 最大在途场景作业数；0 表示不限制 |
 | SLURM_SUBMIT_RETRIES | 3 | 明确 sbatch 失败的重试次数 |
 | SLURM_SUBMIT_RETRY_DELAY | 2.0 | sbatch 重试退避秒数 |
@@ -183,14 +185,17 @@ Cairo 不申请 GPU；只有 MANIM_RENDERER=opengl 时才使用 GPU 配置。所
 | MANIM_FRAME_RATE | 60 | 输出帧率 |
 | MANIM_OPENGL_PLATFORM | egl | OpenGL 后端：egl 或 glx |
 | SMOKE_RENDER_ENABLED | true | 正式 Slurm 渲染前执行轻量探针 |
-| SMOKE_RENDER_MODE | frame | 预检模式：frame、video 或 both |
+| SMOKE_RENDER_MODE | both | 预检模式：frame、video 或 both |
 | SMOKE_RENDER_QUALITY | l | Smoke Render 质量：l 或 m |
 | SMOKE_RENDER_TIMEOUT | 180 | 远端 Smoke Render 超时秒数 |
+| SMOKE_RENDER_SHORT_ANIMATIONS | 3 | 短视频预检最多执行的前几个动画事件 |
+| ADAPTIVE_SMOKE_RENDER | true | 是否按场景风险选择 Smoke 强度 |
 | LOCAL_SMOKE_RENDER_ENABLED | false | 是否在本地做额外运行时预检 |
 | LOCAL_SMOKE_RENDER_MODE | frame | 本地预检模式：frame、video 或 both |
 | LOCAL_SMOKE_RENDER_QUALITY | l | 本地预检质量 |
 | LOCAL_SMOKE_RENDER_TIMEOUT | 180 | 本地预检超时秒数 |
 | LOCAL_SMOKE_RENDER_MEMORY_MB | 4096 | 本地预检地址空间上限 |
+| LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS | 3 | 本地短视频预检最多执行的动画事件 |
 | ALLOW_PARTIAL_OUTPUT | false | 是否允许缺少场景时合并 |
 | OVERWRITE_OUTPUT | false | 是否允许覆盖自定义输出 |
 | TRANSITION_TYPE | fade | 当前支持的场景转场 |

@@ -26,6 +26,12 @@ from rich.prompt import Confirm
 
 from kd1_anime.agents.api_linter import lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
+from kd1_anime.agents.capability import (
+    CapabilityContract,
+    build_capability_contract,
+    recommended_renderer,
+    validate_capability_contract,
+)
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import (
     ContinuityIssue,
@@ -36,6 +42,7 @@ from kd1_anime.agents.continuity import (
     normalize_scene_plan_contract,
     strip_redundant_optional_export_block,
 )
+from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
     repair_required_export_alias_lifecycle,
@@ -66,7 +73,7 @@ from kd1_anime.agents.planner import (
     repair_obvious_math_contradictions,
 )
 from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
-from kd1_anime.agents.render_error_parser import extract_render_error
+from kd1_anime.agents.render_error_parser import RenderErrorEvidence, extract_render_error
 from kd1_anime.agents.review_policy import review_budget
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
 from kd1_anime.agents.risk import assess_scene_risk
@@ -81,7 +88,11 @@ from kd1_anime.agents.scene_ir import (
     compile_scene_program,
 )
 from kd1_anime.agents.scene_templates import build_safe_scene_code
-from kd1_anime.agents.state_ledger import LedgerElement, StateLedger
+from kd1_anime.agents.state_ledger import (
+    LedgerElement,
+    StateLedger,
+    validate_boundary_handoff,
+)
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
     TechnicalSpec,
@@ -126,6 +137,7 @@ from kd1_anime.run_store import (
     MANIFEST_NAME,
     RunManifest,
     RunRepository,
+    StoredCodeCandidate,
     StoredSceneState,
     StoredVisualCandidate,
     VisualEvalProfile,
@@ -294,6 +306,8 @@ class SceneState:
     technical_input_sha256: str = ""
     technical_status: str = "pending"
     technical_error: str = ""
+    capability_contract: CapabilityContract | None = None
+    capability_status: str = "pending"
     resource_profile: RenderResourceProfile | None = None
     # 本地 Smoke Render 的恢复凭据；未通过或未完成时，恢复/AutoFix 后
     # 必须在 Reviewer 前重新执行，不能只依赖旧的内存状态。
@@ -323,6 +337,7 @@ class SceneState:
     visual_artifact_sha256: str = ""
     visual_feedback: str = ""
     visual_best_candidate: VisualCandidate | None = None
+    candidates: list[StoredCodeCandidate] = field(default_factory=list)
 
 
 @dataclass
@@ -428,6 +443,7 @@ class Orchestrator:
         self.rag = RagService(
             rag_semaphore=(resource_coordinator.rag if resource_coordinator is not None else None)
         )
+        self.failure_cases = FailureCaseStore()
 
     @staticmethod
     def _configured_visual_profile(*, enabled: bool | None = None) -> VisualEvalProfile:
@@ -471,6 +487,9 @@ class Orchestrator:
         state.technical_input_sha256 = ""
         state.technical_status = "pending"
         state.technical_error = ""
+        state.capability_contract = None
+        state.capability_status = "pending"
+        state.candidates = []
 
     def _cancel_unfinished_scene_job(self, state: SceneState, *, reason: str) -> None:
         """在丢弃场景代码/计划前取消仍可能执行的旧 Job。
@@ -585,6 +604,24 @@ class Orchestrator:
                     "运行事件日志写入失败: %s",
                     redact_text(exc, self._event_secrets()),
                 )
+
+    def _write_run_report(self, ctx: PipelineContext) -> None:
+        """尽力写入离线运行报告；报告失败不改变已确定的运行终态。"""
+
+        manifest = self._manifest
+        if manifest is None:
+            return
+        try:
+            from kd1_anime.stats import write_run_report
+
+            report_path = write_run_report(manifest, ctx.paths.root)
+        except Exception as exc:
+            logger.warning(
+                "运行报告写入失败: %s",
+                redact_text(exc, self._event_secrets()),
+            )
+            return
+        self._emit("run_report_written", path=str(report_path.relative_to(ctx.paths.root)))
 
     @staticmethod
     def _supports_keyword(callable_obj: object, name: str) -> bool:
@@ -873,6 +910,8 @@ class Orchestrator:
                     technical_input_sha256=scene.technical_input_sha256,
                     technical_status=scene.technical_status,
                     technical_error=scene.technical_error,
+                    capability_contract=scene.capability_contract,
+                    capability_status=scene.capability_status,
                     resource_profile=scene.resource_profile,
                     local_smoke_status=scene.local_smoke_status,
                     rewrite_feedback=scene.rewrite_feedback,
@@ -898,6 +937,7 @@ class Orchestrator:
                         if scene.visual_best_candidate is not None
                         else None
                     ),
+                    candidates=list(scene.candidates),
                 )
             ctx.manifest_revision = (
                 max(
@@ -1050,6 +1090,32 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _restore_code_candidates(
+        candidates: list[StoredCodeCandidate],
+        root: Path,
+    ) -> list[StoredCodeCandidate]:
+        """只恢复代码文件和哈希均匹配的回滚候选。"""
+
+        restored: list[StoredCodeCandidate] = []
+        for candidate in candidates[-3:]:
+            try:
+                path = restore_run_path(root, candidate.code_file)
+                if path.is_symlink() or not path.is_file():
+                    continue
+                code = path.read_text(encoding="utf-8")
+                if sha256_text(code) != candidate.code_sha256:
+                    continue
+                if (
+                    candidate.artifact is not None
+                    and candidate.artifact.code_sha256 != candidate.code_sha256
+                ):
+                    continue
+            except (OSError, UnicodeError, ValueError):
+                continue
+            restored.append(candidate)
+        return restored
+
+    @staticmethod
     def _context_from_manifest(manifest: RunManifest, root: Path) -> PipelineContext:
         root = root.resolve()
         output = Path(manifest.output_path).expanduser()
@@ -1167,6 +1233,8 @@ class Orchestrator:
                 technical_input_sha256=getattr(stored, "technical_input_sha256", ""),
                 technical_status=getattr(stored, "technical_status", "pending"),
                 technical_error=getattr(stored, "technical_error", ""),
+                capability_contract=getattr(stored, "capability_contract", None),
+                capability_status=getattr(stored, "capability_status", "pending"),
                 resource_profile=(
                     getattr(stored, "resource_profile", None)
                     or (getattr(job, "resource_profile", None) if job is not None else None)
@@ -1193,6 +1261,7 @@ class Orchestrator:
                 visual_best_candidate=Orchestrator._restore_visual_candidate(
                     stored.visual_best_candidate, root
                 ),
+                candidates=Orchestrator._restore_code_candidates(stored.candidates, root),
             )
         direct_render = getattr(manifest, "direct_render", False) or (
             not manifest.auto_fix
@@ -2264,6 +2333,7 @@ class Orchestrator:
                     self._checkpoint(ctx, State.ERROR, status="failed", error=message)
                     raise RuntimeError(message)
                 self._checkpoint(ctx, State.DONE, status="dry_run_complete")
+                self._write_run_report(ctx)
                 self._emit("dry_run_complete", run_dir=str(ctx.paths.root))
                 return None
             if ctx.final_video is None:
@@ -2271,6 +2341,7 @@ class Orchestrator:
                 self._checkpoint(ctx, State.ERROR, status="failed", error=message)
                 raise RuntimeError(message)
             self._checkpoint(ctx, State.DONE, status="completed")
+            self._write_run_report(ctx)
             return ctx.final_video
         except KeyboardInterrupt:
             self.cancel_all()
@@ -2283,6 +2354,7 @@ class Orchestrator:
                 )
             except Exception as checkpoint_error:
                 console.print(f"[yellow]写入中断清单失败: {checkpoint_error}[/]", markup=False)
+            self._write_run_report(ctx)
             raise
         except Exception as exc:
             self.cancel_all()
@@ -2295,6 +2367,7 @@ class Orchestrator:
                 )
             except Exception as checkpoint_error:
                 console.print(f"[yellow]写入失败清单失败: {checkpoint_error}[/]", markup=False)
+            self._write_run_report(ctx)
             raise
 
     def _latest_checkpoint_state(self, fallback: State) -> State:
@@ -2361,6 +2434,7 @@ class Orchestrator:
             raise
         with self._state_lock:
             state.local_smoke_status = "passed"
+            self._record_code_candidate(ctx, state, verification="smoke")
             self._checkpoint(ctx, State.CODING)
         self._emit("scene_smoke_rendered", scene_id=state.plan.scene_id)
 
@@ -2392,14 +2466,26 @@ class Orchestrator:
             smoke_width = max(16, (ctx.render_profile.pixel_width // 8) // 2 * 2)
             smoke_height = max(16, (ctx.render_profile.pixel_height // 8) // 2 * 2)
             smoke_fps = min(ctx.render_profile.frame_rate, 15)
+            local_smoke_mode = settings.LOCAL_SMOKE_RENDER_MODE
+            if settings.ADAPTIVE_SMOKE_RENDER:
+                local_smoke_mode = (
+                    "both"
+                    if assess_scene_risk(state.plan, state.technical_spec).level == "high"
+                    else "frame"
+                )
             env = os.environ.copy()
             env["MANIM_RENDERER"] = ctx.render_profile.renderer
             if ctx.render_profile.renderer == "opengl":
                 env["PYOPENGL_PLATFORM"] = ctx.render_profile.opengl_platform
             image = settings.SLURM_CONTAINER_IMAGE
 
-            def run_smoke(manim_command: list[str], *, write_video: bool = False) -> None:
-                command_args = list(manim_command)
+            def run_smoke(
+                command_args: list[str],
+                *,
+                write_video: bool = False,
+                module: str = "manim",
+            ) -> None:
+                command_args = list(command_args)
                 if write_video and ctx.render_profile.renderer == "opengl":
                     command_args.insert(-2, "--write_to_movie")
                 if image:
@@ -2427,11 +2513,19 @@ class Orchestrator:
                             "--bind",
                             f"{ctx.paths.root.resolve()}:{ctx.paths.root.resolve()}",
                             str(Path(image).expanduser().resolve()),
-                            *command_args,
+                            *(
+                                ["python", "-m", module, *command_args]
+                                if module
+                                else ["python", *command_args]
+                            ),
                         ]
                     )
                 else:
-                    command = [sys.executable, "-m", *command_args]
+                    command = (
+                        [sys.executable, "-m", module, *command_args]
+                        if module
+                        else [sys.executable, *command_args]
+                    )
                 try:
                     result = _run_limited_process(
                         command,
@@ -2459,7 +2553,21 @@ class Orchestrator:
                 str(smoke_fps),
                 "--disable_caching",
             ]
-            if settings.LOCAL_SMOKE_RENDER_MODE in {"frame", "both"}:
+            import_check = (
+                "import importlib.util, pathlib, sys; "
+                "path=pathlib.Path(sys.argv[1]); name=sys.argv[2]; "
+                "spec=importlib.util.spec_from_file_location('kd1_smoke_scene', path); "
+                "module=importlib.util.module_from_spec(spec); "
+                "spec.loader.exec_module(module); "
+                "candidate=getattr(module, name, None); "
+                "raise SystemExit(1) if not isinstance(candidate, type) else None"
+            )
+            run_smoke(
+                ["-c", import_check, str(source), state.class_name],
+                module="",
+            )
+            self._emit("scene_smoke_imported", scene_id=state.plan.scene_id)
+            if local_smoke_mode in {"frame", "both"}:
                 frame_dir = media_dir / "__frame_smoke__"
                 frame_dir.mkdir(parents=True, exist_ok=True)
                 run_smoke(
@@ -2486,12 +2594,14 @@ class Orchestrator:
                 ]
                 if not frames:
                     raise RuntimeError("本地 Frame Canary 完成但没有生成最后一帧 PNG")
-            if settings.LOCAL_SMOKE_RENDER_MODE in {"video", "both"}:
+            if local_smoke_mode in {"video", "both"}:
                 video_dir = media_dir / "__smoke__"
                 video_dir.mkdir(parents=True, exist_ok=True)
                 run_smoke(
                     [
                         *common_args,
+                        "--from_animation_number",
+                        f"0,{settings.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS}",
                         "--media_dir",
                         str(video_dir),
                         str(source),
@@ -2515,7 +2625,9 @@ class Orchestrator:
                 "status": "passed",
                 "renderer": ctx.render_profile.renderer,
                 "quality": settings.LOCAL_SMOKE_RENDER_QUALITY,
-                "mode": settings.LOCAL_SMOKE_RENDER_MODE,
+                "mode": local_smoke_mode,
+                "stages": ["import", "frame", "short_video"],
+                "short_animations": settings.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS,
                 "resolution": [smoke_width, smoke_height],
                 "frame_rate": smoke_fps,
                 "container": bool(settings.SLURM_CONTAINER_IMAGE),
@@ -3032,6 +3144,44 @@ class Orchestrator:
         }
         return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
+    def _adapt_renderer_for_plans(self, ctx: PipelineContext) -> None:
+        """在首次提交前为明确需要 Cairo 运镜的计划切换 renderer。"""
+
+        if ctx.render_profile.renderer != "opengl":
+            return
+        contracts = [
+            build_capability_contract(
+                state.plan,
+                renderer=ctx.render_profile.renderer,
+                render_profile=ctx.render_profile,
+                gpu_type=settings.SLURM_GPU_TYPE,
+            )
+            for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            if state.plan_ready and not state.failed and not state.give_up
+        ]
+        if not any(recommended_renderer(contract) == "cairo" for contract in contracts):
+            return
+        has_started_scene = any(
+            state.code or state.slurm_job is not None or state.rendered
+            for state in ctx.scene_states.values()
+        )
+        if has_started_scene:
+            ctx.continuity_warnings.append(
+                "当前运行已有场景代码/作业，无法安全自动切换 renderer；能力合同将阻止不兼容提交。"
+            )
+            return
+        previous = ctx.render_profile.renderer
+        ctx.render_profile = ctx.render_profile.model_copy(update={"renderer": "cairo"})
+        ctx.continuity_warnings.append(
+            f"能力合同检测到 Cairo 专用运镜，已在首次提交前将 renderer 从 {previous} 切换为 cairo。"
+        )
+        self._emit(
+            "renderer_auto_switched",
+            previous=previous,
+            current="cairo",
+            reason="场景能力合同需要 MovingCameraScene/camera.frame",
+        )
+
     def _run_scheduler(self, ctx: PipelineContext, *, planning_only: bool = False) -> None:
         """启动每个场景的独立流水线线程, 全部结束后返回。"""
         import threading
@@ -3066,6 +3216,7 @@ class Orchestrator:
             # 缺失断言会被错误归因到其它场景，既浪费 LLM 预算又掩盖真正根因。
             self._checkpoint(ctx, State.DETAILING)
             return
+        self._adapt_renderer_for_plans(ctx)
         self._normalize_pending_scene_contracts(ctx)
         self._compile_scene_plans(ctx)
         # 计划审查与全片连续性审查可能互相触发：连续性重规划后需要重新
@@ -3591,6 +3742,44 @@ class Orchestrator:
                 raise ValidationError(
                     "TechnicalSpec 未生成有效结果",
                     hint="请修正技术计划后再生成代码",
+                )
+            capability_contract = build_capability_contract(
+                state.plan,
+                spec,
+                renderer=ctx.render_profile.renderer,
+                render_profile=ctx.render_profile,
+                gpu_type=settings.SLURM_GPU_TYPE,
+            )
+            capability_result = validate_capability_contract(
+                capability_contract,
+                render_profile=ctx.render_profile,
+                gpu_type=settings.SLURM_GPU_TYPE,
+            )
+            if spec.renderer != ctx.render_profile.renderer:
+                capability_result = capability_result.model_copy(
+                    update={
+                        "is_valid": False,
+                        "errors": (
+                            *capability_result.errors,
+                            f"TechnicalSpec.renderer={spec.renderer} 与当前 renderer="
+                            f"{ctx.render_profile.renderer} 不一致",
+                        ),
+                    }
+                )
+            with self._state_lock:
+                state.capability_contract = capability_contract
+                state.capability_status = "passed" if capability_result.is_valid else "failed"
+                self._checkpoint(ctx, State.REVIEWING)
+            if not capability_result.is_valid:
+                raise ValidationError(
+                    "场景能力合同未通过：\n"
+                    + "\n".join(f"- {error}" for error in capability_result.errors),
+                    hint="请修正 renderer、Scene 基类或技术对象声明",
+                )
+            if capability_result.warnings:
+                ctx.continuity_warnings.extend(
+                    f"Scene {scene_id} 能力合同：{warning}"
+                    for warning in capability_result.warnings
                 )
         except Exception as exc:
             with self._state_lock:
@@ -5765,7 +5954,8 @@ class Orchestrator:
         # update_scene 会按 element_id 覆盖当前场景重新导出的快照；历史
         # 元素则保留为 inactive tombstone，供旧边界和恢复诊断引用。
         ctx.state_ledger = ctx.state_ledger.model_copy(update={"elements": current_elements})
-        ctx.state_ledger = ctx.state_ledger.update_scene(
+        previous_boundary = ctx.state_ledger.boundaries.get(state.plan.scene_id - 1)
+        next_ledger = ctx.state_ledger.update_scene(
             scene_id=state.plan.scene_id,
             elements=ledger_elements,
             opening_element_ids=[item.element_id for item in state.plan.inherited_elements],
@@ -5781,6 +5971,13 @@ class Orchestrator:
             else "",
             artifact_video_sha256=(state.artifact.video_sha256 if state.artifact else ""),
         )
+        boundary_errors = validate_boundary_handoff(
+            previous_boundary,
+            next_ledger.boundaries[state.plan.scene_id],
+        )
+        if boundary_errors:
+            raise ValueError("场景边界状态合同无效：" + "；".join(boundary_errors))
+        ctx.state_ledger = next_ledger
         self._write_stage_artifact(
             ctx,
             "state_ledger.json",
@@ -5903,7 +6100,7 @@ class Orchestrator:
                             scene_id=scene_id,
                             reason="Coder 生成失败后使用结构化程序编译",
                         )
-                if not program_used:
+                if not program_used and settings.CODEGEN_MODE != "python":
                     # Coder 的网络/截断/结构化输出故障不应直接把一个已经通过
                     # Plan/TechnicalSpec 的场景判死。使用不依赖 LLM 的最小代码
                     # 作为最后保险；它仍必须通过与正常候选完全相同的校验链。
@@ -5956,6 +6153,8 @@ class Orchestrator:
                         scene_id=scene_id,
                         reason=code_fallback_reason,
                     )
+                if not program_used and settings.CODEGEN_MODE == "python":
+                    raise
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
         with self._state_lock:
@@ -5979,6 +6178,7 @@ class Orchestrator:
                 )[:5_000]
             self._remove_element_manifest_scene(ctx, scene_id)
             self._reset_visual_receipt(ctx, state)
+            self._record_code_candidate(ctx, state, verification="validated")
             self._checkpoint(ctx, State.CODING)
         self._local_smoke_render(ctx, state)
         api_result = lint_manim_api(
@@ -6127,6 +6327,39 @@ class Orchestrator:
                     self._checkpoint(ctx, State.DISPATCHING)
                 self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
                 return
+        capability = state.capability_contract or build_capability_contract(
+            state.plan,
+            state.technical_spec,
+            renderer=ctx.render_profile.renderer,
+            render_profile=ctx.render_profile,
+            gpu_type=settings.SLURM_GPU_TYPE,
+        )
+        capability_result = validate_capability_contract(
+            capability,
+            render_profile=ctx.render_profile,
+            gpu_type=settings.SLURM_GPU_TYPE,
+            code=on_disk_code,
+        )
+        if not capability_result.is_valid:
+            with self._state_lock:
+                state.capability_contract = capability
+                state.capability_status = "failed"
+                self._mark_failed(
+                    state,
+                    "提交前场景能力合同校验失败：\n"
+                    + "\n".join(f"- {error}" for error in capability_result.errors),
+                    "renderer",
+                )
+                self._checkpoint(ctx, State.DISPATCHING)
+            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
+            return
+        with self._state_lock:
+            state.capability_contract = capability
+            state.capability_status = "passed"
+        if capability_result.warnings:
+            ctx.continuity_warnings.extend(
+                f"Scene {scene_id} 能力合同：{warning}" for warning in capability_result.warnings
+            )
         state.class_name = validation.scene_classes[0]
         job: SlurmJob | None = None
         try:
@@ -6272,6 +6505,12 @@ class Orchestrator:
                 state.rendered = True
                 state.failure_reason = ""
                 state.failure_category = ""
+                self._record_code_candidate(
+                    ctx,
+                    state,
+                    verification="rendered",
+                    artifact=state.artifact,
+                )
                 self._reset_visual_receipt(ctx, state)
                 self._update_state_ledger(ctx, state)
                 self._checkpoint(ctx, State.MONITORING)
@@ -6380,6 +6619,176 @@ class Orchestrator:
         state.last_repair_error_fp = ""
         state.stagnant_repair_count = 0
 
+    @staticmethod
+    def _candidate_rank(candidate: StoredCodeCandidate) -> tuple[int, float]:
+        verification_rank = {"validated": 1, "smoke": 2, "rendered": 3}.get(
+            candidate.verification,
+            0,
+        )
+        return verification_rank, candidate.visual_score or 0.0
+
+    def _record_code_candidate(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+        *,
+        verification: str,
+        artifact: SceneArtifact | None = None,
+        visual_score: float | None = None,
+    ) -> None:
+        """保存当前代码的有限回滚凭据，不把代码直接塞进 manifest。"""
+
+        if not state.code:
+            return
+        code_hash = sha256_text(state.code)
+        candidate_dir = ctx.paths.root / "artifacts" / "candidates" / f"scene_{state.plan.scene_id}"
+        candidate_path = candidate_dir / f"{verification}_{code_hash[:16]}.py"
+        if not candidate_path.is_file():
+            self._write_private(candidate_path, state.code)
+        existing = next(
+            (item for item in state.candidates if item.code_sha256 == code_hash),
+            None,
+        )
+        if existing is None:
+            state.candidates.append(
+                StoredCodeCandidate(
+                    code_file=candidate_path.relative_to(ctx.paths.root).as_posix(),
+                    code_sha256=code_hash,
+                    class_name=state.class_name,
+                    verification=verification,
+                    inherited_elements_sha256=sha256_text(state.inherited_elements_code),
+                    exported_elements_code=state.exported_elements_code,
+                    exported_elements=list(state.exported_elements),
+                    artifact=artifact,
+                    visual_score=visual_score,
+                )
+            )
+        else:
+            if self._candidate_rank(
+                StoredCodeCandidate(
+                    code_file=existing.code_file,
+                    code_sha256=existing.code_sha256,
+                    class_name=existing.class_name,
+                    verification=verification,
+                    inherited_elements_sha256=existing.inherited_elements_sha256,
+                    exported_elements_code=existing.exported_elements_code,
+                    exported_elements=list(existing.exported_elements),
+                    artifact=artifact or existing.artifact,
+                    visual_score=visual_score
+                    if visual_score is not None
+                    else existing.visual_score,
+                )
+            ) > self._candidate_rank(existing):
+                existing.verification = verification
+            if artifact is not None:
+                existing.artifact = artifact
+            if visual_score is not None:
+                existing.visual_score = visual_score
+            if state.exported_elements_code:
+                existing.exported_elements_code = state.exported_elements_code
+                existing.exported_elements = list(state.exported_elements)
+        state.candidates.sort(key=self._candidate_rank, reverse=True)
+        del state.candidates[3:]
+
+    def _best_code_candidate(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+    ) -> StoredCodeCandidate | None:
+        """返回当前代码之外的、可验证的最高等级成功候选。"""
+
+        current_hash = sha256_text(state.code) if state.code else ""
+        for candidate in sorted(state.candidates, key=self._candidate_rank, reverse=True):
+            if candidate.code_sha256 == current_hash or candidate.verification not in {
+                "smoke",
+                "rendered",
+            }:
+                continue
+            try:
+                path = restore_run_path(ctx.paths.root, candidate.code_file)
+                if path.is_symlink() or not path.is_file():
+                    continue
+                code = path.read_text(encoding="utf-8")
+                if sha256_text(code) != candidate.code_sha256:
+                    continue
+                validation = self._validate(code, renderer=ctx.render_profile.renderer)
+                if not validation.is_valid or candidate.class_name not in validation.scene_classes:
+                    continue
+                api_result = lint_manim_api(
+                    code,
+                    renderer=ctx.render_profile.renderer,
+                    scene_plan=state.plan,
+                )
+                if not api_result.is_valid:
+                    continue
+                extract_scene_continuity_elements(code, state.plan)
+                if state.technical_spec is not None:
+                    lifecycle = validate_animation_lifecycle(
+                        code,
+                        state.technical_spec,
+                        renderer=ctx.render_profile.renderer,
+                    )
+                    if not lifecycle.is_valid:
+                        continue
+                if candidate.artifact is not None:
+                    self._artifact_video_path(ctx, candidate.artifact)
+            except (OSError, UnicodeError, ValueError, RuntimeError):
+                continue
+            return candidate
+        return None
+
+    def _rollback_to_best_candidate(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+    ) -> bool:
+        """回滚到最近可验证版本；返回是否找到可用候选。"""
+
+        candidate = self._best_code_candidate(ctx, state)
+        if candidate is None:
+            return False
+        path = restore_run_path(ctx.paths.root, candidate.code_file)
+        code = path.read_text(encoding="utf-8")
+        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", code)
+        with self._state_lock:
+            state.code = code
+            state.class_name = candidate.class_name
+            state.rewrite_feedback = ""
+            state.review_signature = ""
+            state.identical_review_count = 0
+            state.review_round = 0
+            state.slurm_job = None
+            state.local_smoke_status = (
+                "passed" if candidate.verification in {"smoke", "rendered"} else "pending"
+            )
+            state.exported_elements_code = candidate.exported_elements_code
+            state.exported_elements = list(candidate.exported_elements)
+            state.artifact = candidate.artifact
+            state.rendered = candidate.artifact is not None and candidate.verification == "rendered"
+            state.reviewed = state.rendered
+            state.failure_reason = ""
+            state.failure_category = ""
+            state.failed = False
+            state.give_up = False
+            self._reset_repair_progress(state)
+            self._reset_visual_receipt(ctx, state)
+            self._checkpoint(ctx, State.FIXING)
+        self._emit(
+            "scene_code_rolled_back",
+            scene_id=scene_id,
+            verification=candidate.verification,
+            code_sha256=candidate.code_sha256,
+        )
+        self._request_continuity_rebuild(
+            ctx,
+            scene_id,
+            reason="恢复最近可信代码候选",
+            preserve_visual_candidates=True,
+            include_failed=True,
+        )
+        return True
+
     def _stagnation_fallback_candidate(
         self,
         ctx: PipelineContext,
@@ -6399,7 +6808,7 @@ class Orchestrator:
                     strategy="scene_ir",
                     reason=str(exc)[:2_000],
                 )
-        candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
+            candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
         for candidate in candidates:
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             if not validation.is_valid:
@@ -6464,6 +6873,7 @@ class Orchestrator:
             if reset_stagnation:
                 state.stagnant_repair_count = 0
             self._remove_element_manifest_scene(ctx, scene_id)
+            self._record_code_candidate(ctx, state, verification="validated")
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.FIXING)
         return code_changed
@@ -6542,6 +6952,40 @@ class Orchestrator:
             )
         self._stop_event.set()
 
+    def _record_failure_case(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+        evidence: RenderErrorEvidence,
+        *,
+        original_code_sha256: str,
+        fixed_code_sha256: str,
+        verification: str,
+        patch_summary: str = "",
+    ) -> None:
+        """把一次可复用修复摘要写入本地案例库。"""
+
+        recorded = self.failure_cases.record(
+            FailureCase(
+                category=evidence.category,
+                fingerprint=evidence.fingerprint,
+                error_type=evidence.error_type,
+                message=evidence.message,
+                original_code_sha256=original_code_sha256,
+                fixed_code_sha256=fixed_code_sha256,
+                verification=verification,
+                renderer=ctx.render_profile.renderer,
+                patch_summary=patch_summary,
+                source_run_id=ctx.paths.run_id,
+            )
+        )
+        self._emit(
+            "failure_case_recorded" if recorded else "failure_case_skipped",
+            scene_id=state.plan.scene_id,
+            category=evidence.category,
+            fingerprint=evidence.fingerprint,
+        )
+
     def _scene_fix(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         self._phase_emit("fixing")
         job = state.slurm_job
@@ -6552,6 +6996,8 @@ class Orchestrator:
         fixer = AutoFixerAgent()
         error_log = self.slurm.get_error_log(job=job)
         if not error_log:
+            if self._rollback_to_best_candidate(ctx, scene_id, state):
+                return
             with self._state_lock:
                 state.give_up = True
                 state.failure_category = "render"
@@ -6565,6 +7011,7 @@ class Orchestrator:
             renderer=ctx.render_profile.renderer,
             secrets=(settings.LLM_API_KEY, settings.VISUAL_LLM_API_KEY),
         )
+        original_code_sha256 = sha256_text(state.code)
         self._write_stage_artifact(
             ctx,
             f"render_error_scene_{scene_id}_{max(1, state.fix_attempts + 1)}.json",
@@ -6614,6 +7061,15 @@ class Orchestrator:
                 fixes=deterministic_patches,
             )
             if self._apply_precise_review_fixes(ctx, scene_id, state, patch_result):
+                self._record_failure_case(
+                    ctx,
+                    state,
+                    error_evidence,
+                    original_code_sha256=original_code_sha256,
+                    fixed_code_sha256=sha256_text(state.code),
+                    verification="validated",
+                    patch_summary="；".join(item.reason for item in deterministic_patches),
+                )
                 # 当前失败 Job 已经结束；补丁产生新代码后必须清除旧
                 # Job，避免渲染循环再次轮询同一个已结束作业。
                 with self._state_lock:
@@ -6698,6 +7154,15 @@ class Orchestrator:
                 fallback = self._stagnation_fallback_candidate(ctx, state)
                 if fallback is not None:
                     candidate, class_name = fallback
+                    self._record_failure_case(
+                        ctx,
+                        state,
+                        error_evidence,
+                        original_code_sha256=original_code_sha256,
+                        fixed_code_sha256=sha256_text(candidate),
+                        verification="validated",
+                        patch_summary="修复停滞后使用 Scene IR/安全模板",
+                    )
                     code_changed = self._install_repair_candidate(
                         ctx,
                         scene_id,
@@ -6729,6 +7194,8 @@ class Orchestrator:
                         error_log,
                     )
                     self._checkpoint(ctx, State.FIXING)
+            if self._rollback_to_best_candidate(ctx, scene_id, state):
+                return
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
         rag_context = self._retrieve_rag(
@@ -6750,6 +7217,10 @@ class Orchestrator:
             if state.inherited_elements_code
             else "",
         )
+        failure_case_context = self.failure_cases.context(
+            category=error_evidence.category,
+            limit=3,
+        )
         self._emit(
             "scene_fixing",
             scene_id=scene_id,
@@ -6770,7 +7241,14 @@ class Orchestrator:
                 fix_kwargs["teaching_graph"] = ctx.teaching_graph
             if self._supports_keyword(fixer.fix, "error_evidence"):
                 fix_kwargs["error_evidence"] = error_evidence
-            candidate = fixer.fix(state.code, error_log, **fix_kwargs)
+            if self._supports_keyword(fixer.fix, "failure_case_context"):
+                fix_kwargs["failure_case_context"] = failure_case_context
+            try:
+                candidate = fixer.fix(state.code, error_log, **fix_kwargs)
+            except Exception:
+                if self._rollback_to_best_candidate(ctx, scene_id, state):
+                    return
+                raise
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             continuity_error = ""
             try:
@@ -6826,6 +7304,15 @@ class Orchestrator:
                 )
             else:
                 class_name = validation.scene_classes[0]
+        self._record_failure_case(
+            ctx,
+            state,
+            error_evidence,
+            original_code_sha256=original_code_sha256,
+            fixed_code_sha256=sha256_text(candidate),
+            verification="validated",
+            patch_summary="AutoFix 候选通过确定性校验",
+        )
         code_changed = self._install_repair_candidate(
             ctx,
             scene_id,
@@ -7529,6 +8016,13 @@ class Orchestrator:
             state.visual_artifact_sha256 = candidate.artifact.video_sha256
             state.visual_feedback = ""
             self._reset_repair_progress(state)
+            self._record_code_candidate(
+                ctx,
+                state,
+                verification="rendered",
+                artifact=candidate.artifact,
+                visual_score=candidate.score,
+            )
         return code_changed
 
     def _visual_gate(

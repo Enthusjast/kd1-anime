@@ -203,8 +203,14 @@ def test_coder_failure_uses_validated_safe_code_fallback(monkeypatch, tmp_path):
     state = SceneState(plan=plan(), plan_ready=True)
     ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
     orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
     monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
-    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "python")
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "hybrid")
+    monkeypatch.setattr(
+        module,
+        "compile_scene_program",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("IR unavailable")),
+    )
     monkeypatch.setattr(
         orchestrator,
         "_generate_validated_code",
@@ -218,6 +224,30 @@ def test_coder_failure_uses_validated_safe_code_fallback(monkeypatch, tmp_path):
     assert state.code.startswith("from manim import *")
     assert state.safe_fallback_used is True
     assert "最小安全代码降级" in state.safe_fallback_reason
+
+
+def test_default_python_codegen_does_not_use_template_fallback(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    state = SceneState(plan=plan(), plan_ready=True)
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "python")
+    monkeypatch.setattr(
+        orchestrator,
+        "_generate_validated_code",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("coder unavailable")),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_safe_scene_code",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("template must be opt-in")),
+    )
+
+    with pytest.raises(RuntimeError, match="coder unavailable"):
+        orchestrator._scene_code(ctx, 1, state)
 
 
 def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
@@ -1411,10 +1441,11 @@ def test_explicit_smoke_override_enables_dry_run_canary(tmp_path):
     assert Orchestrator._local_smoke_enabled(ctx) is True
 
 
-def test_stagnation_fallback_produces_a_different_valid_candidate(tmp_path):
+def test_stagnation_fallback_produces_a_different_valid_candidate(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     state = SceneState(plan=plan(), code="old code", plan_ready=True)
     ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "hybrid")
 
     candidate = Orchestrator()._stagnation_fallback_candidate(ctx, state)
 
@@ -1422,6 +1453,42 @@ def test_stagnation_fallback_produces_a_different_valid_candidate(tmp_path):
     code, class_name = candidate
     assert code != state.code
     assert class_name == "Scene1"
+
+
+def test_code_candidate_history_keeps_at_most_three_versions(tmp_path):
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext("prompt", paths=run_paths)
+    state = SceneState(plan=plan(), class_name="Demo")
+    orchestrator = Orchestrator()
+
+    for index in range(4):
+        state.code = f"from manim import *\n# candidate {index}\n"
+        orchestrator._record_code_candidate(ctx, state, verification="validated")
+
+    assert len(state.candidates) == 3
+    assert all(
+        item.code_file.startswith("artifacts/candidates/scene_1/") for item in state.candidates
+    )
+
+
+def test_rollback_restores_a_previous_smoke_candidate(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    ctx = PipelineContext("prompt", paths=run_paths)
+    good_code = "from manim import *\nclass Good(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(plan=plan(), code=good_code, class_name="Good")
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    orchestrator._record_code_candidate(ctx, state, verification="smoke")
+    state.code = "from manim import *\nclass Bad(Scene):\n    def construct(self): pass\n"
+    state.class_name = "Bad"
+    state.give_up = True
+
+    assert orchestrator._rollback_to_best_candidate(ctx, 1, state) is True
+    assert state.code == good_code
+    assert state.class_name == "Good"
+    assert state.rendered is False
+    assert state.reviewed is False
+    assert state.give_up is False
 
 
 def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
@@ -1434,8 +1501,11 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     orchestrator = Orchestrator()
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "video")
+    monkeypatch.setattr(module.settings, "ADAPTIVE_SMOKE_RENDER", False)
 
     def successful_run(command, **kwargs):
+        if "--media_dir" not in command:
+            return module.subprocess.CompletedProcess(command, 0, "", "")
         media_index = command.index("--media_dir") + 1
         media_dir = Path(command[media_index])
         output = media_dir / "nested" / "Demo.mp4"
@@ -1467,6 +1537,8 @@ def test_local_frame_canary_checks_last_frame(monkeypatch, tmp_path):
     captured = {}
 
     def successful_run(command, **kwargs):
+        if "--media_dir" not in command:
+            return module.subprocess.CompletedProcess(command, 0, "", "")
         captured["command"] = command
         media_dir = Path(command[command.index("--media_dir") + 1])
         output = media_dir / "nested" / "Demo.png"

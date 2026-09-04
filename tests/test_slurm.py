@@ -147,6 +147,27 @@ def test_script_runs_same_renderer_smoke_before_formal_render(monkeypatch, tmp_p
     assert '"$smoke_video"' in script
 
 
+def test_script_runs_import_only_and_short_video_stages(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    monkeypatch.setattr(settings, "SMOKE_RENDER_ENABLED", True)
+    monkeypatch.setattr(settings, "SMOKE_RENDER_MODE", "both")
+    monkeypatch.setattr(settings, "SMOKE_RENDER_SHORT_ANIMATIONS", 3)
+
+    script = SlurmDispatcher()._build_script(
+        1,
+        tmp_path / "scene.py",
+        "Demo",
+        tmp_path / "media",
+        tmp_path / "out",
+        tmp_path / "err",
+        run_root=tmp_path,
+    )
+
+    assert "importlib.util" in script
+    assert "import-only 检查通过" in script
+    assert "--from_animation_number 0,3" in script
+
+
 def test_script_can_run_fast_frame_canary_without_video_probe(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
     monkeypatch.setattr(settings, "SMOKE_RENDER_ENABLED", True)
