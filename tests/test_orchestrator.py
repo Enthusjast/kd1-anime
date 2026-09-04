@@ -1450,12 +1450,14 @@ def test_rollback_restores_a_previous_smoke_candidate(monkeypatch, tmp_path):
     orchestrator._record_code_candidate(ctx, state, verification="smoke")
     state.code = "from manim import *\nclass Bad(Scene):\n    def construct(self): pass\n"
     state.class_name = "Bad"
+    state.give_up = True
 
     assert orchestrator._rollback_to_best_candidate(ctx, 1, state) is True
     assert state.code == good_code
     assert state.class_name == "Good"
     assert state.rendered is False
     assert state.reviewed is False
+    assert state.give_up is False
 
 
 def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):

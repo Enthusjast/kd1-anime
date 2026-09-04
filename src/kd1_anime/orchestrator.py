@@ -6767,6 +6767,8 @@ class Orchestrator:
             state.reviewed = state.rendered
             state.failure_reason = ""
             state.failure_category = ""
+            state.failed = False
+            state.give_up = False
             self._reset_repair_progress(state)
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.FIXING)
@@ -7239,7 +7241,12 @@ class Orchestrator:
                 fix_kwargs["error_evidence"] = error_evidence
             if self._supports_keyword(fixer.fix, "failure_case_context"):
                 fix_kwargs["failure_case_context"] = failure_case_context
-            candidate = fixer.fix(state.code, error_log, **fix_kwargs)
+            try:
+                candidate = fixer.fix(state.code, error_log, **fix_kwargs)
+            except Exception:
+                if self._rollback_to_best_candidate(ctx, scene_id, state):
+                    return
+                raise
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             continuity_error = ""
             try:
