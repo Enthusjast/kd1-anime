@@ -321,8 +321,8 @@ class Settings(BaseSettings):
     LLM_MAX_TECHNICAL_SPEC_CHARS: int = Field(default=30_000, ge=5_000, le=500_000)
     MAX_TECHNICAL_SPEC_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     CODEGEN_MODE: Literal["hybrid", "python", "ir"] = Field(
-        default="hybrid",
-        description="代码生成模式：普通 Python、结构化 IR，或失败时 IR 回退",
+        default="python",
+        description="代码生成模式：普通 Python；hybrid/ir 为实验性模板化路径",
     )
 
     # --- 独立视觉 LLM API ---

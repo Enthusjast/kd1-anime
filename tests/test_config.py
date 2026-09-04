@@ -195,7 +195,7 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_MAX_REVIEW_CONTEXT_CHARS == 90_000
     assert config.LLM_MAX_TECHNICAL_SPEC_CHARS == 30_000
     assert config.MAX_TECHNICAL_SPEC_ATTEMPTS == 3
-    assert config.CODEGEN_MODE == "hybrid"
+    assert config.CODEGEN_MODE == "python"
     assert config.MAX_PLAN_REPLAN_ATTEMPTS == 3
     assert config.SMOKE_RENDER_ENABLED is True
     assert config.SMOKE_RENDER_MODE == "both"

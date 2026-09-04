@@ -151,28 +151,6 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；
   不需要交给下一场景的临时对象不得导出。
 
-## 代码骨架模板
-```python
-from manim import *
-
-class Scene1(Scene):
-    def construct(self):
-        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
-        tex_template.add_to_preamble(r"\usepackage{ctex}")
-        config.tex_template = tex_template
-
-        # KD1_CONTINUITY_EXPORT_BEGIN
-        # element_id: title
-        title = Tex(r"标题", tex_template=tex_template).to_edge(UP)
-        # element_id: formula
-        formula = MathTex(r"a^2+b^2=c^2", tex_template=tex_template)
-        # KD1_CONTINUITY_EXPORT_END
-        formula.next_to(title, DOWN, buff=0.8)
-        self.play(Write(title), run_time=1)
-        self.play(Write(formula), run_time=1.5)
-        self.wait(1)
-```
-
 ## 输出前自查清单
 - Scene 类唯一，construct 存在，无顶层执行代码。
 - TexTemplate、ctex、.xdv 和每个 tex_template 参数完整。
@@ -184,10 +162,22 @@ class Scene1(Scene):
 
 def build_coder_system_prompt(
     renderer: Literal["cairo", "opengl"] | None = None,
+    use_experimental_template: bool | None = None,
 ) -> str:
-    return "\n\n".join(
-        (_CODER_BASE_PROMPT, renderer_guidance(renderer), animation_lifecycle_guidance())
+    use_template = (
+        settings.CODEGEN_MODE != "python"
+        if use_experimental_template is None
+        else bool(use_experimental_template)
     )
+    sections = [_CODER_BASE_PROMPT]
+    if use_template:
+        sections.append(
+            "## 实验性代码模板参考\n"
+            "以下模板只提供文件骨架，不替代 ScenePlan/TechnicalSpec，也不应覆盖数学与生命周期合同。\n"
+            "模板功能由 CODEGEN_MODE=hybrid 或 CODEGEN_MODE=ir 显式启用。"
+        )
+    sections.extend((renderer_guidance(renderer), animation_lifecycle_guidance()))
+    return "\n\n".join(sections)
 
 
 # 保留公开常量供文档和测试使用；实际调用每次按当前配置重新构建。
@@ -298,14 +288,17 @@ class CoderAgent(BaseAgent):
                 required=True,
                 priority=100,
             ),
-            PromptSection(
-                "稳定代码骨架",
-                build_scene_template(scene_plan, technical_spec, renderer=renderer),
-                required=True,
-                priority=108,
-                max_chars=12_000,
-            ),
         ]
+        if settings.CODEGEN_MODE != "python":
+            sections.append(
+                PromptSection(
+                    "实验性稳定代码骨架",
+                    build_scene_template(scene_plan, technical_spec, renderer=renderer),
+                    required=True,
+                    priority=108,
+                    max_chars=12_000,
+                )
+            )
         if technical_contract:
             sections.append(
                 PromptSection(

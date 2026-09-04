@@ -6100,7 +6100,7 @@ class Orchestrator:
                             scene_id=scene_id,
                             reason="Coder 生成失败后使用结构化程序编译",
                         )
-                if not program_used:
+                if not program_used and settings.CODEGEN_MODE != "python":
                     # Coder 的网络/截断/结构化输出故障不应直接把一个已经通过
                     # Plan/TechnicalSpec 的场景判死。使用不依赖 LLM 的最小代码
                     # 作为最后保险；它仍必须通过与正常候选完全相同的校验链。
@@ -6153,6 +6153,8 @@ class Orchestrator:
                         scene_id=scene_id,
                         reason=code_fallback_reason,
                     )
+                if not program_used and settings.CODEGEN_MODE == "python":
+                    raise
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
         with self._state_lock:
@@ -6806,7 +6808,7 @@ class Orchestrator:
                     strategy="scene_ir",
                     reason=str(exc)[:2_000],
                 )
-        candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
+            candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
         for candidate in candidates:
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             if not validation.is_valid:

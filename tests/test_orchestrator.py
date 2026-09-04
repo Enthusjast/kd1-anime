@@ -203,8 +203,14 @@ def test_coder_failure_uses_validated_safe_code_fallback(monkeypatch, tmp_path):
     state = SceneState(plan=plan(), plan_ready=True)
     ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
     orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
     monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
-    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "python")
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "hybrid")
+    monkeypatch.setattr(
+        module,
+        "compile_scene_program",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("IR unavailable")),
+    )
     monkeypatch.setattr(
         orchestrator,
         "_generate_validated_code",
@@ -218,6 +224,30 @@ def test_coder_failure_uses_validated_safe_code_fallback(monkeypatch, tmp_path):
     assert state.code.startswith("from manim import *")
     assert state.safe_fallback_used is True
     assert "最小安全代码降级" in state.safe_fallback_reason
+
+
+def test_default_python_codegen_does_not_use_template_fallback(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    state = SceneState(plan=plan(), plan_ready=True)
+    ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "python")
+    monkeypatch.setattr(
+        orchestrator,
+        "_generate_validated_code",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("coder unavailable")),
+    )
+    monkeypatch.setattr(
+        module,
+        "build_safe_scene_code",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("template must be opt-in")),
+    )
+
+    with pytest.raises(RuntimeError, match="coder unavailable"):
+        orchestrator._scene_code(ctx, 1, state)
 
 
 def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
@@ -1411,10 +1441,11 @@ def test_explicit_smoke_override_enables_dry_run_canary(tmp_path):
     assert Orchestrator._local_smoke_enabled(ctx) is True
 
 
-def test_stagnation_fallback_produces_a_different_valid_candidate(tmp_path):
+def test_stagnation_fallback_produces_a_different_valid_candidate(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     state = SceneState(plan=plan(), code="old code", plan_ready=True)
     ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "hybrid")
 
     candidate = Orchestrator()._stagnation_fallback_candidate(ctx, state)
 
