@@ -3,12 +3,11 @@
 测试代码生成、代码块提取和错误处理。
 """
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from kd1_anime.agents.coder import CoderAgent, CODER_SYSTEM_PROMPT
+from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, CoderAgent
 from kd1_anime.agents.planner import ScenePlan
 
 
@@ -40,7 +39,7 @@ class TestCoderAgent:
 
     def test_extract_code_block_with_fences(self, coder_agent):
         """测试提取带围栏的代码块。"""
-        response = '''这是代码：
+        response = """这是代码：
 
 ```python
 from manim import *
@@ -51,7 +50,7 @@ class TestScene(Scene):
         self.play(Create(circle))
 ```
 
-希望对你有帮助！'''
+希望对你有帮助！"""
         code = coder_agent._extract_code_block(response)
         assert "from manim import *" in code
         assert "class TestScene(Scene):" in code
@@ -59,19 +58,19 @@ class TestScene(Scene):
 
     def test_extract_code_block_without_fences(self, coder_agent):
         """测试提取不带围栏的代码块。"""
-        response = '''from manim import *
+        response = """from manim import *
 
 class TestScene(Scene):
     def construct(self):
         circle = Circle()
-        self.play(Create(circle))'''
+        self.play(Create(circle))"""
         code = coder_agent._extract_code_block(response)
         assert "from manim import *" in code
         assert "class TestScene(Scene):" in code
 
     def test_extract_code_block_multiple_fences(self, coder_agent):
         """测试提取多个围栏中的第一个代码块。"""
-        response = '''第一个代码块：
+        response = """第一个代码块：
 
 ```python
 from manim import *
@@ -84,18 +83,18 @@ class First(Scene):
 ```python
 class Second(Scene):
     def construct(self): pass
-```'''
+```"""
         code = coder_agent._extract_code_block(response)
         assert "class First(Scene):" in code
         assert "class Second(Scene):" not in code
 
     def test_extract_code_block_with_language_tag(self, coder_agent):
         """测试提取带语言标签的代码块。"""
-        response = '''```python
+        response = """```python
 from manim import *
 class Test(Scene):
     def construct(self): pass
-```'''
+```"""
         code = coder_agent._extract_code_block(response)
         assert "from manim import *" in code
 
@@ -108,7 +107,7 @@ class Test(Scene):
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_basic(self, mock_call_llm, coder_agent, sample_plan):
         """测试基本的代码生成。"""
-        mock_call_llm.return_value = '''```python
+        mock_call_llm.return_value = """```python
 from manim import *
 
 class TestScene(Scene):
@@ -120,10 +119,10 @@ class TestScene(Scene):
         circle = Circle()
         self.play(Create(circle))
         self.wait(1)
-```'''
-        
+```"""
+
         code = coder_agent.generate_code(sample_plan, stream=False)
-        
+
         assert "from manim import *" in code
         assert "class TestScene(Scene):" in code
         assert "TexTemplate" in code
@@ -132,7 +131,7 @@ class TestScene(Scene):
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_with_feedback(self, mock_call_llm, coder_agent, sample_plan):
         """测试带反馈的代码生成。"""
-        mock_call_llm.return_value = '''```python
+        mock_call_llm.return_value = """```python
 from manim import *
 
 class TestScene(Scene):
@@ -144,21 +143,23 @@ class TestScene(Scene):
         circle = Circle(color=BLUE)
         self.play(Create(circle))
         self.wait(2)
-```'''
-        
+```"""
+
         feedback = "请使用蓝色圆形，并增加等待时间"
         code = coder_agent.generate_code(sample_plan, feedback=feedback, stream=False)
-        
+
         assert "color=BLUE" in code
         assert "self.wait(2)" in code
         # 验证 feedback 被传递到 prompt
         call_args = mock_call_llm.call_args
-        assert feedback in call_args[1]["user_message"] or feedback in str(call_args[1].get("messages", []))
+        assert feedback in call_args[1]["user_message"] or feedback in str(
+            call_args[1].get("messages", [])
+        )
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_with_previous_code(self, mock_call_llm, coder_agent, sample_plan):
         """测试带之前代码的代码生成。"""
-        mock_call_llm.return_value = '''```python
+        mock_call_llm.return_value = """```python
 from manim import *
 
 class TestScene(Scene):
@@ -169,21 +170,23 @@ class TestScene(Scene):
         
         square = Square()
         self.play(Create(square))
-```'''
-        
-        previous_code = '''from manim import *
+```"""
+
+        previous_code = """from manim import *
 
 class TestScene(Scene):
     def construct(self):
         circle = Circle()
-        self.play(Create(circle))'''
-        
+        self.play(Create(circle))"""
+
         code = coder_agent.generate_code(sample_plan, previous_code=previous_code, stream=False)
-        
+
         assert "class TestScene(Scene):" in code
         # 验证 previous_code 被传递到 prompt
         call_args = mock_call_llm.call_args
-        assert previous_code in call_args[1]["user_message"] or previous_code in str(call_args[1].get("messages", []))
+        assert previous_code in call_args[1]["user_message"] or previous_code in str(
+            call_args[1].get("messages", [])
+        )
 
     def test_system_prompt_contains_requirements(self):
         """测试系统提示包含必要要求。"""
@@ -196,18 +199,22 @@ class TestScene(Scene):
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_uses_scene_plan_info(self, mock_call_llm, coder_agent, sample_plan):
         """测试代码生成使用场景规划信息。"""
-        mock_call_llm.return_value = '''```python
+        mock_call_llm.return_value = """```python
 from manim import *
 class TestScene(Scene):
     def construct(self): pass
-```'''
-        
+```"""
+
         coder_agent.generate_code(sample_plan, stream=False)
-        
+
         # 验证场景规划信息被传递到 prompt
         call_args = mock_call_llm.call_args
-        user_message = call_args[1]["user_message"] if "user_message" in call_args[1] else str(call_args[1].get("messages", []))
-        
+        user_message = (
+            call_args[1]["user_message"]
+            if "user_message" in call_args[1]
+            else str(call_args[1].get("messages", []))
+        )
+
         assert "Test Scene" in user_message
         assert "圆形面积" in user_message
         assert "30" in user_message or "30 秒" in user_message
@@ -218,7 +225,7 @@ class TestCodeExtraction:
 
     def test_extract_with_markdown_before(self, coder_agent):
         """测试提取前面有 Markdown 的代码块。"""
-        response = '''# 代码说明
+        response = """# 代码说明
 
 这是一个示例：
 
@@ -228,26 +235,26 @@ class Test(Scene):
     def construct(self): pass
 ```
 
-## 注意事项'''
+## 注意事项"""
         code = coder_agent._extract_code_block(response)
         assert "from manim import *" in code
 
     def test_extract_with_markdown_after(self, coder_agent):
         """测试提取后面有 Markdown 的代码块。"""
-        response = '''```python
+        response = """```python
 from manim import *
 class Test(Scene):
     def construct(self): pass
 ```
 
-## 解释'''
+## 解释"""
         code = coder_agent._extract_code_block(response)
         assert "from manim import *" in code
         assert "## 解释" not in code
 
     def test_extract_with_inline_code(self, coder_agent):
         """测试提取包含内联代码的响应。"""
-        response = '''使用 `Circle()` 创建圆形：
+        response = """使用 `Circle()` 创建圆形：
 
 ```python
 from manim import *
@@ -255,14 +262,14 @@ class Test(Scene):
     def construct(self):
         circle = Circle()
         self.play(Create(circle))
-```'''
+```"""
         code = coder_agent._extract_code_block(response)
         assert "from manim import *" in code
         assert "`Circle()`" not in code
 
     def test_extract_preserves_indentation(self, coder_agent):
         """测试提取保持缩进。"""
-        response = '''```python
+        response = """```python
 from manim import *
 
 class Test(Scene):
@@ -270,7 +277,7 @@ class Test(Scene):
         if True:
             circle = Circle()
             self.play(Create(circle))
-```'''
+```"""
         code = coder_agent._extract_code_block(response)
         assert "        if True:" in code
         assert "            circle = Circle()" in code
@@ -283,9 +290,9 @@ class TestCoderAgentErrorHandling:
     def test_generate_code_handles_llm_error(self, mock_call_llm, coder_agent, sample_plan):
         """测试处理 LLM 调用错误。"""
         from kd1_anime.exceptions import LLMError
-        
+
         mock_call_llm.side_effect = LLMError("API 调用失败")
-        
+
         with pytest.raises(LLMError):
             coder_agent.generate_code(sample_plan, stream=False)
 
@@ -293,7 +300,7 @@ class TestCoderAgentErrorHandling:
     def test_generate_code_handles_empty_response(self, mock_call_llm, coder_agent, sample_plan):
         """测试处理空响应。"""
         mock_call_llm.return_value = ""
-        
+
         code = coder_agent.generate_code(sample_plan, stream=False)
         # 应该返回空字符串或抛出错误
         assert isinstance(code, str)

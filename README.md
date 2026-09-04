@@ -10,7 +10,8 @@
 - **并行执行**：独立场景的 LLM 请求可并发；所有场景分别提交 Slurm，可由集群并行渲染。
 - **确定性安全校验**：在 LLM 审查之外，使用 Python AST 检查语法、Scene 结构、导入和危险调用。
 - **运行隔离**：每次运行写入独立的 `workspace/runs/<run-id>/`，避免并发运行和旧产物互相污染。
-- **中断恢复**：原子 `manifest.json` 保存 FSM、代码哈希和 Slurm Job ID，可查询并恢复中断运行。
+- **可验证产物**：每个 MP4 都绑定代码哈希、渲染配置哈希、视频哈希和 ffprobe 元数据，避免把旧文件误判为本次结果。
+- **中断恢复**：版本化、原子 `manifest.json` 保存阶段、代码哈希、Slurm Job ID 和产物凭据，可查询并恢复中断运行。
 - **可选容器隔离**：可用 Apptainer 执行 LLM 生成的 Manim 代码。
 - **可恢复渲染**：监控 Slurm 状态、区分排队/运行超时、失败后读取日志并自动修复。
 - **通用 LLM 接口**：通过 `.env` 配置任意 OpenAI-compatible API，不绑定 DeepSeek 或其他特定厂商。
@@ -32,10 +33,14 @@ curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.s
 ```bash
 export KD1_ANIME_REF=v0.3.0
 export KD1_ANIME_ARCHIVE_SHA256=<release-zip-sha256>
+# 可选：同时固定 TeX Live 安装器摘要；设置为 1 后两项摘要都必须提供
+export KD1_ANIME_TEXLIVE_INSTALLER_SHA256=<install-tl-unx-tar-gz-sha256>
+# export KD1_ANIME_REQUIRE_CHECKSUM=1
 bash /tmp/kd1-anime-install.sh
 ```
 
-摘要不匹配或 ref 含路径遍历字符时，安装器会在调用 pip 前终止。
+摘要不匹配或 ref 含路径遍历字符时，安装器会在调用 pip 前终止。设置
+`KD1_ANIME_REQUIRE_CHECKSUM=1` 可让远程源码归档和 TeX Live 安装器都强制要求 SHA-256。
 
 安装器会全自动完成：
 
@@ -133,6 +138,9 @@ kd1-anime status 20260728-120000-1234abcd
 # 从清单恢复中断运行；不会重复提交仍有 Job ID 的场景
 kd1-anime resume 20260728-120000-1234abcd
 
+# 检查依赖；--probe 会额外运行本地最小 FFmpeg/XeLaTeX/Manim 探测，不提交 Slurm
+kd1-anime doctor --probe
+
 # 清理 30 天前的已结束运行目录
 kd1-anime clean --older-than 30d --yes
 ```
@@ -147,7 +155,7 @@ kd1-anime clean --older-than 30d --yes
 ```text
 workspace/runs/<timestamp>-<uuid>/
 ├── prompt.md
-├── manifest.json         # FSM、场景状态、代码哈希和 Slurm Job ID
+├── manifest.json         # schema v2：场景阶段、Job、渲染配置与产物凭据
 ├── scenes/              # 生成的 Python 和 sbatch 脚本
 ├── logs/                # Slurm stdout/stderr
 ├── videos/              # 当前 run 的 Manim 媒体目录
@@ -155,7 +163,8 @@ workspace/runs/<timestamp>-<uuid>/
 ```
 
 如设置 `OUTPUT_FILE=/path/to/final.mp4`，最终视频写到该路径；其余中间产物仍保留在独立 run 目录中。
-`manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，并持有运行级排他锁，防止两个进程同时恢复同一批作业。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
+`manifest.json` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。旧版清单会在内存中保守迁移；无法验证的旧产物会重新渲染。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
+增量运行复用的场景视频会复制到新 run 的私有目录，因此清理基准 run 不会破坏新 run 的恢复或重新拼接。
 
 ## 关键配置
 
@@ -164,21 +173,31 @@ workspace/runs/<timestamp>-<uuid>/
 | `LLM_BASE_URL` | OpenAI API 地址 | 任意 OpenAI-compatible 端点 |
 | `LLM_MODEL` | 空 | 必须设置为实际模型名 |
 | `LLM_PARALLEL_WORKERS` | `4` | 逐场景 LLM 并发数 |
+| `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
 | `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
 | `MAX_PROMPT_CHARS` | `50000` | 用户需求最大字符数 |
+| `MAX_CLARIFY_CONTEXT_CHARS` | `40000` | 澄清多轮对话发送给模型的最大字符数，超出时保留初始需求和最近回答 |
 | `MAX_LOG_CHARS` | `30000` | 发送给 AutoFixer 的错误日志字符上限 |
 | `MANIM_RENDERER` | `cairo` | `cairo` 使用 CPU；`opengl` 可使用 GPU |
 | `MANIM_QUALITY` | `h` | Manim 质量级别 `l/m/h/p/k` |
+| `MANIM_PIXEL_WIDTH` / `MANIM_PIXEL_HEIGHT` | `1920` / `1080` | 显式输出分辨率，也是产物身份的一部分 |
+| `MANIM_FRAME_RATE` | `60` | 显式输出帧率，也是产物身份的一部分 |
 | `SLURM_CPUS_PER_TASK` | `4` | 每个场景作业的 CPU 数 |
 | `SLURM_GPU_TYPE` | 空 | OpenGL 模式必须设置；Cairo 模式不会申请 GPU |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
 | `SLURM_SUBMIT_RETRIES` | `3` | 明确失败时的 sbatch 重试次数；命令超时不会自动重提 |
 | `MONITOR_QUEUE_TIMEOUT` | `3600` | 排队超时秒数，超时自动 `scancel` |
 | `MONITOR_RUN_TIMEOUT` | `3600` | 运行超时秒数，超时自动 `scancel` |
+| `MONITOR_UNKNOWN_TIMEOUT` | `300` | 集群状态连续不可查询的最短持续时间，避免短暂控制面故障误取消作业 |
+| `MONITOR_ARTIFACT_GRACE` | `60` | Slurm 完成后等待共享文件系统同步最终 MP4 的秒数 |
+| `MAX_INFRA_RETRIES` | `2` | 节点故障、抢占等基础设施终态的自动重新排队次数 |
 | `ALLOW_PARTIAL_OUTPUT` | `false` | 是否允许缺失场景时合并部分视频 |
 | `OVERWRITE_OUTPUT` | `false` | 是否允许覆盖已存在的自定义输出文件 |
 | `SLURM_CONTAINER_IMAGE` | 空 | 可选 Apptainer 镜像路径 |
 | `SLURM_REQUIRE_CONTAINER` | `false` | 为 `true` 时未配置镜像即拒绝执行 |
+| `SLURM_CONTAINER_DISABLE_NETWORK` | `false` | 容器支持时通过独立网络命名空间禁用网络；需先在目标集群验证 |
+| `ENABLE_AUTO_EVAL` | `false` | 合并后执行确定性代码/效率评估，可选视觉评估与改进循环 |
+| `ENABLE_VISUAL_EVAL` | `false` | 抽取关键帧并调用支持图像输入的模型；失败记为未知，不生成虚假分数 |
 
 ### 并行与 GPU 说明
 
@@ -193,9 +212,10 @@ LLM 生成代码在提交前会经过 AST 校验，包括顶层动态执行、�
 
 1. 构建包含 Manim、TeX Live、FFmpeg 和字体的只读 Apptainer 镜像；
 2. 设置 `SLURM_CONTAINER_IMAGE=/path/to/image.sif`；
-3. 设置 `SLURM_REQUIRE_CONTAINER=true`。
+3. 设置 `SLURM_REQUIRE_CONTAINER=true`；
+4. 若集群允许无特权网络命名空间，测试通过后设置 `SLURM_CONTAINER_DISABLE_NETWORK=true`。
 
-容器作业使用 `--containall --cleanenv --no-home`，仅绑定当前 run 目录；OpenGL 模式额外使用 `--nv`。
+容器作业使用 `--containall --cleanenv --no-home`，仅绑定当前 run 目录；OpenGL 模式额外使用 `--nv` 并显式传递 `PYOPENGL_PLATFORM`（例如 `egl`）。未配置容器时程序保持兼容运行，但 `doctor` 和生成流程会给出醒目的安全提示。
 
 ## 开发与验证
 
@@ -213,14 +233,9 @@ CI 会执行静态检查、编译检查、Shell 语法检查、测试和 wheel �
 
 Python 3.10+ · OpenAI-compatible API · Pydantic · Rich · Typer · prompt_toolkit · Manim CE · FFmpeg · TeX Live · Slurm · 可选 Apptainer
 
-## 许可证
-
-MIT
-
-
 ## 增量渲染
 
-增量渲染允许你基于上一次运行的结果，只重新渲染受 prompt 变化影响的场景，节省时间和计算资源。
+增量渲染允许你基于上一次运行的结果，安全复用身份完全一致的场景视频。
 
 ```bash
 # 普通渲染
@@ -232,17 +247,14 @@ kd1-anime generate "解释欧拉公式 e^{iπ}+1=0 的几何意义" --incrementa
 
 ### 增量渲染工作原理
 
-1. **场景级比较**：比较新旧场景的代码 hash，只重新渲染变化的场景
-2. **视频复用**：未变化场景的视频直接从旧 run 目录复用
-3. **智能合并**：VideoMerger 自动处理来自不同 run 目录的视频
+1. 新运行仍会完成规划、代码生成、确定性校验和 Reviewer 审查。
+2. 审查通过后，只有代码 SHA-256 与旧场景一致、渲染 profile 哈希一致、旧视频哈希仍匹配且元数据已验证时才复用。
+3. 任一身份条件不满足都会重新提交 Slurm；复用不会伪造 Job ID。
+4. 合并阶段再次校验场景 ID、类名、代码哈希、配置哈希和视频哈希。
 
 ### 增量渲染优势
 
-| 场景 | 普通渲染 | 增量渲染 |
-|------|---------|---------|
-| 修改 1 个场景 | 渲染全部 10 个场景 | 只渲染 1 个 |
-| 调整 prompt | 全部重新生成 | 智能复用 |
-| 节省时间 | - | 70-90% |
+实际节省取决于新旧代码是否逐字节一致。该模式节省的是已确认不变场景的 Slurm 渲染与视频编码成本，不跳过生成和审查安全门。
 
 ## 批量并行处理
 
@@ -271,6 +283,9 @@ cat > prompts.json << 'EOF'
 EOF
 
 kd1-anime batch prompts.json
+
+# 输出固定为 videos/task_001.mp4、task_002.mp4……
+kd1-anime batch prompts.json --output-dir videos --max-parallel 3
 ```
 
 ### 批量处理选项
@@ -279,21 +294,21 @@ kd1-anime batch prompts.json
 - `--dry-run`：只生成场景代码，不提交 Slurm 渲染
 - `--output-dir, -o`：输出目录
 
+`--max-parallel` 限制同时运行的项目数；所有项目还共享进程级
+`LLM_PARALLEL_WORKERS` 和 `SLURM_MAX_IN_FLIGHT` 配额，避免每个项目各自放大并发。
+输出路径在启动前统一解析并检查，重复目标或禁止覆盖的已存在文件会直接报错。
+
 ### 批量处理输出
 
 批量处理完成后会显示摘要：
 
 ```
-批量处理摘要
-============
-总任务数: 3
-成功: 3
-失败: 0
-总耗时: 120.5秒
-
-详细结果:
-  ✓ 任务 1: /path/to/output_1.mp4
-  ✓ 任务 2: /path/to/output_2.mp4
-  ✓ 任务 3: /path/to/output_3.mp4
+批量处理结果
+  ✓ 任务 1 completed (120.5s) /path/to/task_001.mp4
+  ✓ 任务 2 completed (118.2s) /path/to/task_002.mp4
+  ✓ 任务 3 completed (125.7s) /path/to/task_003.mp4
 ```
 
+## 许可证
+
+MIT

@@ -10,9 +10,9 @@ TUI 交互模块
 """
 
 import locale
-import time
 import signal
 import sys
+import time
 from contextlib import suppress
 
 from prompt_toolkit import PromptSession
@@ -134,14 +134,14 @@ class Clarifier:
         while True:
             try:
                 # 非流式接收，以便区分用户问题和内部 READY JSON
-                response = self.agent.call_llm(messages=self.history, stream=False)
+                response = self.agent.call_llm(messages=self._bounded_history(), stream=False)
                 self.history.append({"role": "assistant", "content": response})
                 if self.extract_ready(response) is None:
                     # 非 READY 响应：逐字打印模拟流式效果
                     console.print("[dim cyan]AI:[/]")
                     for char in response:
                         console.print(char, end="", highlight=False)
-                        if char in "，。！？、；：""''（）":
+                        if char in "，。！？、；：''（）":
                             time.sleep(0.05)
                         elif char == "\n":
                             time.sleep(0.08)
@@ -164,6 +164,53 @@ class Clarifier:
                     # 移除刚才加入但未得到回复的 user message
                     self.history.pop()
                     raise RuntimeError("Clarifier 失败, 用户选择退出") from e
+
+    @staticmethod
+    def _clip_text(content: str, limit: int) -> str:
+        """按字符裁剪长消息，同时保留开头和结尾的关键信息。"""
+
+        if len(content) <= limit:
+            return content
+        if limit <= 80:
+            return content[:limit]
+        marker = "\n...[内容因上下文预算被裁剪]...\n"
+        available = max(1, limit - len(marker))
+        head = (available + 1) // 2
+        tail = available - head
+        return content[:head] + marker + (content[-tail:] if tail else "")
+
+    def _bounded_history(self) -> list[dict]:
+        """构造有界的澄清上下文，保留系统提示、初始需求和最近回答。"""
+
+        if not self.history:
+            return []
+        budget = settings.MAX_CLARIFY_CONTEXT_CHARS
+        system = dict(self.history[0])
+        system_content = str(system.get("content", ""))
+        system_limit = min(len(system_content), max(1000, budget // 4))
+        system["content"] = self._clip_text(system_content, system_limit)
+        if len(self.history) == 1:
+            return [system]
+
+        # 初始需求是后续澄清的锚点，始终保留；单条超长消息也不能独占整个预算。
+        first = dict(self.history[1])
+        first_limit = max(500, min(budget // 3, budget - len(system["content"]) - 500))
+        first["content"] = self._clip_text(str(first.get("content", "")), first_limit)
+        used = len(str(system.get("content", ""))) + len(str(first.get("content", "")))
+        recent: list[dict] = []
+        for original in reversed(self.history[2:]):
+            message = dict(original)
+            content = str(message.get("content", ""))
+            available = budget - used - 2
+            if available <= 0:
+                break
+            clipped = self._clip_text(content, available)
+            message["content"] = clipped
+            recent.append(message)
+            used += len(clipped) + 2
+            if len(clipped) < len(content):
+                break
+        return [system, first, *reversed(recent)]
 
     def extract_ready(self, response: str) -> str | None:
         """
@@ -218,9 +265,18 @@ class Clarifier:
             if content and content != initial_normalized and content not in additions:
                 additions.append(content)
         if not additions:
-            return initial_normalized
-        details = "\n\n".join(f"- {content}" for content in additions)
-        return f"{initial_normalized}\n\n用户在澄清过程中补充的信息：\n{details}"
+            return self._clip_text(initial_normalized, settings.MAX_PROMPT_CHARS)
+        prefix = f"{initial_normalized}\n\n用户在澄清过程中补充的信息：\n"
+        result = prefix
+        for content in additions:
+            item = f"- {content}\n"
+            available = settings.MAX_PROMPT_CHARS - len(result)
+            if available <= 0:
+                break
+            result += self._clip_text(item, available)
+            if len(item) > available:
+                break
+        return result[: settings.MAX_PROMPT_CHARS]
 
 
 def _setup_terminal() -> None:
@@ -267,21 +323,25 @@ class ChatSession:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
         self.clarifier: Clarifier | None = None
+        # 交互模式也必须向 shell 传递流水线失败/中断语义，不能只在终端
+        # 打印红字后以退出码 0 结束。
+        self.exit_code = 0
 
-    def run(self) -> None:
+    def run(self) -> int:
         """启动完整的交互会话"""
+
         # 设置信号处理，避免退出时的 threading 警告
         def _signal_handler(signum, frame):
             raise KeyboardInterrupt()
-        
+
         signal.signal(signal.SIGINT, _signal_handler)
-        
+
         _setup_terminal()
         try:
             # 用户选择了"恢复运行"时 _show_banner 返回 True:
             # 恢复结束 (成功或失败) 后直接退出会话, 不要落入"描述你的需求"新提示。
             if self._show_banner():
-                return
+                return self.exit_code
 
             # 在构造 Agent 前检查完整的 OpenAI-compatible 配置。
             try:
@@ -294,12 +354,13 @@ class ChatSession:
                         border_style="red",
                     )
                 )
-                return
+                self.exit_code = 1
+                return self.exit_code
 
             # 获取初始需求
             user_prompt = self._get_initial_prompt()
             if not user_prompt:
-                return
+                return self.exit_code
 
             # 此刻才构造 Clarifier (Key 已确认存在)
             self.clarifier = Clarifier()
@@ -308,7 +369,7 @@ class ChatSession:
             while True:
                 refined_prompt = self._run_clarification(user_prompt)
                 if not refined_prompt:
-                    return
+                    return self.exit_code
 
                 if self._confirm_prompt(refined_prompt):
                     break
@@ -318,7 +379,7 @@ class ChatSession:
                 feedback = _read_multiline(">>> ")
                 if not feedback or feedback.lower() in ("quit", "exit", "q"):
                     console.print("[dim]已退出[/]")
-                    return
+                    return self.exit_code
                 user_prompt = (
                     f"用户对当前需求描述不满意: {feedback}\n\n"
                     f"当前的需求描述是: {refined_prompt}\n\n"
@@ -327,9 +388,12 @@ class ChatSession:
 
             # 执行生成流水线
             self._run_pipeline(refined_prompt)
+            return self.exit_code
 
         except KeyboardInterrupt:
             console.print("\n[dim]已取消[/]")
+            self.exit_code = 130
+            return self.exit_code
 
     def _show_banner(self) -> bool:
         """显示欢迎横幅; 返回 True 表示用户选择了恢复运行 (会话应结束)。"""
@@ -361,37 +425,44 @@ class ChatSession:
         """检查并提示恢复中断的运行; 返回是否选择了恢复 (调用方据此结束会话)。"""
         try:
             from kd1_anime.run_store import RunRepository
+
             repository = RunRepository(settings.WORKSPACE_DIR)
-            manifests = repository.list()[:10]
-            
+            manifests = repository.list()
+            if repository.list_errors:
+                console.print(
+                    f"[yellow]警告: 有 {len(repository.list_errors)} 个运行清单无法读取，"
+                    "请使用 kd1-anime status <run-id> 检查。[/]"
+                )
+
             resumable = []
             for manifest in manifests:
                 if manifest.status == "interrupted":
                     resumable.append(manifest)
                 elif manifest.status == "failed":
                     rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
-                    if rendered > 0 and rendered < len(manifest.scenes):
+                    if manifest.scenes and rendered < len(manifest.scenes):
                         resumable.append(manifest)
-            
+            resumable = resumable[:10]
+
             if not resumable:
-                return
-            
+                return False
+
             console.print()
             console.print(Rule("发现中断的运行", style="yellow"))
-            
+
             table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
             table.add_column("#", style="cyan", justify="center")
             table.add_column("Run ID", style="dim")
             table.add_column("时间", style="dim")
             table.add_column("状态", style="yellow")
             table.add_column("进度", style="green")
-            
-            for i, manifest in enumerate(resumable[:5], 1):
+
+            for i, manifest in enumerate(resumable, 1):
                 rendered = sum(1 for s in manifest.scenes.values() if s.rendered)
                 total = len(manifest.scenes)
                 updated = manifest.updated_at.astimezone().strftime("%m-%d %H:%M")
                 status_color = "yellow" if manifest.status == "interrupted" else "red"
-                
+
                 table.add_row(
                     str(i),
                     manifest.run_id[:16] + "...",
@@ -399,10 +470,10 @@ class ChatSession:
                     f"[{status_color}]{manifest.status}[/]",
                     f"{rendered}/{total} 场景",
                 )
-            
+
             console.print(table)
             console.print()
-            
+
             choice = input("  输入编号恢复运行 (直接回车跳过): ").strip()
             if choice.isdigit() and 1 <= int(choice) <= len(resumable):
                 selected = resumable[int(choice) - 1]
@@ -411,42 +482,56 @@ class ChatSession:
                 return True
             return False
         except Exception as e:
-            console.print(f"[dim]检查历史运行时出错: {e}[/]")
-            return False
+            # 历史清单读取失败不应被当成“没有可恢复运行”，否则用户会
+            # 被静默带入新 Prompt，原运行状态也无法修复。
+            self.exit_code = 1
+            console.print(f"[bold red]检查历史运行失败:[/] {e}", markup=False)
+            return True
 
-    def _resume_run(self, run_id: str) -> None:
+    def _resume_run(self, run_id: str) -> bool:
         """恢复指定的运行 (与 _run_pipeline 一样带 Live 场景仪表盘)"""
         from kd1_anime.dashboard import SceneDashboard
         from kd1_anime.orchestrator import Orchestrator
+        from kd1_anime.run_store import RESUME_LLM_STATES, RunRepository
 
-        dashboard = SceneDashboard()
-        dashboard_active = dashboard.start()
-
-        def callback(event: str, data: dict) -> None:
-            if dashboard_active:
-                dashboard.on_event(event, data)
-            else:
-                self._pipeline_callback(event, data)
-
+        dashboard = None
+        dashboard_active = False
         try:
+            # 欢迎页会在检查 LLM 配置之前提供恢复选项；已经进入渲染/合并的
+            # 运行不应因为当前没有 API Key 而无法继续，但仍需 LLM 的阶段要
+            # 在启动 Live 前给出明确的配置错误。
+            manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
+            if manifest.state in RESUME_LLM_STATES:
+                settings.require_llm_key()
+
+            dashboard = SceneDashboard()
+            dashboard_active = dashboard.start()
+
+            def callback(event: str, data: dict) -> None:
+                if dashboard_active:
+                    dashboard.on_event(event, data)
+                else:
+                    self._pipeline_callback(event, data)
+
             orchestrator = Orchestrator()
-            final_video = orchestrator.resume(
-                run_id, callback=callback, interactive=True
-            )
-            if dashboard_active:
-                dashboard.stop()
+            final_video = orchestrator.resume(run_id, callback=callback, interactive=True)
             self._show_completion(final_video)
+            self.exit_code = 0
+            return True
 
         except KeyboardInterrupt:
-            if dashboard_active:
-                dashboard.stop()
             console.print("\n[yellow]用户中断[/]")
+            self.exit_code = 130
+            return False
         except Exception as e:
-            if dashboard_active:
-                dashboard.stop()
             console.print(f"\n[bold red]恢复失败:[/] {e}", markup=False)
             if settings.LLM_DEBUG:
                 console.print_exception()
+            self.exit_code = 1
+            return False
+        finally:
+            if dashboard is not None and dashboard_active:
+                dashboard.stop()
 
     def _get_initial_prompt(self) -> str | None:
         """获取用户的初始需求描述
@@ -484,7 +569,7 @@ class ChatSession:
 
     def _run_clarification(self, initial_prompt: str) -> str | None:
         """运行需求澄清对话"""
-        max_rounds = getattr(settings, "MAX_CLARIFY_ROUNDS", 6)
+        max_rounds = settings.MAX_CLARIFY_ROUNDS
 
         console.print(Rule("需求澄清", style="dim"))
         console.print()
@@ -578,7 +663,7 @@ class ChatSession:
             console.print("[dim]已取消. 重新描述需求或输入 quit 退出.[/]")
         return answer
 
-    def _run_pipeline(self, prompt: str) -> None:
+    def _run_pipeline(self, prompt: str) -> bool:
         """执行生成流水线,带进度指示"""
         console.print()
         console.print(Rule("开始生成", style="bold magenta"))
@@ -608,10 +693,13 @@ class ChatSession:
             if dashboard_active:
                 dashboard.stop()
             self._show_completion(final_video)
+            self.exit_code = 0
+            return True
         except KeyboardInterrupt:
             if dashboard_active:
                 dashboard.stop()
             console.print("\n[bold yellow]用户中断,正在清理...[/]")
+            self.exit_code = 130
             raise
         except Exception as e:
             if dashboard_active:
@@ -620,6 +708,8 @@ class ChatSession:
             console.print(f"生成失败: {e}", style="bold red", markup=False)
             if settings.LLM_DEBUG:
                 console.print_exception()
+            self.exit_code = 1
+            return False
 
     @staticmethod
     def _escape_markup(text: str) -> str:
@@ -655,6 +745,8 @@ class ChatSession:
                         console.print(Rule("[bold magenta]自动修复[/]", style="magenta"))
                     case "merging":
                         console.print(Rule("[bold magenta]视频拼接[/]", style="magenta"))
+                    case "evaluating":
+                        console.print(Rule("[bold magenta]质量评估[/]", style="magenta"))
 
             case "security_warning":
                 console.print(f"[bold yellow]安全警告:[/] {esc(data.get('message', ''))}")
@@ -700,9 +792,17 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]审查通过 ✓[/]")
 
+            case "scene_reviewing":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]代码审查中[/]")
+
+            case "scene_review_skipped":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]已跳过审查[/]")
+
             case "scene_rewriting":
                 scene_id = data.get("scene_id", "?")
-                reason = data.get("reason", "")
+                reason = esc(data.get("reason", ""))
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]Coder 正在修正...[/]")
                 if reason:
                     console.print(f"    [dim]原因: {reason}[/]")

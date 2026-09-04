@@ -3,18 +3,18 @@
 测试场景规划、outline生成和detail生成。
 """
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from kd1_anime.agents.planner import (
+    DETAIL_PROMPT,
+    OUTLINE_PROMPT,
     PlannerAgent,
     SceneDetail,
     SceneOutline,
     ScenePlan,
-    OUTLINE_PROMPT,
-    DETAIL_PROMPT,
 )
 
 
@@ -63,7 +63,7 @@ class TestSceneOutline:
 
     def test_outline_requires_title(self):
         """测试场景概要需要标题。"""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SceneOutline(
                 scene_id=1,
                 title="",
@@ -74,7 +74,7 @@ class TestSceneOutline:
 
     def test_outline_requires_positive_duration(self):
         """测试场景概要需要正时长。"""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SceneOutline(
                 scene_id=1,
                 title="Test",
@@ -85,7 +85,7 @@ class TestSceneOutline:
 
     def test_outline_max_duration(self):
         """测试场景概要最大时长。"""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SceneOutline(
                 scene_id=1,
                 title="Test",
@@ -118,7 +118,7 @@ class TestScenePlan:
 
     def test_plan_requires_visual_flow(self):
         """测试场景规划需要视觉流程。"""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ScenePlan(
                 scene_id=1,
                 title="Test",
@@ -134,7 +134,7 @@ class TestScenePlan:
 
     def test_plan_requires_key_moments(self):
         """测试场景规划需要关键时刻。"""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ScenePlan(
                 scene_id=1,
                 title="Test",
@@ -165,7 +165,7 @@ class TestSceneDetail:
 
     def test_detail_requires_visual_design(self):
         """测试场景细节需要视觉设计。"""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             SceneDetail(
                 visual_design="",
                 camera_movement="Fixed",
@@ -181,12 +181,12 @@ class TestPlannerAgent:
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_outline_basic(self, mock_call_llm, planner):
         """测试基本的场景概要生成。"""
-        mock_call_llm.return_value = '''{"items": [
+        mock_call_llm.return_value = """{"items": [
             {"scene_id": 1, "title": "Introduction", "duration_seconds": 30, "purpose": "Introduce topic", "math_concept": "Circle"}
-        ]}'''
-        
+        ]}"""
+
         outlines = planner.plan_outline("Explain circle area formula")
-        
+
         assert len(outlines) == 1
         assert outlines[0].scene_id == 1
         assert outlines[0].title == "Introduction"
@@ -194,29 +194,45 @@ class TestPlannerAgent:
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_outline_normalizes_ids(self, mock_call_llm, planner):
         """测试场景 ID 规范化。"""
-        mock_call_llm.return_value = '''{"items": [
+        mock_call_llm.return_value = """{"items": [
             {"scene_id": 5, "title": "First", "duration_seconds": 30, "purpose": "Test", "math_concept": "Test"},
             {"scene_id": 10, "title": "Second", "duration_seconds": 30, "purpose": "Test", "math_concept": "Test"}
-        ]}'''
-        
+        ]}"""
+
         outlines = planner.plan_outline("Test prompt")
-        
+
         # ID 应该被规范化为 1, 2
         assert outlines[0].scene_id == 1
         assert outlines[1].scene_id == 2
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_plan_outline_prompt_respects_small_max_scenes(
+        self, mock_call_llm, planner, monkeypatch
+    ):
+        from kd1_anime.config import settings
+
+        monkeypatch.setattr(settings, "MAX_SCENES", 2)
+        mock_call_llm.return_value = """{"items": [
+            {"scene_id": 1, "title": "Only", "duration_seconds": 30, "purpose": "Test", "math_concept": "Test"}
+        ]}"""
+
+        planner.plan_outline("Test prompt")
+
+        assert "场景数量控制在 2-2 个" in mock_call_llm.call_args.kwargs["system_prompt"]
+        assert "最多不超过 2 个" in mock_call_llm.call_args.kwargs["system_prompt"]
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_outline_rejects_too_many_scenes(self, mock_call_llm, planner):
         """测试拒绝过多场景。"""
         from kd1_anime.config import settings
-        
+
         # 生成超过 MAX_SCENES 的场景
         items = [
             f'{{"scene_id": {i}, "title": "Scene {i}", "duration_seconds": 30, "purpose": "Test", "math_concept": "Test"}}'
             for i in range(1, settings.MAX_SCENES + 2)
         ]
         mock_call_llm.return_value = f'{{"items": [{", ".join(items)}]}}'
-        
+
         with pytest.raises(RuntimeError, match="超过 MAX_SCENES"):
             planner.plan_outline("Test prompt")
 
@@ -224,30 +240,30 @@ class TestPlannerAgent:
     def test_plan_outline_rejects_long_prompt(self, mock_call_llm, planner):
         """测试拒绝过长的 prompt。"""
         from kd1_anime.config import settings
-        
+
         long_prompt = "x" * (settings.MAX_PROMPT_CHARS + 1)
-        
+
         with pytest.raises(ValueError, match="过长"):
             planner.plan_outline(long_prompt)
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_detail_basic(self, mock_call_llm, planner, sample_outlines):
         """测试基本的场景细节生成。"""
-        mock_call_llm.return_value = '''{
+        mock_call_llm.return_value = """{
             "visual_design": "深灰背景，蓝色圆形",
             "camera_movement": "固定机位",
             "visual_flow": ["显示圆形"],
             "key_moments": ["圆形出现"],
             "computation": "r=2, A=4π"
-        }'''
-        
+        }"""
+
         plan = planner.plan_detail(
             sample_outlines[0],
             sample_outlines,
             "Test prompt",
             stream=False,
         )
-        
+
         assert isinstance(plan, ScenePlan)
         assert plan.scene_id == 1
         assert plan.visual_design == "深灰背景，蓝色圆形"
@@ -255,25 +271,29 @@ class TestPlannerAgent:
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_detail_includes_outline_info(self, mock_call_llm, planner, sample_outlines):
         """测试场景细节包含概要信息。"""
-        mock_call_llm.return_value = '''{
+        mock_call_llm.return_value = """{
             "visual_design": "Test design",
             "camera_movement": "Fixed",
             "visual_flow": ["Step 1"],
             "key_moments": ["Moment 1"],
             "computation": "Test"
-        }'''
-        
+        }"""
+
         planner.plan_detail(
             sample_outlines[0],
             sample_outlines,
             "Test prompt",
             stream=False,
         )
-        
+
         # 验证 outline 信息被传递到 prompt
         call_args = mock_call_llm.call_args
-        user_message = call_args[1]["user_message"] if "user_message" in call_args[1] else str(call_args[1].get("messages", []))
-        
+        user_message = (
+            call_args[1]["user_message"]
+            if "user_message" in call_args[1]
+            else str(call_args[1].get("messages", []))
+        )
+
         assert "引言" in user_message or "Introduction" in user_message
         assert "圆的定义" in user_message
 
@@ -307,9 +327,9 @@ class TestPlannerAgentErrorHandling:
     def test_plan_outline_handles_llm_error(self, mock_call_llm, planner):
         """测试处理 LLM 调用错误。"""
         from kd1_anime.exceptions import LLMError
-        
+
         mock_call_llm.side_effect = LLMError("API 调用失败")
-        
+
         with pytest.raises(LLMError):
             planner.plan_outline("Test prompt")
 
@@ -317,17 +337,17 @@ class TestPlannerAgentErrorHandling:
     def test_plan_outline_handles_invalid_json(self, mock_call_llm, planner):
         """测试处理无效 JSON。"""
         mock_call_llm.return_value = "This is not JSON"
-        
-        with pytest.raises(Exception):
+
+        with pytest.raises(RuntimeError):
             planner.plan_outline("Test prompt")
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_plan_detail_handles_llm_error(self, mock_call_llm, planner, sample_outlines):
         """测试处理 LLM 调用错误。"""
         from kd1_anime.exceptions import LLMError
-        
+
         mock_call_llm.side_effect = LLMError("API 调用失败")
-        
+
         with pytest.raises(LLMError):
             planner.plan_detail(
                 sample_outlines[0],
@@ -346,22 +366,22 @@ class TestPlannerAgentIntegration:
         # 第一次调用：生成概要
         # 第二次调用：生成细节
         mock_call_llm.side_effect = [
-            '''{"items": [
+            """{"items": [
                 {"scene_id": 1, "title": "Test", "duration_seconds": 30, "purpose": "Test", "math_concept": "Test"}
-            ]}''',
-            '''{
+            ]}""",
+            """{
                 "visual_design": "Test design",
                 "camera_movement": "Fixed",
                 "visual_flow": ["Step 1"],
                 "key_moments": ["Moment 1"],
                 "computation": "Test"
-            }''',
+            }""",
         ]
-        
+
         # 生成概要
         outlines = planner.plan_outline("Test prompt")
         assert len(outlines) == 1
-        
+
         # 生成细节
         plan = planner.plan_detail(
             outlines[0],
@@ -369,7 +389,7 @@ class TestPlannerAgentIntegration:
             "Test prompt",
             stream=False,
         )
-        
+
         assert isinstance(plan, ScenePlan)
         assert plan.scene_id == 1
         assert plan.visual_design == "Test design"

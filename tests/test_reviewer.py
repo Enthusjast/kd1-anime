@@ -42,6 +42,17 @@ def test_valid_result_is_normalized():
     assert result.fixes == []
 
 
+def test_valid_none_severity_is_normalized_without_retry():
+    result = ReviewResult.model_validate({"is_valid": True, "severity": "none"})
+
+    assert result.severity == "info"
+
+
+def test_invalid_none_severity_still_requires_major_feedback():
+    with pytest.raises(ValidationError):
+        ReviewResult.model_validate({"is_valid": False, "severity": "none"})
+
+
 def test_reviewer_receives_complete_scene_plan(monkeypatch):
     from kd1_anime.agents.planner import ScenePlan
     from kd1_anime.agents.reviewer import ReviewerAgent

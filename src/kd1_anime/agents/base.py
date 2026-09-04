@@ -36,6 +36,10 @@ class StreamCancelledError(RuntimeError):
     """用户主动取消流式响应。"""
 
 
+class TruncatedResponseError(RuntimeError):
+    """模型反复达到输出上限，响应不能安全消费。"""
+
+
 class BaseAgent:
     """所有 Agent 的基类,封装 LLM 交互逻辑"""
 
@@ -68,6 +72,7 @@ class BaseAgent:
         """打印 Agent 思考过程（仪表盘激活时抑制，避免破坏 Live 渲染）"""
         # 延迟导入避免循环依赖
         from kd1_anime.dashboard import suppress_agent_logs
+
         if suppress_agent_logs():
             return
         safe_msg = str(message).replace("[", "\\[")
@@ -78,6 +83,7 @@ class BaseAgent:
         """用 Panel 展示详细内容 (仪表盘激活时抑制, 避免破坏 Live 渲染)"""
         # 延迟导入避免循环依赖
         from kd1_anime.dashboard import suppress_agent_logs
+
         if suppress_agent_logs():
             return
         console.print(Panel(content, title=title, border_style=style))
@@ -156,7 +162,14 @@ class BaseAgent:
                     for i, msg in enumerate(messages):
                         role = msg["role"]
                         body = msg["content"]
-                        preview = body[:500] + ("..." if len(body) > 500 else "")
+                        if isinstance(body, str):
+                            preview = body[:500] + ("..." if len(body) > 500 else "")
+                        else:
+                            preview = ", ".join(
+                                str(item.get("type", "unknown"))
+                                for item in body
+                                if isinstance(item, dict)
+                            )
                         console.print(f"[dim]DEBUG [{role} #{i}]: {preview}[/]", markup=False)
                 if use_stream_transport:
                     content, finish_reason = self._stream_llm(kwargs, display=stream)
@@ -171,7 +184,7 @@ class BaseAgent:
                         # 空内容 + length: 推理模型常把输出预算耗尽在 reasoning 上,
                         # 导致 content 为空且 finish=length。先补足 max_tokens 重试
                         # (不消耗业务重试), 而不是立刻把整个场景判死。
-                        if not max_tokens_boosted:
+                        if not max_tokens_boosted and not max_tokens_fallback_used:
                             max_tokens_val = kwargs.get("max_tokens")
                             boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
                             if max_tokens_val:
@@ -192,15 +205,14 @@ class BaseAgent:
                             f"(max_tokens={kwargs.get('max_tokens')})",
                             style="bold yellow",
                         )
-                        last_error = RuntimeError("LLM 输出被截断且内容为空")
+                        last_error = TruncatedResponseError("LLM 输出被截断且内容为空")
                         if attempt < settings.LLM_MAX_RETRIES:
                             delay = self._retry_delay(attempt, last_error)
                             time.sleep(delay)
                         continue
                     if json_mode and "response_format" in kwargs and not json_fallback_used:
                         self._log(
-                            "端点在 response_format 模式返回空内容，"
-                            "降级为 prompt-only JSON 重试",
+                            "端点在 response_format 模式返回空内容，降级为 prompt-only JSON 重试",
                             style="yellow",
                         )
                         kwargs.pop("response_format", None)
@@ -208,7 +220,9 @@ class BaseAgent:
                         # 在系统提示中添加明确的 JSON 输出要求
                         for msg in kwargs.get("messages", []):
                             if msg.get("role") == "system":
-                                msg["content"] += "\n\n重要：你必须返回有效的 JSON 格式。不要包含任何其他文本，只返回 JSON。"
+                                msg["content"] += (
+                                    "\n\n重要：你必须返回有效的 JSON 格式。不要包含任何其他文本，只返回 JSON。"
+                                )
                                 break
                         attempt -= 1  # 参数兼容性降级，不消耗业务重试次数
                         continue
@@ -223,11 +237,14 @@ class BaseAgent:
                         continue
                     # 推理模型空响应：常因 reasoning_content 耗尽服务端默认输出上限。
                     # 补上充足 max_tokens 后重试, 避免反复拿到空响应。
-                    if "max_tokens" not in kwargs and not max_tokens_boosted:
+                    if (
+                        "max_tokens" not in kwargs
+                        and not max_tokens_boosted
+                        and not max_tokens_fallback_used
+                    ):
                         boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
                         self._log(
-                            f"空响应: 补充 max_tokens={boost} 后重试 "
-                            "(推理模型可能耗尽输出预算)",
+                            f"空响应: 补充 max_tokens={boost} 后重试 (推理模型可能耗尽输出预算)",
                             style="yellow",
                         )
                         kwargs["max_tokens"] = boost
@@ -243,7 +260,26 @@ class BaseAgent:
                         delay = self._retry_delay(attempt, last_error)
                         time.sleep(delay)
                     continue
-                # 有内容: 即使是 finish_reason=length (截断) 也直接返回, 不重试
+                if finish_reason == "length":
+                    if not max_tokens_boosted and not max_tokens_fallback_used:
+                        current_limit = kwargs.get("max_tokens")
+                        boost = settings.LLM_EMPTY_RETRY_MAX_TOKENS
+                        if current_limit:
+                            boost = max(int(current_limit) * 2, boost)
+                        boost = min(boost, 65536)
+                        kwargs["max_tokens"] = boost
+                        max_tokens_boosted = True
+                        self._log(
+                            f"LLM 响应被截断: 提高 max_tokens={boost} 后重新生成",
+                            style="yellow",
+                        )
+                        attempt -= 1
+                        continue
+                    last_error = TruncatedResponseError("LLM 输出被截断")
+                    self._log("LLM 响应仍被截断，将重新生成", style="bold yellow")
+                    if attempt < settings.LLM_MAX_RETRIES:
+                        time.sleep(self._retry_delay(attempt, last_error))
+                    continue
                 if getattr(settings, "LLM_DEBUG", False) and (
                     not use_stream_transport or not stream
                 ):
@@ -283,7 +319,9 @@ class BaseAgent:
                     # 在系统提示中添加明确的 JSON 输出要求
                     for msg_item in kwargs.get("messages", []):
                         if msg_item.get("role") == "system":
-                            msg_item["content"] += "\n\n重要：你必须返回有效的 JSON 格式。不要包含任何其他文本，只返回 JSON。"
+                            msg_item["content"] += (
+                                "\n\n重要：你必须返回有效的 JSON 格式。不要包含任何其他文本，只返回 JSON。"
+                            )
                             break
                     attempt -= 1  # 参数修复, 不消耗重试次数
                     continue
@@ -326,6 +364,8 @@ class BaseAgent:
             except Exception as e:
                 raise RuntimeError(f"[{self.name}] LLM 调用发生未知错误: {e}") from e
 
+        if isinstance(last_error, TruncatedResponseError):
+            raise TruncatedResponseError(f"[{self.name}] LLM 输出在重试后仍被截断") from last_error
         raise RuntimeError(
             f"[{self.name}] LLM 调用在 {settings.LLM_MAX_RETRIES} 次重试后仍然失败: {last_error}"
         )
