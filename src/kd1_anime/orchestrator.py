@@ -6677,7 +6677,7 @@ class Orchestrator:
                     else existing.visual_score,
                 )
             ) > self._candidate_rank(existing):
-                existing.verification = verification  # type: ignore[misc]
+                existing.verification = verification
             if artifact is not None:
                 existing.artifact = artifact
             if visual_score is not None:
@@ -6709,6 +6709,25 @@ class Orchestrator:
                 code = path.read_text(encoding="utf-8")
                 if sha256_text(code) != candidate.code_sha256:
                     continue
+                validation = self._validate(code, renderer=ctx.render_profile.renderer)
+                if not validation.is_valid or candidate.class_name not in validation.scene_classes:
+                    continue
+                api_result = lint_manim_api(
+                    code,
+                    renderer=ctx.render_profile.renderer,
+                    scene_plan=state.plan,
+                )
+                if not api_result.is_valid:
+                    continue
+                extract_scene_continuity_elements(code, state.plan)
+                if state.technical_spec is not None:
+                    lifecycle = validate_animation_lifecycle(
+                        code,
+                        state.technical_spec,
+                        renderer=ctx.render_profile.renderer,
+                    )
+                    if not lifecycle.is_valid:
+                        continue
                 if candidate.artifact is not None:
                     self._artifact_video_path(ctx, candidate.artifact)
             except (OSError, UnicodeError, ValueError, RuntimeError):
