@@ -459,9 +459,8 @@ def _requests_single_visual_unit(user_prompt: str) -> bool:
         "一次性展示",
         "一起展示",
     )
-    persistent_sequence = (
-        ("逐个" in text or "依次" in text or "先后" in text)
-        and ("保持显示" in text or "保留" in text or "直到视频结束" in text)
+    persistent_sequence = ("逐个" in text or "依次" in text or "先后" in text) and (
+        "保持显示" in text or "保留" in text or "直到视频结束" in text
     )
     return any(marker in text for marker in simultaneous_markers) or persistent_sequence
 
@@ -507,10 +506,9 @@ def _coalesce_single_visual_unit(
         scene_id=1,
         title=title,
         duration_seconds=duration,
-        purpose=(
-            "在同一视觉场景中完成对象的逐步展示、保留和整体对比；"
-            + "；".join(purposes)
-        )[:5_000],
+        purpose=("在同一视觉场景中完成对象的逐步展示、保留和整体对比；" + "；".join(purposes))[
+            :5_000
+        ],
         math_concept="；".join(concepts)[:5_000],
     )
     return [merged]

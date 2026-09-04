@@ -268,7 +268,9 @@ class TestPlannerAgent:
             {"scene_id": 2, "title": "第二章", "duration_seconds": 15, "purpose": "展开推导", "math_concept": "推导"}
         ]}"""
 
-        outlines = planner.plan_outline("请分成 2 个场景，分别展示问题和推导；两个场景使用同一坐标系。")
+        outlines = planner.plan_outline(
+            "请分成 2 个场景，分别展示问题和推导；两个场景使用同一坐标系。"
+        )
 
         assert len(outlines) == 2
 

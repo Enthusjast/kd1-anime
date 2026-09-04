@@ -159,10 +159,10 @@ def test_clarifier_skips_latex_braces_before_ready_payload():
     """前置 LaTeX 上标的花括号不能成为 READY JSON 的起点。"""
 
     clarifier = Clarifier()
-    response = r'''前面的整合说明包含 ( y = x^{1/2} ) 这样的公式。
+    response = r"""前面的整合说明包含 ( y = x^{1/2} ) 这样的公式。
 
 {"READY": true, "prompt": "## 核心内容
-在同一坐标系中展示 ( y = x^{1/2} )，并保持显示。"}'''
+在同一坐标系中展示 ( y = x^{1/2} )，并保持显示。"}"""
 
     refined = clarifier.extract_ready(response)
 
