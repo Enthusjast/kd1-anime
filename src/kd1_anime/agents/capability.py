@@ -91,7 +91,11 @@ def build_capability_contract(
         constructors & {"Surface", "ThreeDAxes", "Sphere", "Cube", "ParametricSurface"}
     ) or any(token in text for token in ("三维", "3d", "曲面", "切平面", "threedscene"))
     requires_moving_camera = bool(
-        re.search(r"self\.camera\.frame|movingcamerascene|camera\.frame", text)
+        re.search(
+            r"self\.camera\.frame|movingcamerascene|camera\.frame|"
+            r"镜头(?:推近|拉远|平移|缩放)|camera\s+(?:zoom|pan)",
+            text,
+        )
     )
     requires_tex = bool(constructors & {"Tex", "MathTex", "MarkupText"}) or bool(
         re.search(r"mathtex|textemplate|\\(?:frac|sum|int|alpha|beta)", text)
