@@ -8,6 +8,12 @@ Auto-Fix Agent
 from typing import Literal
 
 from kd1_anime.agents.base import BaseAgent
+from kd1_anime.agents.planner import (
+    LessonSpec,
+    TeachingGraph,
+    compact_lesson_spec,
+    compact_teaching_graph,
+)
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
@@ -172,6 +178,8 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
    继承元素定义和全局颜色/字体配置；除非错误日志直接涉及导出区，否则不要删除或重命名它们。
 10. TechnicalSpec 是只读的技术合同。修复后必须继续满足对象生命周期、动画源/目标、
     renderer 和最终导出清单，不能用删除动画或重建整场景掩盖错误。
+11. LessonSpec/TeachingGraph 是只读数学合同。只修复运行时错误；不得因为渲染日志
+    自行改写公式、推导结论或定义域。若错误来自计划，应交回计划阶段。
 
 ## 输出格式
 
@@ -225,6 +233,8 @@ class AutoFixerAgent(BaseAgent):
         renderer: Literal["cairo", "opengl"] | None = None,
         technical_spec: TechnicalSpec | None = None,
         rag_context: str = "",
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> str:
         """
         根据错误日志修复代码
@@ -274,6 +284,19 @@ class AutoFixerAgent(BaseAgent):
                     required=True,
                     priority=110,
                     max_chars=settings.LLM_MAX_TECHNICAL_SPEC_CHARS,
+                )
+            )
+        if lesson_spec is not None or teaching_graph is not None:
+            sections.append(
+                PromptSection(
+                    "lesson_spec（只读）",
+                    "<lesson_spec>\n"
+                    f"{compact_lesson_spec(lesson_spec, max_chars=12_000)}\n"
+                    "</lesson_spec>\n<teaching_graph>\n"
+                    f"{compact_teaching_graph(teaching_graph, max_chars=6_000)}\n"
+                    "</teaching_graph>",
+                    priority=90,
+                    max_chars=30_000,
                 )
             )
         if rag_context:

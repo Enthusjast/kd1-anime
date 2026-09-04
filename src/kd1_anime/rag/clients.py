@@ -27,11 +27,14 @@ def _headers(api_key: str) -> dict[str, str]:
 
 
 def _safe_endpoint(url: str) -> str:
-    parsed = urlsplit(url)
-    host = parsed.hostname or "<invalid-host>"
-    if parsed.port is not None:
-        host = f"{host}:{parsed.port}"
-    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or "<invalid-host>"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    except ValueError:
+        return "<invalid-endpoint>"
 
 
 def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> Any:

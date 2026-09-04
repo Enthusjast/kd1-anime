@@ -56,6 +56,7 @@ _IN_PLACE_ANIMATIONS = {
     "Wiggle",
 }
 _CONTAINER_ANIMATIONS = {"AnimationGroup", "LaggedStart", "Succession", "Group"}
+_SCENE_SIDE_EFFECTS = {"play", "add", "remove", "clear"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +161,39 @@ def _statement_nodes(construct: ast.FunctionDef | ast.AsyncFunctionDef) -> list[
     return sorted(nodes, key=lambda item: (item.lineno, item.col_offset))
 
 
+def _side_effects_outside_construct(tree: ast.AST, construct: ast.AST) -> list[str]:
+    """找出辅助函数中的 Scene 副作用。
+
+    生命周期模拟只对 construct 建立 active 状态；若辅助函数藏有
+    self.play/add/remove/clear，静态状态会被绕过。因此生成代码采用保守
+    合同：辅助函数只能构造并返回 Mobject，所有 Scene 副作用必须直接位于
+    construct()。
+    """
+
+    errors: list[str] = []
+    seen: set[tuple[int, str, str]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node is construct:
+            continue
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and isinstance(child.func.value, ast.Name)
+                and child.func.value.id == "self"
+                and child.func.attr in _SCENE_SIDE_EFFECTS
+            ):
+                key = (child.lineno, node.name, child.func.attr)
+                if key in seen:
+                    continue
+                seen.add(key)
+                errors.append(
+                    f"第 {child.lineno} 行辅助函数 {node.name} 调用了 self.{child.func.attr}()；"
+                    "Scene 副作用必须直接写在 construct() 中"
+                )
+    return errors
+
+
 def _assignment_names(node: ast.Assign | ast.AnnAssign) -> tuple[str, ...]:
     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
     return tuple(target.id for target in targets if isinstance(target, ast.Name))
@@ -183,6 +217,8 @@ def validate_animation_lifecycle(
     construct = _construct_node(tree)
     if construct is None:
         return LifecycleValidationResult(False, ("生命周期检查找不到 construct()",))
+
+    errors.extend(_side_effects_outside_construct(tree, construct))
 
     object_by_variable = {
         item.variable_name: item for item in technical_spec.objects if item.variable_name

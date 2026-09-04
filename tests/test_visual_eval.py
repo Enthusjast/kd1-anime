@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -6,7 +8,11 @@ from pydantic import ValidationError
 from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.config import settings
 from kd1_anime.eval.evaluator import Evaluator
-from kd1_anime.eval.visual_eval import FrameSample, VisualAnalysisResult, VisualEvaluator
+from kd1_anime.eval.visual_eval import (
+    FrameSample,
+    VisualAnalysisResult,
+    VisualEvaluator,
+)
 from kd1_anime.rendering import RenderProfile, SceneArtifact, VideoMetadata, sha256_file
 from kd1_anime.run_store import RunManifest, StoredSceneState, sha256_text, write_manifest
 
@@ -112,6 +118,137 @@ def test_visual_evaluator_rejects_issue_referencing_missing_frame(tmp_path):
 
     with pytest.raises(ValueError, match="不存在的关键帧"):
         evaluator.evaluate_video_frames([image])
+
+
+def test_visual_evaluator_rejects_issue_referencing_missing_boundary(tmp_path):
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    payload = json.loads(visual_payload())
+    payload["issues"] = [
+        {
+            "category": "consistency",
+            "severity": "major",
+            "repair_target": "continuity",
+            "frame_ids": ["F01"],
+            "boundary_ids": ["B02"],
+            "evidence": "边界状态突变",
+            "recommendation": "保持边界对象",
+        }
+    ]
+
+    class FakeAgent:
+        def call_llm(self, **kwargs):
+            return json.dumps(payload)
+
+    evaluator = VisualEvaluator("vision-model")
+    evaluator._agent = FakeAgent()
+    samples = [
+        FrameSample(
+            frame_id="F01",
+            path=first,
+            boundary_id="B01",
+            role="boundary_end",
+        ),
+        FrameSample(
+            frame_id="F02",
+            path=second,
+            boundary_id="B01",
+            role="boundary_start",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="不存在的场景边界"):
+        evaluator.evaluate_video_frames(samples)
+
+
+def test_visual_evaluator_accepts_boundary_issue_with_valid_references(tmp_path):
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    payload = json.loads(visual_payload())
+    payload["issues"] = [
+        {
+            "category": "consistency",
+            "severity": "minor",
+            "repair_target": "continuity",
+            "confidence": 0.8,
+            "frame_ids": ["F01", "F02"],
+            "boundary_ids": ["B01"],
+            "evidence": "边界略有变化",
+            "recommendation": "保持对象锚点",
+        }
+    ]
+
+    class FakeAgent:
+        def call_llm(self, **kwargs):
+            return json.dumps(payload)
+
+    evaluator = VisualEvaluator("vision-model")
+    evaluator._agent = FakeAgent()
+    samples = [
+        FrameSample(frame_id="F01", path=first, boundary_id="B01", role="boundary_end"),
+        FrameSample(frame_id="F02", path=second, boundary_id="B01", role="boundary_start"),
+    ]
+
+    result = evaluator.evaluate_video_frames(samples)
+
+    assert result.issues[0].repair_target == "continuity"
+    assert result.issues[0].boundary_ids == ["B01"]
+
+
+def test_extract_boundary_samples_records_real_adjacent_scene_ids(monkeypatch, tmp_path):
+    first = tmp_path / "scene_1.mp4"
+    second = tmp_path / "scene_2.mp4"
+    third = tmp_path / "scene_3.mp4"
+    for path in (first, second, third):
+        path.write_bytes(b"video")
+
+    def fake_run(command, **kwargs):
+        output = Path(command[-1])
+        output.write_bytes(b"frame")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr("kd1_anime.eval.evaluator.shutil.which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("kd1_anime.eval.evaluator.subprocess.run", fake_run)
+
+    samples = Evaluator.extract_boundary_samples(
+        [(1, first), (2, second), (3, third)],
+        tmp_path / "frames",
+        max_boundaries=2,
+    )
+
+    assert [(sample.scene_id, sample.boundary_id, sample.role) for sample in samples] == [
+        (1, "B01", "boundary_end"),
+        (2, "B01", "boundary_start"),
+        (2, "B02", "boundary_end"),
+        (3, "B02", "boundary_start"),
+    ]
+
+
+def test_extract_boundary_samples_skips_missing_scene_boundaries(monkeypatch, tmp_path):
+    first = tmp_path / "scene_1.mp4"
+    third = tmp_path / "scene_3.mp4"
+    first.write_bytes(b"video")
+    third.write_bytes(b"video")
+
+    def fake_run(command, **kwargs):
+        output = Path(command[-1])
+        output.write_bytes(b"frame")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr("kd1_anime.eval.evaluator.shutil.which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("kd1_anime.eval.evaluator.subprocess.run", fake_run)
+
+    samples = Evaluator.extract_boundary_samples(
+        [(3, third), (1, first)],
+        tmp_path / "frames",
+        max_boundaries=1,
+    )
+
+    assert samples == []
 
 
 def test_visual_failure_is_recorded_as_unknown_not_fake_score(monkeypatch, tmp_path):

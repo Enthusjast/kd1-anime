@@ -9,6 +9,7 @@ from kd1_anime.agents.technical_planner import (
     TechnicalObject,
     TechnicalSpec,
     compile_technical_spec,
+    normalize_technical_spec_contract,
 )
 
 
@@ -146,6 +147,105 @@ def test_compile_technical_spec_rejects_camera_frame_for_opengl():
     assert any("camera.frame" in error for error in result.errors)
 
 
+def test_compile_technical_spec_ignores_negative_camera_guidance_for_opengl():
+    plan = make_plan()
+    spec = TechnicalSpec(
+        scene_id=1,
+        renderer="opengl",
+        objects=[TechnicalObject(element_id="formula", variable_name="formula", exported=True)],
+        export_element_ids=["formula"],
+        implementation_notes=["OpenGL 渲染器，禁止使用 camera.frame 和 MovingCameraScene"],
+    )
+
+    result = compile_technical_spec(plan, spec, renderer="opengl")
+
+    assert not any("camera.frame" in error for error in result.errors)
+
+
+def test_normalize_technical_spec_repairs_common_lifecycle_hallucinations():
+    elements = [
+        VisualElementState(element_id="title", variable_name="title", required=True),
+        VisualElementState(element_id="step", variable_name="step", required=False),
+        VisualElementState(element_id="before", variable_name="before", required=False),
+        VisualElementState(element_id="after", variable_name="after", required=False),
+        VisualElementState(element_id="result", variable_name="result", required=True),
+    ]
+    plan = make_plan(new=elements)
+    spec = TechnicalSpec(
+        scene_id=1,
+        renderer="opengl",
+        objects=[
+            TechnicalObject(
+                element_id=item.element_id,
+                variable_name=item.variable_name,
+                exported=item.required,
+                constructor="Text",
+            )
+            for item in elements
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_title",
+                start_seconds=0,
+                end_seconds=1,
+                operation="fade_in",
+                target_element_ids=["title"],
+                create_element_ids=["title"],
+            ),
+            TechnicalAnimation(
+                event_id="show_before",
+                start_seconds=1,
+                end_seconds=2,
+                operation="fade_in",
+                target_element_ids=["before"],
+                create_element_ids=["before"],
+            ),
+            TechnicalAnimation(
+                event_id="replace",
+                start_seconds=2,
+                end_seconds=3,
+                operation="transform",
+                source_element_ids=["before"],
+                target_element_ids=["after"],
+                create_element_ids=["after"],
+            ),
+            TechnicalAnimation(
+                event_id="show_result",
+                start_seconds=3,
+                end_seconds=4,
+                operation="fade_in",
+                target_element_ids=["result"],
+                create_element_ids=["result"],
+            ),
+            TechnicalAnimation(
+                event_id="cleanup",
+                start_seconds=4,
+                end_seconds=5,
+                operation="fade_out",
+                remove_element_ids=["step", "before", "after", "title", "result"],
+            ),
+            TechnicalAnimation(
+                event_id="hold",
+                start_seconds=5,
+                end_seconds=10,
+                operation="wait",
+            ),
+        ],
+        export_element_ids=["title", "result"],
+        implementation_notes=["OpenGL renderer，禁止使用 camera.frame 和 MovingCameraScene"],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec, renderer="opengl")
+    result = compile_technical_spec(plan, normalized, renderer="opengl")
+
+    cleanup = next(item for item in normalized.animations if item.event_id == "cleanup")
+    replace = next(item for item in normalized.animations if item.event_id == "replace")
+    assert replace.operation == "replacement_transform"
+    assert cleanup.remove_element_ids == ["after"]
+    assert result.is_valid is True
+    assert repairs
+
+
 def test_compile_technical_spec_requires_xelatex_contract_for_mathtex():
     plan = make_plan()
     spec = TechnicalSpec(
@@ -165,6 +265,22 @@ def test_compile_technical_spec_requires_xelatex_contract_for_mathtex():
 
     assert result.is_valid is False
     assert any("latex.required" in error for error in result.errors)
+
+
+def test_normalize_technical_spec_copies_scene_removals_and_inherited_activity():
+    inherited = VisualElementState(element_id="old", variable_name="old")
+    plan = make_plan(inherited=[inherited], removed=[inherited])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="old", variable_name="old")],
+        removed_element_ids=[],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+
+    assert normalized.removed_element_ids == ["old"]
+    assert normalized.objects[0].initially_active is True
+    assert repairs
 
 
 def test_technical_spec_is_closed():

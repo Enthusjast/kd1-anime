@@ -1,0 +1,50 @@
+name: Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cairo-tex-ffmpeg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install native rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            dvisvgm \
+            ffmpeg \
+            fonts-noto-cjk \
+            texlive-fonts-recommended \
+            texlive-lang-chinese \
+            texlive-latex-extra \
+            texlive-xetex
+      - name: Install pinned Manim and package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "manim==0.20.1"
+          python -m pip install -e .
+      - name: Render a real CJK and MathTex scene
+        run: |
+          rm -rf "$RUNNER_TEMP/kd1-anime-media"
+          python -m manim render \
+            --renderer=cairo \
+            -ql \
+            --resolution 320,180 \
+            --fps 15 \
+            --disable_caching \
+            --media_dir "$RUNNER_TEMP/kd1-anime-media" \
+            tests/fixtures/integration_scene.py IntegrationScene
+          video="$(find "$RUNNER_TEMP/kd1-anime-media" -type f -name 'IntegrationScene.mp4' -print -quit)"
+          test -n "$video"
+          test -s "$video"
+          ffprobe -v error \
+            -show_entries stream=width,height,avg_frame_rate \
+            -of default=nw=1 "$video"

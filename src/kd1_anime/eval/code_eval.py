@@ -7,7 +7,7 @@
 import ast
 import re
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from kd1_anime.agents.validator import (
     ALLOWED_IMPORT_ROOTS,
@@ -45,7 +45,12 @@ class CodeEvaluator:
     # 危险函数调用
     DANGEROUS_CALLS: ClassVar[set[str]] = set(BANNED_CALLS)
 
-    def analyze_code(self, code: str) -> CodeAnalysisResult:
+    def analyze_code(
+        self,
+        code: str,
+        *,
+        renderer: Literal["cairo", "opengl"] | None = None,
+    ) -> CodeAnalysisResult:
         """分析代码质量
 
         Args:
@@ -94,7 +99,7 @@ class CodeEvaluator:
 
         # 评估结果必须和真正的提交前安全校验保持一致；仅凭 AST 统计
         # 可能把缺少 Scene、非法 renderer API 或危险能力的代码评为高分。
-        validation = validate_manim_code(code)
+        validation = validate_manim_code(code, renderer=renderer)
         result.validation_errors = validation.errors
 
         return result
@@ -144,7 +149,15 @@ class CodeEvaluator:
                         f"Line {node.lineno}: Dangerous function call '{func_name}'"
                     )
 
-            elif isinstance(node, ast.Attribute) and node.attr in BANNED_ATTRIBUTE_NAMES:
+            elif (
+                isinstance(node, ast.Attribute)
+                and node.attr in BANNED_ATTRIBUTE_NAMES
+                and not (
+                    node.attr == "remove"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "self"
+                )
+            ):
                 result.security_issues.append(
                     f"Line {node.lineno}: Dangerous attribute reference '{node.attr}'"
                 )
@@ -190,7 +203,12 @@ class CodeEvaluator:
 
         return complexity
 
-    def evaluate(self, code: str) -> list[QualityScore]:
+    def evaluate(
+        self,
+        code: str,
+        *,
+        renderer: Literal["cairo", "opengl"] | None = None,
+    ) -> list[QualityScore]:
         """评估代码质量并返回评分
 
         Args:
@@ -199,7 +217,7 @@ class CodeEvaluator:
         Returns:
             List[QualityScore]: 各维度评分列表
         """
-        analysis = self.analyze_code(code)
+        analysis = self.analyze_code(code, renderer=renderer)
         scores = []
 
         # 语法正确性评分
@@ -271,7 +289,12 @@ class CodeEvaluator:
 
         return scores
 
-    def get_scene_complexity(self, code: str) -> dict[str, Any]:
+    def get_scene_complexity(
+        self,
+        code: str,
+        *,
+        renderer: Literal["cairo", "opengl"] | None = None,
+    ) -> dict[str, Any]:
         """评估场景复杂度
 
         Args:
@@ -280,7 +303,7 @@ class CodeEvaluator:
         Returns:
             复杂度评估结果
         """
-        analysis = self.analyze_code(code)
+        analysis = self.analyze_code(code, renderer=renderer)
 
         # 分析 Manim 特定复杂度
         manim_objects = len(

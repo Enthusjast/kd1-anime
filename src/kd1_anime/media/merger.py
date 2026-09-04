@@ -14,7 +14,13 @@ from rich.console import Console
 
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
-from kd1_anime.rendering import RenderProfile, VideoMetadata, sha256_file, verify_video
+from kd1_anime.rendering import (
+    RenderProfile,
+    VideoMetadata,
+    effective_transition_duration,
+    sha256_file,
+    verify_video,
+)
 
 console = Console()
 
@@ -233,15 +239,14 @@ class VideoMerger:
             raise ValueError("xfade 至少需要两个输入视频")
         if len(inputs) != len(metadata):
             raise ValueError("输入视频与视频元数据数量不一致")
-        transition = min(
-            settings.TRANSITION_DURATION, min(item.duration_seconds for item in metadata) / 2
-        )
+        transition = effective_transition_duration(item.duration_seconds for item in metadata)
         if transition <= 0.01:
             raise RuntimeError("视频时长过短，无法安全添加转场")
         width = profile.pixel_width
         height = profile.pixel_height
         fps = profile.frame_rate
         video_filter = (
+            "setpts=PTS-STARTPTS,"
             f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
             "settb=AVTB,format=yuv420p"

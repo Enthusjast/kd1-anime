@@ -6,7 +6,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kd1_anime.agents.base import BaseAgent, TruncatedResponseError
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    LessonSpec,
+    ScenePlan,
+    compact_lesson_spec,
+)
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
@@ -198,12 +203,9 @@ class ReviewResult(BaseModel):
             self.findings = []
             return self
         if self.severity == "info":
-            # info 级别视为通过
-            self.is_valid = True
-            self.feedback = ""
-            self.fixes = []
-            self.findings = []
-            return self
+            # 失败结果不能因为错误的 severity 而绕过代码审查；与
+            # PlanReviewResult 一样采取 fail-closed 策略。
+            self.severity = "major"
         if self.severity == "minor" and not self.fixes:
             # 没有 fixes 的 minor 升级为 major
             self.severity = "major"
@@ -347,6 +349,7 @@ class ReviewerAgent(BaseAgent):
         technical_spec: TechnicalSpec | None = None,
         safe_fallback: bool = False,
         protocol_feedback: str = "",
+        lesson_spec: LessonSpec | None = None,
     ) -> str:
         inherited_context = cls._bounded_text(inherited_elements_code, 8_000)
         fallback_context = (
@@ -387,6 +390,20 @@ class ReviewerAgent(BaseAgent):
                     required=True,
                     priority=110,
                     max_chars=settings.LLM_MAX_TECHNICAL_SPEC_CHARS,
+                )
+            )
+        if lesson_spec is not None:
+            sections.append(
+                PromptSection(
+                    "lesson_spec（只读）",
+                    "<lesson_spec>\n"
+                    f"{compact_lesson_spec(lesson_spec, claim_ids=set(scene_plan.claim_ids), max_chars=16_000)}\n"
+                    "</lesson_spec>\n"
+                    f"当前场景 claim_ids: {json.dumps(scene_plan.claim_ids, ensure_ascii=False)}\n"
+                    "若发现数学事实本身错误，请明确标记为 math/major，交回计划审查，"
+                    "不要建议 Coder 修改教学合同。",
+                    priority=85,
+                    max_chars=30_000,
                 )
             )
         if inherited_context:
@@ -430,6 +447,7 @@ class ReviewerAgent(BaseAgent):
         inherited_elements_code: str = "",
         technical_spec: TechnicalSpec | None = None,
         safe_fallback: bool = False,
+        lesson_spec: LessonSpec | None = None,
     ) -> ReviewResult:
         self._log(f"正在审查代码 [{scene_plan.title}]...")
         bible_context = (
@@ -451,6 +469,7 @@ class ReviewerAgent(BaseAgent):
             inherited_elements_code=inherited_elements_code,
             technical_spec=technical_spec,
             safe_fallback=safe_fallback,
+            lesson_spec=lesson_spec,
         )
         try:
             result = self.call_llm_json(
@@ -470,6 +489,7 @@ class ReviewerAgent(BaseAgent):
                 inherited_elements_code="（继承元素已在 manim_code 中定义，请直接对照代码审查）",
                 technical_spec=technical_spec,
                 safe_fallback=safe_fallback,
+                lesson_spec=lesson_spec,
             )
             result = self.call_llm_json(
                 system_prompt=system_prompt,
@@ -494,6 +514,7 @@ class ReviewerAgent(BaseAgent):
                 inherited_elements_code="",
                 technical_spec=technical_spec,
                 safe_fallback=safe_fallback,
+                lesson_spec=lesson_spec,
                 protocol_feedback=protocol_feedback,
             )
             result = self.call_llm_json(

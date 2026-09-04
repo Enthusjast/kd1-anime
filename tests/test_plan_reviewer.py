@@ -8,14 +8,17 @@ from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
     PlanReviewResult,
+    classify_plan_review_issues,
     deterministic_plan_issues,
     filter_verified_plan_issues,
 )
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    LessonSpec,
     MathClaim,
     SceneHandoff,
     ScenePlan,
+    TeachingGraph,
     VisualElementState,
 )
 
@@ -90,6 +93,32 @@ def test_deterministic_plan_review_does_not_reject_explicit_safe_fallback():
     assert not any(issue.category == "geometry" for issue in issues)
 
 
+def test_plan_reviewer_prompt_includes_readonly_teaching_graph(monkeypatch):
+    reviewer = PlanReviewerAgent()
+    captured = {}
+
+    def fake_call_llm_json(**kwargs):
+        captured["kwargs"] = kwargs
+        return PlanReviewResult(is_valid=True, severity="info")
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call_llm_json)
+    reviewer.review(
+        make_plan(),
+        user_prompt="解释公式",
+        continuity_bible=ContinuityBible(),
+        lesson_spec=LessonSpec(
+            claims=[MathClaim(claim_id="claim_1", statement="a=a", relation="definition")]
+        ),
+        teaching_graph=TeachingGraph(claim_order=["claim_1"], scene_claims={2: ["claim_1"]}),
+    )
+
+    assert "teaching_graph" in captured["kwargs"]["user_message"]
+
+
+def test_plan_review_prompt_does_not_use_claim_removal_to_bypass_evidence():
+    assert "不能建议删除 claim_ids" in PLAN_REVIEW_PROMPT
+
+
 def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():
     result_formula = VisualElementState(
         element_id="result_formula",
@@ -138,6 +167,72 @@ def test_plan_review_does_not_keep_false_math_and_new_element_handoff_errors():
     )
 
     assert filtered == []
+
+
+def test_plan_review_only_major_issues_block():
+    plan = make_plan()
+    result = PlanReviewResult(
+        is_valid=False,
+        severity="minor",
+        summary="建议调整停顿",
+        issues=[
+            {
+                "category": "timing",
+                "severity": "minor",
+                "field": "key_moments",
+                "message": "停顿略短",
+                "fix_instruction": "可选地增加停顿",
+            }
+        ],
+    )
+
+    all_issues, blocking, warnings = classify_plan_review_issues(
+        plan,
+        deterministic_issues=[],
+        result=result,
+    )
+
+    assert len(all_issues) == 1
+    assert blocking == []
+    assert len(warnings) == 1
+
+
+def test_plan_review_drops_model_issue_that_explicitly_says_no_change_needed():
+    plan = make_plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_step",
+                    variable_name="temporary_step",
+                    required=False,
+                )
+            ]
+        }
+    )
+    result = PlanReviewResult(
+        is_valid=False,
+        severity="major",
+        summary="计划符合要求",
+        issues=[
+            {
+                "category": "contract",
+                "field": "new_elements",
+                "message": (
+                    "temporary_step 的 required=false 符合要求，作为中间步骤不应标记为 required=true。"
+                ),
+                "fix_instruction": "无需修改；确保结束时淡出。",
+            }
+        ],
+    )
+
+    _, blocking, warnings = classify_plan_review_issues(
+        plan,
+        deterministic_issues=[],
+        result=result,
+    )
+
+    assert blocking == []
+    assert warnings == []
 
 
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")

@@ -622,6 +622,8 @@ class ChatSession:
                         console.print(Rule("[bold magenta]场景概要[/]", style="magenta"))
                     case "detailing":
                         console.print(Rule("[bold magenta]导演分镜[/]", style="magenta"))
+                    case "technical":
+                        console.print(Rule("[bold magenta]技术实现设计[/]", style="magenta"))
                     case "coding":
                         console.print(Rule("[bold magenta]代码生成[/]", style="magenta"))
                     case "reviewing":
@@ -682,6 +684,20 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]分镜完成 ✓[/]")
 
+            case "scene_technical_planning":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]技术实现设计中[/]")
+
+            case "scene_technical_ready":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]技术合同完成 ✓[/]")
+
+            case "scene_technical_failed":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold red]技术合同失败 ✗[/]{suffix}")
+
             case "scene_plan_reviewing":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]计划正确性审查中[/]")
@@ -738,10 +754,26 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]需修正[/]")
 
+            case "scene_smoke_rendering":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]Smoke Render 检查中[/]")
+
+            case "scene_smoke_rendered":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]Smoke Render 通过 ✓[/]")
+
             case "scene_submitted":
                 scene_id = data.get("scene_id", "?")
                 job_id = data.get("job_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id} → Job {job_id}")
+
+            case "scene_artifact_invalid":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]渲染产物不可用，将重新处理[/]{suffix}"
+                )
 
             case "scene_rendered":
                 scene_id = data.get("scene_id", "?")
@@ -766,6 +798,43 @@ class ChatSession:
                 console.print(
                     f"  [dim]▸[/] Scene {scene_id}: [yellow]安排视觉修复 {attempt}/{maximum}[/]"
                 )
+
+            case "scene_visual_plan_fixing":
+                scene_id = data.get("scene_id", "?")
+                target = esc(data.get("target", "计划"))
+                attempt = data.get("attempt", 0)
+                maximum = data.get("max_attempts", 0)
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]视觉反馈回到{target}层 "
+                    f"{attempt}/{maximum}[/]"
+                )
+
+            case "scene_plan_repair_requested":
+                scene_id = data.get("scene_id", "?")
+                target = esc(data.get("target", "计划"))
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]代码审查反馈回到{target}层[/]"
+                )
+
+            case "scene_waiting_for_dependency":
+                scene_id = data.get("scene_id", "?")
+                dependency = data.get("dependency_scene_id", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]等待 Scene {dependency} 完成后继续[/]"
+                )
+
+            case "boundary_visual_pass":
+                score = data.get("score")
+                suffix = f" ({score:.2f}/5)" if isinstance(score, (int, float)) else ""
+                console.print(f"  [dim]▸[/] [green]场景边界视觉审查通过 ✓[/]{suffix}")
+
+            case "boundary_visual_warning":
+                target = esc(data.get("target", "unknown"))
+                console.print(f"  [dim]▸[/] [yellow]场景边界视觉提示，路由: {target}[/]")
+
+            case "boundary_visual_unknown":
+                reason = esc(data.get("reason", "视觉端点不可用"))
+                console.print(f"  [dim]▸[/] [yellow]场景边界视觉结果 unknown: {reason}[/]")
 
             case "scene_visual_warning":
                 scene_id = data.get("scene_id", "?")

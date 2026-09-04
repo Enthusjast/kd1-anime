@@ -15,9 +15,15 @@ from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.planner import (
     ContinuityBible,
     ExtractedElement,
+    LessonSpec,
+    SceneHandoff,
     SceneOutline,
     ScenePlan,
+    TeachingGraph,
+    TimelineEvent,
     VisualElementState,
+    compact_lesson_spec,
+    compact_teaching_graph,
 )
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
@@ -494,10 +500,14 @@ def extract_continuity_elements(code: str) -> tuple[str, list[ExtractedElement]]
             raise ValueError("连续性导出区必须位于 Scene.construct() 内")
     if marker_lines:
         lines = code.splitlines()
-        begin_index = next(
+        begin_indices = [
             index for index, line in enumerate(lines) if CONTINUITY_EXPORT_BEGIN in line
-        )
-        end_index = next(index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line)
+        ]
+        end_indices = [index for index, line in enumerate(lines) if CONTINUITY_EXPORT_END in line]
+        if len(begin_indices) != 1 or len(end_indices) != 1:
+            raise ValueError("连续性导出区标记不成对或重复")
+        begin_index = begin_indices[0]
+        end_index = end_indices[0]
         block_text = textwrap.dedent("\n".join(lines[begin_index + 1 : end_index])).strip()
         prefix_code = _safe_alias_prefix(code, begin_index + 1, block_text)
         marked_code, marked_elements = _parse_export_block(code, prefix_code=prefix_code)
@@ -600,11 +610,33 @@ def validate_export_contract(
             )
 
 
+def _is_terminal_exit_action(action: str) -> bool:
+    text = str(action or "").lower()
+    return any(
+        token in text for token in ("淡出", "消失", "清空", "收束", "结束", "fade out", "fadeout")
+    )
+
+
+def _terminal_exit_element_ids(plan: ScenePlan) -> set[str]:
+    if not plan.timeline:
+        return set()
+    event = max(
+        plan.timeline,
+        key=lambda item: (item.end_seconds, item.start_seconds, item.event_id),
+    )
+    if event.end_seconds < plan.duration_seconds - 0.05 or not _is_terminal_exit_action(
+        event.action
+    ):
+        return set()
+    return set(event.element_ids)
+
+
 def normalize_scene_plan_contract(
     plan: ScenePlan,
     bible: ContinuityBible,
     *,
     previous_plan: ScenePlan | None = None,
+    has_next_scene: bool | None = None,
 ) -> tuple[ScenePlan, list[str]]:
     """确定性修复分镜交接合同中的机械性错误。
 
@@ -643,40 +675,39 @@ def normalize_scene_plan_contract(
         previous_available_by_id = {
             item.element_id: item
             for item in [*previous_plan.inherited_elements, *previous_plan.new_elements]
-            if item.element_id not in previous_removed
+            if item.required and item.element_id not in previous_removed
         }
         previous_available = set(previous_available_by_id)
-        if previous_available:
-            kept = [item for item in inherited if item.element_id in previous_available]
-            dropped = [
-                item.element_id for item in inherited if item.element_id not in previous_available
-            ]
-            if dropped:
-                repairs.append("删除上一场景未声明导出的继承元素: " + ", ".join(sorted(dropped)))
-            inherited = kept
+        kept = [item for item in inherited if item.element_id in previous_available]
+        dropped = [
+            item.element_id for item in inherited if item.element_id not in previous_available
+        ]
+        if dropped:
+            repairs.append("删除上一场景未声明导出的继承元素: " + ", ".join(sorted(dropped)))
+        inherited = kept
 
-            # element_id 是语义身份，variable_name 是代码级身份。Planner
-            # 经常会在相邻场景里把同一个对象从 ``triangle`` 改名为
-            # ``right_triangle``；如果不在这里固定为上一场景的变量名，
-            # Coder 会收到互相矛盾的继承代码和结构化合同，最终生成重复
-            # 或无法导出的连续性区。
-            aligned_inherited: list[VisualElementState] = []
-            for current_item in inherited:
-                previous_item = previous_available_by_id[current_item.element_id]
-                aligned_item = current_item
-                if (
-                    previous_item.variable_name
-                    and current_item.variable_name != previous_item.variable_name
-                ):
-                    repairs.append(
-                        f"元素 {current_item.element_id} 的变量名固定为上一场景的 "
-                        f"{previous_item.variable_name}"
-                    )
-                    aligned_item = current_item.model_copy(
-                        update={"variable_name": previous_item.variable_name}
-                    )
-                aligned_inherited.append(aligned_item)
-            inherited = aligned_inherited
+        # element_id 是语义身份，variable_name 是代码级身份。Planner
+        # 经常会在相邻场景里把同一个对象从 ``triangle`` 改名为
+        # ``right_triangle``；如果不在这里固定为上一场景的变量名，
+        # Coder 会收到互相矛盾的继承代码和结构化合同，最终生成重复
+        # 或无法导出的连续性区。
+        aligned_inherited: list[VisualElementState] = []
+        for current_item in inherited:
+            previous_item = previous_available_by_id[current_item.element_id]
+            aligned_item = current_item
+            if (
+                previous_item.variable_name
+                and current_item.variable_name != previous_item.variable_name
+            ):
+                repairs.append(
+                    f"元素 {current_item.element_id} 的变量名固定为上一场景的 "
+                    f"{previous_item.variable_name}"
+                )
+                aligned_item = current_item.model_copy(
+                    update={"variable_name": previous_item.variable_name}
+                )
+            aligned_inherited.append(aligned_item)
+        inherited = aligned_inherited
 
     inherited_ids = {item.element_id for item in inherited}
     valid_removals: list[VisualElementState] = []
@@ -732,10 +763,27 @@ def normalize_scene_plan_contract(
     if normalized_handoff:
         handoff_ids = {item.element_id for item in normalized_handoff}
         declared_ids = {item.element_id for item in [*inherited, *removals, *new_elements]}
+        previous_declared_ids = {
+            item.element_id
+            for item in (
+                [*previous_plan.inherited_elements, *previous_plan.new_elements]
+                if previous_plan is not None
+                else []
+            )
+        }
+        valid_handoff: list[SceneHandoff] = []
         for handoff_item in normalized_handoff:
-            if handoff_item.element_id in declared_ids or handoff_item.action == "remove":
-                continue
             previous_item = previous_available_by_id.get(handoff_item.element_id)
+            if (
+                previous_plan is not None
+                and handoff_item.element_id in previous_declared_ids
+                and previous_item is None
+            ):
+                repairs.append(f"删除上一场景未导出的过期 handoff 元素: {handoff_item.element_id}")
+                continue
+            if handoff_item.element_id in declared_ids or handoff_item.action == "remove":
+                valid_handoff.append(handoff_item)
+                continue
             inferred = VisualElementState(
                 element_id=handoff_item.element_id,
                 role="",
@@ -761,6 +809,9 @@ def normalize_scene_plan_contract(
                 new_elements.append(inferred)
                 repairs.append(f"handoff 中的元素 {handoff_item.element_id} 已补入 new_elements")
             declared_ids.add(handoff_item.element_id)
+            valid_handoff.append(handoff_item)
+
+        normalized_handoff = valid_handoff
 
         handoff_ids = {item.element_id for item in normalized_handoff}
         repaired_new: list[VisualElementState] = []
@@ -776,15 +827,276 @@ def normalize_scene_plan_contract(
             repaired_new.append(repaired_item)
         new_elements = repaired_new
 
+    # ``remove`` 不是 new element 的边界动作：它表示对象在当前场景内
+    # 已经退出，不应继续出现在 handoff 中。模型经常把“淡出中间步骤”
+    # 直接写成 handoff.remove，导致 PlanCompiler 将其误当成 required
+    # 交接元素并阻断整个场景。
+    new_ids = {item.element_id for item in new_elements}
+    new_remove_handoff_ids = {
+        item.element_id
+        for item in normalized_handoff
+        if item.element_id in new_ids and item.action == "remove"
+    }
+    if new_remove_handoff_ids:
+        normalized_handoff = [
+            item for item in normalized_handoff if item.element_id not in new_remove_handoff_ids
+        ]
+        new_elements = [
+            (
+                item.model_copy(update={"required": False})
+                if item.element_id in new_remove_handoff_ids and item.required
+                else item
+            )
+            for item in new_elements
+        ]
+        repairs.append(
+            "已将场景内退出的 new_elements 移出 handoff: "
+            + ", ".join(sorted(new_remove_handoff_ids))
+        )
+
+    inherited_remove_handoff_ids = {
+        item.element_id
+        for item in normalized_handoff
+        if item.element_id in inherited_ids and item.action == "remove"
+    }
+    if inherited_remove_handoff_ids:
+        removal_ids = {item.element_id for item in removals}
+        for item in inherited:
+            if (
+                item.element_id not in inherited_remove_handoff_ids
+                or item.element_id in removal_ids
+            ):
+                continue
+            removals.append(
+                item.model_copy(
+                    update={
+                        "required": True,
+                        "reason": item.reason or "handoff 明确要求在本场景退出",
+                    }
+                )
+            )
+            removal_ids.add(item.element_id)
+        repairs.append(
+            "handoff.remove 的继承元素已补入移除合同: "
+            + ", ".join(sorted(inherited_remove_handoff_ids))
+        )
+
+    # 最后一个场景的终态事件若明确淡出某个对象，该对象不可能继续作为
+    # required/handoff 元素存在。只在调用方确认“没有下一场景”时启用，
+    # 避免把可交给下一场景处理的延迟淡出误判成当前冲突。
+    terminal_exit_ids = _terminal_exit_element_ids(plan) if has_next_scene is False else set()
+    if terminal_exit_ids:
+        terminal_new_ids = terminal_exit_ids & new_ids
+        terminal_inherited_ids = terminal_exit_ids & inherited_ids
+        if terminal_new_ids:
+            new_elements = [
+                (
+                    item.model_copy(update={"required": False})
+                    if item.element_id in terminal_new_ids and item.required
+                    else item
+                )
+                for item in new_elements
+            ]
+            normalized_handoff = [
+                item for item in normalized_handoff if item.element_id not in terminal_new_ids
+            ]
+            repairs.append(
+                "场景末尾淡出的 new_elements 已标记为 optional: "
+                + ", ".join(sorted(terminal_new_ids))
+            )
+        if terminal_inherited_ids:
+            removal_ids = {item.element_id for item in removals}
+            for item in inherited:
+                if item.element_id not in terminal_inherited_ids or item.element_id in removal_ids:
+                    continue
+                removals.append(
+                    item.model_copy(
+                        update={
+                            "required": True,
+                            "reason": item.reason or "场景末尾淡出",
+                        }
+                    )
+                )
+                removal_ids.add(item.element_id)
+            normalized_handoff = [
+                (
+                    item.model_copy(update={"action": "remove"})
+                    if item.element_id in terminal_inherited_ids
+                    else item
+                )
+                for item in normalized_handoff
+            ]
+            repairs.append(
+                "场景末尾淡出的继承元素已列入移除合同: " + ", ".join(sorted(terminal_inherited_ids))
+            )
+
+    # 如果当前场景明确声明在边界处整体退出，required 元素就不可能同时
+    # 作为交接对象保留。模型常把“下一场景开始时再淡出”写进
+    # transition_out；这种延后退出不属于当前 closing_state 冲突，应保留
+    # 原合同。除此之外，按退出描述机械地把 inherited 元素列入移除，
+    # 并把本场景 new_elements 还原为临时对象，避免 Coder 被要求导出已
+    # 淡出的中间公式。
+    closing_text = " ".join(plan.closing_state).lower()
+    transition_text = plan.transition_out.lower()
+    broad_exit_pattern = r"(?:所有|全部|整体|全片).{0,16}(?:淡出|消失|清空|移除)"
+    closing_broad_exit = bool(
+        re.search(broad_exit_pattern, closing_text) or "self.clear" in closing_text
+    )
+    transition_broad_exit = bool(
+        re.search(broad_exit_pattern, transition_text) or "self.clear" in transition_text
+    )
+    deferred_transition_exit = (
+        transition_broad_exit
+        and has_next_scene is not False
+        and any(
+            marker in transition_text
+            for marker in (
+                "下一场景",
+                "下一个场景",
+                "后续场景",
+                "进入下一",
+                "场景切换",
+                "next scene",
+                "following scene",
+            )
+        )
+    )
+    if closing_broad_exit or (transition_broad_exit and not deferred_transition_exit):
+        removal_ids = {item.element_id for item in removals}
+        added_removals: list[str] = []
+        for item in inherited:
+            if item.element_id in removal_ids:
+                continue
+            removals.append(
+                item.model_copy(
+                    update={
+                        "required": True,
+                        "reason": item.reason or "场景边界整体退出",
+                    }
+                )
+            )
+            removal_ids.add(item.element_id)
+            added_removals.append(item.element_id)
+        if added_removals:
+            repairs.append(
+                "场景边界整体退出，已将继承元素列入移除合同: " + ", ".join(sorted(added_removals))
+            )
+
+        new_ids = {item.element_id for item in new_elements}
+        normalized_handoff = [item for item in normalized_handoff if item.element_id not in new_ids]
+        normalized_handoff = [
+            (
+                item.model_copy(update={"action": "remove"})
+                if item.element_id in {element.element_id for element in inherited}
+                and item.action != "remove"
+                else item
+            )
+            for item in normalized_handoff
+        ]
+        normalized_new: list[VisualElementState] = []
+        for item in new_elements:
+            normalized_item = item
+            if item.required:
+                repairs.append(f"整体退出场景中的元素 {item.element_id} 已标记为 optional")
+                normalized_item = item.model_copy(update={"required": False})
+            normalized_new.append(normalized_item)
+        new_elements = normalized_new
+
+    declared_ids = {item.element_id for item in [*inherited, *removals, *new_elements]}
+    normalized_timeline: list[TimelineEvent] = []
+    for event in plan.timeline:
+        unknown_ids = set(event.element_ids) - declared_ids
+        if unknown_ids:
+            repairs.append(
+                f"事件 {event.event_id} 删除未声明的元素引用: " + ", ".join(sorted(unknown_ids))
+            )
+            normalized_event = event.model_copy(
+                update={
+                    "element_ids": [
+                        element_id for element_id in event.element_ids if element_id in declared_ids
+                    ]
+                }
+            )
+        else:
+            normalized_event = event
+        normalized_timeline.append(normalized_event)
+
     allowed_colors = set(bible.global_visual_state.colors)
+    normalized_color_names = {key.lower().replace("-", "_"): key for key in allowed_colors}
+    color_aliases = {
+        "primary": ("primary", "primary_blue", "a_blue", "blue", "input"),
+        "secondary": ("secondary", "secondary_red", "b_red", "red", "support"),
+        "result": ("result", "highlight", "highlight_green", "green", "accent"),
+        "highlight": ("highlight", "highlight_green", "result", "green", "accent"),
+        "neutral": ("neutral", "neutral_black", "text_dark", "text", "black"),
+        "gray": ("gray", "neutral_gray", "cancel_gray", "text_light_gray"),
+        "cancel": ("cancel", "cancel_gray", "neutral_gray", "gray"),
+        "white": ("white", "text_light"),
+        "background": ("background",),
+    }
+    for alias_group in tuple(color_aliases.values()):
+        for alias in alias_group:
+            color_aliases.setdefault(alias, alias_group)
 
     def normalize_color(item: VisualElementState) -> VisualElementState:
-        if not item.color_key or item.color_key in allowed_colors:
-            return item
-        fallback = (
-            "primary" if "primary" in allowed_colors else next(iter(sorted(allowed_colors)), "")
+        role_text = f"{item.role} {item.semantic_state}".lower()
+        looks_like_recovered_background = (
+            item.color_key.lower().replace("-", "_") == "background"
+            and "背景" not in role_text
+            and "background" not in role_text
         )
-        repairs.append(f"元素 {item.element_id} 的未知颜色键 {item.color_key} 已映射为 {fallback}")
+        if not item.color_key or (
+            item.color_key in allowed_colors and not looks_like_recovered_background
+        ):
+            return item
+        original_key = item.color_key
+        normalized_key = original_key.lower().replace("-", "_")
+        if looks_like_recovered_background:
+            candidates = (
+                ("highlight", "highlight_green", "result", "green", "accent")
+                if any(token in role_text for token in ("结论", "结果", "result", "conclusion"))
+                else ("gray", "neutral_gray", "cancel_gray", "text_light_gray")
+                if any(token in role_text for token in ("步骤", "辅助", "说明", "step", "helper"))
+                else ("neutral", "neutral_black", "text_dark", "foreground", "primary")
+            )
+        else:
+            candidates = color_aliases.get(normalized_key, (normalized_key,))
+        fallback = next(
+            (
+                normalized_color_names[candidate]
+                for candidate in candidates
+                if candidate in normalized_color_names
+            ),
+            None,
+        )
+        if fallback is None:
+            # 不要把未知语义统一映射成 background：那会让标题、步骤和
+            # 公式在进入 Coder 前丢失颜色含义。按元素角色选择稳定的
+            # 中性色，只有连续性圣经没有中性色时才退回 background。
+            role_candidates = (
+                ("neutral_black", "text_dark", "neutral", "black")
+                if any(token in role_text for token in ("标题", "文本", "公式", "等式", "运算"))
+                else ("neutral_gray", "gray", "cancel_gray")
+                if any(token in role_text for token in ("步骤", "辅助", "说明", "抵消"))
+                else ("neutral_black", "text_dark", "neutral", "black")
+            )
+            fallback = next(
+                (
+                    normalized_color_names[candidate]
+                    for candidate in role_candidates
+                    if candidate in normalized_color_names
+                ),
+                normalized_color_names.get(
+                    "primary",
+                    normalized_color_names.get(
+                        "foreground",
+                        normalized_color_names.get(
+                            "background", next(iter(sorted(allowed_colors)), "")
+                        ),
+                    ),
+                ),
+            )
+        repairs.append(f"元素 {item.element_id} 的颜色键 {original_key} 已规范为 {fallback}")
         return item.model_copy(update={"color_key": fallback})
 
     inherited = [normalize_color(item) for item in inherited]
@@ -803,6 +1115,8 @@ def normalize_scene_plan_contract(
         updates["new_elements"] = new_elements
     if normalized_handoff != plan.handoff:
         updates["handoff"] = normalized_handoff
+    if normalized_timeline != plan.timeline:
+        updates["timeline"] = normalized_timeline
 
     return (plan.model_copy(update=updates) if updates else plan), repairs
 
@@ -924,6 +1238,8 @@ CONTINUITY_REVIEW_PROMPT = r"""你是数学动画的总剪辑师，负责审查�
 9. 所有场景的 global_visual_state 是否完全服从同一份全局颜色、字体、字号、线宽和布局配置。
 10. 涉及切割、碎片、旋转或拼接时，computation 是否给出了足以核验顶点、面积和覆盖关系的
     数值；如果没有，要求改为面积标签或等式演示，不要继续规划“示意性无缝拼接”。
+11. ScenePlan 是否只引用 LessonSpec 已声明的数学断言，且所有断言都遵守教学图谱中的
+    前置依赖顺序；不能在不同场景中重新定义同一个符号或结论。
 
 ## 判定原则
 - 只报告会破坏观众理解或造成明显视觉跳变的问题。
@@ -957,12 +1273,17 @@ def _state_tokens(values: list[str]) -> set[str]:
     return {
         token
         for token in re.findall(r"[a-z][a-z0-9_]*|\d+|[\u4e00-\u9fff]{2,}", text)
-        if len(token) > 1 or token.isdigit()
+        # 单字母变量（a、b、x 等）是数学状态的重要组成部分；中文单字
+        # 仍然忽略，避免普通语句因一个常见虚词产生误匹配。
+        if len(token) > 1 or token.isdigit() or (len(token) == 1 and token.isascii())
     }
 
 
 def deterministic_continuity_issues(
-    plans: list[ScenePlan], bible: ContinuityBible
+    plans: list[ScenePlan],
+    bible: ContinuityBible,
+    lesson_spec: LessonSpec | None = None,
+    teaching_graph: TeachingGraph | None = None,
 ) -> list[ContinuityIssue]:
     """执行不依赖 LLM 的结构检查，先拦截明显的断接和空合同。"""
 
@@ -989,6 +1310,61 @@ def deterministic_continuity_issues(
                 fix_instruction="补齐全片级视觉规范后再生成场景分镜。",
             )
         )
+
+    if lesson_spec is not None and lesson_spec.claims:
+        known_claim_ids = {claim.claim_id for claim in lesson_spec.claims}
+        for plan in ordered:
+            unknown = set(plan.claim_ids) - known_claim_ids
+            if unknown:
+                issues.append(
+                    ContinuityIssue(
+                        scene_ids=[plan.scene_id],
+                        category="math",
+                        message="场景引用了教学合同中不存在的断言: " + ", ".join(sorted(unknown)),
+                        fix_instruction="只保留 LessonSpec 已声明的 claim_id。",
+                        target_fields=["claim_ids"],
+                    )
+                )
+        first_scene_by_claim: dict[str, int] = {}
+        for plan in ordered:
+            for claim_id in plan.claim_ids:
+                first_scene_by_claim.setdefault(claim_id, plan.scene_id)
+        for claim in lesson_spec.claims:
+            dependent_scene = first_scene_by_claim.get(claim.claim_id)
+            if dependent_scene is None:
+                continue
+            for prerequisite_id in claim.prerequisite_claim_ids:
+                prerequisite_scene = first_scene_by_claim.get(prerequisite_id)
+                if prerequisite_scene is not None and prerequisite_scene > dependent_scene:
+                    issues.append(
+                        ContinuityIssue(
+                            scene_ids=[prerequisite_scene, dependent_scene],
+                            category="math",
+                            message=(
+                                f"断言 {claim.claim_id} 的前置断言 {prerequisite_id} 出现在后面，"
+                                "教学顺序不连续。"
+                            ),
+                            fix_instruction="先分配并展示前置断言，再展示依赖断言。",
+                            target_fields=["claim_ids"],
+                        )
+                    )
+    if teaching_graph is not None:
+        graph_claim_ids = set(teaching_graph.claim_order)
+        graph_claim_ids.update(
+            claim_id for claim_ids in teaching_graph.scene_claims.values() for claim_id in claim_ids
+        )
+        if lesson_spec is not None and lesson_spec.claims:
+            unknown_graph = graph_claim_ids - {claim.claim_id for claim in lesson_spec.claims}
+            if unknown_graph:
+                issues.append(
+                    ContinuityIssue(
+                        scene_ids=actual_ids or [1],
+                        category="math",
+                        message="教学图谱包含未声明的断言: " + ", ".join(sorted(unknown_graph)),
+                        fix_instruction="删除未知图谱节点，或重新生成全片教学合同。",
+                        target_fields=["claim_ids"],
+                    )
+                )
 
     for index, plan in enumerate(ordered):
         if plan.global_visual_state != bible.global_visual_state:
@@ -1152,7 +1528,7 @@ def deterministic_continuity_issues(
         previous_variable_by_id = {
             item.element_id: item.variable_name
             for item in (*plan.inherited_elements, *plan.new_elements)
-            if item.element_id not in removal_ids and item.variable_name
+            if item.required and item.element_id not in removal_ids and item.variable_name
         }
         variable_drifts = [
             f"{item.element_id}: {previous_variable_by_id[item.element_id]} -> {item.variable_name}"
@@ -1306,6 +1682,8 @@ class ContinuityReviewerAgent(BaseAgent):
         deterministic_issues: list[ContinuityIssue] | None = None,
         renderer: Literal["cairo", "opengl"] | None = None,
         stream: bool = False,
+        lesson_spec: LessonSpec | None = None,
+        teaching_graph: TeachingGraph | None = None,
     ) -> ContinuityReviewResult:
         outline_context = [outline.model_dump(mode="json") for outline in outlines]
         plan_context = [
@@ -1341,6 +1719,24 @@ class ContinuityReviewerAgent(BaseAgent):
                 required=True,
                 priority=110,
                 max_chars=70_000,
+            ),
+            PromptSection(
+                "lesson_spec",
+                "<lesson_spec>\n"
+                f"{compact_lesson_spec(lesson_spec, max_chars=18_000)}\n"
+                "</lesson_spec>",
+                required=True,
+                priority=100,
+                max_chars=30_000,
+            ),
+            PromptSection(
+                "teaching_graph",
+                "<teaching_graph>\n"
+                f"{compact_teaching_graph(teaching_graph, max_chars=8_000)}\n"
+                "</teaching_graph>",
+                required=True,
+                priority=100,
+                max_chars=20_000,
             ),
             PromptSection(
                 "deterministic_findings",

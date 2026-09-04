@@ -90,8 +90,10 @@ VISUAL_EVAL_PROMPT = """Evaluate the supplied ordered keyframes as one {scope}.
 {frame_manifest}
 </frame_manifest>
 
-Frame roles such as opening, first_math_state, transition_boundary, conclusion, and ending
-are hints for temporal interpretation; inspect the actual image rather than trusting the label.
+Frame roles such as opening, first_math_state, conclusion, ending, boundary_start, and
+boundary_end are hints for temporal interpretation; inspect the actual image rather than
+trusting the label. A boundary_start/boundary_end pair represents a real adjacent-scene
+boundary, not merely an evenly sampled frame.
 For a scene, pay special attention to opening/ending consistency with its handoff contract.
 
 Score each dimension from 1 to 5:
@@ -100,6 +102,13 @@ Score each dimension from 1 to 5:
 3. visual_quality: text/formulas are readable; contrast, scale, and rendering are clear.
 4. element_layout: no unintended overlap, clipping, crowding, or off-screen content.
 5. visual_consistency: colors, typography, object identity, and progression remain coherent.
+
+For issues, always cite at least one frame_id from the manifest. If the issue concerns a
+scene transition, also cite the corresponding boundary_id. Set repair_target to planner for
+mathematical/storyboard errors, continuity for handoff errors, coder for layout/readability,
+infrastructure for rendering/environment symptoms, and unknown when attribution is uncertain.
+Use confidence between 0 and 1. A mathematical error must not be routed to code repair when
+the plan itself is the likely source.
 
 Report concrete issues only. A major issue blocks understanding or shows incorrect mathematics;
 a minor issue is visible but does not block understanding; info is an optional polish suggestion.
@@ -120,7 +129,10 @@ Return exactly this JSON shape, without markdown fences:
     {{
       "category": "mathematics|relevance|readability|layout|clipping|overlap|contrast|consistency|other",
       "severity": "info|minor|major",
+      "repair_target": "planner|continuity|coder|infrastructure|unknown",
+      "confidence": 0.0,
       "frame_ids": ["F01"],
+      "boundary_ids": [],
       "evidence": "what is visibly wrong",
       "recommendation": "actionable visual change, no code"
     }}

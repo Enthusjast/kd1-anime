@@ -324,6 +324,7 @@ def test_installer_uses_private_application_home_for_user_storage(tmp_path):
     assert "RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples" in content
     assert "WORKSPACE_DIR=~/.kd1-anime/workspace" in content
     assert "MAX_PLAN_REVIEW_ROUNDS=2" in content
+    assert "MAX_PLAN_REPLAN_ATTEMPTS=3" in content
     assert "SAFE_FALLBACK_ENABLED=true" in content
     assert "MAX_IDENTICAL_REVIEW_ATTEMPTS=2" in content
     assert (config_dir / "knowledge" / "docs").is_dir()

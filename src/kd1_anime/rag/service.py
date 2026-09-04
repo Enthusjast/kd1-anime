@@ -232,6 +232,31 @@ class RagService:
             "reranker_configured": self.reranker_configured,
         }
 
+    def require_index(self) -> None:
+        """在启用 RAG 的生成入口前确认索引存在且没有过期。"""
+
+        if not self.enabled:
+            return
+        status = self.runtime_status()
+        if status["index"] is None:
+            raise RagClientError("RAG 索引不存在，请先执行 `kd1-anime rag index` 构建索引")
+        if status["index_error"]:
+            raise RagClientError(str(status["index_error"]))
+
+    def require_ready(self) -> None:
+        """确认启用 RAG 的本地索引和两个外部服务配置完整。
+
+        ``search`` 仍然保留运行时降级能力，便于已有任务在服务临时故障
+        时记录 ``degraded``；但新生成入口不能在启动时就悄悄接受一个
+        永远无法工作的 RAG 配置。网络连通性由 CLI 的 probe 负责。
+        """
+
+        if not self.enabled:
+            return
+        self.require_index()
+        self.embedding.require()
+        self.reranker.require()
+
     def _empty_result(
         self,
         query: str,
@@ -315,10 +340,11 @@ class RagService:
                 return cached
             with self._semaphore:
                 vector = self.embedding.embed([query])[0]
-            candidates = index.search(
+            candidates = index.search_verified(
                 vector,
                 top_k=effective_top_k,
                 source_kinds=source_kinds,
+                info=info,
             )
         except (OSError, ValueError, RagClientError) as exc:
             return self._empty_result(
@@ -410,8 +436,9 @@ class RagService:
         *,
         docs_dir: Path | None = None,
         examples_dir: Path | None = None,
+        rebuild: bool = False,
     ) -> RagIndexBuildResult:
-        """严格构建本地索引；索引命令失败时抛错，不留下半成品。"""
+        """构建本地索引；未变化时复用，``rebuild`` 强制重新 Embedding。"""
 
         self.embedding.require()
         docs_root = docs_dir if docs_dir is not None else self.config.RAG_DOCS_DIR
@@ -423,6 +450,14 @@ class RagService:
             raise ValueError(
                 "没有找到可索引的 .md/.rst/.py 文档或示例，请配置 RAG_DOCS_DIR/RAG_EXAMPLES_DIR"
             )
+        if not rebuild:
+            reusable = self._reusable_index_info(docs_root, examples_root)
+            if reusable is not None:
+                return RagIndexBuildResult(
+                    info=reusable,
+                    source_file_count=len(sources),
+                    chunk_count=reusable.chunk_count,
+                )
         chunks: list[SourceChunk] = []
         skipped: list[str] = []
         for path, source_kind in sources:
@@ -467,6 +502,42 @@ class RagService:
             chunk_count=len(chunks),
             skipped_files=tuple(skipped),
         )
+
+    def _reusable_index_info(
+        self,
+        docs_root: Path | None,
+        examples_root: Path | None,
+    ) -> RagIndexInfo | None:
+        """返回与当前源目录、Embedding 模型完全匹配的已有索引。"""
+
+        try:
+            info = RagIndex(self.index_path).verify_integrity()
+            if info.embedding_model != self.config.RAG_EMBEDDING_MODEL:
+                return None
+            if not info.source_docs_dir and not info.source_examples_dir:
+                # 没有源目录元数据的旧索引无法判断外部文件是否变化；只有
+                # 当前调用也明确没有配置源目录时才可以安全复用。若当前
+                # 配置有源目录，必须重建并写入新的来源身份。
+                return info if docs_root is None and examples_root is None else None
+            indexed_docs = (
+                Path(info.source_docs_dir).expanduser().resolve()
+                if info.source_docs_dir
+                else docs_root
+            )
+            indexed_examples = (
+                Path(info.source_examples_dir).expanduser().resolve()
+                if info.source_examples_dir
+                else examples_root
+            )
+            if indexed_docs != docs_root or indexed_examples != examples_root:
+                return None
+            current_source_sha256 = source_manifest_digest(docs_root, examples_root)
+            if current_source_sha256 != info.source_sha256:
+                return None
+            return info
+        except (OSError, ValueError):
+            # 索引不存在、损坏或来源发生变化时走正常完整构建路径。
+            return None
 
     def probe(self) -> None:
         """验证 Embedding 和 Reranker 的最小标准响应。"""

@@ -469,6 +469,11 @@ LLM_DEBUG=false
 LLM_CACHE_ENABLED=true
 LLM_CACHE_PATH=~/.kd1-anime/cache/llm.sqlite3
 LLM_CACHE_MAX_ENTRIES=512
+LLM_MAX_CONTEXT_CHARS=120000
+LLM_MAX_CODE_CONTEXT_CHARS=60000
+LLM_MAX_REVIEW_CONTEXT_CHARS=90000
+LLM_MAX_TECHNICAL_SPEC_CHARS=30000
+MAX_TECHNICAL_SPEC_ATTEMPTS=3
 VISUAL_LLM_API_KEY=
 VISUAL_LLM_BASE_URL=
 VISUAL_LLM_MODEL=
@@ -541,6 +546,8 @@ MERGE_AUDIO_CHANNEL_LAYOUT=stereo
 LLM_PARALLEL_WORKERS=4
 MAX_REVIEW_ROUNDS=5
 MAX_PLAN_REVIEW_ROUNDS=2
+# 同一场景计划审查反馈后的 Planner 重调用总次数，防止重规划死循环。
+MAX_PLAN_REPLAN_ATTEMPTS=3
 MAX_CONTINUITY_FIX_ROUNDS=2
 SKIP_REVIEW=false
 SAFE_FALLBACK_ENABLED=true
@@ -578,7 +585,7 @@ EOF
 }
 
 install_manim_knowledge() {
-    local archive ref archive_url expected actual tmp extract source_root source relative target
+    local archive ref archive_url expected actual tmp extract source_root source relative target temporary_target
     archive="$SCRIPT_DIR/$MANIM_KNOWLEDGE_ARCHIVE"
     if [ ! -f "$archive" ]; then
         ref="${KD1_ANIME_REF:-main}"
@@ -671,8 +678,23 @@ install_manim_knowledge() {
             warn "知识库文件已存在，保留用户版本: $target"
             continue
         fi
-        cp "$source" "$target"
-        chmod 600 "$target"
+        # 逐文件原子安装；若安装过程被中断，下一次运行不能把残缺文件
+        # 当作用户版本永久保留下来。
+        temporary_target="$(mktemp "$CONFIG_DIR/.knowledge.XXXXXX")"
+        cleanup_dirs+=("$temporary_target")
+        cp "$source" "$temporary_target"
+        chmod 600 "$temporary_target"
+        # 用硬链接“仅当目标不存在时创建”，避免两个安装进程并发时用
+        # -f 覆盖用户刚放入知识库的文件；临时文件与目标位于同一目录。
+        if ln "$temporary_target" "$target" 2>/dev/null; then
+            rm -f "$temporary_target"
+        elif [ -e "$target" ] || [ -L "$target" ]; then
+            warn "知识库文件在安装期间已出现，保留现有版本: $target"
+            rm -f "$temporary_target"
+        else
+            err "无法安全安装知识库文件: $target"
+            return 1
+        fi
     done < <(find "$source_root" -type f -print0 | sort -z)
     log "Manim ${MANIM_KNOWLEDGE_VERSION} 文档和示例已安装到 $CONFIG_DIR/knowledge"
 }

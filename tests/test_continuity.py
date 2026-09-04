@@ -246,6 +246,19 @@ class Demo(Scene):
     assert [item.element_id for item in elements] == ["formula"]
 
 
+def test_extract_continuity_elements_reports_unpaired_markers_cleanly():
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        formula = Circle()
+"""
+
+    with pytest.raises(ValueError, match="标记不成对"):
+        extract_continuity_elements(code)
+
+
 def test_extract_continuity_elements_without_marker_uses_safe_fallback():
     code = """
 from manim import *
@@ -468,6 +481,132 @@ def test_normalize_scene_plan_contract_repairs_mechanical_conflicts():
     assert normalized.global_visual_state == ContinuityBible().global_visual_state
 
 
+def test_normalize_scene_plan_contract_preserves_semantic_color_aliases():
+    bible = ContinuityBible(
+        global_visual_state=GlobalVisualState(
+            colors={
+                "primary_blue": "#1F77B4",
+                "secondary_red": "#D62728",
+                "highlight_green": "#2CA02C",
+                "neutral_black": "#2C3E50",
+                "neutral_gray": "#7F8C8D",
+                "background": "#F8F9FA",
+            }
+        )
+    )
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="title",
+                    variable_name="title",
+                    role="场景标题",
+                    color_key="neutral",
+                ),
+                VisualElementState(
+                    element_id="step",
+                    variable_name="step",
+                    role="步骤标签",
+                    color_key="gray",
+                ),
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    role="公式",
+                    color_key="primary",
+                ),
+                VisualElementState(
+                    element_id="result",
+                    variable_name="result",
+                    role="最终结论",
+                    color_key="highlight",
+                ),
+            ]
+        }
+    )
+
+    normalized, _ = normalize_scene_plan_contract(plan, bible)
+    colors = {item.element_id: item.color_key for item in normalized.new_elements}
+
+    assert colors == {
+        "title": "neutral_black",
+        "step": "neutral_gray",
+        "formula": "primary_blue",
+        "result": "highlight_green",
+    }
+
+
+def test_normalize_scene_plan_contract_handles_explicit_full_exit():
+    plan = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="result", variable_name="result", required=True)
+            ],
+            "handoff": [SceneHandoff(element_id="result", variable_name="result", action="keep")],
+            "closing_state": ["所有元素整体淡出，场景结束"],
+            "transition_out": "本场景结束时所有元素整体淡出",
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(plan, ContinuityBible())
+
+    assert normalized.new_elements[0].required is False
+    assert normalized.handoff == []
+    assert any("整体退出" in repair for repair in repairs)
+
+
+def test_normalize_scene_plan_contract_drops_stale_handoff_for_unexported_previous_element():
+    previous = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="transition",
+                    variable_name="transition",
+                    required=False,
+                )
+            ]
+        }
+    )
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [
+                VisualElementState(
+                    element_id="transition",
+                    variable_name="transition",
+                    required=True,
+                )
+            ],
+            "handoff": [
+                SceneHandoff(
+                    element_id="transition",
+                    variable_name="transition",
+                    action="keep",
+                )
+            ],
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(
+        current,
+        ContinuityBible(),
+        previous_plan=previous,
+        has_next_scene=False,
+    )
+
+    all_ids = {
+        item.element_id
+        for group in (
+            normalized.inherited_elements,
+            normalized.elements_to_remove,
+            normalized.new_elements,
+        )
+        for item in group
+    }
+    assert "transition" not in all_ids
+    assert all(item.element_id != "transition" for item in normalized.handoff)
+    assert any("过期 handoff" in repair for repair in repairs)
+
+
 def test_normalize_scene_plan_contract_uses_handoff_for_boundary_elements():
     plan = make_plan(2).model_copy(
         update={
@@ -542,6 +681,67 @@ def test_normalize_scene_plan_contract_drops_unexported_previous_elements():
 
     assert [item.element_id for item in normalized.inherited_elements] == ["kept"]
     assert any("未声明导出" in repair for repair in repairs)
+
+
+def test_normalize_scene_plan_contract_drops_all_inherited_when_previous_exports_none():
+    previous = make_plan(1)
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [
+                VisualElementState(element_id="missing", variable_name="missing")
+            ]
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(
+        current,
+        ContinuityBible(),
+        previous_plan=previous,
+    )
+
+    assert normalized.inherited_elements == []
+    assert any("未声明导出" in repair for repair in repairs)
+
+
+def test_normalize_scene_plan_contract_drops_optional_previous_elements():
+    previous = make_plan(1).model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary",
+                    variable_name="temporary",
+                    required=False,
+                )
+            ]
+        }
+    )
+    current = make_plan(2).model_copy(
+        update={
+            "inherited_elements": [
+                VisualElementState(element_id="temporary", variable_name="temporary")
+            ]
+        }
+    )
+
+    normalized, repairs = normalize_scene_plan_contract(
+        current,
+        ContinuityBible(),
+        previous_plan=previous,
+    )
+
+    assert normalized.inherited_elements == []
+    assert any("未声明导出" in repair for repair in repairs)
+
+
+def test_continuity_state_matching_keeps_single_letter_math_variables():
+    plans = [
+        make_plan(1, closing=["保留变量 a"]),
+        make_plan(2, opening=["接管变量 a"], closing=["结论"]),
+    ]
+
+    issues = deterministic_continuity_issues(plans, ContinuityBible())
+
+    assert not any(issue.category == "state" for issue in issues)
 
 
 def test_normalize_scene_plan_contract_keeps_previous_variable_name():
