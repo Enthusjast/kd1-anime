@@ -245,6 +245,329 @@ def repair_required_export_alias_lifecycle(
     return source_bytes.decode("utf-8"), tuple(dict.fromkeys(repairs))
 
 
+def repair_required_export_transform_alias_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """收敛“变换后把临时 target 重绑定为导出变量”的生命周期写法。
+
+    生成代码常写成 ``ReplacementTransform(grid, sheared_grid)``，随后
+    ``grid = sheared_grid``。这在 Python 中看似更新了引用，但技术合同
+    导出的对象身份已经被 ReplacementTransform 移除，且 ``sheared_grid``
+    不是合同变量，静态检查会把 ``grid`` 判定为不 active。若能确认临时
+    名称确实是某个必需导出变量的 Transform target，则把替换变换收敛为
+    原地 ``Transform``，删除重绑定，并把重绑定之后的临时引用改回合同
+    变量。所有判断均来自 AST，不执行生成代码。
+    """
+
+    if not code or not technical_spec.export_element_ids:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+
+    exported_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.element_id in technical_spec.export_element_ids and item.variable_name
+    }
+    if not exported_variables:
+        return code, ()
+
+    statements = _statement_nodes(construct)
+    rebinding_candidates: list[tuple[ast.Assign, str, str]] = []
+    for node in statements:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in exported_variables:
+            continue
+        if not isinstance(node.value, ast.Name) or node.value.id == target.id:
+            continue
+        rebinding_candidates.append((node, target.id, node.value.id))
+    if not rebinding_candidates:
+        return code, ()
+
+    # 找到“导出变量 -> 临时 target”的变换调用。只接受发生在重绑定前的
+    # Transform/ReplacementTransform，避免把普通业务别名误判为场景边界。
+    target_transforms: dict[tuple[str, str], list[ast.Call]] = {}
+    for node in statements:
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "play"
+        ):
+            continue
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call) or _call_name(child) not in {
+                "Transform",
+                "ReplacementTransform",
+            }:
+                continue
+            if len(child.args) < 2:
+                continue
+            source_names = _root_names(child.args[0])
+            target_names = _root_names(child.args[1])
+            for variable in source_names & exported_variables:
+                for alias in target_names:
+                    target_transforms.setdefault((variable, alias), []).append(child)
+
+    selected: list[tuple[ast.Assign, str, str, ast.Call]] = []
+    for rebind, variable, alias in rebinding_candidates:
+        calls = [
+            call
+            for call in target_transforms.get((variable, alias), ())
+            if call.lineno < rebind.lineno
+        ]
+        if calls:
+            selected.append((rebind, variable, alias, calls[-1]))
+    if not selected:
+        return code, ()
+
+    source_bytes = code.encode("utf-8")
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+
+    def offset(lineno: int, column: int) -> int:
+        if lineno < 1 or lineno > len(lines):
+            return len(source_bytes)
+        return line_offsets[lineno - 1] + column
+
+    def node_range(node: ast.AST) -> tuple[int, int]:
+        start = offset(node.lineno, node.col_offset)  # type: ignore[attr-defined]
+        end_line = getattr(node, "end_lineno", node.lineno)
+        end_col = getattr(node, "end_col_offset", node.col_offset)
+        return start, offset(end_line, end_col)
+
+    def inside_any(start: int, end: int, ranges: list[tuple[int, int]]) -> bool:
+        return any(start >= left and end <= right for left, right in ranges)
+
+    edits: list[tuple[int, int, bytes]] = []
+    skipped_ranges: list[tuple[int, int]] = []
+    replacements: dict[str, str] = {}
+    repairs: list[str] = []
+    for rebind, variable, alias, transform in selected:
+        # 只转换 ReplacementTransform。原地 Transform 已保留 source 的
+        # active 身份，仍需删除重绑定并收敛后续 alias 引用。
+        if _call_name(transform) == "ReplacementTransform":
+            func_start, func_end = node_range(transform.func)
+            edits.append((func_start, func_end, b"Transform"))
+        rebind_start, rebind_end = node_range(rebind)
+        edits.append((rebind_start, rebind_end, b"pass"))
+        skipped_ranges.append((rebind_start, rebind_end))
+        replacements[alias] = variable
+        repairs.append(f"将 {variable} 的变换 target {alias} 收敛到导出变量")
+
+    # 保留临时 target 的构造定义和变换调用；重绑定之后对它的引用应当
+    # 指向已经原地变换完成的导出对象。定义自身可能出现在重绑定之后，
+    # 这种不确定写法不自动改写，交给 Coder 修复。
+    definition_ranges: list[tuple[int, int]] = []
+    for node in ast.walk(construct):
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id in replacements for target in node.targets
+        ):
+            definition_ranges.append(node_range(node))
+
+    for node in ast.walk(construct):
+        if not isinstance(node, ast.Name) or node.id not in replacements:
+            continue
+        start, end = node_range(node)
+        if inside_any(start, end, skipped_ranges) or inside_any(start, end, definition_ranges):
+            continue
+        # 仅改写重绑定之后的使用；变换调用的 target 必须保留临时对象，
+        # 否则会变成 Transform(variable, variable)。
+        matching_rebinds = [
+            item for item in selected if item[2] == node.id and node.lineno > item[0].lineno
+        ]
+        if not matching_rebinds:
+            continue
+        variable = matching_rebinds[-1][1]
+        edits.append((start, end, variable.encode("utf-8")))
+
+    for start, end, replacement in sorted(edits, key=lambda item: (item[0], item[1]), reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    return source_bytes.decode("utf-8"), tuple(dict.fromkeys(repairs))
+
+
+def repair_required_export_replacement_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """保留必需导出 source 的身份，避免替换到未声明的临时 target。
+
+    当代码没有写 ``grid = grid_target`` 这样的重绑定时，前一个兼容修复
+    没有可处理的赋值，但 ``ReplacementTransform(grid, grid_target)`` 仍会
+    把合同要求导出的 ``grid`` 从 Scene 中移除。若 target 不是另一个已
+    声明的合同变量，则将其降为原地 ``Transform``；target 仍可作为目标
+    快照提供几何形状，而导出 source 的 active 身份得到保留。
+    """
+
+    if not code or not technical_spec.export_element_ids:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+    exported_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.element_id in technical_spec.export_element_ids and item.variable_name
+    }
+    declared_variables = {
+        item.variable_name for item in technical_spec.objects if item.variable_name
+    }
+    if not exported_variables:
+        return code, ()
+
+    replacements: list[ast.Call] = []
+    for node in _statement_nodes(construct):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "play"
+        ):
+            continue
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and _call_name(child) == "ReplacementTransform"
+                and len(child.args) >= 2
+            ):
+                sources = _root_names(child.args[0])
+                targets = _root_names(child.args[1])
+                if sources & exported_variables and targets and not targets <= declared_variables:
+                    replacements.append(child)
+    if not replacements:
+        return code, ()
+
+    source_bytes = code.encode("utf-8")
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+
+    def offset(lineno: int, column: int) -> int:
+        if lineno < 1 or lineno > len(lines):
+            return len(source_bytes)
+        return line_offsets[lineno - 1] + column
+
+    edits: list[tuple[int, int, bytes]] = []
+    for call in replacements:
+        start = offset(call.func.lineno, call.func.col_offset)  # type: ignore[attr-defined]
+        end = offset(
+            getattr(call.func, "end_lineno", call.func.lineno),
+            getattr(call.func, "end_col_offset", call.func.col_offset),
+        )
+        edits.append((start, end, b"Transform"))
+    for start, end, replacement in sorted(edits, reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    return (
+        source_bytes.decode("utf-8"),
+        (
+            "将必需导出对象到未声明 target 的 ReplacementTransform 降为 Transform: "
+            + ", ".join(
+                sorted(
+                    {
+                        variable
+                        for call in replacements
+                        for variable in _root_names(call.args[0]) & exported_variables
+                    }
+                )
+            ),
+        ),
+    )
+
+
+def repair_removed_active_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+    errors: tuple[str, ...] | list[str],
+) -> tuple[str, tuple[str, ...]]:
+    """为明确报告为 active 的移除对象补一条最小 FadeOut。
+
+    ``elements_to_remove`` 是结构化边界合同。Coder 有时能正确实现主体
+    动画，却因为阅读了互相矛盾的自然语言 transition_out，漏掉最后的
+    FadeOut。此时把场景判死没有必要：生命周期错误已经精确指出了应退出
+    的合同变量，可以在 construct() 末尾补一条退出动画，再由完整校验链
+    复核。只有错误文本明确列出“已移除对象仍 active”的变量才会触发，
+    不会为普通运行时错误或未确认的对象擅自添加动画。
+    """
+
+    if not code or not technical_spec.removed_element_ids:
+        return code, ()
+    reported: set[str] = set()
+    marker = "场景结束时已移除对象仍 active:"
+    for error in errors:
+        text = str(error)
+        if marker not in text:
+            continue
+        reported.update(item.strip() for item in text.split(marker, 1)[1].split(","))
+    if not reported:
+        return code, ()
+
+    removed_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.element_id in set(technical_spec.removed_element_ids) and item.variable_name
+    }
+    variables = sorted(reported & removed_variables)
+    if not variables:
+        return code, ()
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None or not construct.body:
+        return code, ()
+    defined = {
+        name
+        for node in _statement_nodes(construct)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for name in _assignment_names(node)
+    }
+    variables = [name for name in variables if name in defined]
+    if not variables:
+        return code, ()
+
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+    last_body = construct.body[-1]
+    last_line = int(getattr(last_body, "end_lineno", last_body.lineno))
+    insert_at = (
+        line_offsets[last_line] if last_line < len(line_offsets) else len(code.encode("utf-8"))
+    )
+    first_body_line = lines[construct.body[0].lineno - 1] if lines else ""
+    indentation = first_body_line[: len(first_body_line) - len(first_body_line.lstrip())]
+    cleanup = f"{indentation}self.play(FadeOut({', '.join(variables)}), run_time=0.5)\n"
+    source_bytes = code.encode("utf-8")
+    if insert_at == 0 or (insert_at > 0 and source_bytes[insert_at - 1 : insert_at] != b"\n"):
+        cleanup = "\n" + cleanup
+    source_bytes = source_bytes[:insert_at] + cleanup.encode("utf-8") + source_bytes[insert_at:]
+    return (
+        source_bytes.decode("utf-8"),
+        ("为仍 active 的移除对象补齐 FadeOut: " + ", ".join(variables),),
+    )
+
+
 def _call_name(node: ast.Call) -> str:
     if isinstance(node.func, ast.Name):
         return node.func.id

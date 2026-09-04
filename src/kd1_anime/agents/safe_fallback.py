@@ -68,6 +68,10 @@ def is_high_confidence_geometry_conflict(plan: ScenePlan, feedback: str) -> bool
             plan.visual_design,
             *plan.visual_flow,
             plan.computation,
+            " ".join(
+                f"{item.geometry_id} {item.shape} {item.target_description}"
+                for item in plan.geometry_specs
+            ),
             " ".join(item.element_id for item in plan.new_elements),
         )
     ).lower()
@@ -76,8 +80,9 @@ def is_high_confidence_geometry_conflict(plan: ScenePlan, feedback: str) -> bool
     feedback_marks_geometry = "[geometry]" in feedback_text or any(
         term in feedback_text for term in ("几何", "顶点", "正方形", "三角形")
     )
-    if feedback_marks_geometry and any(
-        term in plan_text for term in ("正方形", "三角形", "坐标", "顶点", "面积")
+    if feedback_marks_geometry and (
+        any(term in plan_text for term in ("正方形", "三角形", "坐标", "顶点", "面积"))
+        or bool(plan.geometry_specs)
     ):
         has_geometry = True
     has_structured_risk = any(

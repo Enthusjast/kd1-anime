@@ -63,6 +63,11 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 16. Transform 后的变量引用、VGroup 成员关系和 z-index 应保持一致。
     VGroup 本身只有在被加入或引入后才是 active；但不要把“对子对象分别淡入”与“对未引入的
     group 做 Transform”混为一谈，必须以当前代码中实际的 active 状态为依据。
+    生命周期判断以结构化 TechnicalSpec 的 `initially_active`、动画 source/target、
+    `export_element_ids` 和 `removed_element_ids` 为准；不要让与这些字段冲突的
+    transition_out/persistent_elements 自由文本迫使代码同时执行互相矛盾的保留和移除动作。
+    若结构化合同与自由文本本身冲突，这是计划问题，应作为可定位的计划层 finding，不能
+    把其中一套动作误判成代码错误。
 17. ValueTracker、Axes.c2p、plot、Surface 等 API 参数应符合 ManimCE。
 18. 动画顺序应可执行，不能同时对同一对象施加冲突动画。
 
@@ -88,6 +93,9 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
     variable_name、颜色和布局锚点不能无故改变。
 31. 只有 elements_to_remove 中明确列出的元素才能 FadeOut；持续元素不能通过 clear()、整体淡出
     或无替换重画而丢失。
+    当 `removed_element_ids` 明确列出元素时，代码必须在场景结束前让其不再 active；当
+    `export_element_ids` 明确要求保留时，代码不得将其 FadeOut。两者同时出现在自由文本中时，
+    只按结构化合同审查代码，并指出计划文本冲突，不要求代码猜测优先级。
 32. 需要跨场景交接对象时，必须存在 KD1_CONTINUITY_EXPORT_BEGIN/END 导出区；导出区只能包含可独立重建的 Mobject
     定义，以及作用于导出区内已定义对象的安全样式/布局调用。导出集合以结构化
     ScenePlan/TechnicalSpec 中 `required=true` 且未移除的元素为唯一权威，不要从

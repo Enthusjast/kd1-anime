@@ -417,19 +417,34 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
 
 _MATRIX_LITERAL = r"\[\s*\[[^\[\]]{1,120}\]\s*(?:,\s*\[[^\[\]]{1,120}\]\s*)*\]"
 _MATRIX_EQUATION_RE = re.compile(rf"({_MATRIX_LITERAL})\s*(?:=|→|⟶)\s*({_MATRIX_LITERAL})")
+_MATRIX_PRODUCT_OPERATOR = r"(?:\*|×|⋅|\\cdot|\\times)"
 
 
 def _matrix_equations(text: str) -> list[tuple[str, str]]:
-    """从自由文本中提取纯数字矩阵等式。"""
+    """从自由文本中提取纯数字矩阵等式。
 
-    return _MATRIX_EQUATION_RE.findall(str(text or ""))
+    只检查显式的 ``matrix = matrix``。矩阵乘积的最后一个因子也可能
+    紧邻等号，例如 ``P D P^{-1} = [[4,2],...] * 0.5 * [[1,1],...] =``；
+    它不是一个独立的矩阵恒等式，真正的乘法由 ``_matrix_products`` 或
+    上层数学断言负责验证。过滤乘法运算符可以避免把这个因子误报成
+    ``P^{-1} = P D``。
+    """
+
+    pairs: list[tuple[str, str]] = []
+    source = str(text or "")
+    for match in _MATRIX_EQUATION_RE.finditer(source):
+        prefix = source[: match.start()]
+        if re.search(rf"{_MATRIX_PRODUCT_OPERATOR}\s*$", prefix):
+            continue
+        pairs.append(match.groups())
+    return pairs
 
 
 def _matrix_products(text: str) -> list[tuple[str, str, str]]:
     """提取 ``数字矩阵 * 数字矩阵 = 数字矩阵``。"""
 
     pattern = re.compile(
-        rf"({_MATRIX_LITERAL})\s*(?:\*|×|⋅)\s*({_MATRIX_LITERAL})\s*="
+        rf"({_MATRIX_LITERAL})\s*{_MATRIX_PRODUCT_OPERATOR}\s*({_MATRIX_LITERAL})\s*="
         rf"\s*({_MATRIX_LITERAL})"
     )
     return pattern.findall(str(text or ""))

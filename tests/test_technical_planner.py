@@ -2,7 +2,7 @@
 
 import pytest
 
-from kd1_anime.agents.planner import ScenePlan, VisualElementState
+from kd1_anime.agents.planner import ScenePlan, TimelineEvent, VisualElementState
 from kd1_anime.agents.technical_planner import (
     TechnicalAnimation,
     TechnicalLatex,
@@ -487,6 +487,61 @@ def test_normalize_infers_missing_transform_source_from_active_target():
     assert any("补齐 source_element_ids" in repair for repair in repairs)
 
 
+def test_normalize_infers_transform_source_from_matching_plan_timeline():
+    grid = VisualElementState(
+        element_id="grid",
+        variable_name="grid",
+        required=True,
+    )
+    formula = VisualElementState(element_id="formula", variable_name="formula")
+    plan = make_plan(
+        inherited=[grid],
+        new=[formula],
+    ).model_copy(
+        update={
+            "timeline": [
+                TimelineEvent(
+                    event_id="reset_grid",
+                    start_seconds=0,
+                    end_seconds=5,
+                    action="网格反向变换回标准状态",
+                    element_ids=["grid"],
+                )
+            ]
+        }
+    )
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+                exported=True,
+            ),
+            TechnicalObject(element_id="formula", variable_name="formula", constructor="Text"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="reset_grid",
+                start_seconds=0,
+                end_seconds=5,
+                operation="transform",
+            )
+        ],
+        export_element_ids=["grid"],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    reset_event = next(item for item in normalized.animations if item.event_id == "reset_grid")
+    assert reset_event.source_element_ids == ["grid"]
+    assert result.is_valid is True, result.errors
+    assert any("从时间线补齐 source_element_ids" in repair for repair in repairs)
+
+
 def test_normalize_infers_replacement_source_from_target_dependency():
     old = VisualElementState(element_id="old", variable_name="old", required=True)
     replacement = VisualElementState(
@@ -605,6 +660,83 @@ def test_normalize_degrades_source_less_transform_to_safe_introduction():
     assert normalized.animations[0].create_element_ids == ["target"]
     assert result.is_valid is True, result.errors
     assert any("降级为 fade_in" in repair for repair in repairs)
+
+
+def test_normalize_converts_new_object_used_as_transform_source_to_fade_in():
+    inherited = VisualElementState(element_id="grid", variable_name="grid", required=True)
+    new = VisualElementState(
+        element_id="eigen_vector",
+        variable_name="eigen_vector",
+        kind="line",
+        required=False,
+    )
+    plan = make_plan(inherited=[inherited], new=[new])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                initially_active=True,
+                exported=True,
+            ),
+            TechnicalObject(element_id="eigen_vector", variable_name="eigen_vector"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="scale_eigen_vector",
+                start_seconds=1,
+                end_seconds=3,
+                operation="transform",
+                source_element_ids=["eigen_vector"],
+                target_element_ids=["eigen_vector"],
+                create_element_ids=["eigen_vector"],
+            )
+        ],
+        export_element_ids=["grid"],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    event = normalized.animations[0]
+    assert event.operation == "fade_in"
+    assert event.source_element_ids == []
+    assert event.target_element_ids == ["eigen_vector"]
+    assert result.is_valid is True, result.errors
+    assert any("删除 inactive source 后改为 fade_in" in repair for repair in repairs)
+
+
+def test_normalize_adds_missing_plan_object_declaration():
+    formula = VisualElementState(
+        element_id="formula_label",
+        kind="text",
+        role="公式标签",
+        required=True,
+    )
+    plan = make_plan(new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        animations=[
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=0,
+                end_seconds=2,
+                operation="fade_in",
+                target_element_ids=["formula_label"],
+                create_element_ids=["formula_label"],
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    object_by_id = {item.element_id: item for item in normalized.objects}
+    assert object_by_id["formula_label"].constructor == "Text"
+    assert object_by_id["formula_label"].variable_name == "formula_label"
+    assert result.is_valid is True, result.errors
+    assert any("补齐计划元素对象" in repair for repair in repairs)
 
 
 def test_normalize_uses_api_notes_to_recover_missing_transform_target():

@@ -62,6 +62,10 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - TechnicalSpec 是只读的技术执行合同；每个 `self.play` 的对象、源/目标和生命周期
   必须与其中的动画事件对应。`Transform` 原地修改 source，target 不能在后续被当作
   已加入场景的对象；需要 target 成为活动对象时使用 `ReplacementTransform` 或显式引入。
+- 生命周期字段的优先级高于 transition_in/transition_out、persistent_elements 等自由文本：
+  `export_element_ids`/`required=true` 表示场景末尾必须 active，`removed_element_ids`/`[Elements To Remove]`
+  表示必须退出。自然语言若与这些结构化字段冲突，不要试图同时满足两套相反动作，按结构化
+  TechnicalSpec 实现并保持唯一的 FadeOut/导出结果。
 - `VGroup` 只有在整个 group 本身通过 `self.add` 或 introducer 动画加入场景后，才算该
   group active；单独 FadeIn 其子对象不会使 group active。不要先逐个引入子对象，再对
   一个新建的 group 调用 `Transform(group, target)`；要么从一开始就 FadeIn/Write 整个
@@ -103,6 +107,10 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   不要为了删除 `self.add` 而让继承对象既没有加入场景、也没有对应的 FadeIn/Create。
 - 必须保留每个元素的 `element_id` 和语义状态。需要改变位置、内容、大小、颜色或形状时，
   优先对已定义对象使用 `Transform`/`ReplacementTransform`，不得无理由删除后重画。
+- 如果使用临时 target（如 `grid_target`/`j_hat_target`）完成变换，必需导出对象必须仍由合同
+  变量承接：优先使用 `Transform(contract_variable, target)`；若使用
+  `ReplacementTransform`，必须随后将临时 target 的活动身份安全收敛到合同变量，并且不能
+  在最后把合同变量再次 FadeOut。不要只做 Python 重绑定来假装对象仍在场景中。
 - 只有 `[Elements To Remove]` 明确列出的对象才能 `FadeOut`；持续元素在场景结尾必须真实存在，
   并重新写入连续性导出区，交给下一个场景。
 - `[Global Visual State]` 是只读配置。所有颜色、字体、字号、线宽和布局锚点必须由其中的

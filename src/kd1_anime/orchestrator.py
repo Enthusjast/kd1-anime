@@ -45,7 +45,10 @@ from kd1_anime.agents.continuity import (
 from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
+    repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
+    repair_required_export_replacement_lifecycle,
+    repair_required_export_transform_alias_lifecycle,
     validate_animation_lifecycle,
 )
 from kd1_anime.agents.plan_compiler import PlanCompiler, normalize_scene_timeline_contract
@@ -1430,6 +1433,18 @@ class Orchestrator:
                     code,
                     technical_spec,
                 )
+                transform_alias_code, transform_alias_repairs = (
+                    repair_required_export_transform_alias_lifecycle(code, technical_spec)
+                )
+                if transform_alias_repairs:
+                    code = transform_alias_code
+                    lifecycle_repairs = (*lifecycle_repairs, *transform_alias_repairs)
+                replacement_code, replacement_repairs = (
+                    repair_required_export_replacement_lifecycle(code, technical_spec)
+                )
+                if replacement_repairs:
+                    code = replacement_code
+                    lifecycle_repairs = (*lifecycle_repairs, *replacement_repairs)
                 if lifecycle_repairs:
                     log = getattr(agent, "_log", None)
                     if callable(log):
@@ -1454,6 +1469,27 @@ class Orchestrator:
                     renderer=renderer,
                 )
                 if not lifecycle_result.is_valid:
+                    repaired_code, removed_repairs = repair_removed_active_lifecycle(
+                        code,
+                        technical_spec,
+                        lifecycle_result.errors,
+                    )
+                    if removed_repairs:
+                        code = repaired_code
+                        # 末尾补丁虽是一个很窄的 AST 修复，也改变了候选
+                        # 源码；不能沿用修复前的校验结果作为通过依据。
+                        validation = self._validate(code, renderer=renderer)
+                        api_result = lint_manim_api(code, renderer=renderer, scene_plan=plan)
+                        continuity_error = ""
+                        try:
+                            extract_scene_continuity_elements(code, plan)
+                        except ValueError as exc:
+                            continuity_error = str(exc)
+                        lifecycle_result = validate_animation_lifecycle(
+                            code,
+                            technical_spec,
+                            renderer=renderer,
+                        )
                     lifecycle_error = "\n".join(lifecycle_result.errors)
             if (
                 validation.is_valid
@@ -7578,7 +7614,12 @@ class Orchestrator:
         )
         if plan_finding is not None:
             target = "planner" if plan_finding.category == "math" else "continuity"
-            feedback = original_feedback or plan_finding.repair or plan_finding.why
+            # 计划层只需要接收被判定为“计划本身错误”的 finding。Reviewer
+            # 的总 feedback 往往还混有代码行级 API/布局建议；把这些噪声
+            # 一并交给 Planner 会让它误改正确分镜，并触发昂贵的连续性重建。
+            # 优先使用 finding 的可执行修复，其次使用原因，最后才回退到
+            # 总反馈（兼容旧模型没有 why/repair 的结果）。
+            feedback = plan_finding.repair or plan_finding.why or original_feedback
             self._schedule_visual_plan_repair(
                 ctx,
                 scene_id,

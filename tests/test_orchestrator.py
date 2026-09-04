@@ -1652,6 +1652,48 @@ def test_code_level_math_finding_is_sent_back_to_coder_not_planner(monkeypatch, 
     assert state.give_up is False
 
 
+def test_plan_repair_receives_only_plan_finding_not_code_review_noise(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    captured: dict[str, str] = {}
+
+    def capture_plan_repair(ctx, scene_id, state, feedback, target, source="视觉评估"):
+        captured["feedback"] = feedback
+        captured["target"] = target
+
+    monkeypatch.setattr(orchestrator, "_schedule_visual_plan_repair", capture_plan_repair)
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="代码级噪声：这一行的布局可能重叠，应该交给 Coder",
+        findings=[
+            ReviewFinding(
+                category="continuity",
+                severity="major",
+                evidence_type="contract",
+                why="ScenePlan 的 opening_state 与 handoff 不一致",
+                repair="修正 ScenePlan 的跨场景交接合同",
+            )
+        ],
+    )
+
+    orchestrator._apply_review_result(ctx, 1, state, result)
+
+    assert captured == {
+        "feedback": "修正 ScenePlan 的跨场景交接合同",
+        "target": "continuity",
+    }
+
+
 def test_review_exhaustion_switches_high_risk_geometry_to_safe_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
     monkeypatch.setattr(module.settings, "SAFE_FALLBACK_ENABLED", True)

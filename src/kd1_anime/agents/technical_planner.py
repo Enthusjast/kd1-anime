@@ -205,6 +205,7 @@ def _normalise_technical_lifecycle(
     spec: TechnicalSpec,
     *,
     required_boundary_ids: set[str],
+    timeline_element_ids: dict[str, set[str]] | None = None,
 ) -> tuple[TechnicalSpec, tuple[str, ...]]:
     """修复技术模型最常见的生命周期歧义。
 
@@ -229,6 +230,28 @@ def _normalise_technical_lifecycle(
         event = original
         target_ids = set(event.target_element_ids)
         create_ids = set(event.create_element_ids)
+
+        if (
+            event.operation in {"transform", "replacement_transform"}
+            and not event.source_element_ids
+        ):
+            timeline_ids = set((timeline_element_ids or {}).get(event.event_id, ()))
+            inferred_from_timeline = timeline_ids & active
+            if inferred_from_timeline:
+                event = event.model_copy(
+                    update={
+                        "source_element_ids": sorted(inferred_from_timeline),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "已从同名 ScenePlan.timeline 事件的 active 元素推断 source_element_ids",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 从时间线补齐 source_element_ids: "
+                    + ", ".join(sorted(inferred_from_timeline))
+                )
+                changed = True
 
         if (
             event.operation in {"transform", "replacement_transform"}
@@ -357,6 +380,38 @@ def _normalise_technical_lifecycle(
                 repairs.append(
                     f"事件 {event.event_id} 删除 inactive source: "
                     + ", ".join(sorted(removable_sources))
+                )
+                changed = True
+
+        if (
+            event.operation in {"transform", "replacement_transform"}
+            and not event.source_element_ids
+        ):
+            # 上面的兼容修复会把“新对象既是 source 又是 target/create”中的
+            # inactive source 删除。此时原事件已经不再是 Transform：它表达
+            # 的是把一组尚未进入 Scene 的对象首次展示出来。若仍保留
+            # transform，编译器只能报告一个没有 source 的错误；按一次明确
+            # 的 fade_in 处理既符合剩余字段，也让后续事件可以使用这些对象。
+            candidate_ids = target_ids | create_ids
+            known_candidates = candidate_ids & set(object_by_id)
+            if candidate_ids and known_candidates == candidate_ids:
+                event = event.model_copy(
+                    update={
+                        "operation": "fade_in",
+                        "source_element_ids": [],
+                        "target_element_ids": sorted(candidate_ids),
+                        "create_element_ids": sorted(candidate_ids),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "inactive source 已删除，剩余对象按首次 fade_in 引入",
+                        ),
+                    }
+                )
+                target_ids = set(candidate_ids)
+                create_ids = set(candidate_ids)
+                repairs.append(
+                    f"事件 {event.event_id} 删除 inactive source 后改为 fade_in: "
+                    + ", ".join(sorted(candidate_ids))
                 )
                 changed = True
 
@@ -765,6 +820,107 @@ def _ensure_required_export_introductions(
     )
 
 
+def _default_constructor_for_element(element: VisualElementState) -> str:
+    """为缺失的计划元素提供保守的技术构造器提示。
+
+    Technical Planner 偶尔会漏写一个 ``objects`` 条目，但 ScenePlan 已经
+    明确声明了该元素。这里不猜测几何参数，只根据元素的 kind/role 选择
+    Coder 可继续细化的 Manim 类名；具体位置、颜色和数学内容仍以
+    ScenePlan 为准。
+    """
+
+    kind = str(element.kind or "").lower()
+    if kind in {"text", "label", "title", "caption", "文字", "标注"}:
+        return "Text"
+    if kind in {"formula", "equation", "math", "latex", "公式", "方程"}:
+        return "MathTex"
+    text = " ".join(
+        str(value) for value in (element.kind, element.role, element.element_id)
+    ).lower()
+    if any(term in text for term in ("grid", "plane", "坐标系", "网格")):
+        return "NumberPlane"
+    if any(term in text for term in ("matrix", "矩阵")):
+        return "Matrix"
+    if any(term in text for term in ("formula", "equation", "math", "公式", "方程")):
+        return "MathTex"
+    if any(term in text for term in ("arrow", "vector", "向量", "箭头")):
+        return "Arrow"
+    if any(term in text for term in ("text", "label", "title", "caption", "文字", "标注")):
+        return "Text"
+    if any(term in text for term in ("circle", "圆")):
+        return "Circle"
+    if any(term in text for term in ("square", "正方形")):
+        return "Square"
+    if any(term in text for term in ("rectangle", "rect", "矩形")):
+        return "Rectangle"
+    if any(term in text for term in ("polygon", "triangle", "多边形", "三角形")):
+        return "Polygon"
+    if any(term in text for term in ("line", "segment", "直线", "线段")):
+        return "Line"
+    return "Mobject"
+
+
+def _unique_variable_name(element: VisualElementState, used: set[str]) -> str:
+    """生成一个符合 Python 标识符规则且不与现有对象冲突的变量名。"""
+
+    candidate = element.variable_name or re.sub(r"[^A-Za-z0-9_]", "_", element.element_id)
+    if not candidate or candidate[0].isdigit():
+        candidate = f"element_{candidate}"
+    base = candidate
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _ensure_declared_objects(
+    objects: list[TechnicalObject],
+    plan: ScenePlan,
+    *,
+    inherited_ids: set[str],
+    expected_exports: set[str],
+) -> tuple[list[TechnicalObject], tuple[str, ...]]:
+    """补齐 TechnicalSpec 漏掉的 ScenePlan 对象声明。
+
+    对象声明是边界合同的机械投影。若模型只描述了动画事件却漏掉
+    ``TechnicalSpec.objects``，后续编译器无法判断生命周期，且 Coder 会
+    收到一个自相矛盾的技术合同。补齐声明不会替换已有构造器或参数，
+    只为真正缺失的 element_id 添加最小元数据。
+    """
+
+    declared: dict[str, VisualElementState] = {}
+    for element in [*plan.inherited_elements, *plan.new_elements, *plan.elements_to_remove]:
+        declared.setdefault(element.element_id, element)
+    existing_ids = {item.element_id for item in objects}
+    missing_ids = sorted(set(declared) - existing_ids)
+    if not missing_ids:
+        return objects, ()
+
+    used_variables = {item.variable_name for item in objects if item.variable_name}
+    completed = list(objects)
+    for element_id in missing_ids:
+        element = declared[element_id]
+        variable_name = _unique_variable_name(element, used_variables)
+        used_variables.add(variable_name)
+        completed.append(
+            TechnicalObject(
+                element_id=element.element_id,
+                variable_name=variable_name,
+                constructor=_default_constructor_for_element(element),
+                initial_state=element.semantic_state,
+                final_state=element.semantic_state,
+                visual_role=element.role,
+                initially_active=element.element_id in inherited_ids,
+                exported=element.element_id in expected_exports,
+            )
+        )
+    return (
+        completed,
+        ("为 TechnicalSpec 补齐计划元素对象: " + ", ".join(missing_ids),),
+    )
+
+
 def normalize_technical_spec_contract(
     plan: ScenePlan,
     spec: TechnicalSpec,
@@ -863,14 +1019,21 @@ def normalize_technical_spec_contract(
             normalized_animations.append(normalized_event)
         updates["animations"] = normalized_animations
 
-    objects_to_normalize = normalized_objects
-    normalized_objects = []
-    object_changed = False
     expected_exports = [
         item.element_id
         for item in [*plan.inherited_elements, *plan.new_elements]
         if item.required and item.element_id not in set(expected_removed)
     ]
+    normalized_objects, object_repairs = _ensure_declared_objects(
+        normalized_objects,
+        plan,
+        inherited_ids=inherited_ids,
+        expected_exports=set(expected_exports),
+    )
+    repairs.extend(object_repairs)
+    objects_to_normalize = normalized_objects
+    normalized_objects = []
+    object_changed = bool(object_repairs)
     if spec.export_element_ids != expected_exports:
         updates["export_element_ids"] = expected_exports
         repairs.append("export_element_ids 已与计划中的必需边界元素对齐")
@@ -949,6 +1112,7 @@ def normalize_technical_spec_contract(
     normalized_spec, lifecycle_repairs = _normalise_technical_lifecycle(
         normalized_spec,
         required_boundary_ids=required_boundary_ids,
+        timeline_element_ids={event.event_id: set(event.element_ids) for event in plan.timeline},
     )
     repairs.extend(lifecycle_repairs)
     normalized_spec, introduction_repairs = _ensure_required_export_introductions(
@@ -1240,6 +1404,8 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
    removed_element_ids 必须逐项对应 ScenePlan.elements_to_remove；不能自行推断、遗漏或新增。
 3. 每个动画事件必须明确 source_element_ids、target_element_ids、create_element_ids 和
    remove_element_ids；Transform/ReplacementTransform 不能引用不存在或尚未出现的对象。
+   如果事件对应 ScenePlan.timeline 中同名的 element_ids，变换事件必须将其中当前
+   active 的元素填写到 source_element_ids；不能只把对象写在自然语言 api_notes 中。
    新对象不能同时出现在 Transform 的 source 中；若要在同一时间段引入新对象，
    请另建一个 fade_in/create 事件，或只把它放在 target/create 字段。
 4. 已经 FadeOut、Uncreate 或 ReplacementTransform 移除的对象不能在后续事件中继续使用。

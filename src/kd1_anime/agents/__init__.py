@@ -14,7 +14,10 @@ from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import FailureRoute, classify_failure
 from kd1_anime.agents.lifecycle import (
     LifecycleValidationResult,
+    repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
+    repair_required_export_replacement_lifecycle,
+    repair_required_export_transform_alias_lifecycle,
     validate_animation_lifecycle,
 )
 from kd1_anime.agents.math_verifier import (
@@ -132,7 +135,10 @@ __all__ = [
     "normalize_technical_spec_contract",
     "recommended_renderer",
     "repair_obvious_math_contradictions",
+    "repair_removed_active_lifecycle",
     "repair_required_export_alias_lifecycle",
+    "repair_required_export_replacement_lifecycle",
+    "repair_required_export_transform_alias_lifecycle",
     "review_budget",
     "validate_animation_lifecycle",
     "validate_boundary_handoff",

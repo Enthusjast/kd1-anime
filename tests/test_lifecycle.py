@@ -1,7 +1,10 @@
 """生成代码对象生命周期校验测试。"""
 
 from kd1_anime.agents.lifecycle import (
+    repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
+    repair_required_export_replacement_lifecycle,
+    repair_required_export_transform_alias_lifecycle,
     validate_animation_lifecycle,
 )
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
@@ -118,6 +121,123 @@ class Demo(Scene):
 
     assert repaired == code
     assert repairs == ()
+
+
+def test_repairs_replacement_target_rebound_to_required_export():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+                exported=True,
+            )
+        ],
+        export_element_ids=["grid"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: grid
+        grid = NumberPlane()
+        # KD1_CONTINUITY_EXPORT_END
+        self.add(grid)
+        target_grid = NumberPlane()
+        self.play(ReplacementTransform(grid, target_grid))
+        grid = target_grid
+        self.play(grid.animate.scale(0.9))
+"""
+
+    repaired, repairs = repair_required_export_transform_alias_lifecycle(code, technical_spec)
+
+    assert repairs
+    assert "ReplacementTransform(grid, target_grid)" not in repaired
+    assert "Transform(grid, target_grid)" in repaired
+    assert "grid = target_grid" not in repaired
+    assert "self.play(grid.animate.scale(0.9))" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
+def test_repairs_reported_active_removed_objects_at_construct_end():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+            ),
+            TechnicalObject(
+                element_id="vector",
+                variable_name="vector",
+                constructor="Vector",
+                initially_active=True,
+            ),
+        ],
+        removed_element_ids=["grid", "vector"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        grid = NumberPlane()
+        vector = Vector(RIGHT)
+        self.add(grid, vector)
+        self.wait(1)
+"""
+
+    repaired, repairs = repair_removed_active_lifecycle(
+        code,
+        technical_spec,
+        ["场景结束时已移除对象仍 active: grid, vector"],
+    )
+
+    assert repairs == ("为仍 active 的移除对象补齐 FadeOut: grid, vector",)
+    assert "self.play(FadeOut(grid, vector), run_time=0.5)" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
+def test_repairs_replacement_of_required_export_without_rebinding():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+                exported=True,
+            )
+        ],
+        export_element_ids=["grid"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: grid
+        grid = NumberPlane()
+        # KD1_CONTINUITY_EXPORT_END
+        self.add(grid)
+        target_grid = NumberPlane()
+        self.play(ReplacementTransform(grid, target_grid))
+        self.wait(1)
+"""
+
+    repaired, repairs = repair_required_export_replacement_lifecycle(code, technical_spec)
+
+    assert repairs
+    assert "Transform(grid, target_grid)" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
 
 
 def test_lifecycle_accepts_animation_of_loop_variable():
