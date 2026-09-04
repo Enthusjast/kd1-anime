@@ -270,7 +270,7 @@ kd1-anime stats <run-id> --json
 kd1-anime clean --older-than 30d --yes
 ```
 
-启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v6；v4/v5 可以只读查看，但不能安全继续修改。
+启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v7；v4–v6 可以只读查看，但不能安全继续修改。
 
 ### 环境和模型诊断
 
@@ -447,16 +447,18 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 ├── knowledge/                   # Manim 文档和示例
 ├── rag/index.sqlite3            # 本地知识索引
 ├── cache/llm.sqlite3            # LLM 完整响应缓存
+├── diagnostics/failure_cases.sqlite3 # 脱敏渲染失败案例
 └── workspace/
     ├── eval_results/            # 独立 evaluate 命令的报告
     └── runs/<run-id>/
         ├── prompt.md            # 需求文件；不是 prompt.txt
-        ├── manifest.json        # 当前为 schema v6
+        ├── manifest.json        # 当前为 schema v7
         ├── events.jsonl         # 脱敏事件轨迹
         ├── scenes/              # Python Scene 与 sbatch 脚本
         ├── logs/                # stdout/stderr
         ├── videos/              # 当前 run 的媒体目录
         ├── artifacts/            # 计划、合同、审查和账本快照
+        ├── run_report.json       # 结构化运行统计与失败诊断
         ├── eval_frames/          # 视觉评估关键帧
         ├── eval_reports/         # 场景/成片视觉报告
         ├── visual_candidates/    # 视觉修复候选
@@ -520,7 +522,9 @@ kd1-anime batch prompts.json --dry-run
 - `MANIM_RENDERER=cairo` 是默认 CPU 渲染器；`MANIM_RENDERER=opengl` 需要有效 GPU。只有 OpenGL 模式才会申请 `SLURM_GPU_TYPE`。
 - `MANIM_OPENGL_PLATFORM` 只决定 PyOpenGL 上下文后端：`egl` 适合无显示的 headless 节点，`glx` 需要可用显示服务。它不等同于选择 Cairo/OpenGL 渲染器。
 - OpenGL 不支持 `self.camera.frame`/`MovingCameraScene` 这类 Cairo 运镜 API；3D 场景应使用专用相机 API。遇到 `OpenGLCamera ... frame` 错误，应修改代码或切换 Cairo，而不是只重复提交任务。
-- 正式渲染前默认执行同 renderer 的 Smoke Render；本地预检需要显式设置 `LOCAL_SMOKE_RENDER_ENABLED=true`，且 dry-run 永不执行生成代码。
+- 正式渲染前默认执行 import-only、frame 和风险自适应的短视频 Smoke Render；本地预检需要显式设置 `LOCAL_SMOKE_RENDER_ENABLED=true` 或使用 `--smoke`，且 dry-run 默认永不执行生成代码。
+- 复杂场景默认只向上调整 Slurm CPU、内存和时间资源；可通过 `AUTO_RESOURCE_ESTIMATION=false` 恢复固定资源。
+- AutoFix 会优先使用唯一可匹配补丁，并保存最多 3 个经过验证的代码候选；连续无进展时优先回滚到可信版本。
 - 多场景默认使用 FFmpeg `xfade=transition=fade`，转场时长为 `TRANSITION_DURATION=0.5` 秒；有音频时同步使用 `acrossfade`。
 - 合并写入临时文件，ffprobe 验证通过后才原子替换最终输出。默认拒绝覆盖自定义输出，使用 `--force` 或配置 `OVERWRITE_OUTPUT=true` 才允许覆盖。
 
