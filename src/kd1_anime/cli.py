@@ -355,6 +355,11 @@ def generate(
         None, "--max-fix", min=0, help="最大自动修复尝试次数 (默认: 5, 上限 20)"
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成场景规划和代码,不提交 Slurm 任务"),
+    smoke: bool = typer.Option(
+        False,
+        "--smoke",
+        help="显式执行本地低质量 Smoke/Frame Canary（可与 --dry-run 配合）",
+    ),
     approve_plan: bool = typer.Option(
         False,
         "--approve-plan",
@@ -464,14 +469,22 @@ def generate(
                 dry_run=dry_run,
                 output_path=output,
                 approve_plan=approve_plan,
+                smoke=smoke,
             )
         elif incremental:
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
-            final_video = orchestrator.run_incremental(prompt, incremental, dry_run=dry_run)
+            final_video = orchestrator.run_incremental(
+                prompt,
+                incremental,
+                dry_run=dry_run,
+                smoke=smoke,
+            )
         else:
             run_kwargs = {"dry_run": dry_run}
             if approve_plan:
                 run_kwargs["approve_plan"] = True
+            if smoke:
+                run_kwargs["smoke"] = True
             final_video = orchestrator.run(prompt, **run_kwargs)
 
         if dry_run:

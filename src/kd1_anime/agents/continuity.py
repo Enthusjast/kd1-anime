@@ -1991,6 +1991,7 @@ class ContinuityReviewerAgent(BaseAgent):
     """全片分镜连续性审查 Agent。"""
 
     name = "ContinuityReviewer"
+    llm_stage = "review"
 
     @staticmethod
     def _bounded(value: object, limit: int = 2_500) -> str:

@@ -9,6 +9,7 @@ from kd1_anime.agents.lifecycle import (
     repair_required_export_alias_lifecycle,
     validate_animation_lifecycle,
 )
+from kd1_anime.agents.math_verifier import MathVerification, verify_expression_samples
 from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
@@ -29,18 +30,22 @@ from kd1_anime.agents.planner import (
     TeachingGraph,
     repair_obvious_math_contradictions,
 )
+from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
 from kd1_anime.agents.prompt_context import (
     PromptBudgetError,
     PromptContextBuilder,
     PromptSection,
     build_bounded_prompt,
 )
+from kd1_anime.agents.render_error_parser import RenderErrorEvidence, extract_render_error
+from kd1_anime.agents.review_policy import ReviewBudget, review_budget
 from kd1_anime.agents.reviewer import (
     ReviewerAgent,
     ReviewFinding,
     apply_review_policy,
     validate_review_evidence,
 )
+from kd1_anime.agents.risk import SceneRisk, assess_scene_risk
 from kd1_anime.agents.state_ledger import (
     LedgerElement,
     SceneBoundaryIR,
@@ -71,18 +76,23 @@ __all__ = [
     "LessonSpec",
     "LifecycleValidationResult",
     "MathEntity",
+    "MathVerification",
     "PlanReviewIssue",
     "PlanReviewResult",
     "PlanReviewerAgent",
     "PlannerAgent",
     "PlanningDraft",
+    "ProgressSnapshot",
     "PromptBudgetError",
     "PromptContextBuilder",
     "PromptSection",
+    "RenderErrorEvidence",
+    "ReviewBudget",
     "ReviewFinding",
     "ReviewerAgent",
     "SceneBoundaryIR",
     "SceneBoundaryState",
+    "SceneRisk",
     "StateLedger",
     "TeachingEdge",
     "TeachingGraph",
@@ -90,18 +100,23 @@ __all__ = [
     "TechnicalSpec",
     "TechnicalValidationResult",
     "apply_review_policy",
+    "assess_scene_risk",
     "build_bounded_prompt",
     "classify_failure",
     "classify_plan_review_issues",
+    "classify_progress",
     "compile_technical_spec",
     "dedupe_plan_review_issues",
     "deterministic_plan_issues",
+    "extract_render_error",
     "filter_verified_plan_issues",
     "lint_manim_api",
     "normalize_technical_spec_contract",
     "repair_obvious_math_contradictions",
     "repair_required_export_alias_lifecycle",
+    "review_budget",
     "validate_animation_lifecycle",
     "validate_manim_code",
     "validate_review_evidence",
+    "verify_expression_samples",
 ]

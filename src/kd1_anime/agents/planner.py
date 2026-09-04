@@ -1587,6 +1587,7 @@ class PlannerAgent(BaseAgent):
     """场景规划 Agent：概要 → 逐场景导演分镜。"""
 
     name = "Planner"
+    llm_stage = "planning"
 
     @staticmethod
     def _normalize_outlines(outlines: list[SceneOutline], user_prompt: str) -> list[SceneOutline]:

@@ -9,12 +9,17 @@ import pytest
 
 from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, CoderAgent
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
+from kd1_anime.agents.scene_ir import (
+    build_scene_program_from_contract,
+    compile_scene_program,
+)
 from kd1_anime.agents.scene_templates import (
     build_safe_scene_code,
     build_scene_template,
     select_scene_template,
 )
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
+from kd1_anime.agents.validator import validate_manim_code
 
 
 @pytest.fixture
@@ -87,6 +92,25 @@ class TestScene(Scene):
         assert code.count("class ") == 1
         assert "KD1_CONTINUITY_EXPORT_BEGIN" in code
         assert "圆形面积" in code
+
+    def test_scene_program_compiles_to_valid_contract_code(self, sample_plan):
+        plan = sample_plan.model_copy(
+            update={
+                "new_elements": [
+                    VisualElementState(
+                        element_id="circle",
+                        variable_name="circle",
+                        kind="Circle",
+                    )
+                ]
+            }
+        )
+        program = build_scene_program_from_contract(plan)
+        code = compile_scene_program(program, plan)
+        result = validate_manim_code(code, renderer="cairo")
+        assert result.is_valid, result.feedback
+        assert "# element_id: circle" in code
+        assert "KD1_CONTINUITY_EXPORT_BEGIN" in code
 
     def test_extract_code_block_without_fences(self, coder_agent):
         """测试提取不带围栏的代码块。"""
@@ -187,6 +211,28 @@ class TestScene(Scene):
         assert feedback in call_args[1]["user_message"] or feedback in str(
             call_args[1].get("messages", [])
         )
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_labels_alternate_candidate(
+        self, mock_call_llm, coder_agent, sample_plan
+    ):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+
+        coder_agent.generate_code(
+            sample_plan,
+            stream=False,
+            candidate_index=2,
+            candidate_budget=3,
+            risk_level="high",
+        )
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "备选实现" in message
+        assert "2/3" in message
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_with_previous_code(self, mock_call_llm, coder_agent, sample_plan):

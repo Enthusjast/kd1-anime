@@ -6,16 +6,20 @@
 - 生成效率评估 (渲染时间、成功率)
 """
 
+from .boundary_checks import BoundaryCheck, BoundaryCheckReport, check_boundary_samples
 from .code_eval import CodeEvaluator
 from .evaluator import Evaluator
 from .metrics import EvalMetric, EvalResult, QualityScore
 from .visual_eval import VisualEvaluator
 
 __all__ = [
+    "BoundaryCheck",
+    "BoundaryCheckReport",
     "CodeEvaluator",
     "EvalMetric",
     "EvalResult",
     "Evaluator",
     "QualityScore",
     "VisualEvaluator",
+    "check_boundary_samples",
 ]

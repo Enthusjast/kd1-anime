@@ -156,6 +156,9 @@ kd1-anime generate "解释欧拉公式的几何意义"
 
 # 没有 Slurm 时验证完整的计划与代码生成流程
 kd1-anime generate "解释特征值的几何意义" --dry-run
+
+# 需要显式执行本地低质量 Smoke/Frame Canary 时再打开；会执行生成代码
+kd1-anime generate "解释特征值的几何意义" --dry-run --smoke
 ```
 
 完成后，终端会显示最终视频路径和 run ID。默认最终视频位于该 run 的私有目录；需要固定到外部路径时使用 `--output`。
@@ -188,6 +191,7 @@ INIT
 - **审查分级**：确定性校验或带源码/合同证据的高置信度核心错误才是 hard blocker；可唯一匹配的局部替换先自动修复；风格建议、一般节奏和不确定的“可能问题”作为 warning 放行。
 - **Render Fix** 只处理渲染日志暴露的代码问题；环境、Slurm、字体和显示服务错误不会盲目交给模型重写。
 - **Continuity Review** 只处理跨场景边界。达到 `MAX_CONTINUITY_FIX_ROUNDS` 后会记录 warning 并沿用当时的可验证计划继续，不会因为连续性审查耗尽而阻断整条流水线。
+- **可靠性回退**：确定性 Scene IR、稳定场景模板、精确 traceback 证据和修复停滞检测共同限制重复生成；复杂场景可按风险尝试有限的备选实现。
 
 ### 场景粒度与并行
 
@@ -307,6 +311,7 @@ kd1-anime cache clear --yes
 | `LLM_PLANNING_MAX_TOKENS` | `16384` | 计划和澄清阶段输出预算 |
 | `LLM_CODE_MAX_TOKENS` | `24576` | 代码生成阶段输出预算 |
 | `LLM_REVIEW_MAX_TOKENS` | `8192` | 结构化审查输出预算 |
+| `LLM_*_MODEL` | 空 | 可选阶段模型路由；为空回退到 `LLM_MODEL` |
 | `LLM_TRUST_ENV` | `true` | 是否读取 `HTTP(S)_PROXY` 等代理环境变量 |
 | `LLM_CACHE_ENABLED` | `true` | 是否启用本地非流式响应缓存 |
 | `LLM_MAX_CONTEXT_CHARS` | `120000` | Agent 输入总预算；低优先级区块会先裁剪 |
@@ -319,14 +324,19 @@ kd1-anime cache clear --yes
 | `SMOKE_RENDER_MODE` | `frame` | 预检模式：最后一帧、MP4 或两者 |
 | `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外运行时预检 |
 | `LOCAL_SMOKE_RENDER_MODE` | `frame` | 本地预检模式：最后一帧、MP4 或两者 |
+| `CODEGEN_MODE` | `hybrid` | 代码模式：Python、IR，或 Python 失败时 IR 回退 |
+| `MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH` | `1/2/3` | 按场景风险允许的备选实现策略数 |
 | `MAX_SCENES` | `12` | 单次规划的最大场景数 |
 | `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
 | `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 计划反馈后的 Planner 总重调用次数 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 连续性局部重规划次数；耗尽后 warning 放行 |
 | `MAX_REVIEW_ROUNDS` | `5` | 单场景代码审查/重写轮数 |
+| `MAX_LOW_RISK_REVIEW_ROUNDS` | `2` | 低风险场景的审查轮数；确定性检查始终执行 |
+| `MAX_STAGNANT_ATTEMPTS` | `2` | 渲染修复无进展后切换 IR/安全模板的次数 |
 | `MAX_FIX_ATTEMPTS` | `5` | 渲染失败后的代码修复次数 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
+| `AUTO_RESOURCE_ESTIMATION` | `false` | 是否按场景复杂度只向上增加 Slurm 资源 |
 | `MONITOR_QUEUE_TIMEOUT` / `RUN_TIMEOUT` | `3600/3600` | 排队/运行超时（秒） |
 | `MONITOR_UNKNOWN_TIMEOUT` | `300` | 控制面不可查询时的最短等待时间 |
 | `MONITOR_ARTIFACT_GRACE` | `60` | Slurm 完成后等待共享文件系统同步产物的时间 |
