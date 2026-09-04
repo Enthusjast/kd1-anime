@@ -15,6 +15,7 @@ from rich.console import Console
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
 from kd1_anime.rendering import (
+    MergeProfile,
     RenderProfile,
     VideoMetadata,
     effective_transition_duration,
@@ -75,7 +76,10 @@ class VideoMerger:
             raise RuntimeError(
                 f"Scene {job.scene_id} 缺少当前 Slurm Job 的 output_path，拒绝扫描目录选择视频"
             )
-        video = job.output_path.expanduser().resolve()
+        raw_video = job.output_path.expanduser()
+        if raw_video.is_symlink():
+            raise RuntimeError(f"Scene {job.scene_id} 的 output_path 不能是符号链接")
+        video = raw_video.resolve()
         media_dir = job.media_dir.expanduser().resolve()
         try:
             video.relative_to(media_dir)
@@ -147,6 +151,7 @@ class VideoMerger:
         *,
         replace_existing: bool = False,
         render_profile: RenderProfile | None = None,
+        merge_profile: MergeProfile | None = None,
     ) -> Path:
         if not video_paths:
             raise RuntimeError("没有视频文件可供拼接")
@@ -158,6 +163,7 @@ class VideoMerger:
                 output,
                 replace_existing=replace_existing,
                 render_profile=render_profile,
+                merge_profile=merge_profile,
             )
 
     def _merge_unlocked(
@@ -167,6 +173,7 @@ class VideoMerger:
         *,
         replace_existing: bool = False,
         render_profile: RenderProfile | None = None,
+        merge_profile: MergeProfile | None = None,
     ) -> Path:
         resolved_inputs = [path.expanduser().resolve() for path in video_paths]
         if output in resolved_inputs:
@@ -177,6 +184,7 @@ class VideoMerger:
         if not ffmpeg:
             raise RuntimeError("未找到 ffmpeg，请先激活包含 FFmpeg 的环境")
         profile = render_profile or RenderProfile.current()
+        publish_profile = merge_profile or MergeProfile.current()
         temporary_output = output.with_name(
             f".{output.stem}.{uuid4().hex[:8]}.tmp{output.suffix or '.mp4'}"
         )
@@ -209,6 +217,7 @@ class VideoMerger:
                 metadata,
                 profile,
                 temporary_output,
+                merge_profile=publish_profile,
             )
             if self._run_ffmpeg(xfade_cmd, temporary_output, "xfade") and self._verify_output(
                 temporary_output,
@@ -232,6 +241,8 @@ class VideoMerger:
         metadata: list[VideoMetadata],
         profile: RenderProfile,
         output: Path,
+        *,
+        merge_profile: MergeProfile | None = None,
     ) -> tuple[list[str], bool, float]:
         """构造链式 xfade/acrossfade 命令，并返回音频和时长预期。"""
 
@@ -239,7 +250,10 @@ class VideoMerger:
             raise ValueError("xfade 至少需要两个输入视频")
         if len(inputs) != len(metadata):
             raise ValueError("输入视频与视频元数据数量不一致")
-        transition = effective_transition_duration(item.duration_seconds for item in metadata)
+        publish_profile = merge_profile or MergeProfile.current()
+        transition = effective_transition_duration(
+            (item.duration_seconds for item in metadata), publish_profile
+        )
         if transition <= 0.01:
             raise RuntimeError("视频时长过短，无法安全添加转场")
         width = profile.pixel_width
@@ -259,7 +273,7 @@ class VideoMerger:
             offset = max(0.0, elapsed - index * transition)
             next_label = f"vxf{index}"
             filter_parts.append(
-                f"[{current_label}][v{index}]xfade=transition={settings.TRANSITION_TYPE}:"
+                f"[{current_label}][v{index}]xfade=transition={publish_profile.transition_type}:"
                 f"duration={transition:.6f}:offset={offset:.6f}[{next_label}]"
             )
             current_label = next_label
@@ -284,8 +298,8 @@ class VideoMerger:
                             "-i",
                             (
                                 "anullsrc=channel_layout="
-                                f"{settings.MERGE_AUDIO_CHANNEL_LAYOUT}:"
-                                f"sample_rate={settings.MERGE_AUDIO_SAMPLE_RATE}"
+                                f"{publish_profile.audio_channel_layout}:"
+                                f"sample_rate={publish_profile.audio_sample_rate}"
                             ),
                         ]
                     )
@@ -293,9 +307,9 @@ class VideoMerger:
             for index, source_index in enumerate(audio_indices):
                 label = f"a{index}"
                 filter_parts.append(
-                    f"[{source_index}:a]aresample={settings.MERGE_AUDIO_SAMPLE_RATE},"
-                    f"aformat=sample_fmts=fltp:sample_rates={settings.MERGE_AUDIO_SAMPLE_RATE}:"
-                    f"channel_layouts={settings.MERGE_AUDIO_CHANNEL_LAYOUT},"
+                    f"[{source_index}:a]aresample={publish_profile.audio_sample_rate},"
+                    f"aformat=sample_fmts=fltp:sample_rates={publish_profile.audio_sample_rate}:"
+                    f"channel_layouts={publish_profile.audio_channel_layout},"
                     f"atrim=duration={metadata[index].duration_seconds:.6f},"
                     f"apad=whole_dur={metadata[index].duration_seconds:.6f},"
                     f"asetpts=PTS-STARTPTS[{label}]"
@@ -323,11 +337,11 @@ class VideoMerger:
         command.extend(
             [
                 "-c:v",
-                settings.MERGE_VIDEO_CODEC,
+                publish_profile.video_codec,
                 "-preset",
-                settings.MERGE_VIDEO_PRESET,
+                publish_profile.video_preset,
                 "-crf",
-                str(settings.MERGE_VIDEO_CRF),
+                str(publish_profile.video_crf),
                 "-pix_fmt",
                 "yuv420p",
                 "-shortest",
@@ -400,6 +414,7 @@ class VideoMerger:
         *,
         output_path: Path,
         render_profile: RenderProfile | None = None,
+        merge_profile: MergeProfile | None = None,
     ) -> Path:
         scene_ids = [job.scene_id for job in jobs]
         if len(set(scene_ids)) != len(scene_ids):
@@ -408,4 +423,5 @@ class VideoMerger:
             self.collect_job_videos(jobs, render_profile=render_profile),
             output_path,
             render_profile=render_profile,
+            merge_profile=merge_profile,
         )

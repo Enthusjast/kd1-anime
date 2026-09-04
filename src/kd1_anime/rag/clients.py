@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from kd1_anime.security import redact_text
 
 
 class RagClientError(RuntimeError):
     """RAG 外部服务不可用或返回结构不合法。"""
 
 
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
 def _endpoint(base_url: str, suffix: str) -> str:
-    base = base_url.rstrip("/")
-    if base.endswith(f"/{suffix}"):
-        return base
-    return f"{base}/{suffix}"
+    parsed = urlsplit(base_url.strip())
+    path = parsed.path.rstrip("/")
+    if not path.endswith(f"/{suffix}"):
+        path = f"{path}/{suffix}"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -37,29 +44,70 @@ def _safe_endpoint(url: str) -> str:
         return "<invalid-endpoint>"
 
 
-def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> Any:
+def _post_json(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+    *,
+    trust_env: bool = True,
+) -> Any:
     try:
         import httpx
 
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, headers=headers, json=payload)
+        # 使用 streaming + 上限读取，而不是先访问 response.content；后者
+        # 会在检查大小前把异常大的响应完整放入内存。
+        with (
+            httpx.Client(timeout=timeout, trust_env=trust_env) as client,
+            client.stream("POST", url, headers=headers, json=payload) as response,
+        ):
             response.raise_for_status()
-            return response.json()
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except ValueError as exc:
+                    raise RagClientError("RAG 服务返回了非法 Content-Length") from exc
+                if declared_length > MAX_RESPONSE_BYTES:
+                    raise RagClientError("RAG 服务响应超过大小限制")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > MAX_RESPONSE_BYTES:
+                    raise RagClientError("RAG 服务响应超过大小限制")
+                chunks.append(chunk)
+            content = b"".join(chunks)
+            if len(content) > MAX_RESPONSE_BYTES:
+                raise RagClientError("RAG 服务响应超过大小限制")
+            try:
+                return json.loads(content)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RagClientError("RAG 服务返回的 JSON 无法解析") from exc
     except Exception as exc:
         if isinstance(exc, RagClientError):
             raise
-        detail = str(exc).strip() or type(exc).__name__
+        detail = redact_text(str(exc).strip() or type(exc).__name__, headers.values())
         raise RagClientError(f"RAG 服务请求失败（{_safe_endpoint(url)}）: {detail}") from exc
 
 
 class EmbeddingClient:
     """调用 OpenAI-compatible Embeddings 接口。"""
 
-    def __init__(self, *, api_key: str, base_url: str, model: str, timeout: float = 60.0):
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout: float = 60.0,
+        trust_env: bool = True,
+    ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        self.trust_env = trust_env
 
     def require(self) -> None:
         if not self.base_url.strip() or not self.model.strip():
@@ -80,6 +128,7 @@ class EmbeddingClient:
             _headers(self.api_key),
             payload,
             self.timeout,
+            trust_env=self.trust_env,
         )
         if not isinstance(data, dict) or not isinstance(data.get("data"), list):
             raise RagClientError("Embedding 响应缺少 data 数组")
@@ -120,11 +169,20 @@ class EmbeddingClient:
 class RerankerClient:
     """调用 Cohere-compatible rerank 接口。"""
 
-    def __init__(self, *, api_key: str, base_url: str, model: str, timeout: float = 60.0):
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout: float = 60.0,
+        trust_env: bool = True,
+    ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        self.trust_env = trust_env
 
     @property
     def configured(self) -> bool:
@@ -159,6 +217,7 @@ class RerankerClient:
             _headers(self.api_key),
             payload,
             self.timeout,
+            trust_env=self.trust_env,
         )
         if not isinstance(data, dict) or not isinstance(data.get("results"), list):
             raise RagClientError("Reranker 响应缺少 results 数组")

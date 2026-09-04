@@ -1,5 +1,6 @@
 """RAG 索引、服务客户端和流水线降级行为测试。"""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -129,6 +130,17 @@ def test_embedding_client_reorders_and_validates_batch(monkeypatch):
     assert client.embed(["a", "b"]) == [[1.0, 0.0], [0.0, 1.0]]
 
 
+def test_rag_endpoint_appends_path_before_query_parameters():
+    from kd1_anime.rag.clients import _endpoint
+
+    assert _endpoint("https://embedding.invalid/v1?tenant=demo", "embeddings") == (
+        "https://embedding.invalid/v1/embeddings?tenant=demo"
+    )
+    assert _endpoint("https://embedding.invalid/v1/embeddings?tenant=demo", "embeddings") == (
+        "https://embedding.invalid/v1/embeddings?tenant=demo"
+    )
+
+
 def test_embedding_client_rejects_wrong_count(monkeypatch):
     from kd1_anime.rag import clients
 
@@ -171,6 +183,100 @@ def test_rag_error_endpoint_redaction_handles_malformed_url():
     assert _safe_endpoint("https://user:secret@[invalid") == "<invalid-endpoint>"
 
 
+def test_rag_http_client_streams_and_disables_proxy_when_requested(monkeypatch):
+    from kd1_anime.rag import clients
+
+    captured = {}
+
+    class FakeResponse:
+        def __init__(self):
+            self.headers = {"content-length": "2"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"{}"
+
+    class StreamContext:
+        def __enter__(self):
+            return FakeResponse()
+
+        def __exit__(self, *args):
+            return False
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            captured["request"] = (args, kwargs)
+            return StreamContext()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    assert (
+        clients._post_json(
+            "https://embedding.invalid/v1/embeddings",
+            {"Authorization": "Bearer secret-key"},
+            {"input": ["x"]},
+            3,
+            trust_env=False,
+        )
+        == {}
+    )
+    assert captured["trust_env"] is False
+    assert captured["request"][0] == ("POST", "https://embedding.invalid/v1/embeddings")
+
+
+def test_rag_http_client_rejects_oversized_response(monkeypatch):
+    from kd1_anime.rag import clients
+
+    class FakeResponse:
+        def __init__(self):
+            self.headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"x" * (clients.MAX_RESPONSE_BYTES + 1)
+
+    class StreamContext:
+        def __enter__(self):
+            return FakeResponse()
+
+        def __exit__(self, *args):
+            return False
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return StreamContext()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    with pytest.raises(RagClientError, match="超过大小限制"):
+        clients._post_json("https://embedding.invalid/v1/embeddings", {}, {}, 3)
+
+
 def test_rag_index_builds_atomic_sqlite_index_and_searches(tmp_path):
     chunks = [_source_chunk("circle api", 0), _source_chunk("square api", 1)]
     path = tmp_path / "nested" / "index.sqlite3"
@@ -183,6 +289,22 @@ def test_rag_index_builds_atomic_sqlite_index_and_searches(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o600
     assert results[0].chunk.text == "circle api"
     assert results[0].score == pytest.approx(1.0)
+
+
+def test_rag_index_records_chunker_identity(tmp_path):
+    path = tmp_path / "index.sqlite3"
+    info = RagIndex.build(
+        path,
+        [_source_chunk("reference")],
+        [[1, 0]],
+        embedding_model="embed",
+        chunk_size=400,
+        chunk_overlap=40,
+    )
+
+    assert info.chunker_version == "1"
+    assert info.chunk_size == 400
+    assert info.chunk_overlap == 40
 
 
 def test_rag_index_rejects_tampered_chunk(tmp_path):
@@ -229,6 +351,40 @@ def test_rag_service_returns_context_and_receipt(tmp_path, monkeypatch):
     assert "Circle API" in result.context
     assert str(config.RAG_DOCS_DIR) not in result.context
     assert result.receipt.chunks[0].content_sha256
+
+
+def test_rag_context_uses_complete_json_reference_blocks(tmp_path):
+    config = _config(tmp_path, RAG_MAX_CONTEXT_CHARS=500)
+    service = RagService(config)
+    chunks = [
+        _source_chunk('text with </reference> and "quotes"'),
+    ]
+    index = RagIndex.build(
+        tmp_path / "index.sqlite3",
+        chunks,
+        [[1, 0]],
+        embedding_model="embed-test",
+    )
+    from kd1_anime.rag.models import RagChunk, RetrievedChunk
+
+    item = RetrievedChunk(
+        chunk=RagChunk(
+            chunk_id="a" * 64,
+            source_path='docs/"quoted".md',
+            source_kind="manim_doc",
+            source_sha256="b" * 64,
+            content_sha256="c" * 64,
+            ordinal=0,
+            text='text with </reference> and "quotes"',
+        ),
+        score=0.9,
+    )
+    context = service._format_context([item])
+
+    assert "</reference>" not in context
+    assert context.startswith("{")
+    assert json.loads(context)["text"] == 'text with </reference> and "quotes"'
+    assert index.chunk_count == 1
 
 
 def test_source_manifest_digest_matches_index_source_digest(tmp_path):
@@ -361,6 +517,50 @@ def test_rag_service_reuses_unchanged_index_without_reembedding(tmp_path, monkey
 
     assert result.chunk_count == 1
     assert len(calls) == first_call_count
+
+
+def test_rag_service_rebuilds_when_chunker_settings_change(tmp_path, monkeypatch):
+    config = _config(tmp_path, RAG_CHUNK_SIZE=400, RAG_CHUNK_OVERLAP=40)
+    config.RAG_DOCS_DIR.mkdir()
+    (config.RAG_DOCS_DIR / "api.md").write_text("# API\n" + "reference " * 100, encoding="utf-8")
+    service = RagService(config)
+    calls = []
+    monkeypatch.setattr(
+        service.embedding,
+        "embed",
+        lambda texts: calls.append(list(texts)) or [[1.0, 0.0] for _ in texts],
+    )
+    service.build_index(rebuild=True)
+    first_call_count = len(calls)
+
+    config.RAG_CHUNK_SIZE = 600
+    config.RAG_CHUNK_OVERLAP = 60
+    rebuilt = service.build_index()
+
+    assert rebuilt.info.chunk_size == 600
+    assert rebuilt.info.chunk_overlap == 60
+    assert len(calls) > first_call_count
+
+
+def test_rag_service_does_not_search_with_stale_chunker_settings(tmp_path, monkeypatch):
+    config = _config(tmp_path, RAG_CHUNK_SIZE=400, RAG_CHUNK_OVERLAP=40)
+    RagIndex.build(
+        config.RAG_INDEX_PATH,
+        [_source_chunk("reference")],
+        [[1.0, 0.0]],
+        embedding_model=config.RAG_EMBEDDING_MODEL,
+        chunk_size=400,
+        chunk_overlap=40,
+    )
+    service = RagService(config)
+    config.RAG_CHUNK_SIZE = 600
+    config.RAG_CHUNK_OVERLAP = 60
+    monkeypatch.setattr(service.embedding, "embed", lambda texts: [[1.0, 0.0] for _ in texts])
+
+    result = service.search("reference", stage="code")
+
+    assert result.receipt.status == "degraded"
+    assert "分块配置" in result.receipt.warning
 
 
 def test_rag_service_rejects_index_from_different_embedding_model(tmp_path, monkeypatch):

@@ -13,6 +13,9 @@ from typing import Literal
 from kd1_anime.rag.models import RagChunk
 
 ALLOWED_SUFFIXES = frozenset({".md", ".rst", ".py"})
+CHUNKER_VERSION = "1"
+DEFAULT_CHUNK_SIZE = 1_800
+DEFAULT_CHUNK_OVERLAP = 200
 EXCLUDED_PARTS = frozenset(
     {
         ".git",
@@ -208,8 +211,8 @@ def chunk_file(
     path: Path,
     source_kind: SourceKind,
     *,
-    chunk_size: int = 1_800,
-    overlap: int = 200,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    overlap: int = DEFAULT_CHUNK_OVERLAP,
     display_path: str | None = None,
 ) -> list[SourceChunk]:
     """切分单个源文件；调用方负责处理读取失败。"""

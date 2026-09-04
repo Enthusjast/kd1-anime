@@ -74,6 +74,9 @@ class RagRuntimeProfile(BaseModel):
     top_k: int = Field(default=8, ge=1, le=100)
     rerank_top_n: int = Field(default=4, ge=1, le=100)
     max_context_chars: int = Field(default=12_000, ge=500, le=100_000)
+    chunker_version: str = Field(default="", max_length=50)
+    chunk_size: int = Field(default=0, ge=0, le=100_000)
+    chunk_overlap: int = Field(default=0, ge=0, le=100_000)
     evaluator_version: Literal["1"] = "1"
 
 
@@ -103,3 +106,8 @@ class RagIndexInfo(BaseModel):
     # 配置是否仍然指向生成该索引的那组文件。
     source_docs_dir: str = Field(default="", max_length=4_000)
     source_examples_dir: str = Field(default="", max_length=4_000)
+    # 旧索引没有这些字段时读取为 0/空值，但不会被新配置复用；必须
+    # 重新构建，避免修改 chunker 参数后仍使用旧分块。
+    chunker_version: str = Field(default="", max_length=50)
+    chunk_size: int = Field(default=0, ge=0, le=100_000)
+    chunk_overlap: int = Field(default=0, ge=0, le=100_000)

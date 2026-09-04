@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import re
 
-from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    ScenePlan,
+    TimelineEvent,
+    VisualElementState,
+)
 
 _GEOMETRY_TERMS = (
     "切割",
@@ -32,6 +37,9 @@ _FAILURE_TERMS = (
     "未验证",
     "不一致",
     "重叠",
+    "超出",
+    "越界",
+    "安全范围",
     "面积",
     "geometry",
     "geometric",
@@ -140,13 +148,57 @@ def build_safe_fallback_plan(
         "使用颜色编码、面积标签或等式变换表达核心数学关系。",
         "保留公式和结论到场景结束，交给下一场景继续接管。",
     ]
-    duration = max(plan.duration_seconds, 0.1)
+    # 保守方案不是把原计划原样复制后换几句说明：原计划的长时间静止、
+    # 越界顶点和错误几何规格仍会被 PlanCompiler 检出。将时长限制在一个
+    # 可教学且可落地的范围，并重建一条只引用保留元素的最小时间线。
+    duration = min(max(plan.duration_seconds, 0.1), 75.0)
     checkpoints = [0.0, duration * 0.2, duration * 0.53, duration * 0.8, duration]
     fallback_moments = [
         f"{checkpoints[0]:g}-{checkpoints[1]:g}s — 接管已确认对象并稳定构图 — 停留 1s",
         f"{checkpoints[1]:g}-{checkpoints[2]:g}s — 展示面积标签或等式关系 — 停留 1s",
         f"{checkpoints[2]:g}-{checkpoints[3]:g}s — 高亮核心公式和结论 — 停留 1s",
         f"{checkpoints[3]:g}-{checkpoints[4]:g}s — 保持最终状态并完成交接 — 停留 2s",
+    ]
+    declared_element_ids = [item.element_id for item in retained]
+    # 只有计划已有的断言才能继续绑定到画面证据；不凭空制造新的数学
+    # 断言。若上游规范器已把 claim_ids 与 math_claims 对齐，这里会自然
+    # 保留完整的教学合同；若旧计划没有结构化断言，则保持空列表。
+    declared_claim_ids = {claim.claim_id for claim in plan.math_claims}
+    timeline_claim_ids = [claim_id for claim_id in plan.claim_ids if claim_id in declared_claim_ids]
+    fallback_timeline = [
+        TimelineEvent(
+            event_id="fallback_intro",
+            start_seconds=checkpoints[0],
+            end_seconds=checkpoints[1],
+            action="接管已确认对象并稳定构图",
+            element_ids=declared_element_ids,
+            math_claim_ids=timeline_claim_ids,
+        ),
+        TimelineEvent(
+            event_id="fallback_relation",
+            start_seconds=checkpoints[1],
+            end_seconds=checkpoints[2],
+            action="使用面积标签或等式变换表达核心数学关系",
+            element_ids=declared_element_ids,
+            math_claim_ids=timeline_claim_ids,
+        ),
+        TimelineEvent(
+            event_id="fallback_conclusion",
+            start_seconds=checkpoints[2],
+            end_seconds=checkpoints[3],
+            action="高亮核心公式和结论",
+            element_ids=declared_element_ids,
+            math_claim_ids=timeline_claim_ids,
+        ),
+        TimelineEvent(
+            event_id="fallback_hold",
+            start_seconds=checkpoints[3],
+            end_seconds=checkpoints[4],
+            action="保持最终状态并完成场景交接",
+            element_ids=declared_element_ids,
+            math_claim_ids=timeline_claim_ids,
+            pause_seconds=2,
+        ),
     ]
     retained_state = retained_labels
     retained_elements_state = [
@@ -167,6 +219,9 @@ def build_safe_fallback_plan(
                 "只使用分镜中已经给出的可验证公式、面积或变量关系；"
                 "不添加未经计算的碎片顶点、旋转角度或目标坐标。"
             ),
+            # 复杂几何规格是触发降级的根因；继续保留它们会让确定性
+            # 编译器再次验证原错误，从而出现“已降级仍无法通过”的死循环。
+            "geometry_specs": [],
             "persistent_elements": retained_elements_state,
             "opening_state": ["接管已确认的视觉对象：" + retained_labels],
             "closing_state": ["保留已确认的视觉对象和核心数学关系：" + retained_state],
@@ -182,6 +237,8 @@ def build_safe_fallback_plan(
             "inherited_elements": inherited,
             "elements_to_remove": removals,
             "new_elements": new_elements,
+            "timeline": fallback_timeline,
+            "duration_seconds": duration,
         }
     )
 

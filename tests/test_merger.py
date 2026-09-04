@@ -5,7 +5,7 @@ import pytest
 import kd1_anime.media.merger as merger_module
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.media.merger import VideoMerger
-from kd1_anime.rendering import RenderProfile, VideoMetadata
+from kd1_anime.rendering import MergeProfile, RenderProfile, VideoMetadata
 
 
 @pytest.fixture(autouse=True)
@@ -290,6 +290,63 @@ def test_xfade_uses_configured_encoding_and_silent_audio_settings(monkeypatch, t
     assert "-c:v libx265" in command
     assert "-preset fast" in command
     assert "-crf 23" in command
+
+
+def test_xfade_uses_captured_merge_profile_instead_of_mutated_settings(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    output = tmp_path / "output.mp4"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    render_profile = RenderProfile(
+        renderer="cairo", quality="l", pixel_width=320, pixel_height=180, frame_rate=30
+    )
+    merge_profile = MergeProfile(
+        transition_duration=0.25,
+        video_codec="libx264",
+        video_preset="fast",
+        video_crf=27,
+        audio_sample_rate=44100,
+        audio_channel_layout="stereo",
+    )
+    monkeypatch.setattr(settings, "TRANSITION_DURATION", 0.5)
+    monkeypatch.setattr(settings, "MERGE_VIDEO_PRESET", "slow")
+    monkeypatch.setattr(
+        merger_module,
+        "verify_video",
+        lambda path, profile: VideoMetadata(
+            size_bytes=path.stat().st_size,
+            duration_seconds=2.0,
+            width=profile.pixel_width,
+            height=profile.pixel_height,
+            frame_rate=profile.frame_rate,
+        ),
+    )
+    merger = VideoMerger()
+    captured = {}
+
+    def fake_ffmpeg(cmd, temporary_output, label):
+        captured["cmd"] = cmd
+        temporary_output.write_bytes(b"merged")
+        return True
+
+    monkeypatch.setattr(merger, "_run_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(merger, "_verify_output", lambda *args, **kwargs: True)
+
+    merger.merge(
+        [first, second],
+        output,
+        replace_existing=True,
+        render_profile=render_profile,
+        merge_profile=merge_profile,
+    )
+
+    command = " ".join(captured["cmd"])
+    assert "duration=0.250000" in command
+    assert "-preset fast" in command
+    assert "-crf 27" in command
 
 
 def test_run_ffmpeg_handles_process_start_failure(monkeypatch, tmp_path):

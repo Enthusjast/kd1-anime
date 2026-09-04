@@ -70,6 +70,14 @@ def test_compiler_does_not_treat_geometric_constraints_as_identities():
     assert not any(issue.category == "math" for issue in result.issues)
 
 
+def test_compiler_does_not_treat_component_relations_as_identities():
+    plan = make_plan(computation=("特征向量方程给出 v1=-v2，取向量 (1,-1)；验证 A*(1,-1)=2*(1,-1)"))
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any(issue.category == "math" for issue in result)
+
+
 def test_compiler_keeps_middle_dot_equations_intact():
     plan = make_plan(computation="符号规则：a·(-b) = -ab，b·(-b) = -b²")
 
@@ -145,6 +153,30 @@ def test_compiler_does_not_treat_line_as_polygon():
     result = PlanCompiler().compile_scene(plan)
 
     assert result == []
+
+
+def test_compiler_does_not_apply_2d_shoelace_area_to_3d_region():
+    plan = make_plan(
+        geometry_specs=[
+            GeometrySpec.model_validate(
+                {
+                    "element_id": "error_region",
+                    "type": "region",
+                    "vertices": [
+                        [1, 1, 2],
+                        [1.5, 1, 2.5],
+                        [1.5, 1.5, 4.5],
+                        [1, 1.5, 3.5],
+                    ],
+                    "area": 0.5,
+                }
+            )
+        ]
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any(issue.category == "geometry" for issue in result)
 
 
 def test_compiler_accepts_remove_handoff_for_inherited_element():

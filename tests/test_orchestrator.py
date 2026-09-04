@@ -8,6 +8,7 @@ import kd1_anime.orchestrator as module
 from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
     ContinuityBible,
+    ExtractedElement,
     LessonSpec,
     MathClaim,
     PlanningDraft,
@@ -15,10 +16,11 @@ from kd1_anime.agents.planner import (
     SceneOutline,
     ScenePlan,
     TeachingGraph,
+    TimelineEvent,
     VisualElementState,
 )
-from kd1_anime.agents.reviewer import ReviewResult
-from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.agents.reviewer import ReviewFinding, ReviewResult
+from kd1_anime.agents.technical_planner import TechnicalAnimation, TechnicalObject, TechnicalSpec
 from kd1_anime.config import settings
 from kd1_anime.eval.visual_eval import VisualAnalysisResult, VisualIssue
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
@@ -93,6 +95,31 @@ def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
     )
 
     orchestrator._run_code_review_barrier(ctx)
+
+
+def test_checkpoint_and_events_are_private_and_redacted(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    (run_paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={1: SceneState(plan=plan(), code=code, class_name="Demo")},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._ctx = ctx
+    monkeypatch.setattr(settings, "LLM_API_KEY", "top-secret-api-key")
+
+    orchestrator._checkpoint(ctx, State.CODING)
+    orchestrator._emit("diagnostic", error="request failed with top-secret-api-key")
+
+    event_path = run_paths.root / "events.jsonl"
+    assert event_path.stat().st_mode & 0o777 == 0o600
+    records = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+    assert records[0]["event"] == "fsm_checkpoint"
+    assert records[-1]["data"]["error"] == "request failed with <redacted>"
+    assert "top-secret-api-key" not in event_path.read_text(encoding="utf-8")
 
 
 def test_code_barrier_does_not_turn_downstream_missing_ledger_into_failure(monkeypatch, tmp_path):
@@ -175,6 +202,8 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
         ],
         scene_states={1: SceneState(plan=current_plan, plan_ready=True)},
         plan_review_status="pending",
+        continuity_bible=ContinuityBible(),
+        continuity_review_round=1,
     )
     orchestrator = Orchestrator()
     orchestrator._llm_sem = threading.Semaphore(1)
@@ -215,6 +244,73 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
     assert ctx.scene_states[1].failed is True
     assert ctx.plan_review_status == "failed"
     assert "达到最大次数" in ctx.scene_states[1].failure_reason
+    assert ctx.continuity_review_round == 1
+
+
+def test_plan_review_replan_budget_uses_geometry_fallback(monkeypatch, tmp_path):
+    """复杂几何重规划耗尽时应降级，而不是把场景直接判死。"""
+
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    geometry_plan = plan().model_copy(
+        update={
+            "visual_flow": ["切割碎片并无缝拼接到目标区域"],
+            "new_elements": [
+                VisualElementState(
+                    element_id="piece_a",
+                    variable_name="piece_a",
+                    color_key="primary",
+                )
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title=geometry_plan.title,
+                duration_seconds=geometry_plan.duration_seconds,
+                purpose=geometry_plan.purpose,
+                math_concept=geometry_plan.math_concept,
+            )
+        ],
+        scene_states={1: SceneState(plan=geometry_plan, plan_ready=True)},
+        plan_review_status="pending",
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+    monkeypatch.setattr(settings, "MAX_PLAN_REVIEW_ROUNDS", 2)
+    monkeypatch.setattr(settings, "MAX_PLAN_REPLAN_ATTEMPTS", 2)
+    monkeypatch.setattr(settings, "SAFE_FALLBACK_ENABLED", True)
+
+    class FakeReviewer:
+        def review(self, *args, **kwargs):
+            return PlanReviewResult(is_valid=True, severity="info")
+
+    class FakePlanner:
+        calls = 0
+
+        def plan_detail(self, *args, **kwargs):
+            self.calls += 1
+            return geometry_plan
+
+    fake_planner = FakePlanner()
+    monkeypatch.setattr(module, "PlanReviewerAgent", FakeReviewer)
+    monkeypatch.setattr(module, "PlannerAgent", lambda: fake_planner)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    state = ctx.scene_states[1]
+    assert fake_planner.calls == 2
+    assert state.safe_fallback_used is True
+    assert state.failed is False
+    assert state.give_up is False
+    assert state.plan_reviewed is False
+    assert ctx.continuity_rebuild_required is True
 
 
 def test_resume_migrates_claims_out_of_transition_scene(monkeypatch, tmp_path):
@@ -985,8 +1081,8 @@ def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_pa
     assert captured["context"].scene_states[1].failure_reason == ""
 
 
-def test_resume_reopens_continuity_warning_for_unfinished_scenes(monkeypatch, tmp_path):
-    """带已知连续性 warning 的中断运行应在 resume 时重新开启修正预算。"""
+def test_resume_rechecks_continuity_warning_once(monkeypatch, tmp_path):
+    """连续性 warning 的恢复只重新开启一次修正预算。"""
     from kd1_anime.config import settings
 
     run_id = "20260728-120000-1234abcd"
@@ -1018,6 +1114,42 @@ def test_resume_reopens_continuity_warning_for_unfinished_scenes(monkeypatch, tm
     assert Orchestrator().resume(run_id) is None
     assert captured["context"].continuity_review_status == "pending"
     assert captured["context"].continuity_review_round == 0
+    assert captured["context"].continuity_resume_recheck_used is True
+
+
+def test_resume_does_not_recheck_continuity_warning_twice(monkeypatch, tmp_path):
+    """已经用过恢复重检查机会时，resume 应直接沿用 warning 计划。"""
+    run_id = "20260728-120000-1234abcd"
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / run_id
+    root.mkdir(parents=True)
+    manifest = RunManifest(
+        run_id=run_id,
+        status="running",
+        state="CODING",
+        user_prompt="prompt",
+        output_path=str((root / "output.mp4").resolve()),
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="warning",
+        continuity_review_round=3,
+        continuity_resume_recheck_used=True,
+        continuity_warnings=["达到最大连续性修正轮数"],
+        scenes={1: StoredSceneState(plan=plan(), plan_ready=True)},
+    )
+    write_manifest(root / "manifest.json", manifest)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
+    captured = {}
+
+    def fake_execute(self, context, state):
+        captured["context"] = context
+        return None
+
+    monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
+
+    assert Orchestrator().resume(run_id) is None
+    assert captured["context"].continuity_review_status == "warning"
+    assert captured["context"].continuity_review_round == 3
+    assert captured["context"].continuity_resume_recheck_used is True
 
 
 def test_context_derives_pending_plan_review_for_legacy_incomplete_run(tmp_path):
@@ -1136,13 +1268,13 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
         output.write_bytes(b"smoke")
         return module.subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(module.subprocess, "run", successful_run)
+    monkeypatch.setattr(module, "_run_limited_process", successful_run)
     orchestrator._local_smoke_render(ctx, state)
 
     def failed_run(command, **kwargs):
         return module.subprocess.CompletedProcess(command, 1, "", "render boom")
 
-    monkeypatch.setattr(module.subprocess, "run", failed_run)
+    monkeypatch.setattr(module, "_run_limited_process", failed_run)
     with pytest.raises(RuntimeError, match="Smoke Render 失败"):
         orchestrator._local_smoke_render(ctx, state)
 
@@ -1171,6 +1303,76 @@ def test_minor_review_is_bounded_by_max_review_rounds(monkeypatch, tmp_path):
     )
     assert ctx.scene_states[1].give_up is True
     assert ctx.scene_states[1].review_round == 2
+
+
+def test_major_review_with_verified_local_fix_stays_in_code_review(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="代码局部实现需要修正",
+        fixes=[
+            {
+                "find": "pass",
+                "replace": "self.wait(1)",
+                "reason": "补充场景停留",
+            }
+        ],
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert "self.wait(1)" in state.code
+    assert state.reviewed is False
+    assert state.rewrite_feedback == ""
+    assert state.give_up is False
+
+
+def test_code_level_math_finding_is_sent_back_to_coder_not_planner(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(
+        plan=plan(),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="代码中的线性变换 API 需要修正",
+        findings=[
+            ReviewFinding(
+                category="math",
+                severity="major",
+                line_start=3,
+                line_end=3,
+                evidence="self.wait()",
+                why="代码实现使用了错误的变换 API",
+                repair="改用 apply_matrix，修复当前代码",
+            )
+        ],
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert state.rewrite_feedback
+    assert not ctx.plan_compile_issues
+    assert state.give_up is False
 
 
 def test_review_exhaustion_switches_high_risk_geometry_to_safe_fallback(monkeypatch, tmp_path):
@@ -1362,6 +1564,620 @@ class Demo(Scene):
     assert class_name == "Demo"
     assert len(coder.calls) == 2
     assert "连续性导出合同" in coder.calls[1]
+    assert "第 2/3 次修复" in coder.calls[1]
+
+
+def test_code_generation_explains_single_export_definition_on_lifecycle_failure(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    required=True,
+                )
+            ]
+        }
+    )
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                constructor="Circle",
+                lifecycle=["define", "create", "keep"],
+                exported=True,
+            )
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=0,
+                end_seconds=1,
+                operation="create",
+                target_element_ids=["formula"],
+                create_element_ids=["formula"],
+            )
+        ],
+        export_element_ids=["formula"],
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.play(Create(formula))
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+        self.play(Create(formula))
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return invalid if len(self.calls) == 1 else valid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    generated, class_name = Orchestrator()._generate_validated_code(
+        scene_plan,
+        technical_spec=technical_spec,
+        stream=False,
+    )
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 2
+    assert "生命周期修复规则" in coder.calls[1]
+    assert "导出区只能有一个" in coder.calls[1]
+
+
+def test_code_generation_marks_an_unchanged_invalid_candidate(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="formula",
+                    variable_name="formula",
+                    required=True,
+                )
+            ]
+        }
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        duplicate = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return invalid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(settings, "CODE_VALIDATION_ATTEMPTS", 3)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    with pytest.raises(module.ValidationError):
+        Orchestrator()._generate_validated_code(scene_plan, stream=False)
+
+    assert len(coder.calls) == 3
+    assert "完全相同" in coder.calls[2]
+
+
+def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    formula = VisualElementState(
+        element_id="formula",
+        variable_name="formula",
+        semantic_state="核心公式",
+        required=True,
+    )
+    first_plan = plan().model_copy(update={"new_elements": [formula]})
+    first_code = "from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n"
+    first_state = SceneState(
+        plan=first_plan,
+        code=first_code,
+        exported_elements_code="formula = Circle()",
+        exported_elements=[
+            ExtractedElement(
+                element_id="formula",
+                variable_name="formula",
+                code="formula = Circle()",
+            )
+        ],
+    )
+    ctx = PipelineContext("prompt", paths=run_paths)
+    orchestrator = Orchestrator()
+
+    orchestrator._update_state_ledger(ctx, first_state)
+
+    second_plan = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [formula],
+            "elements_to_remove": [formula],
+        }
+    )
+    second_state = SceneState(plan=second_plan)
+
+    orchestrator._update_state_ledger(ctx, second_state)
+
+    historical = next(item for item in ctx.state_ledger.elements if item.element_id == "formula")
+    assert historical.active is False
+    assert historical.required_next is False
+    assert "formula" in ctx.state_ledger.boundaries[1].closing_element_ids
+    assert "formula" in ctx.state_ledger.boundaries[2].opening_element_ids
+    assert "formula" not in ctx.state_ledger.boundaries[2].closing_element_ids
+
+
+def test_removing_reexported_scene_keeps_ids_used_by_older_boundaries(tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    axes = VisualElementState(
+        element_id="axes",
+        variable_name="axes",
+        semantic_state="坐标轴",
+        required=True,
+    )
+    first_plan = plan().model_copy(update={"new_elements": [axes]})
+    first_state = SceneState(
+        plan=first_plan,
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        exported_elements_code="axes = ThreeDAxes()",
+        exported_elements=[
+            ExtractedElement(element_id="axes", variable_name="axes", code="axes = ThreeDAxes()")
+        ],
+    )
+    ctx = PipelineContext("prompt", paths=run_paths)
+    orchestrator = Orchestrator()
+    orchestrator._update_state_ledger(ctx, first_state)
+
+    second_plan = plan().model_copy(update={"scene_id": 2, "inherited_elements": [axes]})
+    second_state = SceneState(
+        plan=second_plan,
+        code=first_state.code,
+        exported_elements_code="axes = ThreeDAxes()",
+        exported_elements=[
+            ExtractedElement(element_id="axes", variable_name="axes", code="axes = ThreeDAxes()")
+        ],
+    )
+    orchestrator._update_state_ledger(ctx, second_state)
+
+    orchestrator._remove_element_manifest_scene(ctx, 2)
+
+    historical = next(item for item in ctx.state_ledger.elements if item.element_id == "axes")
+    assert historical.active is False
+    assert "axes" in ctx.state_ledger.boundaries[1].closing_element_ids
+    assert ctx.state_ledger.current_scene_id == 1
+
+
+def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(
+                    element_id="temporary_formula",
+                    variable_name="temporary_formula",
+                    required=False,
+                )
+            ]
+        }
+    )
+    code = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
+        temporary_formula = MathTex(r"x^2", tex_template=tex_template)
+        self.play(Write(temporary_formula))
+"""
+
+    class FakeCoder:
+        calls = 0
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls += 1
+            return code
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda value, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+
+    generated, class_name = Orchestrator()._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == code
+    assert class_name == "Demo"
+    assert coder.calls == 1
+
+
+def test_plan_review_repairs_explicit_handoff_ids_across_neighboring_scenes(monkeypatch, tmp_path):
+    p1 = plan().model_copy(
+        update={
+            "scene_id": 1,
+            "new_elements": [
+                VisualElementState(
+                    element_id="function_label",
+                    variable_name="function_label",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p2 = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [],
+            "new_elements": [
+                VisualElementState(
+                    element_id="tangent_plane_surface",
+                    variable_name="tangent_plane_surface",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p3 = plan().model_copy(update={"scene_id": 3, "new_elements": []})
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=p1, plan_ready=True),
+            2: SceneState(plan=p2, plan_ready=True),
+            3: SceneState(plan=p3, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    issues = [
+        PlanReviewIssue(
+            category="contract",
+            field="handoff",
+            message=(
+                "tangent_plane_surface 未列入 handoff，应传递给场景3；"
+                "function_label 需要从场景1继承并传递给场景3。"
+            ),
+            fix_instruction="将两个元素标记为 required，并补充 handoff。",
+        )
+    ]
+
+    repairs = orchestrator._repair_plan_handoff_issues(
+        ctx,
+        2,
+        ctx.scene_states[2],
+        issues,
+    )
+
+    assert repairs
+    assert any(
+        item.element_id == "function_label" and item.required
+        for item in ctx.scene_states[1].plan.new_elements
+    )
+    assert any(
+        item.element_id == "function_label" and item.action == "create"
+        for item in ctx.scene_states[1].plan.handoff
+    )
+    assert any(
+        item.element_id == "tangent_plane_surface" and item.required
+        for item in ctx.scene_states[2].plan.new_elements
+    )
+    assert {item.element_id for item in ctx.scene_states[3].plan.inherited_elements} >= {
+        "function_label",
+        "tangent_plane_surface",
+    }
+
+
+def test_plan_review_does_not_resurrect_elements_from_explicit_full_exit(monkeypatch, tmp_path):
+    previous_element = VisualElementState(
+        element_id="temporary_grid",
+        variable_name="temporary_grid",
+        required=False,
+    )
+    previous = plan().model_copy(
+        update={
+            "scene_id": 1,
+            "new_elements": [previous_element],
+            "closing_state": ["所有元素整体淡出，场景结束"],
+        }
+    )
+    current = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "opening_state": ["接管 temporary_grid"],
+            "inherited_elements": [],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=previous, plan_ready=True),
+            2: SceneState(plan=current, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    repairs = orchestrator._repair_plan_handoff_issues(
+        ctx,
+        2,
+        ctx.scene_states[2],
+        [
+            PlanReviewIssue(
+                category="contract",
+                field="inherited_elements",
+                message="temporary_grid 应从场景1继承到场景2",
+                fix_instruction="将 temporary_grid 加入 inherited_elements。",
+            )
+        ],
+    )
+
+    assert repairs == []
+    assert ctx.scene_states[1].plan.new_elements[0].required is False
+    assert ctx.scene_states[2].plan.inherited_elements == []
+
+
+def test_mixed_plan_issues_do_not_trigger_handoff_repair_loop(monkeypatch, tmp_path):
+    previous = plan().model_copy(update={"scene_id": 1})
+    current = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [],
+            "new_elements": [
+                VisualElementState(
+                    element_id="grid_sheared",
+                    variable_name="grid_sheared",
+                    required=False,
+                )
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        scene_states={
+            1: SceneState(plan=previous, plan_ready=True),
+            2: SceneState(plan=current, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    repairs = orchestrator._repair_plan_handoff_issues(
+        ctx,
+        2,
+        ctx.scene_states[2],
+        [
+            PlanReviewIssue(
+                category="geometry",
+                field="geometry_specs[grid_sheared].vertices",
+                message="几何顶点超出安全范围",
+                fix_instruction="缩小网格或改用保守表达",
+            ),
+            PlanReviewIssue(
+                category="contract",
+                field="handoff",
+                message="grid_sheared 未列入 handoff",
+                fix_instruction="将 grid_sheared 标记为 required 并补充 handoff",
+            ),
+        ],
+    )
+
+    assert repairs == []
+    assert ctx.scene_states[1].plan == previous
+    assert ctx.scene_states[2].plan == current
+
+
+def test_compile_scene_plans_removes_extra_detail_claims(monkeypatch, tmp_path):
+    scene_plan = plan().model_copy(
+        update={
+            "claim_ids": ["claim_1"],
+            "math_claims": [
+                MathClaim(claim_id="claim_1", statement="x=x"),
+                MathClaim(claim_id="claim_1_extra", statement="x+1=x+1"),
+            ],
+            "timeline": [
+                TimelineEvent(
+                    event_id="show",
+                    start_seconds=0,
+                    end_seconds=10,
+                    action="展示",
+                    math_claim_ids=["claim_1", "claim_1_extra"],
+                )
+            ],
+        }
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        continuity_bible=ContinuityBible(),
+        scene_states={1: SceneState(plan=scene_plan, plan_ready=True)},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    assert orchestrator._normalize_scene_claim_contracts(ctx) is True
+    assert [claim.claim_id for claim in ctx.scene_states[1].plan.math_claims] == ["claim_1"]
+    assert ctx.scene_states[1].plan.timeline[0].math_claim_ids == ["claim_1"]
+
+
+def test_normalize_scene_claim_contracts_restores_lesson_claim_and_timeline_evidence(
+    monkeypatch, tmp_path
+):
+    scene_plan = plan().model_copy(
+        update={
+            "claim_ids": ["claim_1"],
+            "math_claims": [],
+            "timeline": [
+                TimelineEvent(
+                    event_id="show_formula",
+                    start_seconds=0,
+                    end_seconds=10,
+                    action="展示函数公式",
+                )
+            ],
+        }
+    )
+    lesson_claim = MathClaim(
+        claim_id="claim_1",
+        statement="函数公式 z=x^2+y^2",
+        expression_before="z=x^2+y^2",
+        expression_after="z=x^2+y^2",
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        lesson_spec=LessonSpec(claims=[lesson_claim]),
+        scene_states={1: SceneState(plan=scene_plan, plan_ready=True)},
+    )
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    assert orchestrator._normalize_scene_claim_contracts(ctx) is True
+    repaired = ctx.scene_states[1].plan
+    assert [claim.claim_id for claim in repaired.math_claims] == ["claim_1"]
+    assert repaired.timeline[0].math_claim_ids == ["claim_1"]
+
+
+def test_plan_review_revisits_neighbors_after_mechanical_handoff_repair(monkeypatch, tmp_path):
+    boundary = {
+        "opening_state": ["对象进入画面"],
+        "closing_state": ["对象保留到场景结束"],
+        "transition_in": "对象从上一状态接入",
+        "transition_out": "对象交给下一场景",
+    }
+    p1 = plan().model_copy(
+        update={
+            "scene_id": 1,
+            **boundary,
+            "new_elements": [
+                VisualElementState(
+                    element_id="function_label",
+                    variable_name="function_label",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p2 = plan().model_copy(
+        update={
+            "scene_id": 2,
+            **boundary,
+            "new_elements": [
+                VisualElementState(
+                    element_id="tangent_plane_surface",
+                    variable_name="tangent_plane_surface",
+                    required=False,
+                )
+            ],
+        }
+    )
+    p3 = plan().model_copy(update={"scene_id": 3, **boundary, "new_elements": []})
+    outlines = [
+        SceneOutline(
+            scene_id=scene_id,
+            title=f"Scene {scene_id}",
+            duration_seconds=10,
+            purpose="test",
+            math_concept="test",
+        )
+        for scene_id in (1, 2, 3)
+    ]
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths(tmp_path),
+        outlines=outlines,
+        continuity_bible=ContinuityBible(),
+        plan_review_status="pending",
+        continuity_review_status="passed",
+        scene_states={
+            1: SceneState(plan=p1, plan_ready=True),
+            2: SceneState(plan=p2, plan_ready=True),
+            3: SceneState(plan=p3, plan_ready=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+
+    class Reviewer:
+        def __init__(self):
+            self.calls = []
+
+        def review(self, current_plan, **kwargs):
+            self.calls.append(current_plan.scene_id)
+            if current_plan.scene_id == 2 and self.calls.count(2) == 1:
+                return PlanReviewResult(
+                    is_valid=False,
+                    severity="major",
+                    issues=[
+                        {
+                            "category": "contract",
+                            "field": "handoff",
+                            "message": (
+                                "tangent_plane_surface 未列入 handoff，应传递给场景3；"
+                                "function_label 需要从场景1继承并传递给场景3。"
+                            ),
+                            "fix_instruction": "将两个元素标记为 required，并补充 handoff。",
+                        }
+                    ],
+                )
+            return PlanReviewResult(is_valid=True, severity="info")
+
+    reviewer = Reviewer()
+    monkeypatch.setattr(module, "PlanReviewerAgent", lambda: reviewer)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert reviewer.calls.count(1) == 2
+    assert reviewer.calls.count(2) == 2
+    assert reviewer.calls.count(3) == 1
+    assert ctx.plan_review_status == "passed"
+    assert all(state.plan_reviewed for state in ctx.scene_states.values())
 
 
 def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path):

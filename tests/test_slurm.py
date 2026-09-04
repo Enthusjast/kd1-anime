@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from kd1_anime.cluster.slurm import JobMonitor, SlurmDispatcher, SlurmJob
+from kd1_anime.cluster.slurm import JobMonitor, SlurmDispatcher, SlurmJob, SlurmMonitorCoordinator
 from kd1_anime.config import settings
 from kd1_anime.rendering import VideoMetadata
 
@@ -230,6 +230,27 @@ def test_attempt_media_dir_does_not_break_container_run_bind(monkeypatch, tmp_pa
     assert media_dir == run_root / "videos" / "scene_1" / "attempt_abcdef123456"
     assert f"--bind {run_root}:{run_root}" in script
     assert f"#SBATCH -J kd1-{run_root.name}-s1" in script
+
+
+def test_render_script_records_compute_environment(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "MANIM_RENDERER", "cairo")
+    run_root = tmp_path / "20260811-120000-abcdef12"
+    scene = run_root / "scenes" / "scene_1.py"
+    scene.parent.mkdir(parents=True)
+    scene.write_text("from manim import *\n", encoding="utf-8")
+
+    script_path, _, _, _ = SlurmDispatcher().generate_script(
+        1,
+        scene,
+        "Demo",
+        scenes_dir=scene.parent,
+        logs_dir=run_root / "logs",
+        videos_dir=run_root / "videos",
+    )
+
+    script = script_path.read_text(encoding="utf-8")
+    assert "environment_scene_1.json" in script
+    assert "importlib.metadata" in script
 
 
 def test_submission_uses_captured_render_profile_not_mutated_settings(monkeypatch, tmp_path):
@@ -491,6 +512,7 @@ def test_gone_without_artifacts_waits_for_streak(monkeypatch, tmp_path):
     statuses = iter([{"123": "GONE"}, {"123": "GONE"}])
     cancelled = []
     monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 2)
+    monkeypatch.setattr(settings, "MONITOR_ARTIFACT_GRACE", 0)
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: next(statuses))
     monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: cancelled.append(jid) or True)
 
@@ -499,6 +521,38 @@ def test_gone_without_artifacts_waits_for_streak(monkeypatch, tmp_path):
     assert result == {"123": False}
     assert job.status == "FAILED"
     assert cancelled == []  # 作业已消失, 无需 scancel
+
+
+def test_gone_waits_for_artifact_grace_before_failing(monkeypatch, tmp_path):
+    """sacct 尚未出现终态时，GONE 也必须等待共享文件系统产物同步。"""
+    import kd1_anime.cluster.slurm as slurm_mod
+
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path, submitted_at=100.0)
+    clock = [100.0]
+    calls = {"validate": 0}
+    statuses = iter([{"123": "GONE"}, {"123": "GONE"}])
+    monkeypatch.setattr(slurm_mod.time, "time", lambda: clock[0])
+    monkeypatch.setattr(settings, "MONITOR_ARTIFACT_GRACE", 60)
+    monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 1)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: next(statuses))
+
+    def validate(current):
+        calls["validate"] += 1
+        if calls["validate"] == 1:
+            current.failure_reason = "最终 MP4 尚未同步"
+            return False
+        current.output_path = current.media_dir / "Demo.mp4"
+        current.output_path.parent.mkdir(parents=True, exist_ok=True)
+        current.output_path.write_bytes(b"video")
+        current.output_metadata = valid_metadata()
+        return True
+
+    monkeypatch.setattr(dispatcher, "validate_completed_job", validate)
+    monkeypatch.setattr(slurm_mod.time, "sleep", lambda _: clock.__setitem__(0, clock[0] + 30))
+
+    assert dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1) == {"123": True}
+    assert calls["validate"] == 2
 
 
 def test_cancel_job_invalid_id_is_benign(monkeypatch):
@@ -550,6 +604,7 @@ def test_gone_with_stale_video_is_not_completed(monkeypatch, tmp_path):
     old = time.time() - 3600
     os.utime(vid, (old, old))
     monkeypatch.setattr(settings, "MONITOR_MAX_UNKNOWN", 1)
+    monkeypatch.setattr(settings, "MONITOR_ARTIFACT_GRACE", 0)
     monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": "GONE"})
     monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: True)
 
@@ -712,6 +767,25 @@ def test_preempted_back_to_pending_resets_run_timeout(monkeypatch, tmp_path):
     assert job.status == "COMPLETED"
 
 
+def test_requeued_job_starts_a_new_queue_timeout_window(monkeypatch, tmp_path):
+    """重新排队后的等待时间不应继续消耗第一次提交的排队预算。"""
+    import kd1_anime.cluster.slurm as slurm_mod
+
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path, submitted_at=1000.0)
+    clock = [1000.0]
+    statuses = iter(["RUNNING", "PENDING", "RUNNING", "COMPLETED"])
+    monkeypatch.setattr(slurm_mod.time, "time", lambda: clock[0])
+    monkeypatch.setattr(settings, "MONITOR_RUN_TIMEOUT", 50)
+    monkeypatch.setattr(settings, "MONITOR_QUEUE_TIMEOUT", 20)
+    monkeypatch.setattr(dispatcher, "poll_all_statuses", lambda ids: {"123": next(statuses)})
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda jid: pytest.fail("不应取消"))
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda current: True)
+    monkeypatch.setattr(slurm_mod.time, "sleep", lambda _: clock.__setitem__(0, clock[0] + 40))
+
+    assert dispatcher.wait_for_all_jobs({"123": job}, poll_interval=1) == {"123": True}
+
+
 def test_completed_without_final_video_is_failed(monkeypatch, tmp_path):
     dispatcher = SlurmDispatcher()
     job = make_job(tmp_path)
@@ -742,6 +816,66 @@ def test_completed_with_invalid_video_is_failed(monkeypatch, tmp_path):
     assert result == {"123": False}
     assert job.status == "FAILED"
     assert "视频验证失败" in job.failure_reason
+
+
+def test_completed_job_records_compute_environment(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    job.script_path.parent.mkdir(parents=True, exist_ok=True)
+    marker = job.script_path.parent.parent / "artifacts" / "environment_scene_1.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(
+        '{"python":"3.12.1","manim":"0.20.1","renderer":"cairo"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dispatcher, "_find_final_video", lambda current: tmp_path / "Demo.mp4")
+    (tmp_path / "Demo.mp4").write_bytes(b"video")
+    monkeypatch.setattr(
+        "kd1_anime.cluster.slurm.verify_video", lambda path, profile: valid_metadata()
+    )
+
+    assert dispatcher.validate_completed_job(job) is True
+    assert job.environment_fingerprint["manim"] == "0.20.1"
+    assert job.environment_fingerprint["renderer"] == "cairo"
+
+
+def test_monitor_coordinator_batches_scene_jobs(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    jobs = [make_job(tmp_path / f"scene_{scene_id}") for scene_id in (1, 2)]
+    jobs[1].job_id = "124"
+    calls = []
+    monkeypatch.setattr(
+        dispatcher,
+        "poll_all_statuses",
+        lambda job_ids: calls.append(list(job_ids)) or {job_id: "COMPLETED" for job_id in job_ids},
+    )
+    monkeypatch.setattr(dispatcher, "validate_completed_job", lambda job: True)
+
+    coordinator = SlurmMonitorCoordinator(dispatcher, poll_interval=1)
+    try:
+        for job in jobs:
+            coordinator.register(job)
+        assert coordinator.wait("123") is True
+        assert coordinator.wait("124") is True
+    finally:
+        coordinator.close()
+
+    assert calls == [["123", "124"]]
+
+
+def test_monitor_coordinator_cancels_queued_jobs_when_stopped(monkeypatch, tmp_path):
+    dispatcher = SlurmDispatcher()
+    job = make_job(tmp_path)
+    cancelled = []
+    monkeypatch.setattr(dispatcher, "cancel_job", lambda job_id: cancelled.append(job_id) or True)
+
+    coordinator = SlurmMonitorCoordinator(dispatcher, poll_interval=60)
+    coordinator.register(job)
+    coordinator.cancel_pending(reason="test stop")
+
+    assert coordinator.wait(job.job_id) is False
+    assert cancelled == [job.job_id]
+    coordinator.close()
 
 
 def test_completed_waits_for_delayed_artifact(monkeypatch, tmp_path):

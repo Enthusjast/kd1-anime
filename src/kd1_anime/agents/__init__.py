@@ -2,7 +2,11 @@ from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import ContinuityReviewerAgent, ContinuityReviewResult
-from kd1_anime.agents.lifecycle import LifecycleValidationResult, validate_animation_lifecycle
+from kd1_anime.agents.lifecycle import (
+    LifecycleValidationResult,
+    repair_required_export_alias_lifecycle,
+    validate_animation_lifecycle,
+)
 from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
@@ -21,6 +25,7 @@ from kd1_anime.agents.planner import (
     PlanningDraft,
     TeachingEdge,
     TeachingGraph,
+    repair_obvious_math_contradictions,
 )
 from kd1_anime.agents.prompt_context import (
     PromptBudgetError,
@@ -29,7 +34,12 @@ from kd1_anime.agents.prompt_context import (
     build_bounded_prompt,
 )
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, validate_review_evidence
-from kd1_anime.agents.state_ledger import LedgerElement, SceneBoundaryState, StateLedger
+from kd1_anime.agents.state_ledger import (
+    LedgerElement,
+    SceneBoundaryIR,
+    SceneBoundaryState,
+    StateLedger,
+)
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
     TechnicalSpec,
@@ -62,6 +72,7 @@ __all__ = [
     "PromptSection",
     "ReviewFinding",
     "ReviewerAgent",
+    "SceneBoundaryIR",
     "SceneBoundaryState",
     "StateLedger",
     "TeachingEdge",
@@ -76,6 +87,8 @@ __all__ = [
     "deterministic_plan_issues",
     "filter_verified_plan_issues",
     "normalize_technical_spec_contract",
+    "repair_obvious_math_contradictions",
+    "repair_required_export_alias_lifecycle",
     "validate_animation_lifecycle",
     "validate_manim_code",
     "validate_review_evidence",

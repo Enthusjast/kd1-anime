@@ -43,6 +43,19 @@ def test_prompt_builder_does_not_truncate_required_code():
     assert content in prompt
 
 
+def test_prompt_builder_drops_atomic_context_instead_of_breaking_structure():
+    prompt = build_bounded_prompt(
+        [
+            PromptSection("contract", "CONTRACT", required=True),
+            PromptSection("rag", '{"text":"' + "R" * 500 + '"}', atomic=True),
+        ],
+        max_chars=120,
+    )
+
+    assert "CONTRACT" in prompt
+    assert "### rag" not in prompt
+
+
 def test_prompt_builder_rejects_duplicate_or_empty_section_names():
     with pytest.raises(ValueError, match="区块名称重复"):
         build_bounded_prompt(

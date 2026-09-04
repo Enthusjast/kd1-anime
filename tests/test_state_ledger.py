@@ -1,7 +1,12 @@
 import pytest
 from pydantic import ValidationError
 
-from kd1_anime.agents.state_ledger import LedgerElement, SceneBoundaryState, StateLedger
+from kd1_anime.agents.state_ledger import (
+    LedgerElement,
+    SceneBoundaryIR,
+    SceneBoundaryState,
+    StateLedger,
+)
 
 
 def ledger_element(element_id: str = "formula") -> LedgerElement:
@@ -26,6 +31,24 @@ def test_state_ledger_updates_boundary_and_keeps_digest_stable():
     assert ledger.boundaries[1].closing_element_ids == ["formula"]
     assert len(ledger.digest()) == 64
     assert ledger.for_elements({"formula"})[0].variable_name == "formula"
+
+
+def test_state_ledger_uses_boundary_ir_for_transition_contract():
+    ledger = StateLedger().update_scene(
+        scene_id=1,
+        elements=[ledger_element()],
+        opening_element_ids=[],
+        closing_element_ids=["formula"],
+        removed_element_ids=["old_formula"],
+        transition_in="从左侧接入",
+        transition_out="保留在中心",
+        visual_state_digest="a" * 64,
+    )
+
+    boundary = ledger.boundaries[1]
+    assert isinstance(boundary, SceneBoundaryIR)
+    assert boundary.removed_element_ids == ["old_formula"]
+    assert boundary.transition_out == "保留在中心"
 
 
 def test_state_ledger_rejects_boundary_reference_to_unknown_element():
