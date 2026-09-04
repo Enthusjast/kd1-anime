@@ -42,6 +42,7 @@ from kd1_anime.agents.continuity import (
     normalize_scene_plan_contract,
     strip_redundant_optional_export_block,
 )
+from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
     repair_required_export_alias_lifecycle,
@@ -72,7 +73,7 @@ from kd1_anime.agents.planner import (
     repair_obvious_math_contradictions,
 )
 from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
-from kd1_anime.agents.render_error_parser import extract_render_error
+from kd1_anime.agents.render_error_parser import RenderErrorEvidence, extract_render_error
 from kd1_anime.agents.review_policy import review_budget
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
 from kd1_anime.agents.risk import assess_scene_risk
@@ -442,6 +443,7 @@ class Orchestrator:
         self.rag = RagService(
             rag_semaphore=(resource_coordinator.rag if resource_coordinator is not None else None)
         )
+        self.failure_cases = FailureCaseStore()
 
     @staticmethod
     def _configured_visual_profile(*, enabled: bool | None = None) -> VisualEvalProfile:
@@ -6920,6 +6922,40 @@ class Orchestrator:
             )
         self._stop_event.set()
 
+    def _record_failure_case(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+        evidence: RenderErrorEvidence,
+        *,
+        original_code_sha256: str,
+        fixed_code_sha256: str,
+        verification: str,
+        patch_summary: str = "",
+    ) -> None:
+        """把一次可复用修复摘要写入本地案例库。"""
+
+        recorded = self.failure_cases.record(
+            FailureCase(
+                category=evidence.category,
+                fingerprint=evidence.fingerprint,
+                error_type=evidence.error_type,
+                message=evidence.message,
+                original_code_sha256=original_code_sha256,
+                fixed_code_sha256=fixed_code_sha256,
+                verification=verification,
+                renderer=ctx.render_profile.renderer,
+                patch_summary=patch_summary,
+                source_run_id=ctx.paths.run_id,
+            )
+        )
+        self._emit(
+            "failure_case_recorded" if recorded else "failure_case_skipped",
+            scene_id=state.plan.scene_id,
+            category=evidence.category,
+            fingerprint=evidence.fingerprint,
+        )
+
     def _scene_fix(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         self._phase_emit("fixing")
         job = state.slurm_job
@@ -6945,6 +6981,7 @@ class Orchestrator:
             renderer=ctx.render_profile.renderer,
             secrets=(settings.LLM_API_KEY, settings.VISUAL_LLM_API_KEY),
         )
+        original_code_sha256 = sha256_text(state.code)
         self._write_stage_artifact(
             ctx,
             f"render_error_scene_{scene_id}_{max(1, state.fix_attempts + 1)}.json",
@@ -6994,6 +7031,15 @@ class Orchestrator:
                 fixes=deterministic_patches,
             )
             if self._apply_precise_review_fixes(ctx, scene_id, state, patch_result):
+                self._record_failure_case(
+                    ctx,
+                    state,
+                    error_evidence,
+                    original_code_sha256=original_code_sha256,
+                    fixed_code_sha256=sha256_text(state.code),
+                    verification="validated",
+                    patch_summary="；".join(item.reason for item in deterministic_patches),
+                )
                 # 当前失败 Job 已经结束；补丁产生新代码后必须清除旧
                 # Job，避免渲染循环再次轮询同一个已结束作业。
                 with self._state_lock:
@@ -7078,6 +7124,15 @@ class Orchestrator:
                 fallback = self._stagnation_fallback_candidate(ctx, state)
                 if fallback is not None:
                     candidate, class_name = fallback
+                    self._record_failure_case(
+                        ctx,
+                        state,
+                        error_evidence,
+                        original_code_sha256=original_code_sha256,
+                        fixed_code_sha256=sha256_text(candidate),
+                        verification="validated",
+                        patch_summary="修复停滞后使用 Scene IR/安全模板",
+                    )
                     code_changed = self._install_repair_candidate(
                         ctx,
                         scene_id,
@@ -7132,6 +7187,10 @@ class Orchestrator:
             if state.inherited_elements_code
             else "",
         )
+        failure_case_context = self.failure_cases.context(
+            category=error_evidence.category,
+            limit=3,
+        )
         self._emit(
             "scene_fixing",
             scene_id=scene_id,
@@ -7152,6 +7211,8 @@ class Orchestrator:
                 fix_kwargs["teaching_graph"] = ctx.teaching_graph
             if self._supports_keyword(fixer.fix, "error_evidence"):
                 fix_kwargs["error_evidence"] = error_evidence
+            if self._supports_keyword(fixer.fix, "failure_case_context"):
+                fix_kwargs["failure_case_context"] = failure_case_context
             candidate = fixer.fix(state.code, error_log, **fix_kwargs)
             validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
             continuity_error = ""
@@ -7208,6 +7269,15 @@ class Orchestrator:
                 )
             else:
                 class_name = validation.scene_classes[0]
+        self._record_failure_case(
+            ctx,
+            state,
+            error_evidence,
+            original_code_sha256=original_code_sha256,
+            fixed_code_sha256=sha256_text(candidate),
+            verification="validated",
+            patch_summary="AutoFix 候选通过确定性校验",
+        )
         code_changed = self._install_repair_candidate(
             ctx,
             scene_id,

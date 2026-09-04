@@ -265,6 +265,7 @@ class AutoFixerAgent(BaseAgent):
         lesson_spec: LessonSpec | None = None,
         teaching_graph: TeachingGraph | None = None,
         error_evidence: RenderErrorEvidence | None = None,
+        failure_case_context: str = "",
     ) -> str:
         """
         根据错误日志修复代码
@@ -315,6 +316,16 @@ class AutoFixerAgent(BaseAgent):
                     required=True,
                     priority=116,
                     max_chars=8_000,
+                )
+            )
+        if failure_case_context:
+            sections.append(
+                PromptSection(
+                    "历史脱敏修复案例",
+                    failure_case_context,
+                    priority=20,
+                    max_chars=12_000,
+                    atomic=True,
                 )
             )
         if technical_spec is not None:

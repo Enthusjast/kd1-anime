@@ -10,6 +10,7 @@ from kd1_anime.agents.capability import (
 )
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import ContinuityReviewerAgent, ContinuityReviewResult
+from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import FailureRoute, classify_failure
 from kd1_anime.agents.lifecycle import (
     LifecycleValidationResult,
@@ -84,6 +85,8 @@ __all__ = [
     "ContinuityBible",
     "ContinuityReviewResult",
     "ContinuityReviewerAgent",
+    "FailureCase",
+    "FailureCaseStore",
     "FailureRoute",
     "LearningObjective",
     "LedgerElement",

@@ -67,6 +67,8 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_CACHE_ENABLED | true | 是否启用完整非流式响应缓存 |
 | LLM_CACHE_PATH | ~/.kd1-anime/cache/llm.sqlite3 | 缓存数据库路径 |
 | LLM_CACHE_MAX_ENTRIES | 512 | 最大缓存条目数；0 等同关闭写入 |
+| FAILURE_CASES_PATH | ~/.kd1-anime/diagnostics/failure_cases.sqlite3 | 脱敏失败案例库路径 |
+| FAILURE_CASE_MAX_PER_CATEGORY | 100 | 每类失败案例最大保存数 |
 | LLM_MAX_CONTEXT_CHARS | 120000 | Agent 输入总字符预算 |
 | LLM_MAX_CODE_CONTEXT_CHARS | 60000 | 代码、继承定义和修复上下文预算 |
 | LLM_MAX_REVIEW_CONTEXT_CHARS | 90000 | Reviewer 输入预算 |

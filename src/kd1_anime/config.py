@@ -311,6 +311,8 @@ class Settings(BaseSettings):
     )
     LLM_CACHE_PATH: Path = APP_HOME / "cache" / "llm.sqlite3"
     LLM_CACHE_MAX_ENTRIES: int = Field(default=512, ge=0, le=100_000)
+    FAILURE_CASES_PATH: Path = APP_HOME / "diagnostics" / "failure_cases.sqlite3"
+    FAILURE_CASE_MAX_PER_CATEGORY: int = Field(default=100, ge=1, le=1_000)
     # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
     # 裁剪，低优先级的 RAG/自然语言说明会优先让出空间。
     LLM_MAX_CONTEXT_CHARS: int = Field(default=120_000, ge=10_000, le=2_000_000)
