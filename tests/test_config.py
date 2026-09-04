@@ -28,6 +28,19 @@ def test_llm_config_accepts_generic_openai_compatible_provider():
     config.require_llm_key()
 
 
+def test_llm_base_url_is_normalized_and_rejects_unsafe_or_invalid_urls():
+    config = Settings(_env_file=None, LLM_BASE_URL="https://example.invalid/v1/")
+    assert config.LLM_BASE_URL == "https://example.invalid/v1"
+
+    for value in (
+        "example.invalid/v1",
+        "ftp://example.invalid/v1",
+        "https://example.invalid/v1\nX-Injected: yes",
+    ):
+        with pytest.raises(ValueError, match="LLM_BASE_URL"):
+            Settings(_env_file=None, LLM_BASE_URL=value)
+
+
 def test_slurm_identifier_rejects_newline_injection():
     with pytest.raises(ValueError, match="SLURM_PARTITION"):
         Settings(
@@ -98,6 +111,7 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_TIMEOUT_CONNECT == 30.0
     assert config.LLM_TIMEOUT_READ == 600.0
     assert config.LLM_SILENT_STREAM is True
+    assert config.LLM_HEALTHCHECK_TIMEOUT == 15.0
     assert config.LLM_MAX_TOKENS == 32768
     assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
 
@@ -105,6 +119,8 @@ def test_llm_timeout_and_silent_stream_defaults():
 def test_llm_timeout_and_silent_stream_validation():
     with pytest.raises(ValueError):
         Settings(_env_file=None, LLM_TIMEOUT_READ=5.0)  # 低于下限 10s
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, LLM_HEALTHCHECK_TIMEOUT=0.5)
     with pytest.raises(ValueError):
         Settings(_env_file=None, LLM_EMPTY_RETRY_MAX_TOKENS=100)  # 低于下限
 
@@ -125,3 +141,40 @@ def test_max_fix_identical_errors_default():
     assert config.MAX_FIX_IDENTICAL_ERRORS == 3
     with pytest.raises(ValueError):
         Settings(_env_file=None, MAX_FIX_IDENTICAL_ERRORS=0)
+
+
+def test_visual_llm_profile_is_independent_from_main_endpoint():
+    config = Settings(
+        _env_file=None,
+        LLM_API_KEY="main-key",
+        LLM_BASE_URL="https://main.invalid/v1",
+        LLM_MODEL="main-model",
+    )
+
+    profile = config.visual_llm_profile()
+
+    assert profile.api_key == ""
+    assert profile.base_url == ""
+    assert profile.model == ""
+    with pytest.raises(ValueError, match="VISUAL_LLM_API_KEY"):
+        config.require_visual_llm()
+
+
+def test_visual_llm_profile_uses_only_visual_endpoint_and_model_override():
+    config = Settings(
+        _env_file=None,
+        LLM_API_KEY="main-key",
+        LLM_BASE_URL="https://main.invalid/v1",
+        LLM_MODEL="main-model",
+        VISUAL_LLM_API_KEY="visual-key",
+        VISUAL_LLM_BASE_URL="https://visual.invalid/v1/",
+        VISUAL_LLM_MODEL="visual-default",
+    )
+
+    profile = config.visual_llm_profile(model_override="visual-override")
+
+    profile.require()
+    assert profile.api_key == "visual-key"
+    assert profile.base_url == "https://visual.invalid/v1"
+    assert profile.model == "visual-override"
+    assert profile.debug is False

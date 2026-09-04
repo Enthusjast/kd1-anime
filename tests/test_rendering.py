@@ -46,7 +46,8 @@ def test_probe_video_parses_fractional_frame_rate(monkeypatch, tmp_path):
             returncode=0,
             stdout=(
                 '{"streams":[{"width":1920,"height":1080,'
-                '"avg_frame_rate":"30000/1001"}],"format":{"duration":"2.5"}}'
+                '"avg_frame_rate":"30000/1001","codec_type":"video"},'
+                '{"codec_type":"audio"}],"format":{"duration":"2.5"}}'
             ),
             stderr="",
         ),
@@ -58,6 +59,7 @@ def test_probe_video_parses_fractional_frame_rate(monkeypatch, tmp_path):
     assert metadata.height == 1080
     assert metadata.duration_seconds == 2.5
     assert metadata.frame_rate == pytest.approx(29.97003)
+    assert metadata.has_audio is True
 
 
 def test_probe_video_converts_timeout_to_runtime_error(monkeypatch, tmp_path):

@@ -7,7 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 import kd1_anime.run_store as store_module
-from kd1_anime.agents.planner import ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, ScenePlan
 from kd1_anime.cli import app
 from kd1_anime.config import settings
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
@@ -76,6 +76,37 @@ def test_checkpoint_round_trip_rejects_tampered_code(tmp_path):
     code_path.write_text(code + "# changed\n", encoding="utf-8")
     with pytest.raises(ValueError, match="哈希"):
         orchestrator._context_from_manifest(manifest, paths.root)
+
+
+def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
+    workspace = tmp_path / "workspace"
+    paths = make_paths(workspace)
+    paths.scenes.mkdir(parents=True)
+    bible = ContinuityBible(
+        background="#101010",
+        palette=["蓝色=输入"],
+        persistent_elements=["公式"],
+        transition_rules=["保留公式"],
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=paths,
+        continuity_bible=bible,
+        continuity_review_status="pending",
+        continuity_review_round=1,
+        continuity_warnings=["warning"],
+        scene_states={1: SceneState(plan=make_plan())},
+    )
+    orchestrator = Orchestrator()
+
+    orchestrator._checkpoint(ctx, State.DETAILING)
+
+    manifest = RunRepository(workspace).load(RUN_ID)
+    restored = orchestrator._context_from_manifest(manifest, paths.root)
+    assert restored.continuity_bible == bible
+    assert restored.continuity_review_status == "pending"
+    assert restored.continuity_review_round == 1
+    assert restored.continuity_warnings == ["warning"]
 
 
 def test_resume_completed_run_rejects_tampered_final_video(monkeypatch, tmp_path):
@@ -341,7 +372,7 @@ def test_v1_reused_job_is_migrated_to_safe_rerender(tmp_path):
     manifest = RunRepository(workspace).load(RUN_ID)
     scene = manifest.scenes[1]
 
-    assert manifest.schema_version == 2
+    assert manifest.schema_version == 3
     assert scene.plan_ready is True
     assert scene.rendered is False
     assert scene.slurm_job is None

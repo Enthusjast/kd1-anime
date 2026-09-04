@@ -6,8 +6,19 @@ import threading
 
 
 class ResourceCoordinator:
-    def __init__(self, *, llm_limit: int, slurm_limit: int) -> None:
+    def __init__(
+        self,
+        *,
+        llm_limit: int,
+        slurm_limit: int,
+        visual_llm_limit: int | None = None,
+    ) -> None:
         self.llm = threading.Semaphore(max(1, llm_limit))
+        # 视觉模型使用独立端点和并发池。批处理中的多个 Orchestrator 共享
+        # 此信号量，避免每个任务各自达到上限后把视觉服务瞬间打满。
+        if visual_llm_limit is None:
+            visual_llm_limit = llm_limit
+        self.visual_llm = threading.Semaphore(max(1, visual_llm_limit))
         self._slurm_limit = max(0, slurm_limit)
         self._slurm_active = 0
         self._slurm_lock = threading.Lock()

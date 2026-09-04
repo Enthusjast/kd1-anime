@@ -39,13 +39,14 @@ Settings are defined in `src/kd1_anime/config.py` and loaded in this order:
 process environment > ./.env > ~/.config/kd1-anime/.env
 ```
 
-Never commit `.env` or print API keys. The API is provider-neutral: `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` must work with any OpenAI-compatible endpoint.
+Never commit `.env` or print API keys. The API is provider-neutral: `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` must work with any OpenAI-compatible endpoint. Visual evaluation uses the separate `VISUAL_LLM_*` profile and must never silently inherit the main endpoint.
 
 ## Pipeline
 
 ```text
 INIT → PLANNING → DETAILING → CODING → REVIEWING
-     → DISPATCHING → MONITORING → (FIXING → REVIEWING) → MERGING → DONE
+     → DISPATCHING → MONITORING → (FIXING → REVIEWING)
+     → VISUAL_EVALUATING → MERGING → EVALUATING → DONE
 ```
 
 Key invariants:
@@ -67,6 +68,8 @@ Key invariants:
 15. FFmpeg writes to a temporary file and atomically replaces the final output only after success.
 16. Every FSM transition and successful Slurm submission must be checkpointed atomically in `manifest.json`.
 17. Resume must verify generated-code hashes and hold the per-run lock before reusing any Slurm Job ID.
+18. Visual reports and repair candidates must be bound to exact code, inherited-context, frame, and video hashes.
+19. A visual endpoint failure is `unknown`, never a fabricated low score or a reason to delete a valid render.
 
 ## Module map
 
@@ -82,8 +85,9 @@ Key invariants:
 - `src/kd1_anime/agents/reviewer.py`: closed structured review contract and checklist.
 - `src/kd1_anime/agents/validator.py`: deterministic AST and Scene-structure checks.
 - `src/kd1_anime/agents/auto_fixer.py`: render-log-driven repair.
+- `src/kd1_anime/eval/`: deterministic metrics, keyframe sampling, and independent multimodal visual evaluation.
 - `src/kd1_anime/cluster/slurm.py`: sbatch script generation, submission, batch polling, cancellation.
-- `src/kd1_anime/media/merger.py`: exact video discovery and FFmpeg concat/re-encode fallback.
+- `src/kd1_anime/media/merger.py`: exact inputs and FFmpeg xfade/acrossfade atomic merge.
 - `install.sh`: no-sudo Ubuntu/HPC environment installer.
 - `tests/`: deterministic tests with LLM/Slurm/FFmpeg behavior mocked or isolated.
 

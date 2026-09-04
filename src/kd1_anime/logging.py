@@ -38,7 +38,9 @@ def setup_logging(
 
     # 清除现有 handlers
     root = logging.getLogger()
-    root.handlers.clear()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+        handler.close()
 
     # Rich handler 用于控制台输出
     rich_handler = RichHandler(

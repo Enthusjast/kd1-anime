@@ -17,6 +17,7 @@ class EvalMetric(str, Enum):
     CODE_SECURITY = "code_security"
     CODE_COMPLEXITY = "code_complexity"
     CODE_STYLE = "code_style"
+    VISUAL_MATH_ACCURACY = "visual_math_accuracy"
     VISUAL_RELEVANCE = "visual_relevance"
     VISUAL_QUALITY = "visual_quality"
     VISUAL_CONSISTENCY = "visual_consistency"

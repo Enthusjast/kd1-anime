@@ -76,6 +76,7 @@ def suppress_agent_logs() -> bool:
 
 
 STAGES = ("分镜", "编码", "审查", "渲染")
+VISUAL_STAGE = "视觉"
 
 
 @dataclass
@@ -95,11 +96,11 @@ class SceneStatus:
         if stage_name not in self.done:
             self.done.append(stage_name)
 
-    def invalidate_from(self, stage_name: str) -> None:
+    def invalidate_from(self, stage_name: str, stages: tuple[str, ...] = STAGES) -> None:
         """重做某阶段时清除该阶段及所有下游的完成标记。"""
 
-        start = STAGES.index(stage_name)
-        self.done = [name for name in self.done if STAGES.index(name) < start]
+        start = stages.index(stage_name)
+        self.done = [name for name in self.done if name in stages and stages.index(name) < start]
 
     @property
     def icon(self) -> str:
@@ -108,6 +109,7 @@ class SceneStatus:
             "pending": "⏳",
             "running": "⟳",
             "completed": "✓",
+            "warning": "⚠",
             "failed": "✗",
             "skipped": "–",
         }.get(self.state, "?")
@@ -118,23 +120,24 @@ class SceneStatus:
             "pending": "dim",
             "running": "cyan",
             "completed": "green",
+            "warning": "yellow",
             "failed": "red",
             "skipped": "dim",
         }.get(self.state, "white")
 
-    def render_row(self) -> list[Text]:
+    def render_row(self, stages: tuple[str, ...] = STAGES) -> list[Text]:
         """生成表格行: 状态图标 + 标题 + 阶段流水线 + 最近事件。"""
         icon = Text(f"  {self.icon}", style=self.color)
         title = Text(self.title, style=self.color)
         pipeline = Text()
-        for idx, name in enumerate(STAGES):
+        for idx, name in enumerate(stages):
             if name in self.done:
                 pipeline.append(f"{name}✓", style="green")
-            elif name == self.stage:
+            elif name == self.stage and self.state == "running":
                 pipeline.append(f"{name}⟳", style="cyan")
             else:
                 pipeline.append(f"{name}·", style="dim")
-            if idx < len(STAGES) - 1:
+            if idx < len(stages) - 1:
                 pipeline.append("  ")
         if self.stage == "修复":
             pipeline.append("  ", style="dim")
@@ -157,6 +160,7 @@ class SceneDashboard:
         self.started_at: float = 0.0
         self.scenes: dict[int, SceneStatus] = {}
         self.total: int = 0
+        self.visual_enabled: bool = False
         self._event_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -215,6 +219,10 @@ class SceneDashboard:
         status.message = message
         status.started_at = time.time()
 
+    @property
+    def stages(self) -> tuple[str, ...]:
+        return (*STAGES, VISUAL_STAGE) if self.visual_enabled else STAGES
+
     def _apply_event(self, event: str, data: dict) -> None:
         scene_id = data.get("scene_id")
         if scene_id is not None:
@@ -226,12 +234,14 @@ class SceneDashboard:
             self.stage = data.get("stage", "")
             self.stage_label = {
                 "planning": "场景概要",
+                "continuity": "全片连续性",
                 "detailing": "导演分镜",
                 "coding": "代码生成",
                 "reviewing": "代码审查",
                 "dispatching": "提交渲染",
                 "monitoring": "监控渲染",
                 "fixing": "自动修复",
+                "visual_evaluating": "视觉评估",
                 "merging": "视频拼接",
                 "evaluating": "质量评估",
             }.get(self.stage, self.stage)
@@ -241,8 +251,41 @@ class SceneDashboard:
             if not self.started_at:
                 self.started_at = time.time()
 
+        elif event in ("continuity_bible_start", "continuity_reviewing"):
+            self.stage = "continuity"
+            self.stage_label = "全片连续性"
+            if event == "continuity_reviewing":
+                for scene in self.scenes.values():
+                    if scene.state == "running":
+                        scene.message = "连续性审查中"
+
+        elif event == "continuity_fixing":
+            self.stage = "continuity"
+            self.stage_label = "连续性修正"
+            affected = {int(scene_id) for scene_id in data.get("scene_ids", [])}
+            for scene_id in affected:
+                status = self.scenes.get(scene_id)
+                if status:
+                    self._mark_running(status, "", "连续性修正中")
+
+        elif event == "continuity_pass":
+            self.stage = "continuity"
+            self.stage_label = "连续性通过"
+            for scene in self.scenes.values():
+                if scene.state == "running" and not scene.stage:
+                    scene.message = "连续性通过"
+
+        elif event == "continuity_warning":
+            self.stage = "continuity"
+            self.stage_label = "连续性提示"
+            reason = (data.get("reason", "") or "").strip()
+            for scene in self.scenes.values():
+                if scene.state == "running" and not scene.stage:
+                    scene.message = reason[:40] or "连续性存在提示"
+
         elif event == "plan_complete":
             scenes = data.get("scenes", [])
+            self.visual_enabled = bool(data.get("visual_enabled", False))
             self.total = len(scenes)
             if not self.started_at:
                 self.started_at = time.time()
@@ -261,23 +304,23 @@ class SceneDashboard:
         ):
             if status:
                 if event == "scene_detailing":
-                    status.invalidate_from("分镜")
+                    status.invalidate_from("分镜", self.stages)
                     status.title = status.title or data.get("title", "")
                     self._mark_running(status, "分镜", "生成分镜中")
                 elif event == "scene_coding":
-                    status.invalidate_from("编码")
+                    status.invalidate_from("编码", self.stages)
                     self._mark_running(status, "编码", "生成代码中")
                 elif event == "scene_rewriting":
-                    status.invalidate_from("编码")
+                    status.invalidate_from("编码", self.stages)
                     self._mark_running(status, "编码", "修正代码中")
                 elif event == "scene_reviewing":
-                    status.invalidate_from("审查")
+                    status.invalidate_from("审查", self.stages)
                     self._mark_running(status, "审查", "代码审查中")
                 elif event == "scene_fixing":
-                    status.invalidate_from("审查")
+                    status.invalidate_from("审查", self.stages)
                     self._mark_running(status, "修复", f"自动修复 #{data.get('attempt', 0)}")
                 elif event == "scene_retrying":
-                    status.invalidate_from("渲染")
+                    status.invalidate_from("渲染", self.stages)
                     self._mark_running(status, "渲染", "基础设施故障，重新排队")
 
         elif event in ("scene_detailed", "scene_coded"):
@@ -310,29 +353,90 @@ class SceneDashboard:
                 self._mark_running(status, "渲染", f"Job {data.get('job_id', '?')}")
 
         elif event in ("scene_rendered", "scene_reused"):
-            # 只有渲染完成 (或复用旧视频) 才算整个场景完成, 显示为绿色
             if status:
-                status.state = "completed"
-                status.stage = "渲染"
+                # 启用视觉门时，渲染完成只是中间态；只有视觉评估已接受
+                # 当前产物后才把整行标为终态。
+                status.state = "running" if self.visual_enabled else "completed"
+                status.stage = "" if self.visual_enabled else "渲染"
                 status.started_at = 0.0
                 status.mark_done("渲染")
-                status.message = "渲染完成" if event == "scene_rendered" else "复用旧视频"
+                base_message = "渲染完成" if event == "scene_rendered" else "复用旧视频"
+                status.message = (
+                    f"{base_message}，等待视觉评估" if self.visual_enabled else base_message
+                )
+
+        elif event == "scene_visual_evaluating":
+            if status:
+                status.invalidate_from(VISUAL_STAGE, self.stages)
+                self._mark_running(status, VISUAL_STAGE, "关键帧视觉评估中")
+
+        elif event == "scene_visual_pass":
+            if status:
+                status.mark_done(VISUAL_STAGE)
+                status.state = "completed"
+                status.stage = VISUAL_STAGE
+                status.started_at = 0.0
+                score = data.get("score")
+                status.message = (
+                    f"视觉评估通过 · {score:.2f}/5"
+                    if isinstance(score, (int, float))
+                    else "视觉评估通过"
+                )
+
+        elif event in ("scene_visual_warning", "scene_visual_unknown"):
+            if status:
+                status.mark_done(VISUAL_STAGE)
+                status.state = "warning"
+                status.stage = VISUAL_STAGE
+                status.started_at = 0.0
+                if event == "scene_visual_unknown":
+                    status.message = "视觉评估不可用，已按未知继续"
+                else:
+                    score = data.get("score")
+                    status.message = (
+                        f"视觉问题已记录 · {score:.2f}/5"
+                        if isinstance(score, (int, float))
+                        else "视觉问题已记录"
+                    )
+
+        elif event == "scene_visual_fixing":
+            if status:
+                status.invalidate_from("编码", self.stages)
+                self._mark_running(
+                    status,
+                    VISUAL_STAGE,
+                    f"安排视觉修复 #{data.get('attempt', 0)}",
+                )
 
         elif event == "scene_failed":
             if status:
                 status.state = "failed"
+                # 失败是终态，不应继续把失败前的阶段渲染成“运行中”。
+                status.stage = ""
                 status.started_at = 0.0
                 status.message = (data.get("reason", "") or "")[:40]
 
         elif event == "scene_give_up":
             if status:
                 status.state = "failed"
+                status.stage = ""
                 status.started_at = 0.0
                 status.message = "已放弃"
 
         elif event == "merge_complete":
             self.stage = "merging"
             self.stage_label = "视频拼接"
+
+        elif event == "final_visual_complete":
+            self.stage = "visual_evaluating"
+            score = data.get("score")
+            self.stage_label = (
+                f"成片视觉报告 {score:.2f}/5" if isinstance(score, (int, float)) else "成片视觉报告"
+            )
+
+        elif event == "final_visual_unknown":
+            self.stage = "visual_evaluating"
+            self.stage_label = "成片视觉报告不可用"
 
         elif event == "dry_run_complete":
             self.stage = "dry-run"
@@ -352,8 +456,9 @@ class SceneDashboard:
 
     def _render(self) -> Panel:
         total = self.total
-        completed = sum(1 for s in self.scenes.values() if s.state == "completed")
+        completed = sum(1 for s in self.scenes.values() if s.state in {"completed", "warning"})
         failed = sum(1 for s in self.scenes.values() if s.state == "failed")
+        warnings = sum(1 for s in self.scenes.values() if s.state == "warning")
 
         header = Text()
         header.append(f"  {self.stage_label or '流水线'}  ", style="bold white")
@@ -366,12 +471,14 @@ class SceneDashboard:
         if total:
             header.append(
                 f"完成 {completed}/{total}",
-                style="green" if completed == total else "yellow",
+                style="green" if completed == total and not warnings else "yellow",
             )
         elif completed:
             header.append(f"完成 {completed}", style="yellow")
         if failed:
             header.append(f"  失败 {failed}", style="red")
+        if warnings:
+            header.append(f"  提示 {warnings}", style="yellow")
         if self.started_at:
             header.append(f"  用时 {int(time.time() - self.started_at)}s", style="dim")
 
@@ -391,7 +498,7 @@ class SceneDashboard:
             table.add_row(Text("  …", style="dim"), Text("等待场景规划…", style="dim"), "", "")
         else:
             for sid in sorted(self.scenes):
-                icon, title, stage_txt, msg = self.scenes[sid].render_row()
+                icon, title, stage_txt, msg = self.scenes[sid].render_row(self.stages)
                 table.add_row(icon, title, stage_txt, msg)
 
         title = "[bold cyan]kd1-anime[/]"

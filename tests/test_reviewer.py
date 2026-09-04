@@ -13,6 +13,9 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "E 类问题一律不阻塞" in REVIEWER_SYSTEM_PROMPT
     assert "fixes 必须可匹配" in REVIEWER_SYSTEM_PROMPT
     assert "相对定位" in REVIEWER_SYSTEM_PROMPT
+    assert "KD1_CONTINUITY_EXPORT_BEGIN" in REVIEWER_SYSTEM_PROMPT
+    assert "elements_to_remove" in REVIEWER_SYSTEM_PROMPT
+    assert "GlobalVisualState" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_severity_is_closed_enum():
@@ -54,7 +57,7 @@ def test_invalid_none_severity_still_requires_major_feedback():
 
 
 def test_reviewer_receives_complete_scene_plan(monkeypatch):
-    from kd1_anime.agents.planner import ScenePlan
+    from kd1_anime.agents.planner import ContinuityBible, ScenePlan
     from kd1_anime.agents.reviewer import ReviewerAgent
 
     scene_plan = ScenePlan(
@@ -80,9 +83,11 @@ def test_reviewer_receives_complete_scene_plan(monkeypatch):
     reviewer.review(
         "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()",
         scene_plan,
+        continuity_bible=ContinuityBible(background="#101010"),
     )
 
     message = captured["user_message"]
     assert "展示投影" in message
     assert "a dot b" in message
     assert "<scene_plan>" in message
+    assert "<continuity_bible>" in message
