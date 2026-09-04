@@ -62,6 +62,7 @@ from kd1_anime.agents.state_ledger import (
     SceneBoundaryIR,
     SceneBoundaryState,
     StateLedger,
+    validate_boundary_handoff,
 )
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
@@ -131,6 +132,7 @@ __all__ = [
     "repair_required_export_alias_lifecycle",
     "review_budget",
     "validate_animation_lifecycle",
+    "validate_boundary_handoff",
     "validate_capability_contract",
     "validate_manim_code",
     "validate_review_evidence",

@@ -87,7 +87,11 @@ from kd1_anime.agents.scene_ir import (
     compile_scene_program,
 )
 from kd1_anime.agents.scene_templates import build_safe_scene_code
-from kd1_anime.agents.state_ledger import LedgerElement, StateLedger
+from kd1_anime.agents.state_ledger import (
+    LedgerElement,
+    StateLedger,
+    validate_boundary_handoff,
+)
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
     TechnicalSpec,
@@ -5919,7 +5923,8 @@ class Orchestrator:
         # update_scene 会按 element_id 覆盖当前场景重新导出的快照；历史
         # 元素则保留为 inactive tombstone，供旧边界和恢复诊断引用。
         ctx.state_ledger = ctx.state_ledger.model_copy(update={"elements": current_elements})
-        ctx.state_ledger = ctx.state_ledger.update_scene(
+        previous_boundary = ctx.state_ledger.boundaries.get(state.plan.scene_id - 1)
+        next_ledger = ctx.state_ledger.update_scene(
             scene_id=state.plan.scene_id,
             elements=ledger_elements,
             opening_element_ids=[item.element_id for item in state.plan.inherited_elements],
@@ -5935,6 +5940,13 @@ class Orchestrator:
             else "",
             artifact_video_sha256=(state.artifact.video_sha256 if state.artifact else ""),
         )
+        boundary_errors = validate_boundary_handoff(
+            previous_boundary,
+            next_ledger.boundaries[state.plan.scene_id],
+        )
+        if boundary_errors:
+            raise ValueError("场景边界状态合同无效：" + "；".join(boundary_errors))
+        ctx.state_ledger = next_ledger
         self._write_stage_artifact(
             ctx,
             "state_ledger.json",
