@@ -1,42 +1,62 @@
 # kd1-anime
 
-`kd1-anime` 是一个 AI Agent 驱动的 Manim Community Edition 数学动画生成器。用户用自然语言描述目标，程序会澄清需求、规划场景、生成并审查代码、提交 Slurm 并行渲染、自动修复失败场景，并用 FFmpeg 合并最终视频。
+`kd1-anime` 是一个面向数学教学的 Manim Community Edition 代码生成与渲染流水线。它把自然语言需求转换为分镜和 Manim Scene，先检查数学与可实现性，再生成、审查、渲染、修复并合并视频。
 
-## 主要特性
+项目使用显式有限状态机、Pydantic 数据模型和 OpenAI-compatible API，不依赖 LangChain、AutoGen 或 LangGraph。当前 Python 包版本为 `0.4.0`，默认锁定 Manim Community Edition `0.20.1`。
 
-- **对话式终端交互**：先追问受众、时长、内容重点和视觉风格，再开始生成。
-- **分层规划与计划审查**：先生成全片概要，再为每个场景生成详细导演分镜，并在写代码前审查数学正确性与可实现性。
-- **全片教学合同**：概要阶段同时固定 LessonSpec、数学断言依赖图和最小视觉单元；后续分镜、技术计划与代码只能实现已声明的断言。
-- **确定性计划编译**：对场景编号、时间线覆盖、可解析等式、多边形面积、画布边界和元素生命周期先做本地检查，再调用计划审查模型。
-- **最小场景粒度**：同一画布中的逐步绘制、叠加和对比默认合并为一个场景，避免按函数或清单条目机械拆分。
-- **全片视觉状态**：Planner 固定全局颜色、字体、字号、线宽与布局，并为每个场景声明继承、移除和新增元素。
-- **代码级场景交接**：计划审查通过后才进入编码；编码/代码审查按顺序执行，上一场景的最终 Mobject 定义会安全注入下一场景。
-- **最小连续性清单**：运行中维护带元素身份、变量名、依赖、语义状态、源代码和哈希的 ElementManifest，只把当前场景需要的交接定义注入 Coder。
-- **状态账本**：额外记录每个场景的开场/收场元素、数学状态、代码哈希、视频哈希和相邻边界帧，恢复与视觉审查都绑定到同一份状态证据。
-- **技术实现合同**：每个新场景在 Coder 前先生成结构化 TechnicalSpec，明确对象、生命周期、动画源/目标、布局、LaTeX 和最终导出清单；确定性编译失败会阻断编码。
-- **生命周期校验**：不执行生成代码即可用 AST 检查 Create/FadeOut/Transform、`self.add/remove/clear`、OpenGL 相机 API 和最终交接对象，修复后仍必须复审。
-- **多 Agent 流水线**：Planner → 计划审查 → Technical Planner → Coder → 代码审查 → AutoFixer，不依赖 LangChain 等重型框架。
-- **分阶段并行**：场景分镜并行生成；计划审查和代码交接按场景顺序执行；所有已通过代码审查的场景仍可并行提交 Slurm 渲染。
-- **确定性安全校验**：在 LLM 审查之外，使用 Python AST 检查语法、Scene 结构、导入和危险调用。
-- **运行隔离**：每次运行写入 `~/.kd1-anime/workspace/runs/<run-id>/` 下的独立目录，避免并发运行和旧产物互相污染。
-- **可验证产物**：每个 MP4 都绑定代码哈希、渲染配置哈希、视频哈希和 ffprobe 元数据，避免把旧文件误判为本次结果。
-- **中断恢复**：版本化、原子 `manifest.json` 保存阶段、代码哈希、Slurm Job ID 和产物凭据，可查询并恢复中断运行。
-- **可选容器隔离**：可用 Apptainer 执行 LLM 生成的 Manim 代码。
-- **可恢复渲染**：监控 Slurm 状态、区分排队/运行超时、失败后读取日志并自动修复。
-- **Smoke Render**：正式 Slurm 渲染前在同一 renderer 和节点资源中执行轻量运行时检查；也可显式开启本地 Smoke Render，在编码后提前发现 OpenGL、XeLaTeX、Manim API 和运行时错误。
-- **有界 Prompt**：结构化合同和代码区不会被静默截断，低优先级的 RAG、历史说明和重复上下文会按预算裁剪，避免模型因上下文过长产生不完整输出。
-- **平滑转场**：多场景使用 FFmpeg `xfade` 淡入淡出，默认 0.5 秒；有音频时同步 `acrossfade`。
-- **通用 LLM 接口**：通过 `.env` 配置任意 OpenAI-compatible API，不绑定 DeepSeek 或其他特定厂商。
-- **启动前 API 探测**：进入会话或 LLM 流水线前探测主 LLM；启用 RAG 时同时探测 Embedding 和 Reranker。配置、网络或模型不可用时立即退出。视觉端点单独探测，暂时不可用时安全降级为 `unknown`。
-- **独立视觉质量门**：可为每个已渲染场景抽取带时间戳和哈希的关键帧，用单独的多模态 LLM 检查数学正确性、相关性、可读性、布局和跨帧一致性；主 Planner/Coder 端点不会被替换。
-- **有界视觉修复**：低分场景把纯诊断反馈交回 Coder，重新经过校验、审查和渲染；达到上限时保留更好的可验证版本，视觉端点故障则记为 `unknown` 并继续。
-- **即时视觉门**：场景完成渲染后立即评估，不必等待整批场景结束；低分上游场景会停止并重建后继交接。关键帧包含开场、首个数学状态、转场边界、中段、结论和结束状态。
-- **本地 LLM 缓存**：非流式完整响应默认缓存到用户目录，缓存键包含模型、端点、提示词和生成参数但不含 API Key；可关闭或限制条目数。
-- **可选知识检索**：使用本地 SQLite 索引、独立 Embedding 和 Reranker 服务，为 Planner、Coder 和 AutoFixer 提供受限、可审计的 Manim 文档与示例上下文。
+确定性校验和高置信度证据负责阻断真正的核心错误；风格建议、一般节奏意见和证据不足的模型判断会记录为 warning，不会触发无意义的重写循环。
 
-## 一行安装（Ubuntu / HPC，无 sudo）
+## 目录
 
-只下载并运行安装脚本，不会在当前目录或主目录 `git clone` 完整源码：
+- [kd1-anime](#kd1-anime)
+  - [目录](#目录)
+  - [适用场景与前提](#适用场景与前提)
+  - [快速开始](#快速开始)
+    - [1. 安装](#1-安装)
+    - [2. 配置主模型](#2-配置主模型)
+    - [3. 检查环境](#3-检查环境)
+    - [4. 生成视频](#4-生成视频)
+  - [生成流程](#生成流程)
+    - [计划与代码审查的职责](#计划与代码审查的职责)
+    - [场景粒度与并行](#场景粒度与并行)
+  - [常用命令](#常用命令)
+    - [需求、规划和生成](#需求规划和生成)
+    - [单 Scene 渲染](#单-scene-渲染)
+    - [查询、恢复和清理](#查询恢复和清理)
+    - [环境和模型诊断](#环境和模型诊断)
+    - [缓存](#缓存)
+  - [配置](#配置)
+    - [主模型、视觉模型和 RAG 服务](#主模型视觉模型和-rag-服务)
+  - [RAG 知识检索](#rag-知识检索)
+  - [视觉评估](#视觉评估)
+  - [运行产物与恢复](#运行产物与恢复)
+  - [增量渲染与批量处理](#增量渲染与批量处理)
+    - [增量渲染](#增量渲染)
+    - [批量处理](#批量处理)
+  - [渲染器、转场与视频合并](#渲染器转场与视频合并)
+  - [安全边界](#安全边界)
+  - [开发与验证](#开发与验证)
+  - [文档](#文档)
+  - [技术栈](#技术栈)
+  - [许可证](#许可证)
+
+## 适用场景与前提
+
+| 使用方式 | 必需条件 | 是否提交 Slurm |
+| --- | --- | --- |
+| `generate --dry-run` | 主模型、Python 依赖；启用 RAG 时还需 RAG 服务和索引 | 否 |
+| 完整生成 | 主模型、Manim、XeLaTeX、FFmpeg、Slurm | 是 |
+| `render scene.py` | Manim、XeLaTeX、FFmpeg、Slurm | 是（除非使用全局 `--dry-run`） |
+| 视觉评估 | 独立的多模态视觉模型 | 不一定，取决于评估的运行 |
+| RAG | 独立 Embedding、Reranker 和本地索引 | 否，索引保存在本地 |
+
+完整渲染还需要目标集群提供可用的 `sbatch`、`squeue`、`sacct` 和 `scancel`。没有 Slurm 时，可以用 `--dry-run` 验证规划、技术合同、代码生成和代码审查流程；它不会提交作业，也不会执行生成代码。
+
+## 快速开始
+
+### 1. 安装
+
+在 Ubuntu/HPC 上可以只下载并运行安装脚本。脚本默认不使用 sudo，也不会把完整源码 clone 到当前目录或主目录：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.sh \
@@ -44,106 +64,53 @@ curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.s
   && bash /tmp/kd1-anime-install.sh
 ```
 
-远程运行时，脚本会从 GitHub ZIP 源码归档临时构建并安装 Python 包，临时目录会在退出时清理。默认安装 `main`；发布版本可在运行前设置 `KD1_ANIME_REF=vX.Y.Z` 固定到指定 tag。
+安装器会创建或复用 `manim_env`，安装 Manim CE `0.20.1`、FFmpeg、CJK 字体和 Manim 所需的最小 XeLaTeX 依赖，并将 Manim 文档和示例放入 `~/.kd1-anime/knowledge/`。
 
-发布时建议同时公布该 tag 源码 ZIP 的 SHA-256，用户可执行强校验安装：
+交互式终端中，安装器最后会启动模型配置向导，依次配置主模型、视觉模型、Embedding 和 Reranker。非交互环境默认跳过向导：
+
+```bash
+# 显式启动向导
+KD1_ANIME_CONFIGURE_MODE=interactive bash /tmp/kd1-anime-install.sh
+
+# 显式跳过向导
+KD1_ANIME_CONFIGURE_MODE=never bash /tmp/kd1-anime-install.sh
+```
+
+安装到指定版本时可以固定 tag；发布或生产环境建议同时校验 SHA-256：
 
 ```bash
 export KD1_ANIME_REF=v0.4.0
-export KD1_ANIME_ARCHIVE_SHA256=<release-zip-sha256>
-# 可选：同时固定 TeX Live 安装器摘要；设置为 1 后两项摘要都必须提供
-export KD1_ANIME_TEXLIVE_INSTALLER_SHA256=<install-tl-unx-tar-gz-sha256>
+export KD1_ANIME_ARCHIVE_SHA256=<github-zip-sha256>
+# 可选：校验 TeX Live 安装器
+export KD1_ANIME_TEXLIVE_INSTALLER_SHA256=<install-tl-sha256>
+# 设置后，上面两个摘要都必须提供
 # export KD1_ANIME_REQUIRE_CHECKSUM=1
 bash /tmp/kd1-anime-install.sh
 ```
 
-摘要不匹配或 ref 含路径遍历字符时，安装器会在调用 pip 前终止。设置
-`KD1_ANIME_REQUIRE_CHECKSUM=1` 可让远程源码归档和 TeX Live 安装器都强制要求 SHA-256。
-
-安装器会全自动完成：
-
-1. 加载 `python3.12/3.12` 和 `miniconda/py312` module（若系统提供 module）。
-2. 创建或复用 `manim_env` conda 环境。
-3. 安装 Manim Community Edition 0.20.1、FFmpeg 和 Noto CJK 字体。
-4. 依次检查 PATH、`/usr/local/texlive` 和 `~/texlive` 中已有的 XeLaTeX；完整环境直接复用且不调用 `tlmgr`。
-5. 仅当现有 TeX Live 缺失或无法无 sudo 补齐依赖时，才从 USTC CTAN 镜像安装最小用户目录版到 `~/texlive/<release>/`。
-6. 只安装 Manim/XeLaTeX 所需包及 `ctex`、`xeCJK`、`fontspec`，不安装完整 TeX Live scheme/collection。
-7. 安装 `kd1-anime` 命令，不保留远程源码目录。
-8. 将 Manim Community Edition 0.20.1 文档和示例程序解压到 `~/.kd1-anime/knowledge/`。
-9. 在 `~/.local/bin` 安装 `kd1-anime` / `manim-env` 包装器，并写入 conda 激活钩子、shell 函数和用户级配置模板。
-
-在交互式终端中，安装结束前会自动启动模型配置向导，依次配置主模型、视觉模型、
-Embedding 和 Reranker；非交互安装会自动跳过向导。需要显式开启向导时可执行：
-
-```bash
-KD1_ANIME_CONFIGURE_MODE=interactive bash install.sh
-```
-
-向导会在 Embedding 配置完成后询问是否立即建立 RAG 索引；也可以稍后手动执行
-`kd1-anime rag index`。选择关闭视觉、Embedding 或 Reranker 时会保留已有凭据，
-但不会启用对应功能。
-
-Coder 生成的 `Tex`/`MathTex` 统一使用 `xelatex` 和 `.xdv`，并加载 `ctex`；普通中文文字使用 Noto CJK 字体和 Manim `Text`（Pango）。
-
-安装完成后无需手动 `source` RC 文件或激活 conda，即可直接运行：
-
-```bash
-# 启动程序
-kd1-anime
-
-# 可选：进入已激活 manim_env 的交互 shell
-manim-env
-
-# 配置 OpenAI-compatible API
-$EDITOR ~/.kd1-anime/.env
-```
-
-### 用户数据目录
-
-除非通过配置显式覆盖，程序生成的持久化文件统一位于 `~/.kd1-anime/`：
-
-```text
-~/.kd1-anime/
-├── .env                         # 用户配置
-├── .env.example                 # 配置模板
-├── knowledge/
-│   ├── docs/                    # 默认 Manim 文档源文件
-│   └── examples/                # 默认 Manim 示例源文件
-├── rag/index.sqlite3            # 本地 RAG 索引
-├── cache/llm.sqlite3             # 非流式 LLM 响应缓存（可关闭）
-└── workspace/runs/<run-id>/     # 场景代码、日志、视频和评估报告
-```
-
-旧版本的 `~/.config/kd1-anime/.env` 会在首次加载配置时复制到新位置并更新旧的
-默认路径；旧文件不会被删除。旧的 RAG 索引也会在首次使用 RAG 时复制到新位置。
-为避免意外复制大型视频，旧项目目录中的相对 `workspace/` 不会自动搬迁；如需保留
-旧运行，请先将它移动到 `~/.kd1-anime/workspace/`，或显式设置 `WORKSPACE_DIR`。
-
-> `install.sh` 针对具有 Environment Modules、Miniconda 和 Slurm 的 Ubuntu/HPC 环境。可通过 `KD1_ANIME_CONDA_BASE` 和 `KD1_ANIME_ENV_NAME` 覆盖 conda 路径与环境名。
-
-## 开发安装
+如果已经在源码目录中开发，使用：
 
 ```bash
 git clone https://github.com/Enthusjast/kd1-anime.git
 cd kd1-anime
-bash install.sh
-```
-
-在源码目录运行时，安装器会执行 editable install。若系统已经具备 Manim/TeX/FFmpeg，也可仅安装 Python 包：
-
-```bash
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate manim_env
 python -m pip install -e '.[dev]'
 ```
 
-## LLM 配置
+仅安装 Python 包不会自动安装 Manim、XeLaTeX、FFmpeg 或 Slurm；这些原生依赖由 `install.sh` 或系统环境负责。
 
-配置加载优先级为：
+### 2. 配置主模型
 
-```text
-系统环境变量 > 当前目录 .env > ~/.kd1-anime/.env
+安装器会创建 `~/.kd1-anime/.env`。也可以复制模板后编辑：
+
+```bash
+cp .env.example ~/.kd1-anime/.env
+chmod 600 ~/.kd1-anime/.env
+$EDITOR ~/.kd1-anime/.env
 ```
 
-最少需要填写：
+最少需要配置一个主模型：
 
 ```dotenv
 LLM_API_KEY=your-api-key
@@ -151,356 +118,437 @@ LLM_BASE_URL=https://your-openai-compatible-endpoint/v1
 LLM_MODEL=your-model-name
 ```
 
-若启用 `ENABLE_VISUAL_EVAL=true`，还必须单独配置支持 `image_url` 的多模态端点；它不会继承主 LLM 的 Key、URL 或模型：
+配置优先级为：
+
+```text
+进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env
+```
+
+API Key 不会写入运行清单、事件日志或缓存键。不要把 `.env` 提交到 Git。
+
+### 3. 检查环境
+
+先做本地依赖检查，再按需探测网络服务：
+
+```bash
+# 依赖、配置和安全策略检查；默认不发送网络请求
+kd1-anime doctor
+
+# 额外执行 FFmpeg、XeLaTeX、CJK/MathTex 和当前 renderer 的本地探针
+kd1-anime doctor --probe
+
+# 发送最小请求探测主模型
+kd1-anime doctor --probe-llm
+```
+
+启动 chat、`plan` 或 `generate` 前，程序会自动探测主模型；探测失败会在进入 Agent 流程前退出。`status`、`version`、`logs`、`clean` 等诊断命令不会自动发起业务请求。
+
+### 4. 生成视频
+
+```bash
+# 交互式澄清需求
+kd1-anime
+# 等价写法
+kd1-anime chat
+
+# 跳过澄清，直接使用给定需求
+kd1-anime generate "解释欧拉公式的几何意义"
+
+# 没有 Slurm 时验证完整的计划与代码生成流程
+kd1-anime generate "解释特征值的几何意义" --dry-run
+```
+
+完成后，终端会显示最终视频路径和 run ID。默认最终视频位于该 run 的私有目录；需要固定到外部路径时使用 `--output`。
+
+## 生成流程
+
+完整流水线如下：
+
+```text
+INIT
+  → 主模型/RAG 预检
+  → PLANNING（概要、教学合同、数学断言图）
+  → DETAILING（各场景分镜并行生成）
+  → PLAN_REVIEWING（确定性编译 + 计划审查 + 连续性审查）
+  → CODING（TechnicalSpec → Coder，按场景顺序交接）
+  → REVIEWING（AST/生命周期 + 代码语义审查）
+  → DISPATCHING / MONITORING（场景级 Slurm 并行）
+  → FIXING → REVIEWING → …
+  → VISUAL_EVALUATING（可选）
+  → MERGING
+  → EVALUATING（可选的代码/效率评估循环）
+  → DONE
+```
+
+### 计划与代码审查的职责
+
+- **Plan Review** 检查数学断言、等式关系、定义域、几何方案、时间线和元素交接是否正确。失败只回到 Planner，不会让 Coder 反复修补错误计划。
+- **Technical Planner** 把分镜编译为对象、动画事件、布局、LaTeX 和最终导出清单。确定性编译失败时只有限重试。
+- **Code Review** 检查已确认计划的 Manim 实现、数学展示、API、生命周期、布局、安全和场景交接。代码变化后必须重新审查。
+- **审查分级**：确定性校验或带源码/合同证据的高置信度核心错误才是 hard blocker；可唯一匹配的局部替换先自动修复；风格建议、一般节奏和不确定的“可能问题”作为 warning 放行。
+- **Render Fix** 只处理渲染日志暴露的代码问题；环境、Slurm、字体和显示服务错误不会盲目交给模型重写。
+- **Continuity Review** 只处理跨场景边界。达到 `MAX_CONTINUITY_FIX_ROUNDS` 后会记录 warning 并沿用当时的可验证计划继续，不会因为连续性审查耗尽而阻断整条流水线。
+
+### 场景粒度与并行
+
+场景不是清单条目的机械切分单位。若用户要求在同一画布中同时展示一组对象，且这些对象需要共同变化或最终对比，Planner 应将其合并为一个场景；只有镜头、布局或叙事弧线确实独立时才拆分。
+
+分镜生成可以并行；代码生成按 Scene ID 顺序执行，以便把上一场景实际导出的 Mobject 定义交给下一场景。所有代码通过审查后，场景渲染可以并行提交到 Slurm。`SLURM_MAX_IN_FLIGHT` 可限制同时排队/运行的场景数量。
+
+## 常用命令
+
+### 需求、规划和生成
+
+```bash
+# 交互模式；回车提交，Shift+Enter/Ctrl+Enter 换行
+kd1-anime chat
+
+# 从文件读取长 prompt，避免 shell 转义和多行粘贴问题
+kd1-anime generate --file prompt.md --dry-run
+
+# 只生成规划；默认执行计划审查和连续性审查
+kd1-anime plan "解释傅里叶级数"
+
+# 只预览未经审查的规划
+kd1-anime plan "解释傅里叶级数" --no-review
+
+# 导出结构化计划；计划文件可交给 generate --plan
+kd1-anime plan "解释傅里叶级数" --output fourier-plan.json
+kd1-anime generate --plan fourier-plan.json --dry-run
+
+# 计划审查后暂停人工确认；非交互环境视为批准
+kd1-anime generate "解释勾股定理" --approve-plan
+```
+
+`plan --no-review` 只适合查看模型草案；从计划文件继续生成时，仍会重新执行确定性编译、计划审查和连续性审查。
+
+### 单 Scene 渲染
+
+```bash
+# 校验用户提供的 Scene 后提交 Slurm，并等待结果
+kd1-anime render scene.py --class MyScene --wait
+
+# 只提交，立即返回 run ID；稍后使用 resume
+kd1-anime render scene.py --class MyScene
+kd1-anime resume <run-id>
+
+# 全局 dry-run 只校验代码，不提交作业
+kd1-anime --dry-run render scene.py --class MyScene
+```
+
+`render` 是直接渲染模式，不调用 Planner、Technical Planner、Coder 或 Reviewer；它只执行确定性代码校验、渲染监控和合并。
+
+### 查询、恢复和清理
+
+```bash
+# 最近运行
+kd1-anime status
+
+# 某次运行的详细状态；--json 便于脚本处理
+kd1-anime status <run-id>
+kd1-anime status <run-id> --json
+
+# 查看渲染日志尾部
+kd1-anime logs <run-id> --scene-id 2 --lines 120
+kd1-anime logs <run-id> --scene-id 2 --stderr
+
+# 恢复中断或失败运行；不会自动扫描历史运行
+kd1-anime resume <run-id>
+
+# 只重试某个失败场景
+kd1-anime retry <run-id> --scene-id 2
+
+# 清理 30 天前的已结束运行
+kd1-anime clean --older-than 30d --yes
+```
+
+启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v6；v4/v5 可以只读查看，但不能安全继续修改。
+
+### 环境和模型诊断
+
+```bash
+kd1-anime version
+kd1-anime doctor
+kd1-anime doctor --deep
+kd1-anime doctor --probe
+kd1-anime doctor --probe-llm
+kd1-anime doctor --probe-visual-llm
+kd1-anime doctor --probe-rag
+kd1-anime doctor --security-strict
+
+# 检查 JSON 模式和基本请求
+kd1-anime test-llm
+kd1-anime test-llm --no-json-mode --verbose
+```
+
+`doctor` 默认只做本地配置检查；`--probe-*` 才会发送相应服务请求。视觉探针会发送一张最小图片消息，RAG 探针会分别请求 Embedding 和 Reranker。
+
+### 缓存
+
+```bash
+kd1-anime cache status
+kd1-anime cache clear --yes
+```
+
+缓存只保存完整的非流式业务响应和脱敏调用统计，不缓存交互式流式响应，也不保存 API Key。调试 prompt 变化或怀疑复用了旧响应时，可以先查看或清理缓存。
+
+## 配置
+
+完整配置参考见 [`docs/configuration.md`](docs/configuration.md)，模板见 [`.env.example`](.env.example)。常用配置如下：
+
+| 配置项 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `LLM_BASE_URL` / `LLM_MODEL` | API 地址 / 空 | 主模型端点和模型名；必须配置 |
+| `LLM_HEALTHCHECK_TIMEOUT` | `15` | 启动前主模型探测超时（秒） |
+| `LLM_PLANNING_MAX_TOKENS` | `16384` | 计划和澄清阶段输出预算 |
+| `LLM_CODE_MAX_TOKENS` | `24576` | 代码生成阶段输出预算 |
+| `LLM_REVIEW_MAX_TOKENS` | `8192` | 结构化审查输出预算 |
+| `LLM_TRUST_ENV` | `true` | 是否读取 `HTTP(S)_PROXY` 等代理环境变量 |
+| `LLM_CACHE_ENABLED` | `true` | 是否启用本地非流式响应缓存 |
+| `LLM_MAX_CONTEXT_CHARS` | `120000` | Agent 输入总预算；低优先级区块会先裁剪 |
+| `MANIM_RENDERER` | `cairo` | `cairo` 使用 CPU；`opengl` 需要 GPU/图形上下文 |
+| `MANIM_QUALITY` | `h` | Manim 质量级别：`l/m/h/p/k` |
+| `MANIM_PIXEL_WIDTH` / `HEIGHT` | `1920/1080` | 输出分辨率 |
+| `MANIM_FRAME_RATE` | `60` | 输出帧率 |
+| `MANIM_OPENGL_PLATFORM` | `egl` | OpenGL 上下文后端；无显示的 HPC 通常使用 `egl` |
+| `SMOKE_RENDER_ENABLED` | `true` | 正式 Slurm 渲染前执行同 renderer 的轻量探针 |
+| `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外运行时预检 |
+| `MAX_SCENES` | `12` | 单次规划的最大场景数 |
+| `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
+| `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 计划反馈后的 Planner 总重调用次数 |
+| `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 连续性局部重规划次数；耗尽后 warning 放行 |
+| `MAX_REVIEW_ROUNDS` | `5` | 单场景代码审查/重写轮数 |
+| `MAX_FIX_ATTEMPTS` | `5` | 渲染失败后的代码修复次数 |
+| `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
+| `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
+| `MONITOR_QUEUE_TIMEOUT` / `RUN_TIMEOUT` | `3600/3600` | 排队/运行超时（秒） |
+| `MONITOR_UNKNOWN_TIMEOUT` | `300` | 控制面不可查询时的最短等待时间 |
+| `MONITOR_ARTIFACT_GRACE` | `60` | Slurm 完成后等待共享文件系统同步产物的时间 |
+| `ALLOW_PARTIAL_OUTPUT` | `false` | 是否允许缺少场景时合并部分视频 |
+| `TRANSITION_DURATION` | `0.5` | 相邻场景 `xfade` 转场秒数 |
+| `ENABLE_VISUAL_EVAL` | `false` | 是否启用独立视觉质量门 |
+| `VISUAL_EVAL_THRESHOLD` | `3.5` | 视觉评分通过阈值（1–5） |
+| `MAX_VISUAL_FIX_ATTEMPTS` | `2` | 视觉诊断触发的最大修复次数 |
+| `RAG_ENABLED` | `false` | 是否启用本地知识检索 |
+| `WORKSPACE_DIR` | `~/.kd1-anime/workspace` | 运行目录根路径 |
+
+### 主模型、视觉模型和 RAG 服务
+
+视觉评估必须使用独立的多模态端点，不会继承主模型的 URL、Key 或模型：
 
 ```dotenv
+ENABLE_VISUAL_EVAL=true
 VISUAL_LLM_API_KEY=your-visual-api-key
 VISUAL_LLM_BASE_URL=https://your-visual-endpoint/v1
 VISUAL_LLM_MODEL=your-multimodal-model
 ```
 
-如需使用知识检索，可单独配置 Embedding 和 Reranker 服务。RAG 不会继承主 LLM
-或视觉 LLM 的任何凭据；Embedding 使用 OpenAI-compatible `/embeddings` 接口，
-Reranker 使用 Cohere-compatible `/rerank` 接口：
+RAG 的 Embedding 和 Reranker 同样完全独立。Embedding 使用 OpenAI-compatible `/embeddings`，Reranker 使用 Cohere-compatible `/rerank`：
 
 ```dotenv
 RAG_ENABLED=true
 RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
-# 也可以把文档和示例复制到这两个默认目录，或改为其它绝对路径。
 RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
 RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
 RAG_EMBEDDING_API_KEY=your-embedding-key
 RAG_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 RAG_EMBEDDING_MODEL=your-embedding-model
 RAG_RERANK_API_KEY=your-rerank-key
-RAG_RERANK_BASE_URL=https://your-rerank-endpoint/v1
-RAG_RERANK_MODEL=your-rerank-model
+RAG_RERANK_BASE_URL=https://your-reranker-endpoint/v1
+RAG_RERANK_MODEL=your-reranker-model
 ```
 
-建立索引并检查服务：
+启用 RAG 后，生成入口会检查索引存在且未过期，并在开始 Agent 调用前探测两个服务；缺配置、索引过期或启动探测失败会直接退出。运行中的单次检索异常则记录为 `degraded`，并尽可能继续使用无 RAG 的流程。
+
+## RAG 知识检索
+
+默认知识库由安装器放入：
+
+```text
+~/.kd1-anime/knowledge/
+├── docs/manim-0.20.1/       # Markdown/reStructuredText 文档
+└── examples/manim-0.20.1/   # Python 示例
+```
+
+索引只读取 `.md`、`.rst` 和 `.py`，并将源目录、源文件哈希、分块参数和 Embedding 模型写入 SQLite 索引。修改知识库文件、分块参数或 Embedding 模型后，旧索引会被标记为过期：
 
 ```bash
+# 使用配置中的默认目录建立或复用索引
 kd1-anime rag index
+
+# 强制重新计算所有 Embedding
+kd1-anime rag index --rebuild
+
+# 查看索引和服务配置（不联网）
 kd1-anime rag status
-kd1-anime rag search "TransformMatchingTex usage"
+
+# 手动检索并查看片段
+kd1-anime rag search "TransformMatchingTex usage" --top-k 8
+
+# 真实探测两个服务
 kd1-anime doctor --probe-rag
 ```
 
-将可索引的 `.md`/`.rst`/`.py` 文档复制到上面的两个默认目录后执行 `rag index`；也可以
-通过 `--docs-dir`、`--examples-dir` 或配置项指定其它源目录。索引文件始终默认写入
-`~/.kd1-anime/rag/index.sqlite3`。
+索引构建本身需要 Embedding 服务；完整生成还需要 Reranker。检索结果会以不可信参考资料注入 Planner、Technical Planner、Coder 和 AutoFixer，并在运行清单中保存查询、索引和分块哈希收据，不会直接执行检索内容。
 
-RAG 运行时服务暂时不可用时会降级继续：Embedding 失败则跳过检索，Reranker
-失败则使用 Embedding 初排结果。索引只读取 `.md`/`.rst`/`.py`，并排除运行目录和疑似
-密钥行；知识库源文件发生变化后，旧索引会被标记为过期，需重新执行
-`kd1-anime rag index`。
+## 视觉评估
 
-如果 `RAG_ENABLED=true`，启动生成前还会要求索引存在且未过期；索引缺失或过期时先执行
-`kd1-anime rag index`。源文件和 Embedding 模型未变化时，普通 `rag index` 会复用已有索引；
-需要强制重新计算 Embedding 时使用 `kd1-anime rag index --rebuild`。
-
-完整示例见 `.env.example`。安装脚本也会生成：
-
-```text
-~/.kd1-anime/.env
-~/.kd1-anime/.env.example
-```
-
-## 使用
+视觉评估是可选质量门，使用独立的多模态模型检查关键帧中的数学正确性、相关性、可读性、布局和跨帧/跨场景一致性：
 
 ```bash
-# 默认：交互式需求澄清 + 完整流水线
-kd1-anime
-kd1-anime chat
+# 配置 ENABLE_VISUAL_EVAL、VISUAL_LLM_* 后运行完整流水线
+kd1-anime generate "解释矩阵变换的几何意义"
 
-# 跳过澄清，直接生成
-kd1-anime generate "展示欧拉公式 e^{iπ}+1=0 的直观推导"
+# 对已经完成的运行重新执行视觉评估
+kd1-anime evaluate <run-id> --visual
 
-# 只生成规划和代码，不提交 Slurm
-kd1-anime generate "解释特征值的几何意义" --dry-run
+# 只评估一个场景
+kd1-anime evaluate <run-id> --scene-id 2 --visual
 
-# 仅查看场景规划
-kd1-anime plan "解释傅里叶级数"
-# 仅查看未经审查的模型原始规划
-kd1-anime plan "解释傅里叶级数" --no-review
-# 导出结构化计划（可交给 generate --plan）
-kd1-anime plan "解释傅里叶级数" --output fourier-plan.json
-# 从结构化计划继续生成；仍会执行计划/连续性审查
-kd1-anime generate --plan fourier-plan.json --dry-run
+# 输出 JSON 或保存报告
+kd1-anime evaluate <run-id> --visual --json --output visual-report.json
+```
 
-# 对已有的单 Scene Manim 文件做安全检查并提交渲染
-kd1-anime render scene.py --class MyScene --wait
-# 也可仅提交后立即返回；输出会给出 run ID 和恢复命令
-kd1-anime render scene.py --class MyScene
+每个场景会从精确的已验证视频中抽取 1–8 帧，并在多场景运行中额外抽取真实的相邻结尾/开头帧。视觉报告、关键帧和修复候选均绑定当前代码、继承上下文、视频和帧哈希。
 
-# 覆盖显式指定且已存在的输出文件
-kd1-anime generate "..." --output final.mp4 --force
+- 数学/叙事问题回到 Planner；元素交接问题回到 Continuity；布局、可读性和遮挡问题交给 Coder。
+- 视觉修复仍会重新经过代码校验、代码审查和渲染，且次数有上限。
+- 视觉服务或抽帧失败记为 `unknown`，不伪造低分，也不会删除已经成功的渲染产物。
+- 普通流水线中的视觉端点网络故障可以安全降级；显式 `evaluate --visual` 要求端点可用。
 
-# 查看最近运行或某次运行的逐场景状态
+不带 `--visual` 时，`evaluate` 仍可执行确定性的代码/效率评估；支持 `--code`、`--code-file`、`--image` 和 `--compare`，具体选项可执行 `kd1-anime evaluate --help` 查看。
+
+## 运行产物与恢复
+
+默认所有持久化数据位于 `~/.kd1-anime/`：
+
+```text
+~/.kd1-anime/
+├── .env                         # 私有配置（0600）
+├── .env.example                 # 配置模板
+├── knowledge/                   # Manim 文档和示例
+├── rag/index.sqlite3            # 本地知识索引
+├── cache/llm.sqlite3            # LLM 完整响应缓存
+└── workspace/
+    ├── eval_results/            # 独立 evaluate 命令的报告
+    └── runs/<run-id>/
+        ├── prompt.md            # 需求文件；不是 prompt.txt
+        ├── manifest.json        # 当前为 schema v6
+        ├── events.jsonl         # 脱敏事件轨迹
+        ├── scenes/              # Python Scene 与 sbatch 脚本
+        ├── logs/                # stdout/stderr
+        ├── videos/              # 当前 run 的媒体目录
+        ├── artifacts/            # 计划、合同、审查和账本快照
+        ├── eval_frames/          # 视觉评估关键帧
+        ├── eval_reports/         # 场景/成片视觉报告
+        ├── visual_candidates/    # 视觉修复候选
+        └── output_final.mp4      # 默认最终视频
+```
+
+每个 run 使用独立目录和运行锁。manifest 会原子写入，并保存阶段、代码 SHA-256、精确 Slurm Job、Render/Merge Profile、视频哈希和 ffprobe 元数据。恢复时不会用共享目录扫描猜测视频，也不会复用不匹配的旧产物。
+
+运行 ID 可通过 `status` 获取；中断后显式恢复：
+
+```bash
 kd1-anime status
-kd1-anime status 20260728-120000-1234abcd
-kd1-anime status 20260728-120000-1234abcd --json
-
-# 查看某次运行的日志尾部；不触发模型或 Slurm 请求
-kd1-anime logs 20260728-120000-1234abcd --scene-id 2 --lines 120
-
-# 查看/清理本地 LLM 缓存
-kd1-anime cache status
-kd1-anime cache clear --yes
-
-# 只重试一个失败场景，保留其它场景
-kd1-anime retry 20260728-120000-1234abcd --scene-id 2
-
-# 从清单恢复中断运行；不会重复提交仍有 Job ID 的场景
-kd1-anime resume 20260728-120000-1234abcd
-
-# 计划审查后人工确认再开始编码（默认不暂停）
-kd1-anime generate "解释勾股定理" --approve-plan
-
-# 检查依赖；--probe 会额外运行本地最小 FFmpeg/XeLaTeX/Manim 探测，不提交 Slurm
-kd1-anime doctor --probe
-# 分别探测主 LLM 与独立视觉 LLM（视觉探测会发送一张 1×1 图片）
-kd1-anime doctor --probe-llm --probe-visual-llm
-
-# 对已有运行执行独立视觉评估
-kd1-anime evaluate 20260728-120000-1234abcd --visual
-# 只评估清单中 Scene 2 的精确视频产物
-kd1-anime evaluate 20260728-120000-1234abcd --scene-id 2
-
-# 清理 30 天前的已结束运行目录
-kd1-anime clean --older-than 30d --yes
+kd1-anime resume 20260831-120000-1234abcd
 ```
 
-启动交互会话、规划或生成流水线前，程序会先发送一次最小请求检查主 LLM
-的配置、网络、鉴权和模型路由；启用 RAG 时还会检查索引是否存在/过期以及
-Embedding 与 Reranker 模型。检查失败会立即退出，不进入后续 Agent 流程。
-`status`、`version`、`doctor`、`clean` 等只读或诊断命令不会自动发送业务请求，
-需要真实探测时可使用 `kd1-anime doctor --probe-llm`。
-交互模式启动时不会扫描或弹出历史可恢复运行；需要恢复时请先用 `status` 找到
-run ID，再显式执行 `kd1-anime resume <run-id>`。
-`render` 不带 `--wait` 时只负责提交并立即返回，终端会显示 run ID。之后使用
+旧版本的 `~/.config/kd1-anime/.env` 会非破坏地迁移到 `~/.kd1-anime/.env`；旧文件不会删除。旧项目目录中的相对 `workspace/` 不会自动搬迁，以避免启动时复制大型视频。
 
-`kd1-anime status <run-id>` 查看清单，或用 `kd1-anime resume <run-id>` 继续监控并合并。
-`render --wait` 以及之后的 `resume` 只监控用户提供的 Scene，不会调用 Planner、Technical
-Planner、Coder 或 Reviewer。
+## 增量渲染与批量处理
 
-### 每次运行的产物
+### 增量渲染
 
-默认输出位于：
-
-```text
-~/.kd1-anime/workspace/runs/<timestamp>-<uuid>/
-├── prompt.md
-├── manifest.json         # schema v6：教学合同、状态账本、阶段、Job 与发布配置
-├── events.jsonl          # 私有的阶段/检查点事件轨迹（诊断用）
-├── scenes/              # 生成的 Python 和 sbatch 脚本
-├── logs/                # Slurm stdout/stderr
-├── videos/              # 当前 run 的 Manim 媒体目录
-├── eval_frames/         # 场景/成片关键帧（启用视觉评估时）
-├── eval_reports/        # 严格结构化的场景与成片视觉报告
-├── visual_candidates/   # 视觉修复失败时可恢复的候选代码
-├── artifacts/           # 教学合同、计划编译、TechnicalSpec、审查、状态账本等阶段快照
-└── output_final.mp4
-```
-
-如设置 `OUTPUT_FILE=/path/to/final.mp4`，最终视频写到该路径；其余中间产物仍保留在独立 run 目录中。
-`manifest.json`、`events.jsonl` 和 `.run.lock` 的权限为 `0600`。`resume` 会校验代码 SHA-256，持有运行级排他锁，并只复用与当前代码及渲染配置匹配的已验证视频。当前清单为 v6，除全片教学合同和 StateLedger 外还固定最终合并配置；v4/v5 仅可查看，不能猜测迁移或继续修改，恢复时会给出明确错误，请重新生成。`events.jsonl` 只保存脱敏后的诊断事件，不保存 API Key。`clean` 只删除 run 目录，不会删除目录外的自定义输出。
-增量运行复用的场景视频会复制到新 run 的私有目录，因此清理基准 run 不会破坏新 run 的恢复或重新拼接。
-
-## 关键配置
-
-| 配置项 | 默认值 | 说明 |
-|---|---:|---|
-| `LLM_BASE_URL` | OpenAI API 地址 | 任意 OpenAI-compatible 端点 |
-| `LLM_MODEL` | 空 | 必须设置为实际模型名 |
-| `LLM_HEALTHCHECK_TIMEOUT` | `15` | 进入会话/流水线前的最小 API 探测超时（秒）；探测失败立即退出 |
-| `LLM_PARALLEL_WORKERS` | `4` | 分镜/连续性审查等可并行 LLM 请求上限；代码交接阶段按场景顺序执行 |
-| `LLM_MAX_TOKENS` | `32768` | 默认输出上限；端点拒绝该参数时会自动降级 |
-| `LLM_TRUST_ENV` / `VISUAL_LLM_TRUST_ENV` | `true` | 是否读取 HTTP(S)_PROXY 等环境变量；不使用代理时设为 `false` |
-| `LLM_CACHE_ENABLED` | `true` | 是否缓存完整的非流式 LLM 响应；流式交互永不缓存 |
-| `LLM_CACHE_PATH` | 用户目录 cache/llm.sqlite3 | LLM 缓存 SQLite 路径 |
-| `LLM_CACHE_MAX_ENTRIES` | `512` | 缓存最大条目数，设为 `0` 等同关闭写入 |
-| `LLM_MAX_CONTEXT_CHARS` | `120000` | 单次 Agent 输入的总字符预算；超出时先裁剪低优先级区块 |
-| `LLM_MAX_CODE_CONTEXT_CHARS` | `60000` | 代码、继承定义和修复代码区的字符预算；必需代码不会静默截断 |
-| `LLM_MAX_REVIEW_CONTEXT_CHARS` | `90000` | Reviewer 输入总字符预算 |
-| `LLM_MAX_TECHNICAL_SPEC_CHARS` | `30000` | TechnicalSpec 注入 Coder/Reviewer 的字符预算 |
-| `MAX_TECHNICAL_SPEC_ATTEMPTS` | `3` | TechnicalSpec 确定性编译失败后的最大重生成次数 |
-| `VISUAL_LLM_BASE_URL` | 空 | 独立多模态 OpenAI-compatible 端点；不回退主端点 |
-| `VISUAL_LLM_MODEL` | 空 | 支持 `image_url` 输入的视觉模型；启用视觉评估时必须设置 |
-| `VISUAL_LLM_PARALLEL_WORKERS` | `2` | 进程级并行视觉请求上限，与主 LLM 并发池分离；批处理任务共享此配额 |
-| `RAG_ENABLED` | `false` | 是否启用本地知识检索；启用后启动前检查 Embedding/Reranker |
-| `RAG_INDEX_PATH` | `~/.kd1-anime/rag/index.sqlite3` | SQLite RAG 索引路径 |
-| `RAG_EMBEDDING_BASE_URL` / `RAG_EMBEDDING_MODEL` | 空 | 独立 Embedding 服务和模型 |
-| `RAG_RERANK_BASE_URL` / `RAG_RERANK_MODEL` | 空 | 独立 Reranker 服务和模型 |
-| `RAG_TRUST_ENV` | `true` | RAG HTTP 客户端是否读取 HTTP(S)_PROXY 等环境变量 |
-| `RAG_TOP_K` / `RAG_RERANK_TOP_N` | `8` / `4` | 向量初排和重排数量 |
-| `RAG_MAX_CONTEXT_CHARS` | `12000` | 注入单次 Agent 请求的最大检索上下文 |
-| `RAG_PARALLEL_WORKERS` | `2` | 跨批量任务共享的 RAG 请求并发上限 |
-| `RAG_DOCS_DIR` / `RAG_EXAMPLES_DIR` | `~/.kd1-anime/knowledge/{docs,examples}` | 默认知识库源目录 |
-| `WORKSPACE_DIR` | `~/.kd1-anime/workspace` | 运行、场景、日志、视频和评估产物根目录 |
-| `MAX_SCENES` | `12` | 单次规划允许的最大场景数 |
-| `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
-| `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 同一场景计划反馈后的 Planner 重调用总次数，防止无限重规划 |
-| `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 全片连续性审查发现冲突后的局部分镜重规划轮数 |
-| `SAFE_FALLBACK_ENABLED` | `true` | 复杂几何方案审查耗尽后是否自动切换为保守教学方案 |
-| `MAX_IDENTICAL_REVIEW_ATTEMPTS` | `2` | 相同代码与审查反馈重复出现后的提前终止次数 |
-| `MAX_PROMPT_CHARS` | `50000` | 用户需求最大字符数 |
-| `MAX_CLARIFY_CONTEXT_CHARS` | `40000` | 澄清多轮对话发送给模型的最大字符数，超出时保留初始需求和最近回答 |
-| `MAX_LOG_CHARS` | `30000` | 发送给 AutoFixer 的错误日志字符上限 |
-| `MANIM_RENDERER` | `cairo` | `cairo` 使用 CPU；`opengl` 可使用 GPU |
-| `MANIM_QUALITY` | `h` | Manim 质量级别 `l/m/h/p/k` |
-| `MANIM_PIXEL_WIDTH` / `MANIM_PIXEL_HEIGHT` | `1920` / `1080` | 显式输出分辨率，也是产物身份的一部分 |
-| `MANIM_FRAME_RATE` | `60` | 显式输出帧率，也是产物身份的一部分 |
-| `SMOKE_RENDER_ENABLED` | `true` | 正式渲染前是否执行同 renderer 的轻量运行时检查 |
-| `SMOKE_RENDER_QUALITY` | `l` | Smoke Render 质量级别（`l`/`m`） |
-| `SMOKE_RENDER_TIMEOUT` | `180` | 单个 Smoke Render 的最长秒数 |
-| `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外的运行时预检；默认关闭，dry-run 不执行 |
-| `LOCAL_SMOKE_RENDER_QUALITY` | `l` | 本地 Smoke Render 质量级别（`l`/`m`） |
-| `LOCAL_SMOKE_RENDER_TIMEOUT` | `180` | 本地 Smoke Render 最长秒数 |
-| `LOCAL_SMOKE_RENDER_MEMORY_MB` | `4096` | 本地 Smoke Render 地址空间上限（Linux 优先通过 `prlimit` 生效） |
-| `SLURM_CPUS_PER_TASK` | `4` | 每个场景作业的 CPU 数 |
-| `SLURM_GPU_TYPE` | 空 | OpenGL 模式必须设置；Cairo 模式不会申请 GPU |
-| `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
-| `SLURM_SUBMIT_RETRIES` | `3` | 明确失败时的 sbatch 重试次数；命令超时不会自动重提 |
-| `MONITOR_QUEUE_TIMEOUT` | `3600` | 排队超时秒数，超时自动 `scancel` |
-| `MONITOR_RUN_TIMEOUT` | `3600` | 运行超时秒数，超时自动 `scancel` |
-| `MONITOR_UNKNOWN_TIMEOUT` | `300` | 集群状态连续不可查询的最短持续时间，避免短暂控制面故障误取消作业 |
-| `MONITOR_ARTIFACT_GRACE` | `60` | Slurm 完成后等待共享文件系统同步最终 MP4 的秒数 |
-| `MAX_INFRA_RETRIES` | `2` | 节点故障、抢占等基础设施终态的自动重新排队次数 |
-| `ALLOW_PARTIAL_OUTPUT` | `false` | 是否允许缺失场景时合并部分视频 |
-| `OVERWRITE_OUTPUT` | `false` | 是否允许覆盖已存在的自定义输出文件 |
-| `TRANSITION_TYPE` | `fade` | 相邻场景的视频转场类型 |
-| `TRANSITION_DURATION` | `0.5` | 相邻场景转场秒数，短视频会自动缩短 |
-| `MERGE_VIDEO_CODEC` | `libx264` | 最终视频编码器 |
-| `MERGE_VIDEO_PRESET` | `medium` | FFmpeg 编码速度/压缩 preset |
-| `MERGE_VIDEO_CRF` | `18` | 最终视频质量参数（0–51） |
-| `MERGE_AUDIO_SAMPLE_RATE` | `48000` | 跨场景音频统一采样率 |
-| `MERGE_AUDIO_CHANNEL_LAYOUT` | `stereo` | 跨场景音频统一声道布局 |
-| `SLURM_CONTAINER_IMAGE` | 空 | 可选 Apptainer 镜像路径 |
-| `SLURM_REQUIRE_CONTAINER` | `false` | 为 `true` 时未配置镜像即拒绝执行 |
-| `SLURM_CONTAINER_DISABLE_NETWORK` | `false` | 容器支持时通过独立网络命名空间禁用网络；需先在目标集群验证 |
-| `ENABLE_AUTO_EVAL` | `false` | 合并后执行确定性代码/效率评估改进循环 |
-| `ENABLE_VISUAL_EVAL` | `false` | 合并前执行逐场景视觉质量门，并在合并后生成成片视觉报告 |
-| `VISUAL_EVAL_FRAME_COUNT` | `6` | 每个场景/成片抽取的语义关键帧数（1–8，成片预算优先保留真实相邻场景边界） |
-| `VISUAL_EVAL_THRESHOLD` | `3.5` | 场景视觉通过阈值（1–5）；重大问题无论均分都会触发修复 |
-| `MAX_VISUAL_FIX_ATTEMPTS` | `2` | 每个场景最多由视觉诊断触发的 Coder 修复次数 |
-
-### 并行与 GPU 说明
-
-- **场景级并行**：编码阶段按 Scene ID 顺序传递连续性上下文；编码完成后，每个 Scene 是一个独立 Slurm job，调度器可将多个场景分配到不同节点或 CPU 核心并行渲染。这通常是最有效、最稳定的 Manim 并行方式。
-- **计划级屏障**：所有 Detail 完成后先经过确定性计划编译、Plan Review 和全片连续性 Review；数学断言、定义域、教学依赖或视觉单元冲突会回到 Planner，不会让 Coder 反复修补错误计划。
-- **边界视觉审查**：启用视觉评估且场景数不少于 2 时，合并前会抽取选定相邻场景的真实结尾帧和下一场景开头帧。数学/故事问题回到 Planner，交接问题回到 Continuity，布局问题才回到 Coder。
-- **并发限流**：共享集群可设置 `SLURM_MAX_IN_FLIGHT=4` 等值，程序会分批提交并在完成后继续下一批。
-- **单场景内部**：本项目不把单个 Scene 的动画帧拆成多个进程；ManimCE 本身也没有通用的单 Scene 多进程渲染开关。
-- **GPU**：只有 `MANIM_RENDERER=opengl` 时才申请 GPU。Cairo 是 CPU 渲染，配置了 `SLURM_GPU_TYPE` 也不会浪费 GPU 配额。
-
-## 安全模型
-
-LLM 生成代码在提交前会经过 AST 校验，包括顶层动态执行、装饰器、NumPy 文件 API 和本地图片/SVG 加载检查，但静态校验仍不能等价于完整沙箱。处理不可信输入或多人共享集群时，建议：
-
-1. 构建包含 Manim、TeX Live、FFmpeg 和字体的只读 Apptainer 镜像；
-2. 设置 `SLURM_CONTAINER_IMAGE=/path/to/image.sif`；
-3. 设置 `SLURM_REQUIRE_CONTAINER=true`；
-4. 若集群允许无特权网络命名空间，测试通过后设置 `SLURM_CONTAINER_DISABLE_NETWORK=true`。
-
-容器作业使用 `--containall --cleanenv --no-home`，仅绑定当前 run 目录；OpenGL 模式额外使用 `--nv` 并显式传递 `PYOPENGL_PLATFORM`（例如 `egl`）。未配置容器时程序保持兼容运行，但 `doctor` 和生成流程会给出醒目的安全提示。
-
-可使用 `kd1-anime doctor --probe-llm` 验证主 LLM endpoint，使用
-`kd1-anime doctor --probe-visual-llm` 验证视觉端点确实接受图片消息；使用
-`kd1-anime doctor --security-strict` 检查是否启用了容器 fail-closed 策略。
-
-## 开发与验证
+增量渲染仍会执行新运行的规划、代码生成和审查，只在以下身份全部一致时复用旧场景视频：代码哈希、Render Profile 哈希、旧视频哈希、场景 ID/类名以及环境验证结果。
 
 ```bash
-ruff check .
-python -m compileall -q .
-bash -n install.sh
-pytest -q
-python -m build --wheel
+kd1-anime generate \
+  "解释欧拉公式的几何意义" \
+  --incremental 20260801-120000-1234abcd
 ```
 
-CI 会执行静态检查、编译检查、Shell 语法检查、测试和 wheel 构建。
+复用的视频会复制到新 run 的私有目录，不会创建伪造的 Job ID；合并阶段还会再次验证所有身份。
 
-## 技术栈
+### 批量处理
 
-Python 3.10+ · OpenAI-compatible API · Pydantic · Rich · Typer · prompt_toolkit · Manim CE · FFmpeg · TeX Live · Slurm · 可选 Apptainer
-
-## 增量渲染
-
-增量渲染允许你基于上一次运行的结果，安全复用身份完全一致的场景视频。
+输入文件可以是每行一个 prompt 的文本文件，也可以是包含 `prompts` 数组的 JSON：
 
 ```bash
-# 普通渲染
-kd1-anime generate "解释欧拉公式 e^{iπ}+1=0 的推导"
-
-# 基于上一次运行进行增量渲染
-kd1-anime generate "解释欧拉公式 e^{iπ}+1=0 的几何意义" --incremental 20260801-120000-1234abcd
-```
-
-### 增量渲染工作原理
-
-1. 新运行仍会完成规划、代码生成、确定性校验和 Reviewer 审查。
-2. 审查通过后，只有代码 SHA-256 与旧场景一致、渲染 profile 哈希一致、旧视频哈希仍匹配且元数据已验证时才复用。
-3. 任一身份条件不满足都会重新提交 Slurm；复用不会伪造 Job ID。
-4. 合并阶段再次校验场景 ID、类名、代码哈希、配置哈希和视频哈希。
-
-### 增量渲染优势
-
-实际节省取决于新旧代码是否逐字节一致。该模式节省的是已确认不变场景的 Slurm 渲染与视频编码成本，不跳过生成和审查安全门。
-
-## 批量并行处理
-
-批量处理允许你从文件读取多个 prompt，并行处理多个动画项目。
-
-```bash
-# 创建 prompts 文件
-cat > prompts.txt << 'EOF'
-解释欧拉公式 e^{iπ}+1=0 的推导
+cat > prompts.txt <<'EOF'
+解释欧拉公式的几何意义
 展示傅里叶级数的几何意义
 可视化特征值和特征向量
 EOF
 
-# 批量处理
 kd1-anime batch prompts.txt --max-parallel 3
 
-# 使用 JSON 格式
-cat > prompts.json << 'EOF'
+cat > prompts.json <<'EOF'
 {
   "prompts": [
-    "解释欧拉公式 e^{iπ}+1=0 的推导",
-    "展示傅里叶级数的几何意义",
-    "可视化特征值和特征向量"
+    "解释欧拉公式的几何意义",
+    "展示傅里叶级数的几何意义"
   ]
 }
 EOF
 
-kd1-anime batch prompts.json
-
-# 指定 --output-dir 后输出为 ~/.kd1-anime/exports/task_001.mp4、task_002.mp4……；
-# 未指定时，输出保存在每个任务自己的 ~/.kd1-anime/workspace/runs/<run-id>/ 目录。
-kd1-anime batch prompts.json --output-dir ~/.kd1-anime/exports --max-parallel 3
+kd1-anime batch prompts.json --dry-run
 ```
 
-### 批量处理选项
+`--max-parallel` 限制项目级并行数；所有项目还共享进程级 `LLM_PARALLEL_WORKERS`、`RAG_PARALLEL_WORKERS`、`VISUAL_LLM_PARALLEL_WORKERS` 和 `SLURM_MAX_IN_FLIGHT` 配额。使用 `--output-dir` 时，输出文件会按任务编号写入该目录；重复目标和不允许覆盖的文件会在执行前被拒绝。
 
-- `--max-parallel, -j`：最大并行任务数（默认：3）
-- `--dry-run`：只生成场景代码，不提交 Slurm 渲染
-- `--output-dir, -o`：输出目录
+## 渲染器、转场与视频合并
 
-`--max-parallel` 限制同时运行的项目数；所有项目还共享进程级
-`LLM_PARALLEL_WORKERS` 和 `SLURM_MAX_IN_FLIGHT` 配额，避免每个项目各自放大并发。
-输出路径在启动前统一解析并检查，重复目标或禁止覆盖的已存在文件会直接报错。
+- `MANIM_RENDERER=cairo` 是默认 CPU 渲染器；`MANIM_RENDERER=opengl` 需要有效 GPU。只有 OpenGL 模式才会申请 `SLURM_GPU_TYPE`。
+- `MANIM_OPENGL_PLATFORM` 只决定 PyOpenGL 上下文后端：`egl` 适合无显示的 headless 节点，`glx` 需要可用显示服务。它不等同于选择 Cairo/OpenGL 渲染器。
+- OpenGL 不支持 `self.camera.frame`/`MovingCameraScene` 这类 Cairo 运镜 API；3D 场景应使用专用相机 API。遇到 `OpenGLCamera ... frame` 错误，应修改代码或切换 Cairo，而不是只重复提交任务。
+- 正式渲染前默认执行同 renderer 的 Smoke Render；本地预检需要显式设置 `LOCAL_SMOKE_RENDER_ENABLED=true`，且 dry-run 永不执行生成代码。
+- 多场景默认使用 FFmpeg `xfade=transition=fade`，转场时长为 `TRANSITION_DURATION=0.5` 秒；有音频时同步使用 `acrossfade`。
+- 合并写入临时文件，ffprobe 验证通过后才原子替换最终输出。默认拒绝覆盖自定义输出，使用 `--force` 或配置 `OVERWRITE_OUTPUT=true` 才允许覆盖。
 
-### 批量处理输出
+## 安全边界
 
-批量处理完成后会显示摘要：
+LLM 生成的 Python 是不可信输入。AST 校验会限制导入、动态执行、文件/网络访问、危险属性、Scene 结构、Manim 生命周期和 renderer API，但 AST 校验不是 Python 沙箱。
 
+共享集群或处理不可信需求时，建议使用只读 Apptainer 镜像：
+
+```dotenv
+SLURM_CONTAINER_IMAGE=/path/to/manim.sif
+SLURM_REQUIRE_CONTAINER=true
+# 集群支持无特权网络命名空间且验证通过后再开启
+SLURM_CONTAINER_DISABLE_NETWORK=true
 ```
-批量处理结果
-  ✓ 任务 1 completed (120.5s) /path/to/task_001.mp4
-  ✓ 任务 2 completed (118.2s) /path/to/task_002.mp4
-  ✓ 任务 3 completed (125.7s) /path/to/task_003.mp4
+
+容器作业使用 `--containall --cleanenv --no-home`，只绑定当前 run；OpenGL 会额外使用 `--nv`。使用 `kd1-anime doctor --security-strict` 检查是否启用 fail-closed 策略。
+
+## 开发与验证
+
+```bash
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate manim_env
+python -m pip install -e '.[dev]'
+
+ruff check .
+ruff format --check .
+python -m compileall -q .
+bash -n install.sh
+pytest -q
+python -m build --sdist --wheel
 ```
+
+测试不得调用真实 LLM、提交 Slurm 或执行生成代码。CI 会在 Python 3.10、3.11 和 3.12 上运行静态检查、编译检查、Shell 语法检查、测试、sdist/wheel 构建和安装后 CLI 检查；`Integration` workflow 额外验证真实 Manim、XeLaTeX、CJK、FFmpeg 联动。
+
+## 文档
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md)：FSM、Agent 分工、合同、恢复、渲染和安全边界。
+- [`docs/configuration.md`](docs/configuration.md)：完整配置项参考和推荐配置组合。
+- [`docs/troubleshooting.md`](docs/troubleshooting.md)：LLM、RAG、Slurm、OpenGL、XeLaTeX 和恢复问题排查。
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)：开发环境、测试、提交和 Pull Request 约定。
+- [`CHANGELOG.md`](CHANGELOG.md)：版本变更记录。
+
+## 技术栈
+
+Python 3.10+ · OpenAI-compatible API · Pydantic · Rich · Typer · prompt_toolkit · Manim CE 0.20.1 · FFmpeg · XeLaTeX · Slurm · 可选 Apptainer
 
 ## 许可证
 

@@ -706,6 +706,12 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]计划审查通过 ✓[/]")
 
+            case "scene_plan_review_warning":
+                scene_id = data.get("scene_id", "?")
+                warnings = data.get("warnings", [])
+                detail = ChatSession._escape_markup(warnings[0]) if warnings else "存在非阻断提示"
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]计划审查提示[/] {detail}")
+
             case "scene_plan_replanned":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]计划已重规划[/]")
@@ -734,6 +740,12 @@ class ChatSession:
             case "scene_review_pass":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]审查通过 ✓[/]")
+
+            case "scene_review_warning":
+                scene_id = data.get("scene_id", "?")
+                warnings = data.get("warnings", [])
+                detail = ChatSession._escape_markup(warnings[0]) if warnings else "存在非阻断提示"
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]代码审查提示[/] {detail}")
 
             case "scene_reviewing":
                 scene_id = data.get("scene_id", "?")

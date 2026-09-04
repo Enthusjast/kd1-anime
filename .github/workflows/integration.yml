@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # 每周在干净的 Ubuntu runner 上验证 XeLaTeX、CJK、FFmpeg 与 Manim 的真实联动。
-    - cron: "17 3 * * 1"
+    - cron: "47 4 * * 0"
 
 permissions:
   contents: read

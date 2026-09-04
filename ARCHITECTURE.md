@@ -2,6 +2,11 @@
 
 本文档描述当前实现，而不是未来设计草案。
 
+面向用户的安装、命令和配置入口见 [README.md](README.md)；完整配置项见
+[docs/configuration.md](docs/configuration.md)，常见故障见
+[docs/troubleshooting.md](docs/troubleshooting.md)，开发约定见
+[CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ## 1. 设计目标
 
 - 使用原生 Python、Pydantic 和显式有限状态机，不引入重型 Agent 框架。
@@ -10,6 +15,7 @@
 - 让每次运行拥有隔离的代码、日志、媒体和输出目录。
 - 用可验证的产物身份避免旧视频、错误配置和错误 Job 被误复用。
 - 在集群故障、LLM 格式错误、渲染失败和视频编码差异下提供清晰失败边界。
+- 让没有 Slurm 的环境也能通过 dry-run 验证规划、技术合同、代码校验和审查流程。
 
 ## 2. 组件
 
@@ -95,6 +101,11 @@ ScenePlan 的对象声明映射为变量名、构造器、动画事件、Transfo
 规范化 JSON 一起写入 `artifacts/scene_<id>_technical_spec.json` 与 `manifest.json`，计划或
 继承代码变化后自动失效，恢复时校验哈希后才会复用。
 
+TechnicalSpec 编译前会做有限的确定性归一化：把缺失且可从 active 对象/依赖关系推断的
+Transform source 补齐，把 Transform 中误列出的新对象拆成独立的 introducer，把边界必须
+保留的 source 从 ReplacementTransform 收敛为原地 Transform，并为已退出但确实重新创建的
+对象建立显式生命周期事件。无法证明安全的情况仍然返回编译错误，不会用猜测替代合同。
+
 Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文件读写、shell、subprocess 和动态执行。Coder、Reviewer 和 AutoFixer 都收到当前 renderer 能力说明：
 
 - OpenGL 禁止 `self.camera.frame`、`MovingCameraScene` 运镜和自定义 Mobject 根类子类；
@@ -117,7 +128,19 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - `minor`：至少一条可精确唯一匹配的查找替换；
 - `major`：带具体反馈并回到 Coder 重写。
 
+审查结果还经过统一的分级策略：Plan Review 的确定性编译错误仍是硬阻断，LLM-only
+问题只有在高置信度且提供计算/合同证据时才阻断；style 和一般 timing 统一降为 warning。
+Code Review 中的 layout、低置信度、含不确定措辞或无法绑定当前源码的 finding 只写入
+warning；唯一可匹配的局部 fix 先经过 AST/连续性/生命周期校验后自动应用，再重新审查。
+warning 会通过 `scene_plan_review_warning`/`scene_review_warning` 事件写入运行诊断，
+不会增加重规划或代码审查轮数。
+
 Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
+
+连续性审查与代码审查同样分离。连续性修正轮数耗尽时，系统会把当时已经通过确定性
+检查的计划标记为 warning 并继续编码/渲染；恢复时最多自动重查一次，避免每次启动都
+重新进入同一循环。代码审查中的数学/连续性 finding 只有在证据明确指向计划本身时才回到
+Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder 层修复。
 
 连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除旧交接代码并按顺序重新编码；恢复旧清单时会优先重新提取导出区，提取失败不会静默复用下游状态。
 
@@ -152,6 +175,10 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 失败场景只读取精确 Job 的 stderr 尾部，并受 `LOG_TAIL_LINES` 和 `MAX_LOG_CHARS` 限制。环境、conda、容器、Slurm、显示服务和字体错误不会交给 LLM 重写业务代码。
 
 其余错误交给 AutoFixer，结果再次通过 AST 校验；不通过时由 Coder 根据校验反馈和原始错误重写。修复后的代码强制复审。修复次数和连续相同错误次数都有上限。
+
+如果高风险几何方案在计划或代码修复预算内仍无法稳定验证，且
+`SAFE_FALLBACK_ENABLED=true`，系统会将该场景降级为保守的基础图形/等式教学方案，清空
+受影响的下游交接并重新经过计划审查，而不是无限重复同一套几何修复。
 
 ### 3.5 持久化与恢复
 
@@ -248,6 +275,7 @@ AST 校验是纵深防御，不是 Python 沙箱。共享或高信任要求集�
 ## 7. 打包、测试与 CI
 
 - wheel 只包含 Python 运行时模块；主机依赖由 `install.sh` 和文档管理。
+- sdist 额外包含 README、架构、配置、故障排查和贡献文档；知识库压缩包仍由安装器解压到用户目录。
 - 安装器无 sudo，优先复用完整 XeLaTeX；需要时安装最小用户级 TeX Live。
 - 单元测试不得调用真实 LLM、提交 Slurm 或执行生成代码。
 
@@ -255,10 +283,11 @@ AST 校验是纵深防御，不是 Python 沙箱。共享或高信任要求集�
 
 ```bash
 ruff check .
+ruff format --check .
 python -m compileall -q .
 bash -n install.sh
 pytest -q
-python -m build --wheel
+python -m build --sdist --wheel
 ```
 
 测试覆盖结构化输出、教学合同/依赖图、截断重试、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v6 与 v4/v5 只读恢复、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级、批量资源配额、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
