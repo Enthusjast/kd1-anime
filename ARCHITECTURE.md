@@ -188,8 +188,8 @@ run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信�
 - 可选 Apptainer 使用 `--containall --cleanenv --no-home`，只绑定当前 run；OpenGL 增加 `--nv` 并显式传递 `PYOPENGL_PLATFORM`。
 
 每次成功提交都会保存数字 Job ID、提交时间、代码哈希、RenderProfile 和实际资源配置。资源
-估计器默认只记录基于风险的建议；设置 `AUTO_RESOURCE_ESTIMATION=true` 后，才会对复杂场景
-向上增加 CPU、内存和时间，Cairo 仍不申请 GPU，用户显式资源不会被降低。监控区分：
+估计器默认按风险对复杂场景向上增加 CPU、内存和时间；设置 `AUTO_RESOURCE_ESTIMATION=false`
+可恢复固定资源，Cairo 仍不申请 GPU，用户显式资源不会被降低。监控区分：
 
 - 正常调度器状态；
 - `GONE`：squeue 可达，但作业不在队列且 sacct 无记录；

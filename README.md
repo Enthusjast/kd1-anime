@@ -336,7 +336,7 @@ kd1-anime cache clear --yes
 | `MAX_FIX_ATTEMPTS` | `5` | 渲染失败后的代码修复次数 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
-| `AUTO_RESOURCE_ESTIMATION` | `false` | 是否按场景复杂度只向上增加 Slurm 资源 |
+| `AUTO_RESOURCE_ESTIMATION` | `true` | 是否按场景复杂度只向上增加 Slurm 资源 |
 | `MONITOR_QUEUE_TIMEOUT` / `RUN_TIMEOUT` | `3600/3600` | 排队/运行超时（秒） |
 | `MONITOR_UNKNOWN_TIMEOUT` | `300` | 控制面不可查询时的最短等待时间 |
 | `MONITOR_ARTIFACT_GRACE` | `60` | Slurm 完成后等待共享文件系统同步产物的时间 |
