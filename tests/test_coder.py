@@ -20,6 +20,7 @@ from kd1_anime.agents.scene_templates import (
 )
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 from kd1_anime.agents.validator import validate_manim_code
+from kd1_anime.config import settings
 
 
 @pytest.fixture
@@ -211,6 +212,22 @@ class TestScene(Scene):
         assert feedback in call_args[1]["user_message"] or feedback in str(
             call_args[1].get("messages", [])
         )
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_template_reference_is_opt_in(
+        self, mock_call_llm, coder_agent, sample_plan, monkeypatch
+    ):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+        monkeypatch.setattr(settings, "CODEGEN_MODE", "python")
+
+        coder_agent.generate_code(sample_plan, stream=False)
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "实验性稳定代码骨架" not in message
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_labels_alternate_candidate(

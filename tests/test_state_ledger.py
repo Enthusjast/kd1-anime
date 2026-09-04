@@ -6,6 +6,7 @@ from kd1_anime.agents.state_ledger import (
     SceneBoundaryIR,
     SceneBoundaryState,
     StateLedger,
+    validate_boundary_handoff,
 )
 
 
@@ -68,3 +69,22 @@ def test_state_ledger_rejects_boundary_reference_to_unknown_element():
 def test_state_ledger_rejects_current_scene_without_boundary():
     with pytest.raises(ValidationError, match="没有对应的场景边界"):
         StateLedger(current_scene_id=1)
+
+
+def test_boundary_handoff_requires_previous_closing_element():
+    current = SceneBoundaryIR(scene_id=2, opening_element_ids=["formula"])
+
+    errors = validate_boundary_handoff(SceneBoundaryIR(scene_id=1), current)
+
+    assert any("closing 元素" in error for error in errors)
+
+
+def test_boundary_handoff_allows_inherit_then_remove():
+    previous = SceneBoundaryIR(scene_id=1, closing_element_ids=["formula"])
+    current = SceneBoundaryIR(
+        scene_id=2,
+        opening_element_ids=["formula"],
+        removed_element_ids=["formula"],
+    )
+
+    assert validate_boundary_handoff(previous, current) == ()

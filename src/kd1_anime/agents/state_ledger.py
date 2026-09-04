@@ -159,3 +159,36 @@ class StateLedger(BaseModel):
                 "boundaries": {**self.boundaries, scene_id: boundary},
             }
         )
+
+
+def validate_boundary_handoff(
+    previous: SceneBoundaryIR | None,
+    current: SceneBoundaryIR,
+) -> tuple[str, ...]:
+    """验证相邻边界的完整元素、数学状态和视觉合同。"""
+
+    errors: list[str] = []
+    opening = set(current.opening_element_ids)
+    closing = set(current.closing_element_ids)
+    removed = set(current.removed_element_ids)
+    if current.scene_id == 1 and opening:
+        errors.append("Scene 1 不能从不存在的上一场景继承元素: " + ", ".join(sorted(opening)))
+    if previous is not None:
+        missing = opening - set(previous.closing_element_ids)
+        if missing:
+            errors.append(
+                f"Scene {current.scene_id} opening 缺少上一场景 closing 元素: "
+                + ", ".join(sorted(missing))
+            )
+        if (
+            previous.visual_state_digest
+            and current.visual_state_digest
+            and previous.visual_state_digest != current.visual_state_digest
+        ):
+            errors.append(f"Scene {current.scene_id} 的全局视觉状态 digest 与上一场景不一致")
+        # opening + remove 是合法的“接管后在本场景退出”生命周期。
+    if closing and not current.exported_code_sha256:
+        errors.append(f"Scene {current.scene_id} 有 closing 元素但没有导出代码哈希")
+    if closing & removed:
+        errors.append("closing 元素不能同时被移除: " + ", ".join(sorted(closing & removed)))
+    return tuple(dict.fromkeys(errors))

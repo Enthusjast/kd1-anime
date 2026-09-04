@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from kd1_anime.agents.capability import CapabilityContract
 from kd1_anime.agents.planner import (
     ContinuityBible,
     ElementManifest,
@@ -40,8 +41,8 @@ from kd1_anime.rendering import (
 )
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 6
-READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6})
+MANIFEST_SCHEMA_VERSION = 7
+READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7})
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -217,6 +218,7 @@ VisualStatus = Literal[
 ]
 TechnicalStatus = Literal["pending", "generating", "passed", "failed"]
 LocalSmokeStatus = Literal["pending", "running", "passed", "failed", "skipped"]
+CandidateVerification = Literal["validated", "smoke", "rendered"]
 
 
 def utc_now() -> datetime:
@@ -294,6 +296,22 @@ class StoredVisualCandidate(BaseModel):
     report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class StoredCodeCandidate(BaseModel):
+    """场景可回滚的代码候选；代码本体保存在 run 内私有文件。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code_file: str
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    class_name: str = Field(min_length=1, max_length=200)
+    verification: CandidateVerification = "validated"
+    inherited_elements_sha256: str = Field(default="", max_length=64)
+    exported_elements_code: str = Field(default="", max_length=30_000)
+    exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
+    artifact: SceneArtifact | None = None
+    visual_score: float | None = Field(default=None, ge=1.0, le=5.0)
+
+
 class StoredSceneState(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -316,6 +334,8 @@ class StoredSceneState(BaseModel):
     technical_input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     technical_status: TechnicalStatus = "pending"
     technical_error: str = Field(default="", max_length=50_000)
+    capability_contract: CapabilityContract | None = None
+    capability_status: str = Field(default="pending", max_length=40)
     resource_profile: RenderResourceProfile | None = None
     local_smoke_status: LocalSmokeStatus = "pending"
     rewrite_feedback: str = Field(default="", max_length=50_000)
@@ -366,6 +386,7 @@ class StoredSceneState(BaseModel):
     visual_artifact_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     visual_feedback: str = Field(default="", max_length=20_000)
     visual_best_candidate: StoredVisualCandidate | None = None
+    candidates: list[StoredCodeCandidate] = Field(default_factory=list, max_length=3)
 
 
 class RunManifest(BaseModel):
@@ -373,7 +394,7 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[4, 5, 6] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[4, 5, 6, 7] = MANIFEST_SCHEMA_VERSION
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -395,13 +416,13 @@ class RunManifest(BaseModel):
     merge_profile: MergeProfile = Field(default_factory=MergeProfile.current)
     outlines: list[SceneOutline] = Field(default_factory=list)
     scenes: dict[int, StoredSceneState] = Field(default_factory=dict)
-    # v6 在概要阶段固定全片教学合同、断言依赖和合并配置；旧版本读取
+    # v7 在概要阶段固定全片教学合同、断言依赖和合并配置；旧版本读取
     # 时使用兼容默认值，但 validate_for_resume 会拒绝继续修改旧清单。
     lesson_spec: LessonSpec = Field(default_factory=LessonSpec)
     teaching_graph: TeachingGraph = Field(default_factory=TeachingGraph)
     state_ledger: StateLedger = Field(default_factory=StateLedger)
     expected_final_duration: float | None = Field(default=None, ge=0, le=3_600)
-    # v4-v6 运行都会固定全片连续性规范；v5+ 另外持久化教学合同与状态账本。
+    # v4-v7 运行都会固定全片连续性规范；v5+ 另外持久化教学合同与状态账本。
     continuity_bible: ContinuityBible | None = None
     element_manifest: ElementManifest = Field(default_factory=ElementManifest)
     plan_review_status: Literal["pending", "reviewing", "passed", "failed", "skipped"] = "skipped"
@@ -951,7 +972,7 @@ def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
 
 
 def migrate_manifest_data(raw: dict, root: Path) -> dict:
-    """读取 v4-v6 清单；旧版本只允许查看，不进行猜测迁移。"""
+    """读取 v4-v7 清单；旧版本只允许查看，不进行猜测迁移。"""
 
     version = raw.get("schema_version", 1)
     if isinstance(version, bool) or not isinstance(version, int):

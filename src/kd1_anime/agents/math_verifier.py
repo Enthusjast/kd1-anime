@@ -35,7 +35,6 @@ class MathVerification:
 
 _SAFE_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)
 _SAFE_UNARYOPS = (ast.UAdd, ast.USub)
-_NAME_RE = re.compile(r"\b[A-Za-z_]\w*\b")
 
 
 def _normalise(expression: str) -> str:
@@ -173,4 +172,82 @@ def verify_expression_samples(
     )
 
 
-__all__ = ["MathVerification", "VerificationStatus", "verify_expression_samples"]
+def verify_numeric_matrix_product(
+    left: str,
+    right: str,
+    expected: str,
+    *,
+    tolerance: float = 1e-9,
+) -> MathVerification:
+    """验证三个纯数字矩阵的乘法和维度，不执行用户表达式。"""
+
+    def parse_matrix(value: str) -> list[list[float]] | None:
+        try:
+            parsed = ast.literal_eval(_normalise(value))
+        except (SyntaxError, ValueError):
+            return None
+        if not isinstance(parsed, (list, tuple)) or not parsed:
+            return None
+        rows: list[list[float]] = []
+        width: int | None = None
+        for row in parsed:
+            if not isinstance(row, (list, tuple)) or not row:
+                return None
+            try:
+                converted = [float(item) for item in row]
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if any(not math.isfinite(item) for item in converted):
+                return None
+            width = width or len(converted)
+            if len(converted) != width:
+                return None
+            rows.append(converted)
+        return rows
+
+    left_matrix = parse_matrix(left)
+    right_matrix = parse_matrix(right)
+    expected_matrix = parse_matrix(expected)
+    if left_matrix is None or right_matrix is None or expected_matrix is None:
+        return MathVerification(status="unknown", seed=0, reason="矩阵不是纯数字二维字面量")
+    if len(left_matrix[0]) != len(right_matrix):
+        return MathVerification(
+            status="counterexample",
+            seed=0,
+            reason="矩阵乘法维度不匹配",
+        )
+    product = [
+        [
+            sum(
+                left_matrix[row][inner] * right_matrix[inner][column]
+                for inner in range(len(right_matrix))
+            )
+            for column in range(len(right_matrix[0]))
+        ]
+        for row in range(len(left_matrix))
+    ]
+    if len(product) != len(expected_matrix) or len(product[0]) != len(expected_matrix[0]):
+        return MathVerification(
+            status="counterexample",
+            seed=0,
+            reason="矩阵乘积结果维度不匹配",
+        )
+    for row, values in enumerate(product):
+        for column, value in enumerate(values):
+            if abs(value - expected_matrix[row][column]) > tolerance:
+                return MathVerification(
+                    status="counterexample",
+                    seed=0,
+                    counterexample={"row": float(row), "column": float(column)},
+                    difference=abs(value - expected_matrix[row][column]),
+                    reason="矩阵乘积存在错误元素",
+                )
+    return MathVerification(status="proved", seed=0, reason="纯数字矩阵乘法逐项相等")
+
+
+__all__ = [
+    "MathVerification",
+    "VerificationStatus",
+    "verify_expression_samples",
+    "verify_numeric_matrix_product",
+]

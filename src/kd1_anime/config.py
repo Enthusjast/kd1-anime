@@ -311,6 +311,8 @@ class Settings(BaseSettings):
     )
     LLM_CACHE_PATH: Path = APP_HOME / "cache" / "llm.sqlite3"
     LLM_CACHE_MAX_ENTRIES: int = Field(default=512, ge=0, le=100_000)
+    FAILURE_CASES_PATH: Path = APP_HOME / "diagnostics" / "failure_cases.sqlite3"
+    FAILURE_CASE_MAX_PER_CATEGORY: int = Field(default=100, ge=1, le=1_000)
     # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
     # 裁剪，低优先级的 RAG/自然语言说明会优先让出空间。
     LLM_MAX_CONTEXT_CHARS: int = Field(default=120_000, ge=10_000, le=2_000_000)
@@ -319,8 +321,8 @@ class Settings(BaseSettings):
     LLM_MAX_TECHNICAL_SPEC_CHARS: int = Field(default=30_000, ge=5_000, le=500_000)
     MAX_TECHNICAL_SPEC_ATTEMPTS: int = Field(default=3, ge=1, le=10)
     CODEGEN_MODE: Literal["hybrid", "python", "ir"] = Field(
-        default="hybrid",
-        description="代码生成模式：普通 Python、结构化 IR，或失败时 IR 回退",
+        default="python",
+        description="代码生成模式：普通 Python；hybrid/ir 为实验性模板化路径",
     )
 
     # --- 独立视觉 LLM API ---
@@ -463,7 +465,7 @@ class Settings(BaseSettings):
     SLURM_GPU_TYPE: str = ""
     SLURM_GPU_COUNT: int = Field(default=1, ge=1)
     AUTO_RESOURCE_ESTIMATION: bool = Field(
-        default=False,
+        default=True,
         description="是否按场景复杂度自动增加 Slurm CPU/内存/时间资源",
     )
     # 0 表示不额外限制；正整数用于避免一次向共享集群提交过多场景。
@@ -491,17 +493,28 @@ class Settings(BaseSettings):
         description="正式渲染前是否执行轻量 Smoke Render",
     )
     SMOKE_RENDER_MODE: Literal["frame", "video", "both"] = Field(
-        default="frame",
-        description="Smoke Render 模式：最后一帧、MP4 或两者",
+        default="both",
+        description="Smoke Render 模式：最后一帧、短 MP4 或两者",
     )
     SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
+    SMOKE_RENDER_SHORT_ANIMATIONS: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="短视频 Smoke 最多执行的前几个动画事件",
+    )
+    ADAPTIVE_SMOKE_RENDER: bool = Field(
+        default=True,
+        description="是否按场景风险选择 frame 或 frame+短视频 Smoke 阶段",
+    )
     # 本地生成/无 Slurm 环境的可选运行时预检；默认关闭，避免在 dry-run
     # 或共享登录节点上执行不可信生成代码。
     LOCAL_SMOKE_RENDER_ENABLED: bool = False
     LOCAL_SMOKE_RENDER_MODE: Literal["frame", "video", "both"] = "frame"
     LOCAL_SMOKE_RENDER_QUALITY: Literal["l", "m"] = "l"
     LOCAL_SMOKE_RENDER_TIMEOUT: int = Field(default=180, ge=10, le=3_600)
+    LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS: int = Field(default=3, ge=1, le=20)
     LOCAL_SMOKE_RENDER_MEMORY_MB: int = Field(default=4_096, ge=256, le=65_536)
     ALLOW_PARTIAL_OUTPUT: bool = False
     OVERWRITE_OUTPUT: bool = False

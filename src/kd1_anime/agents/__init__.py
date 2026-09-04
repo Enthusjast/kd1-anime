@@ -1,15 +1,27 @@
 from kd1_anime.agents.api_linter import ApiLintResult, lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.base import BaseAgent
+from kd1_anime.agents.capability import (
+    CapabilityContract,
+    CapabilityValidationResult,
+    build_capability_contract,
+    recommended_renderer,
+    validate_capability_contract,
+)
 from kd1_anime.agents.coder import CoderAgent
 from kd1_anime.agents.continuity import ContinuityReviewerAgent, ContinuityReviewResult
+from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import FailureRoute, classify_failure
 from kd1_anime.agents.lifecycle import (
     LifecycleValidationResult,
     repair_required_export_alias_lifecycle,
     validate_animation_lifecycle,
 )
-from kd1_anime.agents.math_verifier import MathVerification, verify_expression_samples
+from kd1_anime.agents.math_verifier import (
+    MathVerification,
+    verify_expression_samples,
+    verify_numeric_matrix_product,
+)
 from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
     PlanReviewIssue,
@@ -51,6 +63,7 @@ from kd1_anime.agents.state_ledger import (
     SceneBoundaryIR,
     SceneBoundaryState,
     StateLedger,
+    validate_boundary_handoff,
 )
 from kd1_anime.agents.technical_planner import (
     TechnicalPlannerAgent,
@@ -65,11 +78,15 @@ __all__ = [
     "ApiLintResult",
     "AutoFixerAgent",
     "BaseAgent",
+    "CapabilityContract",
+    "CapabilityValidationResult",
     "CodeValidationResult",
     "CoderAgent",
     "ContinuityBible",
     "ContinuityReviewResult",
     "ContinuityReviewerAgent",
+    "FailureCase",
+    "FailureCaseStore",
     "FailureRoute",
     "LearningObjective",
     "LedgerElement",
@@ -102,6 +119,7 @@ __all__ = [
     "apply_review_policy",
     "assess_scene_risk",
     "build_bounded_prompt",
+    "build_capability_contract",
     "classify_failure",
     "classify_plan_review_issues",
     "classify_progress",
@@ -112,11 +130,15 @@ __all__ = [
     "filter_verified_plan_issues",
     "lint_manim_api",
     "normalize_technical_spec_contract",
+    "recommended_renderer",
     "repair_obvious_math_contradictions",
     "repair_required_export_alias_lifecycle",
     "review_budget",
     "validate_animation_lifecycle",
+    "validate_boundary_handoff",
+    "validate_capability_contract",
     "validate_manim_code",
     "validate_review_evidence",
     "verify_expression_samples",
+    "verify_numeric_matrix_product",
 ]

@@ -56,7 +56,7 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── stats.py                清单/事件日志离线统计
        ├── agents/state_ledger.py  场景边界语义账本与渲染证据
        ├── security.py             脱敏和 JSON-safe 诊断序列化
-       └── run_store.py            Manifest v6、原子检查点、运行锁
+       └── run_store.py            Manifest v7、原子检查点、运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
@@ -171,9 +171,10 @@ Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder �
 run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信息的阶段快照，失败直接阻断该场景，
 不会把本地 Smoke Render 产物当作正式视频。
 
-正式 Slurm 作业内部还会先执行独立的低质量 Canary：除了检查命令退出码，还必须找到非空的
-最终 MP4 并通过 ffprobe；Canary 失败时不会开始高清正式渲染。容器模式下 ffprobe 也在同一
-容器环境中执行，避免登录节点与计算节点依赖不一致。
+正式 Slurm 作业内部还会先执行 import-only、最后一帧和短视频三个 Canary 阶段；短视频默认
+只执行前三个动画事件。除了检查命令退出码，还必须找到非空的最终 MP4 并通过 ffprobe；Canary
+失败时不会开始高清正式渲染。容器模式下 ffprobe 也在同一容器环境中执行，避免登录节点与
+计算节点依赖不一致。低风险场景可只执行 frame，高风险场景自动执行 frame+短视频。
 
 ### 3.3 DISPATCHING / MONITORING
 
@@ -187,8 +188,8 @@ run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信�
 - 可选 Apptainer 使用 `--containall --cleanenv --no-home`，只绑定当前 run；OpenGL 增加 `--nv` 并显式传递 `PYOPENGL_PLATFORM`。
 
 每次成功提交都会保存数字 Job ID、提交时间、代码哈希、RenderProfile 和实际资源配置。资源
-估计器默认只记录基于风险的建议；设置 `AUTO_RESOURCE_ESTIMATION=true` 后，才会对复杂场景
-向上增加 CPU、内存和时间，Cairo 仍不申请 GPU，用户显式资源不会被降低。监控区分：
+估计器默认按风险对复杂场景向上增加 CPU、内存和时间；设置 `AUTO_RESOURCE_ESTIMATION=false`
+可恢复固定资源，Cairo 仍不申请 GPU，用户显式资源不会被降低。监控区分：
 
 - 正常调度器状态；
 - `GONE`：squeue 可达，但作业不在队列且 sacct 无记录；
@@ -217,7 +218,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v6 包含单调 revision、LessonSpec、TeachingGraph、StateLedger、场景 phase、代码哈希、审查/修复次数、精确 Job、RenderProfile、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
+Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v7 包含单调 revision、LessonSpec、TeachingGraph、StateLedger、场景 phase、能力合同、代码哈希、审查/修复次数、候选版本、精确 Job、RenderProfile、资源配置、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -226,7 +227,7 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v6 清单只接受当前教学合同、StateLedger、结构化计划、ElementManifest、阶段状态和最终合并配置；v4/v5 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 非流式完整响应默认写入用户私有 SQLite 缓存；缓存键包含端点、模型、提示词、模式、代理策略和生成参数，不含 API Key，条目数受 LLM_CACHE_MAX_ENTRIES 限制。
+v7 清单只接受当前教学合同、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置；v4–v6 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 非流式完整响应默认写入用户私有 SQLite 缓存；缓存键包含端点、模型、提示词、模式、代理策略和生成参数，不含 API Key，条目数受 LLM_CACHE_MAX_ENTRIES 限制。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
 
 `resume` 在持有 `.run.lock` 后读取清单：
 
@@ -325,4 +326,4 @@ pytest -q
 python -m build --sdist --wheel
 ```
 
-测试覆盖结构化输出、教学合同/依赖图、截断重试、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 强制复审、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v6 与 v4/v5 只读恢复、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级、批量资源配额、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
+测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v7 与旧版只读恢复、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。

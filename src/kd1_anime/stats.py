@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from kd1_anime.run_store import RunManifest, RunRepository
+from kd1_anime.run_store import RunManifest, RunRepository, atomic_write_json
 
 
 def _read_events(root: Path) -> list[dict[str, Any]]:
@@ -68,6 +68,24 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
     plan_review_artifacts = (
         len(list((root / "artifacts").glob("plan_review_scene_*.json"))) if root else 0
     )
+    scene_details = {
+        str(scene_id): {
+            "phase": scene.phase,
+            "failure_category": scene.failure_category,
+            "review_round": scene.review_round,
+            "plan_review_round": scene.plan_review_round,
+            "fix_attempts": scene.fix_attempts,
+            "candidate_count": len(getattr(scene, "candidates", [])),
+            "smoke_status": scene.local_smoke_status,
+            "capability_status": getattr(scene, "capability_status", "pending"),
+            "resource_profile": (
+                scene.resource_profile.model_dump(mode="json")
+                if getattr(scene, "resource_profile", None) is not None
+                else None
+            ),
+        }
+        for scene_id, scene in sorted(manifest.scenes.items())
+    }
     return {
         "run_id": manifest.run_id,
         "status": manifest.status,
@@ -91,7 +109,17 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
         "failure_categories": dict(sorted(failures.items())),
         "event_counts": dict(sorted(event_counts.items())),
         "stage_durations_seconds": _stage_durations(events, manifest.updated_at),
+        "scene_details": scene_details,
     }
+
+
+def write_run_report(manifest: RunManifest, root: Path) -> Path:
+    """把离线统计写入当前 run，供用户和后续调参直接查看。"""
+
+    report_path = root / "run_report.json"
+    report = summarize_manifest(manifest, root=root)
+    atomic_write_json(report_path, report)
+    return report_path
 
 
 def collect_stats(
@@ -115,4 +143,4 @@ def collect_stats(
     }
 
 
-__all__ = ["collect_stats", "summarize_manifest"]
+__all__ = ["collect_stats", "summarize_manifest", "write_run_report"]

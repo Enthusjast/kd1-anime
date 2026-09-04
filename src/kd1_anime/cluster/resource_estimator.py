@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -41,6 +42,7 @@ class RenderResourceProfile(BaseModel):
     time_limit: str = Field(pattern=r"^(?:\d+-)?\d{1,3}:\d{2}:\d{2}$")
     gpu_type: str = Field(default="", max_length=100)
     gpu_count: int = Field(default=1, ge=1, le=64)
+    smoke_mode: Literal["frame", "both"] = "frame"
     estimated: bool = False
     reasons: tuple[str, ...] = ()
 
@@ -68,6 +70,11 @@ class RenderResourceProfile(BaseModel):
             time_limit=settings.SLURM_TIME_LIMIT,
             gpu_type=settings.SLURM_GPU_TYPE,
             gpu_count=settings.SLURM_GPU_COUNT,
+            smoke_mode=(
+                settings.SMOKE_RENDER_MODE
+                if settings.SMOKE_RENDER_MODE in {"frame", "both"}
+                else "frame"
+            ),
         )
 
 
@@ -121,12 +128,14 @@ def estimate_render_resources(
         if risk.level == "high" and memory is not None:
             memory = max(memory, memory + 4)
     use_gpu = render_profile.renderer == "opengl"
+    smoke_mode: Literal["frame", "both"] = "both" if risk.level == "high" else "frame"
     return RenderResourceProfile(
         cpus_per_task=cpus,
         mem_gb=memory,
         time_limit=_format_time_limit(seconds),
         gpu_type=gpu_type if use_gpu else "",
         gpu_count=max(1, int(gpu_count)) if use_gpu else 1,
+        smoke_mode=smoke_mode,
         estimated=bool(apply_estimate),
         reasons=tuple(reasons),
     )
