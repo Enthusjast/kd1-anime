@@ -1436,6 +1436,8 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "video")
 
     def successful_run(command, **kwargs):
+        if "--media_dir" not in command:
+            return module.subprocess.CompletedProcess(command, 0, "", "")
         media_index = command.index("--media_dir") + 1
         media_dir = Path(command[media_index])
         output = media_dir / "nested" / "Demo.mp4"
@@ -1467,6 +1469,8 @@ def test_local_frame_canary_checks_last_frame(monkeypatch, tmp_path):
     captured = {}
 
     def successful_run(command, **kwargs):
+        if "--media_dir" not in command:
+            return module.subprocess.CompletedProcess(command, 0, "", "")
         captured["command"] = command
         media_dir = Path(command[command.index("--media_dir") + 1])
         output = media_dir / "nested" / "Demo.png"

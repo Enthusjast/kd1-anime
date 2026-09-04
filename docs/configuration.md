@@ -183,14 +183,16 @@ Cairo 不申请 GPU；只有 MANIM_RENDERER=opengl 时才使用 GPU 配置。所
 | MANIM_FRAME_RATE | 60 | 输出帧率 |
 | MANIM_OPENGL_PLATFORM | egl | OpenGL 后端：egl 或 glx |
 | SMOKE_RENDER_ENABLED | true | 正式 Slurm 渲染前执行轻量探针 |
-| SMOKE_RENDER_MODE | frame | 预检模式：frame、video 或 both |
+| SMOKE_RENDER_MODE | both | 预检模式：frame、video 或 both |
 | SMOKE_RENDER_QUALITY | l | Smoke Render 质量：l 或 m |
 | SMOKE_RENDER_TIMEOUT | 180 | 远端 Smoke Render 超时秒数 |
+| SMOKE_RENDER_SHORT_ANIMATIONS | 3 | 短视频预检最多执行的前几个动画事件 |
 | LOCAL_SMOKE_RENDER_ENABLED | false | 是否在本地做额外运行时预检 |
 | LOCAL_SMOKE_RENDER_MODE | frame | 本地预检模式：frame、video 或 both |
 | LOCAL_SMOKE_RENDER_QUALITY | l | 本地预检质量 |
 | LOCAL_SMOKE_RENDER_TIMEOUT | 180 | 本地预检超时秒数 |
 | LOCAL_SMOKE_RENDER_MEMORY_MB | 4096 | 本地预检地址空间上限 |
+| LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS | 3 | 本地短视频预检最多执行的动画事件 |
 | ALLOW_PARTIAL_OUTPUT | false | 是否允许缺少场景时合并 |
 | OVERWRITE_OUTPUT | false | 是否允许覆盖自定义输出 |
 | TRANSITION_TYPE | fade | 当前支持的场景转场 |

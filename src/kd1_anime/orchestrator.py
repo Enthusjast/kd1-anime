@@ -2412,8 +2412,13 @@ class Orchestrator:
                 env["PYOPENGL_PLATFORM"] = ctx.render_profile.opengl_platform
             image = settings.SLURM_CONTAINER_IMAGE
 
-            def run_smoke(manim_command: list[str], *, write_video: bool = False) -> None:
-                command_args = list(manim_command)
+            def run_smoke(
+                command_args: list[str],
+                *,
+                write_video: bool = False,
+                module: str = "manim",
+            ) -> None:
+                command_args = list(command_args)
                 if write_video and ctx.render_profile.renderer == "opengl":
                     command_args.insert(-2, "--write_to_movie")
                 if image:
@@ -2441,11 +2446,19 @@ class Orchestrator:
                             "--bind",
                             f"{ctx.paths.root.resolve()}:{ctx.paths.root.resolve()}",
                             str(Path(image).expanduser().resolve()),
-                            *command_args,
+                            *(
+                                ["python", "-m", module, *command_args]
+                                if module
+                                else ["python", *command_args]
+                            ),
                         ]
                     )
                 else:
-                    command = [sys.executable, "-m", *command_args]
+                    command = (
+                        [sys.executable, "-m", module, *command_args]
+                        if module
+                        else [sys.executable, *command_args]
+                    )
                 try:
                     result = _run_limited_process(
                         command,
@@ -2473,6 +2486,20 @@ class Orchestrator:
                 str(smoke_fps),
                 "--disable_caching",
             ]
+            import_check = (
+                "import importlib.util, pathlib, sys; "
+                "path=pathlib.Path(sys.argv[1]); name=sys.argv[2]; "
+                "spec=importlib.util.spec_from_file_location('kd1_smoke_scene', path); "
+                "module=importlib.util.module_from_spec(spec); "
+                "spec.loader.exec_module(module); "
+                "candidate=getattr(module, name, None); "
+                "raise SystemExit(1) if not isinstance(candidate, type) else None"
+            )
+            run_smoke(
+                ["-c", import_check, str(source), state.class_name],
+                module="",
+            )
+            self._emit("scene_smoke_imported", scene_id=state.plan.scene_id)
             if settings.LOCAL_SMOKE_RENDER_MODE in {"frame", "both"}:
                 frame_dir = media_dir / "__frame_smoke__"
                 frame_dir.mkdir(parents=True, exist_ok=True)
@@ -2506,6 +2533,8 @@ class Orchestrator:
                 run_smoke(
                     [
                         *common_args,
+                        "--from_animation_number",
+                        f"0,{settings.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS}",
                         "--media_dir",
                         str(video_dir),
                         str(source),
@@ -2530,6 +2559,8 @@ class Orchestrator:
                 "renderer": ctx.render_profile.renderer,
                 "quality": settings.LOCAL_SMOKE_RENDER_QUALITY,
                 "mode": settings.LOCAL_SMOKE_RENDER_MODE,
+                "stages": ["import", "frame", "short_video"],
+                "short_animations": settings.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS,
                 "resolution": [smoke_width, smoke_height],
                 "frame_rate": smoke_fps,
                 "container": bool(settings.SLURM_CONTAINER_IMAGE),

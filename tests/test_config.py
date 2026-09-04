@@ -198,10 +198,12 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.CODEGEN_MODE == "hybrid"
     assert config.MAX_PLAN_REPLAN_ATTEMPTS == 3
     assert config.SMOKE_RENDER_ENABLED is True
-    assert config.SMOKE_RENDER_MODE == "frame"
+    assert config.SMOKE_RENDER_MODE == "both"
     assert config.SMOKE_RENDER_QUALITY == "l"
+    assert config.SMOKE_RENDER_SHORT_ANIMATIONS == 3
     assert config.LOCAL_SMOKE_RENDER_ENABLED is False
     assert config.LOCAL_SMOKE_RENDER_MODE == "frame"
+    assert config.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS == 3
 
 
 def test_stage_model_routing_falls_back_and_overrides_per_stage():

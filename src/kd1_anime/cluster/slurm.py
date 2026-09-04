@@ -666,6 +666,7 @@ class SlurmDispatcher:
                     "scene_id": scene_id,
                     "status": status,
                     "mode": settings.SMOKE_RENDER_MODE,
+                    "short_animations": settings.SMOKE_RENDER_SHORT_ANIMATIONS,
                     **(
                         {"renderer": renderer, "quality": settings.SMOKE_RENDER_QUALITY}
                         if status == "passed"
@@ -697,6 +698,21 @@ class SlurmDispatcher:
                 )
 
             lines.append('echo "[Smoke] 开始轻量运行时检查"')
+            import_check = (
+                "import importlib.util, pathlib, sys; "
+                "path=pathlib.Path(sys.argv[1]); name=sys.argv[2]; "
+                "spec=importlib.util.spec_from_file_location('kd1_smoke_scene', path); "
+                "module=importlib.util.module_from_spec(spec); "
+                "spec.loader.exec_module(module); "
+                "candidate=getattr(module, name, None); "
+                "raise SystemExit(1) if not isinstance(candidate, type) else None"
+            )
+            lines.append(
+                smoke_run(
+                    command_for(["python", "-c", import_check, str(python_file), scene_class_name])
+                )
+            )
+            lines.append('echo "[Smoke] import-only 检查通过"')
             if settings.SMOKE_RENDER_MODE in {"frame", "both"}:
                 frame_dir = media_dir / "__frame_smoke__"
                 frame_args = [
@@ -746,6 +762,8 @@ class SlurmDispatcher:
                     "--fps",
                     str(smoke_fps),
                     "--disable_caching",
+                    "--from_animation_number",
+                    f"0,{settings.SMOKE_RENDER_SHORT_ANIMATIONS}",
                     "--media_dir",
                     str(smoke_dir),
                     str(python_file),
