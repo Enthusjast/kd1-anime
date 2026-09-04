@@ -4001,7 +4001,8 @@ class Orchestrator:
     def _plan_review_feedback(issues: list[PlanReviewIssue]) -> str:
         return "\n\n".join(
             f"[{issue.category}] 字段 {issue.field or '未指定'}: {issue.message}\n"
-            f"修正要求: {issue.fix_instruction}"
+            + (f"证据: {issue.evidence}\n" if issue.evidence else "")
+            + f"修正要求: {issue.fix_instruction}"
             for issue in issues
         )
 
@@ -4528,12 +4529,21 @@ class Orchestrator:
                         "result": result.model_dump(mode="json"),
                         "issues": [item.model_dump(mode="json") for item in all_issues],
                         "blocking_issues": [item.model_dump(mode="json") for item in issues],
+                        "warning_issues": [
+                            item.model_dump(mode="json") for item in non_blocking_issues
+                        ],
                     },
                 )
                 if non_blocking_issues:
-                    ctx.continuity_warnings.extend(
+                    warning_messages = [
                         f"Scene {scene_id} 计划审查提示：{issue.message}"
                         for issue in non_blocking_issues
+                    ]
+                    ctx.continuity_warnings.extend(warning_messages)
+                    self._emit(
+                        "scene_plan_review_warning",
+                        scene_id=scene_id,
+                        warnings=warning_messages[:20],
                     )
                 if not issues:
                     with self._state_lock:
@@ -6510,6 +6520,9 @@ class Orchestrator:
             },
         )
         if result.is_valid:
+            warning_messages = [
+                f"Scene {scene_id} 代码审查提示：{warning}" for warning in result.warnings
+            ]
             with self._state_lock:
                 state.review_round = 0
                 state.review_signature = ""
@@ -6519,17 +6532,35 @@ class Orchestrator:
                 state.failure_category = ""
                 self._apply_incremental_for_scene(ctx, scene_id, state)
                 self._update_state_ledger(ctx, state)
+                if warning_messages:
+                    ctx.continuity_warnings.extend(warning_messages)
                 self._checkpoint(ctx, State.REVIEWING)
             self._emit("scene_review_pass", scene_id=scene_id)
+            if warning_messages:
+                self._emit(
+                    "scene_review_warning",
+                    scene_id=scene_id,
+                    warnings=warning_messages[:20],
+                )
             if state.rendered and state.artifact and state.artifact.origin == "reused":
                 self._emit("scene_reused", scene_id=scene_id)
             return True
 
         original_feedback = result.feedback or ""
-        if result.severity == "major" and self._apply_precise_review_fixes(
-            ctx, scene_id, state, result
-        ):
+        if result.fixes and self._apply_precise_review_fixes(ctx, scene_id, state, result):
             return True
+        if result.severity == "minor":
+            # 精确修复已经在上面经过完整确定性校验；如果失败，不再
+            # 使用旧的“只做 AST 校验”的分支，避免把未经连续性/生命
+            # 周期校验的代码当成可接受修复。将其升级为普通重写反馈。
+            result = ReviewResult(
+                is_valid=False,
+                severity="major",
+                feedback=(original_feedback or "局部修复未通过完整的 AST、连续性或生命周期校验"),
+                fixes=result.fixes,
+                findings=result.findings,
+                warnings=result.warnings,
+            )
         plan_finding = next(
             (
                 finding
@@ -6598,60 +6629,6 @@ class Orchestrator:
                 self._checkpoint(ctx, State.REVIEWING)
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return True
-
-        if result.severity == "minor":
-            candidate = state.code
-            applied_count = 0
-            invalid_fixes: list[str] = []
-            for fix in result.fixes:
-                occurrences = candidate.count(fix.find) if fix.find else 0
-                if occurrences == 1:
-                    candidate = candidate.replace(fix.find, fix.replace, 1)
-                    applied_count += 1
-                else:
-                    invalid_fixes.append(
-                        f"{fix.find!r}（出现 {occurrences} 次，必须恰好出现 1 次）"
-                    )
-            validation = (
-                self._validate(candidate, renderer=ctx.render_profile.renderer)
-                if result.fixes and applied_count == len(result.fixes)
-                else None
-            )
-            if validation and validation.is_valid and not invalid_fixes:
-                self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
-                with self._state_lock:
-                    state.code = candidate
-                    state.class_name = validation.scene_classes[0]
-                    state.artifact = None
-                    state.rendered = False
-                    state.exported_elements_code = ""
-                    state.exported_elements = []
-                    state.local_smoke_status = "pending"
-                    self._remove_element_manifest_scene(ctx, scene_id)
-                    self._reset_visual_receipt(ctx, state)
-                    self._checkpoint(ctx, State.REVIEWING)
-                self._emit(
-                    "scene_coded",
-                    scene_id=scene_id,
-                    file_path=str(ctx.paths.scenes / f"scene_{scene_id}.py"),
-                )
-                self._emit("scene_review_fail", scene_id=scene_id, severity="minor")
-                return True
-            # minor 修复失败 → 升级为 major, 保留原始反馈
-            result = ReviewResult(
-                is_valid=False,
-                severity="major",
-                feedback=(
-                    f"## Reviewer 审查意见（minor 修复未能全部应用）\n{original_feedback}\n\n"
-                    f"## 修复建议详情\n{fix_details}\n\n"
-                    + (
-                        "## 未能唯一定位的修复\n- " + "\n- ".join(invalid_fixes) + "\n\n"
-                        if invalid_fixes
-                        else ""
-                    )
-                    + f"## 确定性校验\n{validation.feedback if validation else '未生成有效代码'}"
-                ),
-            )
 
         # major → 排队重写 (下一轮调度进入编码阶段)
         with self._state_lock:

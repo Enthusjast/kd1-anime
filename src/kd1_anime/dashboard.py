@@ -181,7 +181,10 @@ class SceneDashboard:
         self.visual_enabled: bool = False
         self.rag_status: str = "disabled"
         self.rag_models: str = ""
-        self._event_lock = threading.Lock()
+        # Rich 的自动刷新线程会和 Orchestrator 的事件线程同时读取/修改
+        # 场景状态。使用可重入锁：_render() 需要持锁读取状态，而事件
+        # 线程在更新后还要主动触发一次刷新。
+        self._state_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -193,7 +196,10 @@ class SceneDashboard:
             return False
         try:
             self.live = Live(
-                self._render,  # 传 callable: Rich 每次刷新都会重新渲染, 耗时/进度实时更新
+                # 必须使用 get_renderable，而不是把 callable 当作静态
+                # renderable 传入；否则 Rich 自动刷新时不会重新调用
+                # _render()，顶部和场景的读秒会停在最后一次事件上。
+                get_renderable=self._render,
                 console=console,
                 refresh_per_second=10,
                 transient=False,
@@ -226,12 +232,15 @@ class SceneDashboard:
         """根据 orchestrator 事件更新仪表盘状态 (线程安全)。"""
         if not self.live:
             return
-        # 状态更新与 Live 重绘放在同一把锁内: Rich Live 非线程安全,
-        # 多个场景线程并发调用时避免画面错乱。
-        with self._event_lock:
+        # 先原子更新状态，再让 Rich 按 get_renderable 重新取最新 Panel。
+        # 不要在状态锁内调用 Live.refresh：Rich 的刷新线程可能先持有
+        # Live 内部锁再等待状态锁，反向调用会造成锁顺序反转。
+        with self._state_lock:
             self._apply_event(event, data)
-            with suppress(Exception):
-                self.live.update(self._render(), refresh=True)
+            live = self.live
+        with suppress(Exception):
+            if live is not None:
+                live.refresh()
 
     def _mark_running(self, status: SceneStatus, stage: str, message: str) -> None:
         status.state = "running"
@@ -376,6 +385,15 @@ class SceneDashboard:
                 status.invalidate_from("计划审查", self.stages)
                 self._mark_running(status, "计划审查", "计划正确性审查中")
 
+        elif event == "scene_plan_review_warning":
+            if status:
+                warnings = data.get("warnings", [])
+                message = str(warnings[0]) if warnings else "计划审查存在非阻断提示"
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = message
+
         elif event == "scene_plan_review_pass":
             if status:
                 status.state = "running"
@@ -484,6 +502,15 @@ class SceneDashboard:
                 status.started_at = 0.0
                 status.mark_done("审查")
                 status.message = "审查通过" if event == "scene_review_pass" else "已跳过审查"
+
+        elif event == "scene_review_warning":
+            if status:
+                warnings = data.get("warnings", [])
+                message = str(warnings[0]) if warnings else "代码审查存在非阻断提示"
+                status.state = "running"
+                status.stage = ""
+                status.started_at = 0.0
+                status.message = message
 
         elif event == "scene_review_fail":
             if status:
@@ -650,6 +677,12 @@ class SceneDashboard:
         return counts
 
     def _render(self) -> Panel:
+        """生成当前仪表盘；Rich 自动刷新时每次都会重新调用。"""
+        with self._state_lock:
+            return self._render_locked()
+
+    def _render_locked(self) -> Panel:
+        """在 _state_lock 已持有时构造 Panel。"""
         total = self.total
         completed = sum(1 for s in self.scenes.values() if s.state in {"completed", "warning"})
         failed = sum(1 for s in self.scenes.values() if s.state == "failed")

@@ -7,6 +7,7 @@ from kd1_anime.agents.reviewer import (
     FixSuggestion,
     ReviewFinding,
     ReviewResult,
+    apply_review_policy,
     drop_unverifiable_review_items,
     filter_contradictory_review_findings,
     normalize_review_evidence,
@@ -36,6 +37,9 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "VGroup 本身只有在被加入或引入后才是 active" in REVIEWER_SYSTEM_PROMPT
     assert "证据优先于行号" in REVIEWER_SYSTEM_PROMPT
     assert "只报告确定的问题" in REVIEWER_SYSTEM_PROMPT
+    assert "confidence" in REVIEWER_SYSTEM_PROMPT
+    assert "evidence_type" in REVIEWER_SYSTEM_PROMPT
+    assert "warnings" in REVIEWER_SYSTEM_PROMPT
 
 
 def test_severity_is_closed_enum():
@@ -245,6 +249,81 @@ def test_drop_unverifiable_review_items_does_not_block_with_only_bad_evidence():
     assert filtered.is_valid is True
 
 
+def test_uncertain_code_major_finding_becomes_warning():
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                evidence="self.wait()",
+                why="这里可能存在运行时问题",
+                repair="建议检查",
+            )
+        ],
+    )
+
+    normalized, corrections = apply_review_policy(result, "self.wait()\n")
+
+    assert normalized.is_valid is True
+    assert normalized.findings == []
+    assert normalized.warnings
+    assert corrections == []
+
+
+def test_high_confidence_code_finding_remains_blocking():
+    finding = ReviewFinding(
+        category="runtime",
+        severity="major",
+        confidence="high",
+        evidence_type="source_code",
+        evidence="self.wait()",
+        why="该调用确定会触发运行时错误",
+        repair="删除该调用",
+    )
+    result = ReviewResult(is_valid=False, severity="major", findings=[finding])
+
+    normalized, _ = apply_review_policy(result, "self.wait()\n")
+
+    assert normalized.is_valid is False
+    assert normalized.severity == "major"
+    assert normalized.findings == [finding]
+
+
+def test_layout_major_finding_is_non_blocking_even_with_high_confidence():
+    finding = ReviewFinding(
+        category="layout",
+        severity="major",
+        confidence="high",
+        evidence_type="source_code",
+        evidence="self.wait()",
+        why="布局存在确定的视觉问题",
+        repair="调整位置",
+    )
+    result = ReviewResult(is_valid=False, severity="major", findings=[finding])
+
+    normalized, _ = apply_review_policy(result, "self.wait()\n")
+
+    assert normalized.is_valid is True
+    assert normalized.warnings
+
+
+def test_unique_fix_is_kept_as_repairable_result():
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="请补充停顿",
+        fixes=[FixSuggestion(find="pass", replace="self.wait(1)", reason="补充停顿")],
+    )
+
+    normalized, _ = apply_review_policy(result, "pass\n")
+
+    assert normalized.is_valid is False
+    assert normalized.severity == "minor"
+    assert normalized.fixes[0].replace == "self.wait(1)"
+
+
 def test_reviewer_accepts_unique_evidence_with_wrong_model_line_numbers(monkeypatch):
     from kd1_anime.agents.planner import ScenePlan
     from kd1_anime.agents.reviewer import ReviewerAgent
@@ -268,6 +347,8 @@ def test_reviewer_accepts_unique_evidence_with_wrong_model_line_numbers(monkeypa
             ReviewFinding(
                 category="runtime",
                 severity="major",
+                confidence="high",
+                evidence_type="source_code",
                 line_start=1,
                 line_end=1,
                 evidence="self.play(FadeIn(circle))",
@@ -319,6 +400,8 @@ def test_reviewer_retries_when_model_finding_has_no_code_evidence(monkeypatch):
             ReviewFinding(
                 category="runtime",
                 severity="major",
+                confidence="high",
+                evidence_type="source_code",
                 line_start=4,
                 evidence="self.play(FadeIn(circle))",
                 why="circle 未定义",
@@ -342,6 +425,47 @@ def test_reviewer_retries_when_model_finding_has_no_code_evidence(monkeypatch):
 
     assert len(calls) == 2
     assert result.findings[0].evidence in calls[1]["user_message"]
+
+
+def test_reviewer_downgrades_unverifiable_feedback_after_retry(monkeypatch):
+    from kd1_anime.agents.planner import ScenePlan
+    from kd1_anime.agents.reviewer import ReviewerAgent
+
+    scene_plan = ScenePlan(
+        scene_id=1,
+        title="无证据意见",
+        duration_seconds=10,
+        purpose="测试",
+        math_concept="x",
+        visual_design="固定",
+        camera_movement="固定",
+        visual_flow=["显示"],
+        key_moments=["停顿"],
+        computation="x=1",
+    )
+    responses = iter(
+        [
+            ReviewResult(is_valid=False, severity="major", feedback="缺少具体证据"),
+            ReviewResult(is_valid=False, severity="major", feedback="仍然无法定位源码"),
+        ]
+    )
+    calls = []
+    reviewer = ReviewerAgent()
+
+    def fake_call(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call)
+    result = reviewer.review(
+        "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()",
+        scene_plan,
+    )
+
+    assert len(calls) == 2
+    assert result.is_valid is True
+    assert result.findings == []
+    assert any("未形成可验证阻断证据" in warning for warning in result.warnings)
 
 
 def test_invalid_none_severity_still_requires_major_feedback():

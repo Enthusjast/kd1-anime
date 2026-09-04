@@ -39,6 +39,9 @@ class PlanReviewIssue(BaseModel):
         "style",
     ]
     severity: Literal["minor", "major"] = "major"
+    confidence: Literal["high", "medium", "low"] = "medium"
+    evidence_type: Literal["deterministic", "calculation", "contract", "uncertain"] = "uncertain"
+    evidence: str = Field(default="", max_length=5_000)
     field: str = Field(default="", max_length=100)
     message: str = Field(min_length=1, max_length=5_000)
     fix_instruction: str = Field(min_length=1, max_length=5_000)
@@ -53,6 +56,7 @@ class PlanReviewResult(BaseModel):
     severity: Literal["info", "minor", "major"] = "minor"
     summary: str = Field(default="", max_length=2_000)
     issues: list[PlanReviewIssue] = Field(default_factory=list, max_length=50)
+    warnings: list[PlanReviewIssue] = Field(default_factory=list, max_length=50)
 
     @model_validator(mode="before")
     @classmethod
@@ -70,11 +74,17 @@ class PlanReviewResult(BaseModel):
     def validate_contract(self) -> PlanReviewResult:
         if self.is_valid:
             self.severity = "info"
+            if self.issues:
+                self.warnings = [*self.warnings, *self.issues][:50]
             self.issues = []
             return self
         if self.severity == "info":
             self.severity = "major"
         if not self.issues:
+            if self.warnings:
+                self.is_valid = True
+                self.severity = "info"
+                return self
             raise ValueError("计划审查失败时必须提供 issues")
         return self
 
@@ -103,7 +113,8 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
   `elements_to_remove` 反向要求当前场景把同一元素标成 `remove`。例如“本场景
   create/keep → 下一场景 inherited → 下一场景再 remove”是合法的三段式交接。
 - `major` 才是阻断问题；`minor` 只记录可选提示，不要因为“无需修改”或节奏建议
-  把 is_valid 设为 false。
+  把 is_valid 设为 false。只有 high 置信度、带具体证据且没有“可能/建议”等
+  不确定措辞的问题才能作为 LLM 阻断项；其它意见放入 warnings。
 - 只要复杂几何不能严格验证，就要求改成面积标签、基础图形或等式变换；不要批准
   “先移动到附近，观众会理解”的示意性证明。
 - 每个问题必须定位字段，并给出可直接交给 Planner 的修改指令。
@@ -115,6 +126,15 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
   要求补充 math_claims/timeline，而不能建议删除 claim_ids 来绕过教学合同；重新分配断言
   只能回到全片概要阶段完成。
 - 没有阻断问题时返回 is_valid=true、severity=info、issues=[]。
+
+## 问题证据与分级
+- 确定性检查发现的问题会在 deterministic_findings 中提供；它们的 severity 由本地
+  编译器决定，不能擅自改成通过。
+- LLM 自己发现的问题必须填写 confidence、evidence_type 和 evidence。数学/几何/合同/
+  renderer 的 major 问题只有在 confidence=high 且 evidence 是当前输入中可核验的具体
+  计算、合同片段或能力约束时才可放入 issues；证据不足时放入 warnings。
+- style 和一般 timing 建议放入 warnings；只有时间线确实缺口、超出场景时长或无法完成
+  核心教学目标时才可作为 major。
 
 如果收到 `<safe_fallback_mode>true</safe_fallback_mode>`，说明该计划已经主动放弃
 未经验证的复杂几何，只需审查保守方案的数学、运行时和交接合同，不要因为它没有恢复
@@ -130,11 +150,15 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
     {
       "category": "math|geometry|feasibility|timing|continuity|contract|renderer|style",
       "severity": "minor|major",
+      "confidence": "high|medium|low",
+      "evidence_type": "deterministic|calculation|contract|uncertain",
+      "evidence": "输入中可核验的具体片段或计算",
       "field": "computation",
       "message": "具体问题",
       "fix_instruction": "明确改成什么"
     }
-  ]
+  ],
+  "warnings": []
 }
 """
 
@@ -143,6 +167,47 @@ class PlanReviewBatchItem(PlanReviewResult):
     """批量计划审查中的一个场景结果。"""
 
     scene_id: int = Field(ge=1)
+
+
+_PLAN_HARD_CATEGORIES = frozenset(
+    {"math", "geometry", "feasibility", "continuity", "contract", "renderer"}
+)
+_UNCERTAIN_REVIEW_MARKERS = (
+    "可能",
+    "或许",
+    "似乎",
+    "看起来",
+    "建议",
+    "可考虑",
+    "最好",
+    "might",
+    "maybe",
+    "possibly",
+    "could",
+    "appears",
+    "seems",
+    "suggest",
+    "recommend",
+)
+
+
+def _contains_uncertain_review_language(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker.lower() in lowered for marker in _UNCERTAIN_REVIEW_MARKERS)
+
+
+def _is_high_confidence_plan_issue(issue: PlanReviewIssue) -> bool:
+    """判断 LLM 计划问题是否有资格成为硬阻断。"""
+
+    if issue.severity != "major" or issue.category not in _PLAN_HARD_CATEGORIES:
+        return False
+    # deterministic 只保留给本地编译器产生的 issue；不能因为 LLM 自己
+    # 把 evidence_type 写成 deterministic 就获得硬阻断权限。
+    if issue.confidence != "high" or issue.evidence_type not in {"calculation", "contract"}:
+        return False
+    if not issue.evidence.strip():
+        return False
+    return not _contains_uncertain_review_language(f"{issue.message}\n{issue.fix_instruction}")
 
 
 def filter_verified_plan_issues(
@@ -276,13 +341,32 @@ def classify_plan_review_issues(
     共用这套策略，避免同一份计划在两个入口得到不同结论。
     """
 
-    all_issues = dedupe_plan_review_issues(
-        [*deterministic_issues, *(result.issues if not result.is_valid else [])]
-    )
+    deterministic = dedupe_plan_review_issues(deterministic_issues)
+    deterministic_keys = {(issue.category, issue.field, issue.message) for issue in deterministic}
+    model_issues = [*result.issues, *result.warnings]
+    all_issues = dedupe_plan_review_issues([*deterministic, *model_issues])
     all_issues = filter_verified_plan_issues(plan, all_issues)
-    blocking = [issue for issue in all_issues if issue.severity == "major"]
-    non_blocking = [issue for issue in all_issues if issue.severity != "major"]
-    return all_issues, blocking, non_blocking
+    effective: list[PlanReviewIssue] = []
+    blocking: list[PlanReviewIssue] = []
+    non_blocking: list[PlanReviewIssue] = []
+    for issue in all_issues:
+        key = (issue.category, issue.field, issue.message)
+        is_deterministic = key in deterministic_keys
+        is_blocking = (
+            is_deterministic and issue.category != "style" and issue.severity == "major"
+        ) or (not is_deterministic and _is_high_confidence_plan_issue(issue))
+        if is_blocking:
+            effective.append(issue)
+            blocking.append(issue)
+        else:
+            warning = (
+                issue.model_copy(update={"severity": "minor"})
+                if issue.severity == "major"
+                else issue
+            )
+            effective.append(warning)
+            non_blocking.append(warning)
+    return effective, blocking, non_blocking
 
 
 PLAN_REVIEW_BATCH_PROMPT = (
@@ -293,7 +377,7 @@ PLAN_REVIEW_BATCH_PROMPT = (
 这次输入包含多个场景。逐个审查并为每个场景输出一个 items 项，scene_id 必须与输入
 完全一致，不能漏项、重复或重编号。只报告真正阻断该场景的问题；跨场景问题应在相关
 两个场景中都定位。输出格式：
-{"items": [{"scene_id": 1, "is_valid": true, "severity": "info", "summary": "...", "issues": []}]}
+{"items": [{"scene_id": 1, "is_valid": true, "severity": "info", "summary": "...", "issues": [], "warnings": []}]}
 """
 )
 
@@ -455,7 +539,18 @@ def deterministic_plan_issues(
                 fix_instruction=compiler_issue.fix_instruction,
             )
         )
-    return issues
+    # 确定性发现与 LLM 意见分开标记。style 即使来自确定性比较也只是
+    # 非阻断提示；数学/合同/renderer 等确定错误仍由 classify 函数硬阻断。
+    return [
+        issue.model_copy(
+            update={
+                "confidence": "high",
+                "evidence_type": "deterministic",
+                "severity": "minor" if issue.category == "style" else issue.severity,
+            }
+        )
+        for issue in issues
+    ]
 
 
 class PlanReviewerAgent(BaseAgent):
@@ -887,6 +982,7 @@ class PlanReviewerAgent(BaseAgent):
                 severity=item.severity,
                 summary=item.summary,
                 issues=item.issues,
+                warnings=item.warnings,
             )
             for item in items
         }

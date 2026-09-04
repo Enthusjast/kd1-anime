@@ -113,6 +113,32 @@ class TestSceneDashboard:
         assert dash.scenes[1].stage == "代码审查"
         assert "代码审查⟳" in str(dash.scenes[1].render_row()[2])
 
+    def test_review_warning_does_not_mark_scene_complete_or_rewrite(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_review_warning",
+            {"scene_id": 1, "warnings": ["[layout] 建议调整标题位置"]},
+        )
+
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].stage == ""
+        assert "标题位置" in dash.scenes[1].message
+
+    def test_plan_review_warning_does_not_mark_scene_complete(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_plan_review_warning",
+            {"scene_id": 1, "warnings": ["[timing] 建议增加结论停顿"]},
+        )
+
+        assert dash.scenes[1].state == "running"
+        assert dash.scenes[1].stage == ""
+        assert "结论停顿" in dash.scenes[1].message
+
     def test_visual_enabled_scene_stays_in_progress_until_visual_gate_accepts(self):
         dash = SceneDashboard()
         dash.live = MagicMock()
@@ -289,6 +315,66 @@ class TestSceneDashboard:
 
 def test_suppress_flag_off_by_default():
     assert suppress_agent_logs() is False
+
+
+def test_live_uses_dynamic_render_callback_for_elapsed_time(monkeypatch):
+    """Rich 自动刷新必须重新调用 _render，而不是复用静态 Panel。"""
+    import io
+    import types
+
+    from rich.console import Console as RichConsole
+
+    import kd1_anime.dashboard as dashboard_module
+
+    class FakeLive:
+        def __init__(self, *, get_renderable, **_kwargs):
+            self.get_renderable = get_renderable
+            self.refresh_count = 0
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def refresh(self):
+            self.refresh_count += 1
+            # 模拟 Rich 的自动刷新线程：每次刷新都重新取得 renderable。
+            self.get_renderable()
+
+    monkeypatch.setattr(dashboard_module, "Live", FakeLive)
+    monkeypatch.setattr(
+        dashboard_module,
+        "sys",
+        types.SimpleNamespace(stdout=types.SimpleNamespace(isatty=lambda: True)),
+    )
+    dash = SceneDashboard()
+    assert dash.start() is True
+    try:
+        live = dash.live
+        assert isinstance(live, FakeLive)
+        assert getattr(live.get_renderable, "__self__", None) is dash
+        assert getattr(live.get_renderable, "__func__", None) is SceneDashboard._render
+
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event("scene_coding", {"scene_id": 1})
+        dash.scenes[1].started_at = 100.0
+
+        now = [112.0]
+        monkeypatch.setattr(dashboard_module.time, "time", lambda: now[0])
+        first_buffer = io.StringIO()
+        RichConsole(file=first_buffer, width=120, force_terminal=False).print(live.get_renderable())
+        assert "12s" in first_buffer.getvalue()
+
+        now[0] = 119.0
+        second_buffer = io.StringIO()
+        RichConsole(file=second_buffer, width=120, force_terminal=False).print(
+            live.get_renderable()
+        )
+        assert "19s" in second_buffer.getvalue()
+        assert live.refresh_count >= 2  # plan_complete + scene_coding
+    finally:
+        dash.stop()
 
 
 class TestSceneDashboardEvents:
