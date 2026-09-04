@@ -123,6 +123,7 @@ class BatchProcessor:
         self.tasks: list[BatchTask] = []
         self.resources = ResourceCoordinator(
             llm_limit=settings.LLM_PARALLEL_WORKERS,
+            visual_llm_limit=settings.VISUAL_LLM_PARALLEL_WORKERS,
             slurm_limit=settings.SLURM_MAX_IN_FLIGHT,
         )
         self._active_lock = threading.RLock()
@@ -150,13 +151,15 @@ class BatchProcessor:
 
     def _execute_single_task(self, task: BatchTask) -> BatchTask:
         """执行单个任务。"""
-        from kd1_anime.orchestrator import Orchestrator
-
         task.status = "running"
         task.start_time = datetime.now()
         orchestrator: Orchestrator | None = None
 
         try:
+            # 导入和初始化也属于任务范围；如果安装环境损坏，不能让
+            # future.result() 把整个批次提前抛出并遗漏其它任务的收尾。
+            from kd1_anime.orchestrator import Orchestrator
+
             if self._interrupted.is_set():
                 task.status = "interrupted"
                 task.error = "用户中断，任务已停止"
@@ -257,7 +260,14 @@ class BatchProcessor:
         }
         try:
             for future in as_completed(future_to_task):
-                task = future.result()
+                task = future_to_task[future]
+                try:
+                    task = future.result()
+                except Exception as exc:
+                    task.status = "failed"
+                    task.error = str(exc)
+                    task.end_time = datetime.now()
+                    logger.error("任务 %s worker 异常: %s", task.task_id, exc)
                 completed_tasks.append(task)
                 elapsed = ""
                 if task.start_time and task.end_time:

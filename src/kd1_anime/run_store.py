@@ -9,14 +9,19 @@ import os
 import re
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from kd1_anime.agents.planner import SceneOutline, ScenePlan
+from kd1_anime.agents.planner import (
+    ContinuityBible,
+    ExtractedElement,
+    SceneOutline,
+    ScenePlan,
+)
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import resolve_runtime_path
 from kd1_anime.rendering import (
@@ -28,7 +33,7 @@ from kd1_anime.rendering import (
 )
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -38,6 +43,7 @@ RESUME_LLM_STATES = frozenset(
         "CODING",
         "REVIEWING",
         "FIXING",
+        "VISUAL_EVALUATING",
         "EVALUATING",
         "ERROR",
     }
@@ -52,12 +58,32 @@ FSMState = Literal[
     "DISPATCHING",
     "MONITORING",
     "FIXING",
+    "VISUAL_EVALUATING",
     "MERGING",
     "EVALUATING",
     "DONE",
     "ERROR",
 ]
-ScenePhase = Literal["pending", "detailed", "coded", "reviewed", "monitoring", "rendered", "failed"]
+ScenePhase = Literal[
+    "pending",
+    "detailed",
+    "coded",
+    "reviewed",
+    "monitoring",
+    "rendered",
+    "visual_evaluating",
+    "visual_accepted",
+    "failed",
+]
+VisualStatus = Literal[
+    "pending",
+    "evaluating",
+    "passed",
+    "needs_fix",
+    "warning",
+    "unknown",
+    "skipped",
+]
 
 
 def utc_now() -> datetime:
@@ -93,6 +119,45 @@ class StoredSlurmJob(BaseModel):
     cancelled: bool = False
 
 
+class VisualEvalProfile(BaseModel):
+    """持久化的非敏感视觉评估策略；API Key 和端点不写入运行清单。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    model: str = Field(default="", max_length=300)
+    frame_count: int = Field(default=6, ge=1, le=8)
+    threshold: float = Field(default=3.5, ge=1.0, le=5.0)
+    max_fix_attempts: int = Field(default=2, ge=0, le=5)
+    evaluator_version: Literal["1"] = "1"
+
+    def digest(self) -> str:
+        payload = self.model_dump_json(exclude_none=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class StoredVisualCandidate(BaseModel):
+    """可在视觉修复失败时恢复的、完整且经过验证的场景候选。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: float = Field(ge=1.0, le=5.0)
+    has_major_issue: bool = False
+    passed: bool = False
+    # 全 0 表示旧收据未记录继承上下文；它不会与任何真实 SHA-256 匹配，
+    # 因而可读取但不能被不安全地自动恢复。
+    inherited_elements_sha256: str = Field(default="0" * 64, pattern=r"^[0-9a-f]{64}$")
+    code_file: str
+    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    class_name: str = Field(min_length=1, max_length=200)
+    slurm_job: StoredSlurmJob | None = None
+    artifact: SceneArtifact
+    exported_elements_code: str = Field(default="", max_length=30_000)
+    exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
+    report_file: str
+    report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class StoredSceneState(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -115,6 +180,17 @@ class StoredSceneState(BaseModel):
     give_up: bool = False
     failed: bool = False
     failure_reason: str = Field(default="", max_length=50_000)
+    inherited_elements_code: str = Field(default="", max_length=30_000)
+    exported_elements_code: str = Field(default="", max_length=30_000)
+    exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
+    visual_status: VisualStatus = "skipped"
+    visual_fix_attempts: int = Field(default=0, ge=0)
+    visual_score: float | None = Field(default=None, ge=1.0, le=5.0)
+    visual_report_file: str = ""
+    visual_report_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    visual_artifact_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    visual_feedback: str = Field(default="", max_length=20_000)
+    visual_best_candidate: StoredVisualCandidate | None = None
 
 
 class RunManifest(BaseModel):
@@ -122,7 +198,7 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[2] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[3] = MANIFEST_SCHEMA_VERSION
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -137,6 +213,12 @@ class RunManifest(BaseModel):
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     outlines: list[SceneOutline] = Field(default_factory=list)
     scenes: dict[int, StoredSceneState] = Field(default_factory=dict)
+    # 新运行在分镜生成前固定全片规范；旧 manifest 缺少这些字段时按已完成兼容，
+    # 不会在恢复已有代码/作业时擅自重规划场景。
+    continuity_bible: ContinuityBible | None = None
+    continuity_review_status: Literal["pending", "reviewing", "passed", "warning"] = "passed"
+    continuity_review_round: int = Field(default=0, ge=0)
+    continuity_warnings: list[str] = Field(default_factory=list, max_length=100)
     final_video: str | None = None
     final_video_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     error: str = Field(default="", max_length=50_000)
@@ -145,6 +227,8 @@ class RunManifest(BaseModel):
     incremental: bool = False
     base_run_id: str | None = Field(default=None, pattern=r"^(?:\d{8}-\d{6}-[0-9a-f]{8})?$")
     eval_round: int = Field(default=0, ge=0)
+    continuity_rebuild_required: bool = False
+    visual_eval_profile: VisualEvalProfile = Field(default_factory=VisualEvalProfile)
 
     @field_validator("run_id")
     @classmethod
@@ -159,6 +243,60 @@ class RunManifest(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("时间戳必须包含时区")
         return value
+
+    def integrity_errors(self) -> list[str]:
+        """检查跨字段一致性；供读取清单时拒绝语义损坏的数据。
+
+        这些约束不能只靠 Pydantic 的字段类型表达，例如 rendered=True
+        必须有经过验证的 artifact。单独提供方法是为了让 v1 迁移先完成，
+        再检查当前 schema，避免把可安全迁移的旧清单提前判死。
+        """
+
+        errors: list[str] = []
+        for scene_id, scene in self.scenes.items():
+            if scene.plan.scene_id != scene_id:
+                errors.append(f"Scene key {scene_id} 与 plan.scene_id {scene.plan.scene_id} 不一致")
+            if scene.rendered and scene.artifact is None:
+                errors.append(f"Scene {scene_id} 标记为 rendered 但缺少 artifact")
+            if scene.artifact is not None:
+                artifact = scene.artifact
+                if not scene.rendered:
+                    errors.append(f"Scene {scene_id} 存在 artifact 但 rendered=false")
+                if artifact.scene_id != scene_id:
+                    errors.append(f"Scene {scene_id} 的 artifact.scene_id 不一致")
+                if artifact.scene_class_name != scene.class_name:
+                    errors.append(f"Scene {scene_id} 的 artifact 类名不一致")
+                if scene.code_sha256 and artifact.code_sha256 != scene.code_sha256:
+                    errors.append(f"Scene {scene_id} 的 artifact 代码哈希不一致")
+            if scene.slurm_job is not None:
+                job = scene.slurm_job
+                if job.scene_id != scene_id:
+                    errors.append(f"Scene {scene_id} 的 Slurm Job 场景 ID 不一致")
+                if scene.code_sha256 and job.code_sha256 != scene.code_sha256:
+                    errors.append(f"Scene {scene_id} 的 Slurm Job 代码哈希不一致")
+            if scene.visual_status in {"passed", "warning", "unknown"} and not scene.rendered:
+                errors.append(f"Scene {scene_id} 视觉状态为 {scene.visual_status} 但没有渲染产物")
+            if bool(scene.visual_report_file) != bool(scene.visual_report_sha256):
+                errors.append(f"Scene {scene_id} 的视觉报告路径与哈希不完整")
+            if scene.visual_status in {"passed", "warning", "unknown"}:
+                if not scene.visual_report_file:
+                    errors.append(f"Scene {scene_id} 的视觉终态缺少评估报告")
+                if (
+                    scene.artifact is not None
+                    and scene.visual_artifact_sha256 != scene.artifact.video_sha256
+                ):
+                    errors.append(f"Scene {scene_id} 的视觉评估记录与当前视频哈希不一致")
+            candidate = scene.visual_best_candidate
+            if candidate is not None:
+                if candidate.artifact.scene_id != scene_id:
+                    errors.append(f"Scene {scene_id} 的最佳视觉候选场景 ID 不一致")
+                if candidate.artifact.code_sha256 != candidate.code_sha256:
+                    errors.append(f"Scene {scene_id} 的最佳视觉候选代码哈希不一致")
+                if candidate.slurm_job and candidate.slurm_job.code_sha256 != candidate.code_sha256:
+                    errors.append(f"Scene {scene_id} 的最佳视觉候选 Job 代码哈希不一致")
+        if self.status == "completed" and not self.final_video:
+            errors.append("运行标记为 completed 但缺少 final_video")
+        return errors
 
 
 def _run_relative(root: Path, path: Path) -> str:
@@ -237,9 +375,11 @@ def atomic_write_text(path: Path, payload: str, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=".atomic-", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
+    fd_open = True
     try:
         os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd_open = False  # fdopen 接管描述符，离开 with 后负责关闭
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -251,6 +391,9 @@ def atomic_write_text(path: Path, payload: str, *, mode: int = 0o600) -> None:
         finally:
             os.close(directory_fd)
     except Exception:
+        if fd_open:
+            with suppress(OSError):
+                os.close(fd)
         temporary.unlink(missing_ok=True)
         raise
 
@@ -505,6 +648,22 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
     if version == MANIFEST_SCHEMA_VERSION:
         return raw
+    if version == 2:
+        data = dict(raw)
+        data["schema_version"] = MANIFEST_SCHEMA_VERSION
+        data.setdefault("visual_eval_profile", VisualEvalProfile().model_dump(mode="json"))
+        scenes = data.get("scenes", {})
+        if not isinstance(scenes, dict):
+            raise ValueError("旧版运行清单的 scenes 必须是对象")
+        migrated_scenes: dict[str, dict] = {}
+        for raw_scene_id, raw_scene in scenes.items():
+            if not isinstance(raw_scene, dict):
+                raise ValueError(f"旧版运行清单 Scene {raw_scene_id} 必须是对象")
+            scene = dict(raw_scene)
+            scene.setdefault("visual_status", "skipped")
+            migrated_scenes[str(raw_scene_id)] = scene
+        data["scenes"] = migrated_scenes
+        return data
     if version != 1:
         raise ValueError(f"不支持的 manifest schema_version: {version}")
 

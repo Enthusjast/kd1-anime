@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, CoderAgent
-from kd1_anime.agents.planner import ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, ScenePlan, VisualElementState
 
 
 @pytest.fixture
@@ -195,6 +195,9 @@ class TestScene(Scene):
         assert "ctex" in CODER_SYSTEM_PROMPT
         assert "from manim import *" in CODER_SYSTEM_PROMPT
         assert "construct" in CODER_SYSTEM_PROMPT
+        assert "KD1_CONTINUITY_EXPORT_BEGIN" in CODER_SYSTEM_PROMPT
+        assert "Transform" in CODER_SYSTEM_PROMPT
+        assert "Global Visual State" in CODER_SYSTEM_PROMPT
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_uses_scene_plan_info(self, mock_call_llm, coder_agent, sample_plan):
@@ -218,6 +221,45 @@ class TestScene(Scene):
         assert "Test Scene" in user_message
         assert "圆形面积" in user_message
         assert "30" in user_message or "30 秒" in user_message
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_includes_inherited_elements_context(
+        self, mock_call_llm, coder_agent, sample_plan
+    ):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+        inherited = VisualElementState(
+            element_id="main_formula", variable_name="formula", role="核心公式"
+        )
+        coder_agent.generate_code(
+            sample_plan,
+            inherited_elements_code='formula = MathTex(r"x^2")',
+            inherited_elements=[inherited],
+            stream=False,
+        )
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "[Inherited Elements Code]" in message
+        assert 'formula = MathTex(r"x^2")' in message
+        assert "main_formula" in message
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_receives_continuity_bible(self, mock_call_llm, coder_agent, sample_plan):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+
+        coder_agent.generate_code(
+            sample_plan,
+            continuity_bible=ContinuityBible(background="#101010"),
+            stream=False,
+        )
+
+        assert "全片连续性圣经" in mock_call_llm.call_args.kwargs["user_message"]
 
 
 class TestCodeExtraction:

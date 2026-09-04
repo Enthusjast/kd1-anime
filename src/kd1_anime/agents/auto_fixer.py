@@ -164,6 +164,8 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
 7. **编译器不变式**: 代码使用 Tex/MathTex 时，修复后必须保留或补齐 XeLaTeX
    `.xdv` + `ctex` 模板，禁止回退到 pdflatex；不使用 Tex/MathTex 时不要凭空新增模板
 8. **类结构不变式**: 保持 Scene 类名与唯一性不变, 不新增/删除 Scene 类
+9. **连续性不变式**: 保留 `KD1_CONTINUITY_EXPORT_BEGIN/END` 导出区、element_id、
+   继承元素定义和全局颜色/字体配置；除非错误日志直接涉及导出区，否则不要删除或重命名它们。
 
 ## 输出格式
 

@@ -160,19 +160,37 @@ class JobMonitor:
         try:
             statuses = self.dispatcher.poll_all_statuses(list(self.pending))
         except Exception as exc:
-            # 监控命令本身异常时不能让 worker 直接退出并把远端作业遗留在集群
-            # 上，尤其是 ALLOW_PARTIAL_OUTPUT=true 时后续可能仍会成功合并。
-            # 这是监控故障，不是生成代码故障：立即尝试取消并保留明确状态。
-            reason = f"Slurm 状态查询异常: {exc}；已停止监控并尝试取消远端任务"
-            for job_id, job in list(self.pending.items()):
-                self.dispatcher._cancel_for_monitor_failure(
-                    job,
-                    status="MONITOR_QUERY_FAILED",
-                    reason=reason,
-                )
-                self.results[job_id] = False
-            self.pending.clear()
-            return True
+            # 查询命令的瞬时异常不能等同于远端作业失败，更不能立即取消
+            # 所有健康作业。把本轮当作 UNKNOWN，沿用统一的次数/时间宽限；
+            # 若下一轮恢复为 RUNNING/PENDING，连续未知计数会自动清零。
+            diagnostic = f"Slurm 状态查询异常: {exc}"
+            self.dispatcher.last_status_diagnostic = diagnostic
+            quiet = self._quiet()
+            finished: list[str] = []
+            for job_id, job in self.pending.items():
+                job.status = "UNKNOWN"
+                self.indeterminate_streaks[job_id] += 1
+                unknown_since = self.indeterminate_since.setdefault(job_id, now)
+                if (
+                    self.indeterminate_streaks[job_id] >= self.max_unknown
+                    and now - unknown_since >= self.unknown_timeout
+                ):
+                    reason = f"状态连续未知，已停止监控并尝试取消远端任务；查询诊断: {diagnostic}"
+                    self.dispatcher._cancel_for_monitor_failure(
+                        job,
+                        status="UNKNOWN_TIMEOUT",
+                        reason=reason,
+                    )
+                    self.results[job_id] = False
+                    finished.append(job_id)
+                elif not quiet:
+                    console.print(
+                        f"[dim][Monitor][/] Scene {job.scene_id}: UNKNOWN "
+                        f"({self.indeterminate_streaks[job_id]}/{self.max_unknown})"
+                    )
+            for job_id in finished:
+                self.pending.pop(job_id, None)
+            return bool(finished)
         start_times = getattr(self.dispatcher, "last_start_times", {})
         finished: list[str] = []
         quiet = self._quiet()

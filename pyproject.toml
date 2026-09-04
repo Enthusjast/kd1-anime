@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kd1-anime"
-version = "0.3.0"
+version = "0.4.0"
 description = "AI Agent 驱动的 Manim 数学动画自动渲染流水线"
 readme = "README.md"
 requires-python = ">=3.10"

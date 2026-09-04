@@ -50,6 +50,7 @@ class VideoMetadata(BaseModel):
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     frame_rate: float = Field(gt=0)
+    has_audio: bool = False
 
 
 class SceneArtifact(BaseModel):
@@ -103,10 +104,8 @@ def probe_video(path: Path) -> VideoMetadata:
                 ffprobe,
                 "-v",
                 "error",
-                "-select_streams",
-                "v:0",
                 "-show_entries",
-                "stream=width,height,avg_frame_rate:format=duration",
+                "stream=codec_type,width,height,avg_frame_rate:format=duration",
                 "-of",
                 "json",
                 str(path),
@@ -123,7 +122,8 @@ def probe_video(path: Path) -> VideoMetadata:
         raise ValueError(f"ffprobe 无法解析视频 {path.name}: {detail}")
     try:
         payload = json.loads(result.stdout)
-        stream = payload["streams"][0]
+        streams = payload["streams"]
+        stream = next(item for item in streams if item.get("codec_type", "video") == "video")
         duration = float(payload["format"]["duration"])
         frame_rate = _parse_rate(str(stream["avg_frame_rate"]))
         return VideoMetadata(
@@ -132,8 +132,16 @@ def probe_video(path: Path) -> VideoMetadata:
             width=int(stream["width"]),
             height=int(stream["height"]),
             frame_rate=frame_rate,
+            has_audio=any(item.get("codec_type") == "audio" for item in streams),
         )
-    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        KeyError,
+        IndexError,
+        StopIteration,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         raise ValueError(f"ffprobe 返回的元数据不完整: {path}") from exc
 
 

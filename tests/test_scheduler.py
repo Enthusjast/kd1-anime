@@ -1,6 +1,6 @@
-"""场景级并行调度 (per-scene pipeline) 测试。
+"""分阶段场景调度测试。
 
-每个 Scene 独立推进 分镜→编码→审查→提交→渲染→修复, 互不等待。
+分镜并行，代码按场景顺序交接，渲染任务并行执行。
 """
 
 import threading
@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.planner import SceneOutline, ScenePlan
+from kd1_anime.agents.continuity import ContinuityReviewResult
+from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
 from kd1_anime.agents.reviewer import ReviewResult
 from kd1_anime.agents.validator import CodeValidationResult
 from kd1_anime.cluster.slurm import SlurmJob
@@ -76,6 +77,99 @@ class FakePlanner:
         return make_plan(outline)
 
 
+class ContinuityPlanner(FakePlanner):
+    """支持全片连续性阶段的测试 Planner。"""
+
+    def __init__(self):
+        super().__init__()
+        self.bible_calls = 0
+        self.detail_calls = 0
+
+    def plan_continuity_bible(self, user_prompt, outlines, *, stream=False, renderer=None):
+        self.bible_calls += 1
+        return ContinuityBible()
+
+    def plan_detail(
+        self,
+        outline,
+        all_outlines,
+        user_prompt,
+        *,
+        stream=False,
+        renderer=None,
+        continuity_bible=None,
+        continuity_feedback="",
+    ):
+        self.detail_calls += 1
+        plan = make_plan(outline)
+        plan.opening_state = ["核心公式 x=1"]
+        plan.closing_state = ["核心公式 x=1"]
+        plan.transition_in = "核心公式从上一状态变换接入"
+        plan.transition_out = "保留核心公式并交给下一场景"
+        plan.continuity_references = ["背景 #1C1C1C", "x 使用蓝色"]
+        return plan
+
+
+class PassingContinuityReviewer:
+    calls = 0
+
+    def review(self, *args, **kwargs):
+        self.calls += 1
+        return ContinuityReviewResult(is_valid=True, summary="通过")
+
+
+class OneRoundContinuityReviewer:
+    def __init__(self):
+        self.calls = 0
+
+    def review(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return ContinuityReviewResult(
+                is_valid=False,
+                summary="需要修正",
+                issues=[
+                    {
+                        "scene_ids": [1, 2],
+                        "category": "transition",
+                        "severity": "major",
+                        "message": "两个场景的交接对象不一致",
+                        "fix_instruction": "两场景都使用核心公式 x=1 作为交接对象",
+                    }
+                ],
+            )
+        return ContinuityReviewResult(is_valid=True, summary="通过")
+
+
+class ContextAwareContinuityPlanner(ContinuityPlanner):
+    def __init__(self):
+        super().__init__()
+        self.continuity_contexts: list[str] = []
+
+    def plan_detail(
+        self,
+        outline,
+        all_outlines,
+        user_prompt,
+        *,
+        stream=False,
+        renderer=None,
+        continuity_bible=None,
+        continuity_feedback="",
+        continuity_context="",
+    ):
+        self.continuity_contexts.append(continuity_context)
+        return super().plan_detail(
+            outline,
+            all_outlines,
+            user_prompt,
+            stream=stream,
+            renderer=renderer,
+            continuity_bible=continuity_bible,
+            continuity_feedback=continuity_feedback,
+        )
+
+
 class FakeCoder:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []  # (feedback, previous_code)
@@ -88,6 +182,7 @@ class FakeCoder:
         *,
         stream=True,
         renderer=None,
+        continuity_bible=None,
     ):
         self.calls.append((feedback, previous_code))
         return CODE
@@ -100,7 +195,7 @@ class FakeReviewer:
         self.results = list(results) if results else []
         self.calls = 0
 
-    def review(self, code, scene_plan, *, renderer=None):
+    def review(self, code, scene_plan, *, renderer=None, continuity_bible=None):
         self.calls += 1
         if self.results:
             return self.results.pop(0)
@@ -229,9 +324,9 @@ def make_orchestrator(
 
 
 # ---------------------------------------------------------------------------
-# 1) 已就绪场景立即提交渲染, 不等待其他场景的 LLM 阶段
+# 1) 为了代码级连续性，编码/提交等待所有场景分镜完成
 # ---------------------------------------------------------------------------
-def test_ready_scene_submits_while_other_scene_still_detailing(monkeypatch, tmp_path):
+def test_code_barrier_waits_for_other_scene_detailing(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
     events: list[tuple] = []
     detail_done = threading.Event()
@@ -265,10 +360,11 @@ def test_ready_scene_submits_while_other_scene_still_detailing(monkeypatch, tmp_
 
     orchestrator._run_scheduler(ctx)
 
-    # Scene 1 在 Scene 2 的 detail 完成之前就已提交
+    # Scene 1 的提交必须发生在 Scene 2 detail 完成之后，确保顺序编码前
+    # 每个场景都拥有真实的 ScenePlan。
     detail_end_time = next(t for e, t in events if e == "detail_end")
     scene1_submit_time = next(t for e, sid, t in slurm.events if e == "submit" and sid == 1)
-    assert scene1_submit_time < detail_end_time
+    assert scene1_submit_time >= detail_end_time
     assert ctx.scene_states[1].rendered is True
     assert ctx.scene_states[2].rendered is True
     assert sorted(slurm.submitted) == [1, 2]
@@ -301,6 +397,68 @@ def test_multiple_scenes_complete_independently(monkeypatch, tmp_path):
         assert "scene_coding" in scene_events
         assert "scene_reviewing" in scene_events
         assert "scene_rendered" in scene_events
+
+
+def test_coder_receives_previous_scene_export_in_scene_order(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+
+    class ContextCoder(FakeCoder):
+        def __init__(self):
+            super().__init__()
+            self.inherited: list[str] = []
+
+        def generate_code(
+            self,
+            scene_plan,
+            feedback="",
+            previous_code="",
+            *,
+            stream=True,
+            renderer=None,
+            continuity_bible=None,
+            inherited_elements_code="",
+            inherited_elements=None,
+            elements_to_remove=None,
+        ):
+            self.inherited.append(inherited_elements_code)
+            self.calls.append((feedback, previous_code))
+            return (
+                "from manim import *\n"
+                "class Demo(Scene):\n"
+                "    def construct(self):\n"
+                "        # KD1_CONTINUITY_EXPORT_BEGIN\n"
+                "        formula = MathTex(r'x^2')\n"
+                "        # KD1_CONTINUITY_EXPORT_END\n"
+                "        self.add(formula)\n"
+            )
+
+    class ContextReviewer(FakeReviewer):
+        def review(self, code, scene_plan, *, renderer=None, continuity_bible=None, **kwargs):
+            return ReviewResult(is_valid=True)
+
+    coder = ContextCoder()
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        coder=coder,
+        reviewer=ContextReviewer(),
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        dry_run=True,
+        outlines=[make_outline(1), make_outline(2)],
+        scene_states={
+            1: SceneState(plan=make_plan(make_outline(1))),
+            2: SceneState(plan=make_plan(make_outline(2))),
+        },
+    )
+
+    orchestrator._run_scheduler(ctx)
+
+    assert coder.inherited[0] == ""
+    assert "formula = MathTex" in coder.inherited[1]
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +740,105 @@ def test_dry_run_completes_without_submission(monkeypatch, tmp_path):
     assert ctx.scene_states[1].plan_ready is True
     assert ctx.scene_states[1].reviewed is True
     assert ctx.scene_states[1].rendered is False
+
+
+def test_continuity_review_is_a_barrier_before_coding(monkeypatch, tmp_path):
+    """所有 Detail 完成后才审查连续性，审查通过后才进入编码。"""
+
+    run_paths = make_paths(tmp_path)
+    planner = ContinuityPlanner()
+    continuity_reviewer = PassingContinuityReviewer()
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, planner=planner)
+    orchestrator.planner = planner
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", lambda: continuity_reviewer)
+    events = []
+    orchestrator._callback = lambda event, data: events.append(event)
+
+    outlines = [make_outline(1), make_outline(2)]
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=outlines,
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="pending",
+        scene_states={
+            sid: SceneState(plan=make_plan(outline)) for sid, outline in enumerate(outlines, 1)
+        },
+    )
+    planner.detail_calls = 0
+
+    orchestrator._run_scheduler(ctx)
+
+    assert planner.detail_calls == 2
+    assert continuity_reviewer.calls == 1
+    assert ctx.continuity_review_status == "passed"
+    assert all(state.plan_ready and state.reviewed for state in ctx.scene_states.values())
+    assert max(index for index, event in enumerate(events) if event == "scene_detailed") < min(
+        index for index, event in enumerate(events) if event == "continuity_reviewing"
+    )
+
+
+def test_continuity_review_replans_only_affected_scenes(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    planner = ContinuityPlanner()
+    continuity_reviewer = OneRoundContinuityReviewer()
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, planner=planner)
+    orchestrator.planner = planner
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", lambda: continuity_reviewer)
+
+    outlines = [make_outline(1), make_outline(2), make_outline(3)]
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=outlines,
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="pending",
+        scene_states={
+            sid: SceneState(plan=planner.plan_detail(outline, outlines, "prompt"), plan_ready=True)
+            for sid, outline in enumerate(outlines, 1)
+        },
+    )
+    planner.detail_calls = 0
+
+    orchestrator._run_scheduler(ctx)
+
+    assert continuity_reviewer.calls == 2
+    assert planner.detail_calls == 2
+    assert ctx.continuity_review_status == "passed"
+    assert all(state.reviewed for state in ctx.scene_states.values())
+
+
+def test_continuity_replan_passes_latest_neighbor_snapshot(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    planner = ContextAwareContinuityPlanner()
+    continuity_reviewer = OneRoundContinuityReviewer()
+    orchestrator = make_orchestrator(monkeypatch, tmp_path, run_paths, planner=planner)
+    orchestrator.planner = planner
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", lambda: continuity_reviewer)
+
+    outlines = [make_outline(1), make_outline(2)]
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        dry_run=True,
+        outlines=outlines,
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="pending",
+        scene_states={
+            sid: SceneState(plan=planner.plan_detail(outline, outlines, "prompt"), plan_ready=True)
+            for sid, outline in enumerate(outlines, 1)
+        },
+    )
+    planner.continuity_contexts.clear()
+
+    orchestrator._run_scheduler(ctx)
+
+    assert ctx.continuity_review_status == "passed"
+    assert len(planner.continuity_contexts) == 2
+    assert all('"scene_id": 1' in context for context in planner.continuity_contexts)
+    assert all('"scene_id": 2' in context for context in planner.continuity_contexts)
 
 
 # ---------------------------------------------------------------------------

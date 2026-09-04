@@ -136,6 +136,62 @@ def test_clarifier_accepts_ready_payload_with_raw_newlines():
     assert "### 公式一" in refined
 
 
+def test_clarifier_ignores_math_brackets_before_ready_payload():
+    """前置散文中的坐标区间不能遮蔽后面的 READY JSON 对象。"""
+    clarifier = Clarifier()
+    response = r"""好的，坐标轴范围确认为 \([-5, 5] \times [-5, 5]\)。
+
+现在信息已经足够完整，我来整合所有需求：
+
+{"READY": true, "prompt": "## 核心内容
+- \( y = x \)
+- \( y = x^{-1} \)
+- \( y = x^{1/2} \)"}"""
+
+    refined = clarifier.extract_ready(response)
+
+    assert refined is not None
+    assert "y = x" in refined
+    assert "y = x^{-1}" in refined
+
+
+def test_clarifier_skips_latex_braces_before_ready_payload():
+    """前置 LaTeX 上标的花括号不能成为 READY JSON 的起点。"""
+
+    clarifier = Clarifier()
+    response = r"""前面的整合说明包含 ( y = x^{1/2} ) 这样的公式。
+
+{"READY": true, "prompt": "## 核心内容
+在同一坐标系中展示 ( y = x^{1/2} )，并保持显示。"}"""
+
+    refined = clarifier.extract_ready(response)
+
+    assert refined is not None
+    assert "y = x^{1/2}" in refined
+
+
+def test_clarifier_accepts_ready_payload_missing_final_brace():
+    """模型丢失最末尾的对象闭合符时, 仍可恢复已完整的 READY 载荷。"""
+    clarifier = Clarifier()
+    response = r'''好的，信息已经足够完整了。让我整合所有需求。
+
+{"READY": true, "prompt": "## 动画目标
+- 仅表现核心概念
+
+## 函数列表
+1. \\( y = x \\)
+2. \\( y = x^2 \\)
+
+## 视频时长
+- 总时长控制在 1 分钟以内"'''
+
+    refined = clarifier.extract_ready(response)
+
+    assert refined is not None
+    assert refined.startswith("## 动画目标")
+    assert "y = x^2" in refined
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -195,6 +251,45 @@ def test_clarifier_displays_question_after_buffering(monkeypatch):
     assert "你希望视频时长是多少？" in rendered
 
 
+def test_clarifier_renders_markdown_question(monkeypatch):
+    clarifier = Clarifier()
+    response = "## 需要补充的信息\n\n- 请说明目标受众"
+    markdown = Mock(side_effect=lambda value: value)
+
+    monkeypatch.setattr(clarifier.agent, "call_llm", lambda **kwargs: response)
+    monkeypatch.setattr(tui_module, "Markdown", markdown)
+
+    clarifier.ask("制作一个数学动画")
+
+    markdown.assert_called_once_with(response)
+
+
+def test_clarifier_follow_up_input_uses_standard_prompt(monkeypatch):
+    prompts = []
+
+    class FakeClarifier:
+        def __init__(self):
+            self.round = 0
+
+        def ask(self, _user_input):
+            self.round += 1
+            return "请补充受众" if self.round == 1 else "ready"
+
+        def extract_ready(self, response):
+            return None if response != "ready" else "整理后的需求"
+
+    monkeypatch.setattr(
+        tui_module,
+        "_read_multiline",
+        lambda prompt: prompts.append(prompt) or "面向高中生",
+    )
+    session = ChatSession()
+    session.clarifier = FakeClarifier()
+
+    assert session._run_clarification("解释勾股定理") == "整理后的需求"
+    assert prompts == [">>> "]
+
+
 def test_pipeline_error_is_concise_and_does_not_render_markup(monkeypatch):
     class BrokenOrchestrator:
         def run(self, *args, **kwargs):
@@ -227,6 +322,25 @@ def test_show_banner_returns_false_when_no_resume(monkeypatch):
     session = ChatSession()
     monkeypatch.setattr(session, "_check_interrupted_runs", lambda: False)
     assert session._show_banner() is False
+
+
+def test_show_banner_displays_main_and_visual_models(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(tui_module, "console", Console(file=output, force_terminal=False))
+    monkeypatch.setattr(settings, "LLM_MODEL", "planner-model")
+    monkeypatch.setattr(settings, "VISUAL_LLM_MODEL", "vision-model")
+    monkeypatch.setattr(settings, "ENABLE_VISUAL_EVAL", True)
+
+    session = ChatSession()
+    monkeypatch.setattr(session, "_check_interrupted_runs", lambda: False)
+
+    assert session._show_banner() is False
+    rendered = output.getvalue()
+    assert "对话模型:" in rendered
+    assert "planner-model" in rendered
+    assert "视觉模型:" in rendered
+    assert "vision-model" in rendered
+    assert "已启用" in rendered
 
 
 def test_run_exits_after_resume_instead_of_new_prompt(monkeypatch):
