@@ -204,6 +204,8 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LOCAL_SMOKE_RENDER_ENABLED is False
     assert config.LOCAL_SMOKE_RENDER_MODE == "frame"
     assert config.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS == 3
+    assert config.AUTO_RESOURCE_ESTIMATION is True
+    assert config.ADAPTIVE_SMOKE_RENDER is True
 
 
 def test_stage_model_routing_falls_back_and_overrides_per_stage():

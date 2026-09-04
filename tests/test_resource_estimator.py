@@ -52,6 +52,7 @@ def test_estimator_preserves_base_resources_for_simple_cairo_scene():
     assert result.mem_gb == 16
     assert result.time_limit == "00:10:00"
     assert result.gpu_type == ""
+    assert result.smoke_mode == "frame"
 
 
 def test_estimator_scales_complex_opengl_scene_only_when_enabled():
@@ -76,6 +77,7 @@ def test_estimator_scales_complex_opengl_scene_only_when_enabled():
     assert result.mem_gb == 20
     assert result.time_limit == "00:40:00"
     assert result.gpu_type == "RTX5090"
+    assert result.smoke_mode == "both"
     assert result.reasons
 
 

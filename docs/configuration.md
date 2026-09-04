@@ -163,7 +163,7 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | SLURM_MEM_GB | 空 | 可选内存约束，如 32G |
 | SLURM_GPU_TYPE | 空 | OpenGL 作业的 GPU 类型 |
 | SLURM_GPU_COUNT | 1 | OpenGL GPU 数 |
-| AUTO_RESOURCE_ESTIMATION | false | 是否按场景复杂度自动增加资源（只向上调整） |
+| AUTO_RESOURCE_ESTIMATION | true | 是否按场景复杂度自动增加资源（只向上调整） |
 | SLURM_MAX_IN_FLIGHT | 0 | 最大在途场景作业数；0 表示不限制 |
 | SLURM_SUBMIT_RETRIES | 3 | 明确 sbatch 失败的重试次数 |
 | SLURM_SUBMIT_RETRY_DELAY | 2.0 | sbatch 重试退避秒数 |
@@ -189,6 +189,7 @@ Cairo 不申请 GPU；只有 MANIM_RENDERER=opengl 时才使用 GPU 配置。所
 | SMOKE_RENDER_QUALITY | l | Smoke Render 质量：l 或 m |
 | SMOKE_RENDER_TIMEOUT | 180 | 远端 Smoke Render 超时秒数 |
 | SMOKE_RENDER_SHORT_ANIMATIONS | 3 | 短视频预检最多执行的前几个动画事件 |
+| ADAPTIVE_SMOKE_RENDER | true | 是否按场景风险选择 Smoke 强度 |
 | LOCAL_SMOKE_RENDER_ENABLED | false | 是否在本地做额外运行时预检 |
 | LOCAL_SMOKE_RENDER_MODE | frame | 本地预检模式：frame、video 或 both |
 | LOCAL_SMOKE_RENDER_QUALITY | l | 本地预检质量 |

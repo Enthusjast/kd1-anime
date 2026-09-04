@@ -1468,6 +1468,7 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     orchestrator = Orchestrator()
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "video")
+    monkeypatch.setattr(module.settings, "ADAPTIVE_SMOKE_RENDER", False)
 
     def successful_run(command, **kwargs):
         if "--media_dir" not in command:

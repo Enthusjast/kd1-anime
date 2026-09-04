@@ -2466,6 +2466,13 @@ class Orchestrator:
             smoke_width = max(16, (ctx.render_profile.pixel_width // 8) // 2 * 2)
             smoke_height = max(16, (ctx.render_profile.pixel_height // 8) // 2 * 2)
             smoke_fps = min(ctx.render_profile.frame_rate, 15)
+            local_smoke_mode = settings.LOCAL_SMOKE_RENDER_MODE
+            if settings.ADAPTIVE_SMOKE_RENDER:
+                local_smoke_mode = (
+                    "both"
+                    if assess_scene_risk(state.plan, state.technical_spec).level == "high"
+                    else "frame"
+                )
             env = os.environ.copy()
             env["MANIM_RENDERER"] = ctx.render_profile.renderer
             if ctx.render_profile.renderer == "opengl":
@@ -2560,7 +2567,7 @@ class Orchestrator:
                 module="",
             )
             self._emit("scene_smoke_imported", scene_id=state.plan.scene_id)
-            if settings.LOCAL_SMOKE_RENDER_MODE in {"frame", "both"}:
+            if local_smoke_mode in {"frame", "both"}:
                 frame_dir = media_dir / "__frame_smoke__"
                 frame_dir.mkdir(parents=True, exist_ok=True)
                 run_smoke(
@@ -2587,7 +2594,7 @@ class Orchestrator:
                 ]
                 if not frames:
                     raise RuntimeError("本地 Frame Canary 完成但没有生成最后一帧 PNG")
-            if settings.LOCAL_SMOKE_RENDER_MODE in {"video", "both"}:
+            if local_smoke_mode in {"video", "both"}:
                 video_dir = media_dir / "__smoke__"
                 video_dir.mkdir(parents=True, exist_ok=True)
                 run_smoke(
@@ -2618,7 +2625,7 @@ class Orchestrator:
                 "status": "passed",
                 "renderer": ctx.render_profile.renderer,
                 "quality": settings.LOCAL_SMOKE_RENDER_QUALITY,
-                "mode": settings.LOCAL_SMOKE_RENDER_MODE,
+                "mode": local_smoke_mode,
                 "stages": ["import", "frame", "short_video"],
                 "short_animations": settings.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS,
                 "resolution": [smoke_width, smoke_height],

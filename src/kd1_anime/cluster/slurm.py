@@ -487,6 +487,11 @@ class SlurmDispatcher:
                 raise ValueError(f"{label}必须是单行值")
         profile = render_profile or RenderProfile.current()
         resources = resource_profile or RenderResourceProfile.from_settings()
+        smoke_mode = (
+            resources.smoke_mode
+            if resource_profile is not None and settings.ADAPTIVE_SMOKE_RENDER
+            else settings.SMOKE_RENDER_MODE
+        )
         renderer = profile.renderer
         use_gpu = renderer == "opengl"
         if use_gpu and not resources.gpu_type:
@@ -665,7 +670,7 @@ class SlurmDispatcher:
                     "schema_version": 1,
                     "scene_id": scene_id,
                     "status": status,
-                    "mode": settings.SMOKE_RENDER_MODE,
+                    "mode": smoke_mode,
                     "short_animations": settings.SMOKE_RENDER_SHORT_ANIMATIONS,
                     **(
                         {"renderer": renderer, "quality": settings.SMOKE_RENDER_QUALITY}
@@ -713,7 +718,7 @@ class SlurmDispatcher:
                 )
             )
             lines.append('echo "[Smoke] import-only 检查通过"')
-            if settings.SMOKE_RENDER_MODE in {"frame", "both"}:
+            if smoke_mode in {"frame", "both"}:
                 frame_dir = media_dir / "__frame_smoke__"
                 frame_args = [
                     "manim",
@@ -750,7 +755,7 @@ class SlurmDispatcher:
                         'echo "[Smoke] 最后一帧检查通过"',
                     ]
                 )
-            if settings.SMOKE_RENDER_MODE in {"video", "both"}:
+            if smoke_mode in {"video", "both"}:
                 smoke_dir = media_dir / "__smoke__"
                 smoke_args = [
                     "manim",

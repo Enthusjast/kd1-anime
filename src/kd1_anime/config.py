@@ -465,7 +465,7 @@ class Settings(BaseSettings):
     SLURM_GPU_TYPE: str = ""
     SLURM_GPU_COUNT: int = Field(default=1, ge=1)
     AUTO_RESOURCE_ESTIMATION: bool = Field(
-        default=False,
+        default=True,
         description="是否按场景复杂度自动增加 Slurm CPU/内存/时间资源",
     )
     # 0 表示不额外限制；正整数用于避免一次向共享集群提交过多场景。
@@ -503,6 +503,10 @@ class Settings(BaseSettings):
         ge=1,
         le=20,
         description="短视频 Smoke 最多执行的前几个动画事件",
+    )
+    ADAPTIVE_SMOKE_RENDER: bool = Field(
+        default=True,
+        description="是否按场景风险选择 frame 或 frame+短视频 Smoke 阶段",
     )
     # 本地生成/无 Slurm 环境的可选运行时预检；默认关闭，避免在 dry-run
     # 或共享登录节点上执行不可信生成代码。
