@@ -343,14 +343,23 @@ def test_installer_uses_private_application_home_for_user_storage(tmp_path):
     assert config_file.is_file()
     assert config_file.stat().st_mode & 0o777 == 0o600
     content = config_file.read_text(encoding="utf-8")
-    assert 'index_path = "~/.kd1-anime/rag/index.sqlite3"' in content
-    assert 'docs_dir = "~/.kd1-anime/knowledge/docs"' in content
-    assert 'examples_dir = "~/.kd1-anime/knowledge/examples"' in content
-    assert 'workspace_dir = "~/.kd1-anime/workspace"' in content
-    assert "max_plan_review_rounds = 2" in content
-    assert "max_plan_replan_attempts = 3" in content
-    assert "safe_fallback_enabled = true" in content
-    assert "max_identical_review_attempts = 2" in content
+    assert "[llm]" in content
+    assert 'api_key = "sk-your-key-here"' in content
+    assert 'base_url = "https://api.openai.com/v1"' in content
+    assert 'model = "your-model-name"' in content
+    assert "[render]" in content
+    assert 'backend = "slurm"' in content
+    assert "[slurm]" in content
+    assert 'conda_env = "manim_env"' in content
+    assert 'time_limit = "01:00:00"' in content
+    assert "cpus_per_task = 4" in content
+    assert "[pipeline]" not in content
+    assert "max_review_rounds" not in content
+    assert "max_fix_attempts" not in content
+    assert "[monitor]" not in content
+    assert "[evaluation]" not in content
+    assert "[rag]" not in content
+    assert "[visual_llm]" not in content
     assert (config_dir / "knowledge" / "docs").is_dir()
     assert (config_dir / "knowledge" / "examples").is_dir()
     assert not (tmp_path / ".config" / "kd1-anime").exists()

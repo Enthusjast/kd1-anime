@@ -1,7 +1,7 @@
 # 配置参考
 
 本文是 kd1-anime 当前配置的完整说明。配置字段由
-src/kd1_anime/config.py 校验；TOML 模板见 ../config.toml.example，旧版
+src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，旧版
 .env 模板 ../.env.example 仍用于兼容。
 
 ## 配置文件与优先级
@@ -14,7 +14,13 @@ src/kd1_anime/config.py 校验；TOML 模板见 ../config.toml.example，旧版
 
     mkdir -p ~/.kd1-anime
     chmod 700 ~/.kd1-anime
-    cp config.toml.example ~/.kd1-anime/config.toml
+    # 安装器会自动生成最小配置；手动创建时至少填写：
+    cat > ~/.kd1-anime/config.toml <<'EOF'
+    [llm]
+    api_key = "your-api-key"
+    base_url = "https://your-openai-compatible-endpoint/v1"
+    model = "your-model-name"
+    EOF
     chmod 600 ~/.kd1-anime/config.toml
 
 安装器会保留已有用户配置，不会用模板覆盖它。早期版本的

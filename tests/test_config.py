@@ -84,6 +84,24 @@ def test_nested_toml_loads_and_has_higher_priority_than_dotenv(monkeypatch, tmp_
     assert Settings(_env_file=dotenv_file).LLM_MODEL == "environment-model"
 
 
+def test_minimal_toml_uses_defaults_for_omitted_optional_settings(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text(
+        "[llm]\nmodel = 'model'\n[render]\nbackend = 'local'\n[slurm]\nconda_env = 'manim_env'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+
+    config = Settings()
+
+    assert config.LLM_MODEL == "model"
+    assert config.RENDER_BACKEND == "local"
+    assert config.MAX_REVIEW_ROUNDS == 8
+    assert config.MAX_FIX_ATTEMPTS == 8
+    assert config.MAX_PLAN_REVIEW_ROUNDS == 2
+    assert config.MONITOR_POLL_INTERVAL == 10
+
+
 def test_toml_rejects_unknown_fields_and_malformed_syntax(monkeypatch, tmp_path):
     toml_file = tmp_path / "config.toml"
     monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
@@ -118,6 +136,8 @@ def test_user_env_is_migrated_to_nested_toml_without_overwriting(tmp_path):
     assert "[rag]" in content
     assert "top_k = 9" in content
     assert 'docs_dir = ""' in content
+    assert "max_review_rounds" not in content
+    assert "max_fix_attempts" not in content
 
     target.write_text("[llm]\nmodel = 'edited'\n", encoding="utf-8")
     assert config_module.migrate_user_env_to_toml(source, target) is None

@@ -435,36 +435,15 @@ EOF
     chmod 600 "$CONFIG_FILE"
 }
 
-write_toml_template() {
-    if [ -f "$SCRIPT_DIR/config.toml.example" ]; then
-        cp "$SCRIPT_DIR/config.toml.example" "$CONFIG_FILE"
-    else
-        cat > "$CONFIG_FILE" <<'EOF'
-# kd1-anime 运行时配置；文件可能包含 API Key，权限应为 0600。
-# 优先级：进程环境变量 > 此文件 > 当前目录 .env > ~/.kd1-anime/.env
+write_minimal_toml_config() {
+    cat > "$CONFIG_FILE" <<'EOF'
+# kd1-anime 最小运行配置；文件可能包含 API Key，权限应为 0600。
+# 未列出的配置使用程序默认值；环境变量优先级最高。
 
 [llm]
 api_key = "sk-your-key-here"
 base_url = "https://api.openai.com/v1"
 model = "your-model-name"
-
-[visual_llm]
-api_key = ""
-base_url = ""
-model = ""
-
-[rag]
-enabled = false
-index_path = "~/.kd1-anime/rag/index.sqlite3"
-docs_dir = "~/.kd1-anime/knowledge/docs"
-examples_dir = "~/.kd1-anime/knowledge/examples"
-recipes_dir = "~/.kd1-anime/knowledge/recipes"
-embedding_api_key = ""
-embedding_base_url = ""
-embedding_model = ""
-rerank_api_key = ""
-rerank_base_url = ""
-rerank_model = ""
 
 [render]
 backend = "slurm"
@@ -472,26 +451,20 @@ manim_renderer = "cairo"
 manim_quality = "h"
 
 [slurm]
+partition = ""
+account = ""
+qos = ""
 conda_env = "manim_env"
+conda_base = ""
 time_limit = "01:00:00"
 cpus_per_task = 4
+mem_gb = ""
+gpu_type = ""
 gpu_count = 1
-
-[pipeline]
-max_review_rounds = 8
-max_fix_attempts = 8
-max_plan_review_rounds = 2
-max_plan_replan_attempts = 3
-
-[evaluation]
-enable_auto_eval = false
-enable_visual_eval = false
-
-[paths]
-workspace_dir = "~/.kd1-anime/workspace"
-output_file = "output_final.mp4"
+container_image = ""
+require_container = false
+container_disable_network = false
 EOF
-    fi
     chmod 600 "$CONFIG_FILE"
 }
 
@@ -546,7 +519,7 @@ write_user_config() {
         return
     fi
 
-    write_toml_template
+    write_minimal_toml_config
     write_config_value SLURM_CONDA_ENV "$ENV_NAME"
     write_config_value SLURM_CONDA_BASE "$CONDA_BASE"
     log "已创建用户配置: $CONFIG_FILE"

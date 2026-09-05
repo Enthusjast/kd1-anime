@@ -113,11 +113,16 @@ python -m pip install -e '.[dev]'
 
 ### 2. 配置主模型
 
-安装器会创建 `~/.kd1-anime/config.toml`。也可以复制 TOML 模板后编辑：
+安装器会创建最小的 `~/.kd1-anime/config.toml`。也可以手动创建：
 
 ```bash
 mkdir -p ~/.kd1-anime
-cp config.toml.example ~/.kd1-anime/config.toml
+cat > ~/.kd1-anime/config.toml <<'EOF'
+[llm]
+api_key = "your-api-key"
+base_url = "https://your-openai-compatible-endpoint/v1"
+model = "your-model-name"
+EOF
 chmod 600 ~/.kd1-anime/config.toml
 $EDITOR ~/.kd1-anime/config.toml
 ```
@@ -308,7 +313,8 @@ kd1-anime test-llm --no-json-mode --verbose
 
 ## 配置
 
-完整配置参考见 [`docs/configuration.md`](docs/configuration.md)，模板见 [`config.toml.example`](config.toml.example)。旧版 `.env` 模板 [`.env.example`](.env.example) 仍保留用于兼容。常用配置如下：
+完整配置参考见 [`docs/configuration.md`](docs/configuration.md)。安装器只生成必要配置，
+未填写的审查、重试、监控等选项使用程序默认值；旧版 `.env` 模板 [`.env.example`](.env.example) 仍保留用于兼容。常用配置如下：
 
 | 配置项 | 默认值 | 作用 |
 | --- | ---: | --- |
@@ -458,7 +464,6 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 ```text
 ~/.kd1-anime/
 ├── config.toml                  # 主配置（0600）
-├── config.toml.example          # 配置模板
 ├── .env                         # 旧版兼容配置（0600，可选）
 ├── knowledge/                   # Manim 文档和示例
 ├── rag/index.sqlite3            # 本地知识索引

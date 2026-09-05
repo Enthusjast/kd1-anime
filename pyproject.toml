@@ -64,7 +64,6 @@ packages = ["src/kd1_anime"]
 include = [
     "src/kd1_anime", "main.py",
     "requirements.txt", ".env.example",
-    "config.toml.example",
     "README.md", "LICENSE", "ARCHITECTURE.md", "AGENTS.md", "CONTRIBUTING.md",
     "docs",
 ]

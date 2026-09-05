@@ -387,11 +387,14 @@ def settings_to_toml(
     config: BaseSettings,
     *,
     preserve_empty_fields: set[str] | frozenset[str] = frozenset(),
+    include_fields: set[str] | frozenset[str] | None = None,
 ) -> str:
     """Render a Settings object using the canonical nested TOML layout."""
 
     groups: dict[str, list[tuple[str, str]]] = {}
     for field_name in type(config).model_fields:
+        if include_fields is not None and field_name not in include_fields:
+            continue
         section, key = _toml_field_location(field_name)
         literal = _toml_literal(getattr(config, field_name))
         if literal is None and field_name in preserve_empty_fields:
@@ -985,8 +988,6 @@ class Settings(BaseSettings):
 
         if missing:
             config_path = self.user_config_file
-            example_path = Path.cwd() / "config.toml.example"
-
             error_msg = f"""LLM 配置不完整（缺少或仍为占位值：{", ".join(missing)}）
 
 配置方法（按优先级）：
@@ -1001,7 +1002,7 @@ class Settings(BaseSettings):
 3. 旧版也支持在项目目录创建 .env：
    {Path.cwd() / ".env"}
 
-配置示例见：{example_path}
+配置字段和 TOML 分组示例见 docs/configuration.md
             """
             raise ValueError(error_msg)
 
@@ -1150,7 +1151,11 @@ def migrate_user_env_to_toml(
         preserve_empty = set(values) & _TOML_EMPTY_NULL_FIELDS
         _write_private_text(
             target,
-            settings_to_toml(validated, preserve_empty_fields=preserve_empty),
+            settings_to_toml(
+                validated,
+                preserve_empty_fields=preserve_empty,
+                include_fields=set(values),
+            ),
         )
     except FileExistsError:
         # Another process won the create-only race; its TOML is authoritative.
