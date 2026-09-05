@@ -2060,7 +2060,12 @@ class Orchestrator:
         self._manifest = None
 
         with lock_run(paths.root):
-            self._emit("run_started", run_id=paths.run_id, run_dir=str(paths.root))
+            self._emit(
+                "run_started",
+                run_id=paths.run_id,
+                run_dir=str(paths.root),
+                backend=ctx.backend,
+            )
             if wait:
                 try:
                     final_video = self._execute(ctx, State.DISPATCHING)
@@ -3013,7 +3018,12 @@ class Orchestrator:
         for directory in (ctx.paths.scenes, ctx.paths.logs, ctx.paths.videos):
             directory.chmod(0o700)
         self._write_private(ctx.paths.root / "prompt.md", ctx.user_prompt)
-        self._emit("run_started", run_id=ctx.paths.run_id, run_dir=str(ctx.paths.root))
+        self._emit(
+            "run_started",
+            run_id=ctx.paths.run_id,
+            run_dir=str(ctx.paths.root),
+            backend=ctx.backend,
+        )
 
         if not ctx.dry_run:
             if not settings.SLURM_CONTAINER_IMAGE:
@@ -3379,6 +3389,13 @@ class Orchestrator:
                 if self._render_service().backend.validate_completed_job(job):
                     state.artifact = self._artifact_from_job(ctx, state, job)
                     state.rendered = True
+                    self._mark_execution_verification(
+                        state,
+                        status="passed",
+                        scope="formal_video",
+                        artifact_sha256=state.artifact.video_sha256,
+                        duration_seconds=state.artifact.metadata.duration_seconds,
+                    )
                     self._reset_visual_receipt(ctx, state)
                     self._emit("scene_rendered", scene_id=scene_id)
                 else:
@@ -3390,6 +3407,13 @@ class Orchestrator:
                 if outcome == "COMPLETED":
                     state.artifact = self._artifact_from_job(ctx, state, job)
                     state.rendered = True
+                    self._mark_execution_verification(
+                        state,
+                        status="passed",
+                        scope="formal_video",
+                        artifact_sha256=state.artifact.video_sha256,
+                        duration_seconds=state.artifact.metadata.duration_seconds,
+                    )
                     self._reset_visual_receipt(ctx, state)
                     self._emit("scene_rendered", scene_id=scene_id)
                 elif outcome is None:
@@ -6656,6 +6680,7 @@ class Orchestrator:
                 return
             with self._state_lock:
                 state.reviewed = True
+                self._mark_static_verification(state, status="passed")
                 self._apply_incremental_for_scene(ctx, scene_id, state)
                 if state.rendered:
                     self._update_state_ledger(ctx, state)
@@ -6811,6 +6836,8 @@ class Orchestrator:
             ctx.continuity_warnings.extend(
                 f"Scene {scene_id} 能力合同：{warning}" for warning in capability_result.warnings
             )
+        with self._state_lock:
+            self._mark_static_verification(state, status="passed")
         state.class_name = validation.scene_classes[0]
         job: SlurmJob | None = None
         try:
@@ -8986,6 +9013,12 @@ class Orchestrator:
                 with self._state_lock:
                     state.visual_status = "warning"
                     state.visual_feedback = "视觉修复耗尽后已恢复最高分候选"
+                    state.visual_verification = state.visual_verification.model_copy(
+                        update={
+                            "status": "warning",
+                            "feedback": state.visual_feedback,
+                        }
+                    )
                 if changed:
                     self._request_continuity_rebuild(
                         ctx,
@@ -9001,6 +9034,12 @@ class Orchestrator:
                         state.visual_feedback = (
                             "已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"
                         )
+                    state.visual_verification = state.visual_verification.model_copy(
+                        update={
+                            "status": "warning",
+                            "feedback": state.visual_feedback,
+                        }
+                    )
             self._emit(
                 "scene_visual_warning",
                 scene_id=scene_id,

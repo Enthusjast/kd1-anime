@@ -825,6 +825,7 @@ def stats(
     table = Table(title="Pipeline statistics")
     for column in (
         "Run ID",
+        "Backend",
         "Status",
         "Scenes",
         "Plan reviews",
@@ -837,6 +838,7 @@ def stats(
         scenes = item["scenes"]
         table.add_row(
             item["run_id"],
+            item.get("backend", "slurm"),
             item["status"],
             f"{scenes['rendered']}/{item['scene_count']}",
             str(item["plan_review_attempts"]),

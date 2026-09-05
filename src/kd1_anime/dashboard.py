@@ -184,6 +184,7 @@ class SceneDashboard:
         self.visual_enabled: bool = False
         self.rag_status: str = "disabled"
         self.rag_models: str = ""
+        self.backend: str = "slurm"
         # Rich 的自动刷新线程会和 Orchestrator 的事件线程同时读取/修改
         # 场景状态。使用可重入锁：_render() 需要持锁读取状态，而事件
         # 线程在更新后还要主动触发一次刷新。
@@ -281,6 +282,7 @@ class SceneDashboard:
 
         elif event in ("run_started", "run_resumed"):
             self.run_id = data.get("run_id", "") or self.run_id
+            self.backend = data.get("backend", self.backend) or self.backend
             if not self.started_at:
                 self.started_at = time.time()
 
@@ -757,6 +759,7 @@ class SceneDashboard:
             )
             if self.rag_models:
                 header.append(f" ({self.rag_models})", style="dim")
+        header.append(f"  后端:{self.backend}", style="dim")
         if self.started_at:
             header.append(f"  用时 {int(time.time() - self.started_at)}s", style="dim")
 

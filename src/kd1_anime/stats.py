@@ -93,6 +93,7 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
         "run_id": manifest.run_id,
         "status": manifest.status,
         "state": manifest.state,
+        "backend": getattr(manifest, "backend", "slurm"),
         "created_at": manifest.created_at.isoformat(),
         "updated_at": manifest.updated_at.isoformat(),
         "scene_count": len(scenes),
