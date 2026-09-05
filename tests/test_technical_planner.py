@@ -707,6 +707,40 @@ def test_normalize_converts_new_object_used_as_transform_source_to_fade_in():
     assert any("删除 inactive source 后改为 fade_in" in repair for repair in repairs)
 
 
+def test_normalize_converts_new_object_used_as_animate_source_to_fade_in():
+    new = VisualElementState(
+        element_id="error_highlight",
+        variable_name="error_highlight",
+        kind="line",
+        required=False,
+    )
+    plan = make_plan(new=[new])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="error_highlight", variable_name="error_highlight")],
+        animations=[
+            TechnicalAnimation(
+                event_id="highlight_error",
+                start_seconds=1,
+                end_seconds=3,
+                operation="animate",
+                source_element_ids=["error_highlight"],
+                create_element_ids=["error_highlight"],
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    event = normalized.animations[0]
+    assert event.operation == "fade_in"
+    assert event.source_element_ids == []
+    assert event.create_element_ids == ["error_highlight"]
+    assert result.is_valid is True, result.errors
+    assert any("inactive source 规范为 fade_in" in repair for repair in repairs)
+
+
 def test_normalize_adds_missing_plan_object_declaration():
     formula = VisualElementState(
         element_id="formula_label",

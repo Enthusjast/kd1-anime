@@ -604,6 +604,42 @@ def _normalise_technical_lifecycle(
                 )
                 changed = True
 
+        if event.operation in {"animate", "keep"} and event.source_element_ids:
+            inactive_sources = set(event.source_element_ids) - active
+            declared_introducers = target_ids | create_ids
+            recoverable_sources = inactive_sources & declared_introducers & set(object_by_id)
+            if recoverable_sources and recoverable_sources == inactive_sources:
+                # 模型有时把首次高亮/闪烁写成 animate，同时把对象放进
+                # create_element_ids。它还没有 active 身份，不能直接执行
+                # animate；将这一条规范为首次 fade_in，避免后续相同的
+                # “尚未 active”错误。只有 source 同时明确属于 target/create
+                # 且已在计划对象表中时才做这个无歧义修复。
+                remaining_active_sources = set(event.source_element_ids) - recoverable_sources
+                if remaining_active_sources:
+                    # 混合 active/inactive source 的复杂复合动画不在这里
+                    # 拆分，保留给编译器和 Technical Planner 反馈处理。
+                    pass
+                else:
+                    event = event.model_copy(
+                        update={
+                            "operation": "fade_in",
+                            "source_element_ids": [],
+                            "target_element_ids": sorted(recoverable_sources),
+                            "create_element_ids": sorted(recoverable_sources),
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "inactive source 同时声明为 create，按首次 fade_in 引入",
+                            ),
+                        }
+                    )
+                    target_ids = set(recoverable_sources)
+                    create_ids = set(recoverable_sources)
+                    repairs.append(
+                        f"事件 {event.event_id} 的 inactive source 规范为 fade_in: "
+                        + ", ".join(sorted(recoverable_sources))
+                    )
+                    changed = True
+
         if event.operation in {"fade_out", "uncreate", "remove"}:
             source_ids = set(event.source_element_ids)
             remove_ids = set(event.remove_element_ids)

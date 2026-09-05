@@ -408,8 +408,9 @@ def repair_required_export_replacement_lifecycle(
     当代码没有写 ``grid = grid_target`` 这样的重绑定时，前一个兼容修复
     没有可处理的赋值，但 ``ReplacementTransform(grid, grid_target)`` 仍会
     把合同要求导出的 ``grid`` 从 Scene 中移除。若 target 不是另一个已
-    声明的合同变量，则将其降为原地 ``Transform``；target 仍可作为目标
-    快照提供几何形状，而导出 source 的 active 身份得到保留。
+    声明的合同变量，也将其降为原地 ``Transform``；TechnicalSpec 的
+    ``transform`` 语义不会让 target 自动成为 active，而导出 source 的
+    active 身份必须得到保留。
     """
 
     if not code or not technical_spec.export_element_ids:
@@ -425,9 +426,6 @@ def repair_required_export_replacement_lifecycle(
         item.variable_name
         for item in technical_spec.objects
         if item.element_id in technical_spec.export_element_ids and item.variable_name
-    }
-    declared_variables = {
-        item.variable_name for item in technical_spec.objects if item.variable_name
     }
     if not exported_variables:
         return code, ()
@@ -450,7 +448,7 @@ def repair_required_export_replacement_lifecycle(
             ):
                 sources = _root_names(child.args[0])
                 targets = _root_names(child.args[1])
-                if sources & exported_variables and targets and not targets <= declared_variables:
+                if sources & exported_variables and targets:
                     replacements.append(child)
     if not replacements:
         return code, ()
@@ -597,6 +595,31 @@ def _contains_animate(node: ast.AST) -> bool:
     )
 
 
+def _is_self_camera_path(node: ast.AST) -> bool:
+    """判断属性链是否从 ``self.camera`` 开始。"""
+
+    current = node
+    while isinstance(current, ast.Attribute):
+        current = current.value
+    return (
+        isinstance(current, ast.Name)
+        and current.id == "self"
+        and isinstance(node, ast.Attribute)
+        and (node.attr == "camera" or _is_self_camera_path(node.value))
+    )
+
+
+def _animate_source_names(node: ast.AST) -> set[str]:
+    """提取 Mobject.animate 的根变量，忽略 ThreeDScene 相机运镜。"""
+
+    for child in ast.walk(node):
+        if isinstance(child, ast.Attribute) and child.attr == "animate":
+            if _is_self_camera_path(child.value):
+                return set()
+            return _root_names(child.value)
+    return _root_names(node)
+
+
 def _animation_invocations(node: ast.AST) -> list[_AnimationInvocation]:
     """从 self.play 参数中提取动画操作，忽略普通参数表达式。"""
 
@@ -624,9 +647,11 @@ def _animation_invocations(node: ast.AST) -> list[_AnimationInvocation]:
             )
             return [_AnimationInvocation("animate", tuple(sorted(source)))]
         if _contains_animate(node):
-            return [_AnimationInvocation("animate", tuple(sorted(_root_names(node.func))))]
+            return [_AnimationInvocation("animate", tuple(sorted(_animate_source_names(node))))]
         return []
     if isinstance(node, ast.Attribute) and node.attr == "animate":
+        if _is_self_camera_path(node.value):
+            return []
         return [_AnimationInvocation("animate", tuple(sorted(_root_names(node.value))))]
     return []
 

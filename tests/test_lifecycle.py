@@ -240,6 +240,46 @@ class Demo(Scene):
     assert result.is_valid is True, result.errors
 
 
+def test_repairs_replacement_of_required_export_to_declared_target():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula_before",
+                variable_name="formula_before",
+                constructor="MathTex",
+                initially_active=True,
+                exported=True,
+            ),
+            TechnicalObject(
+                element_id="formula_after",
+                variable_name="formula_after",
+                constructor="MathTex",
+            ),
+        ],
+        export_element_ids=["formula_before"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula_before
+        formula_before = MathTex(r"x")
+        # KD1_CONTINUITY_EXPORT_END
+        formula_after = MathTex(r"x^2")
+        self.add(formula_before)
+        self.play(ReplacementTransform(formula_before, formula_after))
+"""
+
+    repaired, repairs = repair_required_export_replacement_lifecycle(code, technical_spec)
+
+    assert repairs
+    assert "Transform(formula_before, formula_after)" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
 def test_lifecycle_accepts_animation_of_loop_variable():
     code = """
 from manim import *
@@ -253,6 +293,21 @@ class Demo(Scene):
     result = validate_animation_lifecycle(code, spec(exported=()))
 
     assert result.is_valid is True
+
+
+def test_lifecycle_ignores_threedscene_camera_animation():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        formula = MathTex(r"z=f(x,y)")
+        self.play(FadeIn(formula))
+        self.play(self.camera.animate.set_euler_angles(theta=1.2, phi=0.8))
+"""
+
+    result = validate_animation_lifecycle(code, spec())
+
+    assert result.is_valid is True, result.errors
 
 
 def test_lifecycle_tracks_vgroup_aliases_for_member_objects():
