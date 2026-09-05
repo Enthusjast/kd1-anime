@@ -15,7 +15,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
@@ -331,12 +331,31 @@ def _flatten_toml_settings(
     return flattened
 
 
-class _NestedTomlSettingsSource(TomlConfigSettingsSource):
+class _NestedTomlSettingsSource(PydanticBaseSettingsSource):
     """Pydantic source adapter for the project's nested TOML schema."""
 
     def __init__(self, settings_cls: type[BaseSettings], toml_file: Path | None):
-        super().__init__(settings_cls, toml_file=toml_file)
-        self.init_kwargs = _flatten_toml_settings(self.toml_data, settings_cls)
+        super().__init__(settings_cls)
+        self.toml_file = toml_file
+        self.values: dict[str, Any] = {}
+        if toml_file is not None and toml_file.is_file():
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # pragma: no cover - only used on Python 3.10
+                import tomli as tomllib
+
+            try:
+                with toml_file.open("rb") as handle:
+                    data = tomllib.load(handle)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"无法读取 TOML 配置 {toml_file}: {type(exc).__name__}") from exc
+            self.values = _flatten_toml_settings(data, settings_cls)
+
+    def get_field_value(self, field, field_name: str) -> tuple[Any, str, bool]:
+        return self.values.get(field_name), field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return dict(self.values)
 
 
 def _toml_literal(value: Any) -> str | None:
@@ -419,7 +438,6 @@ class Settings(BaseSettings):
         # TOML source 放在其前面，因此 TOML 会覆盖两种旧 .env 配置。
         env_file=_settings_env_files(),
         env_file_encoding="utf-8",
-        toml_file=USER_TOML_FILE,
         extra="ignore",
         validate_assignment=True,
     )
