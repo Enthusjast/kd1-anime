@@ -102,6 +102,19 @@ def test_minimal_toml_uses_defaults_for_omitted_optional_settings(monkeypatch, t
     assert config.MONITOR_POLL_INTERVAL == 10
 
 
+def test_toml_update_preserves_omitted_defaults(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text("[llm]\nmodel = 'model'\n", encoding="utf-8")
+
+    config_module.update_toml_setting(toml_file, "MAX_REVIEW_ROUNDS", "8")
+
+    content = toml_file.read_text(encoding="utf-8")
+    assert "max_review_rounds = 8" in content
+    assert "max_fix_attempts" not in content
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+    assert Settings().MAX_FIX_ATTEMPTS == 8
+
+
 def test_toml_rejects_unknown_fields_and_malformed_syntax(monkeypatch, tmp_path):
     toml_file = tmp_path / "config.toml"
     monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)

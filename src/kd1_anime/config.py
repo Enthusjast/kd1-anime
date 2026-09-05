@@ -430,7 +430,15 @@ def update_toml_setting(path: Path, field_name: str, raw_value: Any) -> None:
         values.update(source())
     values[field_name] = raw_value
     validated = Settings(_env_file=None, **values)
-    _replace_private_text(path, settings_to_toml(validated))
+    preserve_empty = set(values) & _TOML_EMPTY_NULL_FIELDS
+    _replace_private_text(
+        path,
+        settings_to_toml(
+            validated,
+            preserve_empty_fields=preserve_empty,
+            include_fields=set(values),
+        ),
+    )
 
 
 class Settings(BaseSettings):
