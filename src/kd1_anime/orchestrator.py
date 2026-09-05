@@ -1792,6 +1792,29 @@ class Orchestrator:
                 feedback_parts.append(
                     "\n动画生命周期校验未通过，必须修复以下问题：\n- " + lifecycle_error
                 )
+                if (
+                    "动画事件标记重复" in lifecycle_error
+                    or "重复使用动画事件标记" in lifecycle_error
+                ):
+                    feedback_parts.append(
+                        "\n事件标记修复规则：同一个 TechnicalSpec event_id 只能对应一次"
+                        " self.play。需要同时展示向量和标签时，把它们放进同一次"
+                        " AnimationGroup/LaggedStart；不要复制 marker，也不要为同一事件"
+                        "拆成多个 self.play。\n"
+                    )
+                if "未操作合同对象" in lifecycle_error:
+                    feedback_parts.append(
+                        "\n合同对象修复规则：逐字使用 TechnicalSpec 的 variable_name 作为"
+                        "实际动画参数。例如对象变量是 basis_i，就必须在该事件的"
+                        " Create/Write/AnimationGroup 中出现 basis_i；basis_i_arrow、"
+                        "basis_i_label、basis_i_target 等别名不能替代它。\n"
+                    )
+                if "marker 未在 TechnicalSpec 中声明" in lifecycle_error:
+                    feedback_parts.append(
+                        "\n事件范围修复规则：删除 TechnicalSpec 未声明的额外 self.play，"
+                        "或改用已有事件；不要自行发明 title_fade_out 等 marker。若合同"
+                        "已提供 remove 事件，使用该 exact event_id。\n"
+                    )
                 if "重定义仍处于 active 的对象" in lifecycle_error:
                     feedback_parts.append(
                         "\n生命周期修复规则：导出区只能有一个；继承且需要继续交接的对象只能定义一次，"

@@ -18,7 +18,7 @@ from kd1_anime.agents.scene_templates import (
     build_scene_template,
     select_scene_template,
 )
-from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
+from kd1_anime.agents.technical_planner import TechnicalAnimation, TechnicalObject, TechnicalSpec
 from kd1_anime.agents.validator import validate_manim_code
 from kd1_anime.config import settings
 
@@ -385,6 +385,16 @@ class TestScene(Scene):
         technical_spec = TechnicalSpec(
             scene_id=1,
             objects=[TechnicalObject(element_id="circle", variable_name="circle")],
+            animations=[
+                TechnicalAnimation(
+                    event_id="show_circle",
+                    start_seconds=0,
+                    end_seconds=1,
+                    semantic_action="introduce",
+                    target_element_ids=["circle"],
+                    create_element_ids=["circle"],
+                )
+            ],
             export_element_ids=["circle"],
         )
 
@@ -393,6 +403,9 @@ class TestScene(Scene):
         message = mock_call_llm.call_args.kwargs["user_message"]
         assert "TechnicalSpec" in message
         assert '"export_element_ids"' in message
+        assert "TechnicalSpec 事件实现表" in message
+        assert "show_circle" in message
+        assert "exactly one self.play" in message
 
 
 class TestCodeExtraction:

@@ -1004,6 +1004,44 @@ def test_normalize_technical_spec_adds_missing_inherited_removal_event():
     assert any("补齐语义退出事件" in repair for repair in repairs)
 
 
+def test_normalize_technical_spec_adds_missing_internal_lifecycle_removal():
+    title = VisualElementState(element_id="title", variable_name="title", required=False)
+    plan = make_plan(new=[title])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="title",
+                variable_name="title",
+                lifecycle=["define", "introduce", "remove"],
+            )
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_title",
+                start_seconds=0,
+                end_seconds=2,
+                semantic_action="introduce",
+                target_element_ids=["title"],
+                create_element_ids=["title"],
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    removal = next(
+        event
+        for event in normalized.animations
+        if event.event_id.startswith("remove_internal_elements")
+    )
+    assert removal.semantic_action == "remove"
+    assert removal.source_element_ids == ["title"]
+    assert result.is_valid is True, result.errors
+    assert any("内部临时元素补齐 remove" in repair for repair in repairs)
+
+
 def test_normalize_technical_spec_downgrades_create_of_active_target_to_animation():
     point = VisualElementState(element_id="point", variable_name="point")
     formula = VisualElementState(element_id="formula", variable_name="formula")

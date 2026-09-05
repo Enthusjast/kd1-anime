@@ -683,6 +683,57 @@ def _ensure_planned_removals_exit(
     )
 
 
+def _ensure_declared_lifecycle_removals(
+    spec: TechnicalSpec,
+    *,
+    duration_seconds: float,
+) -> tuple[TechnicalSpec, tuple[str, ...]]:
+    """为对象声明的内部 ``remove`` 生命周期补齐语义事件。
+
+    技术规划模型有时会在 ``TechnicalObject.lifecycle`` 中声明临时标题或
+    标签最终应移除，却忘记在 ``animations`` 中创建对应事件。Coder 随后
+    按对象生命周期写出一个未声明的 marker，确定性校验便会拒绝整个候选。
+    对非导出对象补一条场景末尾的 remove 是对象合同的机械投影，不改变
+    数学内容，也不会影响跨场景边界。
+    """
+
+    object_ids = {
+        item.element_id for item in spec.objects if "remove" in item.lifecycle and not item.exported
+    }
+    if not object_ids:
+        return spec, ()
+    exited_ids = {
+        element_id
+        for event in spec.animations
+        if event.semantic_action == "remove"
+        for element_id in {*event.source_element_ids, *event.remove_element_ids}
+    }
+    missing = object_ids - exited_ids
+    if not missing:
+        return spec, ()
+
+    event_ids = {event.event_id for event in spec.animations}
+    event_id = "remove_internal_elements"
+    suffix = 2
+    while event_id in event_ids:
+        event_id = f"remove_internal_elements_{suffix}"
+        suffix += 1
+    tail = min(1.0, max(0.1, duration_seconds * 0.1))
+    end_seconds = max(tail, duration_seconds)
+    event = TechnicalAnimation(
+        event_id=event_id,
+        start_seconds=max(0.0, end_seconds - tail),
+        end_seconds=end_seconds,
+        semantic_action="remove",
+        source_element_ids=sorted(missing),
+        api_notes="根据 TechnicalObject.lifecycle=remove 补齐内部临时对象的退出事件",
+    )
+    return (
+        spec.model_copy(update={"animations": [*spec.animations, event]}),
+        ("为对象生命周期声明的内部临时元素补齐 remove: " + ", ".join(sorted(missing)),),
+    )
+
+
 def _ensure_required_export_introductions(
     spec: TechnicalSpec,
     *,
@@ -1012,6 +1063,11 @@ def normalize_technical_spec_contract(
         duration_seconds=plan.duration_seconds,
     )
     repairs.extend(removal_repairs)
+    normalized_spec, internal_removal_repairs = _ensure_declared_lifecycle_removals(
+        normalized_spec,
+        duration_seconds=plan.duration_seconds,
+    )
+    repairs.extend(internal_removal_repairs)
     required_boundary_ids = {
         item.element_id
         for item in [*plan.inherited_elements, *plan.new_elements]

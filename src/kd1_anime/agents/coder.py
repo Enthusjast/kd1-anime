@@ -64,7 +64,15 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   `# KD1_ANIMATION_EVENT: <event_id>`，并引用对应事件声明的对象。事件的
   `semantic_action` 决定状态：`introduce` 引入新对象，`update` 修改 active source，
   `remove` 退出对象，`camera` 只处理相机，`hold` 不改变状态。具体用哪一种
-  Manim Animation 由你根据画面选择，不要修改合同或伪造 Python 别名。
+  Manim Animation（例如 `Transform` 或 `.animate`）由你根据画面选择，不要修改合同或伪造 Python 别名。
+- TechnicalSpec 中每个事件只对应一次 `self.play` 和一个同名 marker；如果一个事件
+  需要同时展示多个对象，使用 `AnimationGroup`/`LaggedStart` 在这一次 `self.play`
+  中组合它们，不要重复使用同一个 marker。事件中的 element 对应的
+  `variable_name` 必须作为实际动画参数出现，不能只播放同名的 `_arrow`、`_label` 或
+  `_target` 别名。辅助标签可以作为同一次组合动画的额外对象，但不能替代合同对象。
+- `introduce` 事件必须直接引入合同中 exact 的 target/create 变量；例如合同对象为
+  `basis_i` 时，应使用 `Create(basis_i)` 或在 `AnimationGroup` 中使用它。不要在
+  同一事件下拆成多个 `self.play`，也不要额外发明 TechnicalSpec 未声明的 marker。
 - `target_element_ids` 在 update 中只是目标快照；若目标需要以新身份留在场景，
   必须另有 introduce 事件。不要把一个事件同时写成引入、更新和移除。
 - 生命周期字段的优先级高于 transition_in/transition_out、persistent_elements 等自由文本：
@@ -235,6 +243,21 @@ class CoderAgent(BaseAgent):
         technical_contract = (
             technical_spec.model_dump_json(indent=2) if technical_spec is not None else ""
         )
+        technical_event_contract = (
+            "\n".join(
+                (
+                    f"- {event.event_id}: action={event.semantic_action}; "
+                    f"source={event.source_element_ids or []}; "
+                    f"target={event.target_element_ids or []}; "
+                    f"create={event.create_element_ids or []}; "
+                    f"remove={event.remove_element_ids or []}; "
+                    "exactly one self.play with this marker"
+                )
+                for event in technical_spec.animations
+            )
+            if technical_spec is not None
+            else ""
+        )
         inherited = (
             inherited_elements if inherited_elements is not None else scene_plan.inherited_elements
         )
@@ -313,6 +336,17 @@ class CoderAgent(BaseAgent):
                     required=True,
                     priority=110,
                     max_chars=settings.LLM_MAX_TECHNICAL_SPEC_CHARS,
+                )
+            )
+            sections.append(
+                PromptSection(
+                    "TechnicalSpec 事件实现表",
+                    "下面是代码实现时必须逐一对应的精简表。每个事件只写一个同名 marker，"
+                    "并在紧随其后的一次 self.play 中使用 exact source/target/create/remove 变量；"
+                    "辅助标签只能作为同一次组合动画的额外参数。\n" + technical_event_contract,
+                    required=True,
+                    priority=115,
+                    max_chars=20_000,
                 )
             )
         sections.extend(
