@@ -962,6 +962,10 @@ class Orchestrator:
                     job.cancelled = True
                     job.status = "CANCELLED"
                     job.failure_reason = "本地流水线停止时已取消远端任务"
+        if self._backend_name == "local":
+            close = getattr(self.slurm, "close", None)
+            if callable(close):
+                close()
 
     def _ask_retry_or_skip(self, scene_id: int, error: str) -> bool:
         if not self._ctx or not self._ctx.interactive:
@@ -2344,7 +2348,12 @@ class Orchestrator:
                     ctx.continuity_review_status = "passed"
                 self._checkpoint(ctx, state)
 
-            self._emit("run_resumed", run_id=run_id, state=state.name)
+            self._emit(
+                "run_resumed",
+                run_id=run_id,
+                state=state.name,
+                backend=ctx.backend,
+            )
             return self._execute(ctx, state)
 
     def plan_only(

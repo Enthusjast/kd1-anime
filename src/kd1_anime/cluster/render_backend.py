@@ -128,17 +128,21 @@ class LocalRenderBackend(SlurmDispatcher):
         logs_dir: Path | None,
         videos_dir: Path | None,
     ) -> tuple[Path, Path, Path]:
-        resolved = tuple(
-            Path(item or default).expanduser().resolve()
+        raw_directories = tuple(
+            Path(item or default).expanduser()
             for item, default in (
                 (scenes_dir, settings.SCENES_DIR),
                 (logs_dir, settings.LOGS_DIR),
                 (videos_dir, settings.VIDEOS_DIR),
             )
         )
+        for raw_directory in raw_directories:
+            if raw_directory.is_symlink() or (
+                raw_directory.exists() and not raw_directory.is_dir()
+            ):
+                raise RuntimeError(f"本地渲染目录不是可信的真实目录: {raw_directory}")
+        resolved = tuple(directory.resolve() for directory in raw_directories)
         for directory in resolved:
-            if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-                raise RuntimeError(f"本地渲染目录不是可信的真实目录: {directory}")
             directory.mkdir(parents=True, exist_ok=True)
             directory.chmod(0o700)
         return resolved  # type: ignore[return-value]
