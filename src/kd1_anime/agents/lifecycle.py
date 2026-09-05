@@ -1025,6 +1025,25 @@ def validate_animation_lifecycle(
         event_targets = contract_variables(event, "target_element_ids")
         event_creates = contract_variables(event, "create_element_ids")
         event_removes = contract_variables(event, "remove_element_ids")
+        actual_sources = mapped({name for call in invocations for name in call.source_names})
+        actual_targets = mapped({name for call in invocations for name in call.target_names})
+        expected = event_sources | event_targets | event_creates | event_removes
+        if expected - (actual_sources | actual_targets):
+            errors.append(
+                f"第 {node.lineno} 行事件 {event.event_id} 未操作合同对象: "
+                + ", ".join(sorted(expected - (actual_sources | actual_targets)))
+            )
+        actual_exits = mapped(
+            {
+                name
+                for call in invocations
+                if call.operation in _REMOVERS or call.operation == "ReplacementTransform"
+                for name in call.source_names
+            }
+        )
+        if actual_exits and action != "remove":
+            errors.append(f"第 {node.lineno} 行实际退出对象与 {action} 语义不符")
+            active.difference_update(actual_exits)
         if action == "introduce":
             missing = event_sources & active
             if missing:
@@ -1034,7 +1053,7 @@ def validate_animation_lifecycle(
             introduced = event_targets | event_creates
             if introduced - defined:
                 require_defined(introduced - defined, node.lineno, "introduce")
-            active.update(introduced)
+            active.update(introduced & (actual_sources | actual_targets))
         elif action == "update":
             missing = event_sources - active
             if missing:

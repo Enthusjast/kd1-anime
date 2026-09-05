@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import os
 import re
@@ -41,7 +42,8 @@ def anonymize_code(code: str) -> str:
             continue
         safe_line = _RUN_ID_RE.sub("<run>", raw_line)
         safe_line = _ABSOLUTE_PATH_RE.sub("<path>", safe_line)
-        safe_lines.append(_SECRET_VALUE_RE.sub("<redacted>", redact_text(safe_line)).rstrip())
+        indentation = safe_line[: len(safe_line) - len(safe_line.lstrip())]
+        safe_lines.append(indentation + _SECRET_VALUE_RE.sub("<redacted>", redact_text(safe_line)))
     return "\n".join(safe_lines).strip() + ("\n" if safe_lines else "")
 
 
@@ -103,6 +105,10 @@ class RecipeStore:
         safe_code = anonymize_code(code)
         if not safe_code:
             raise ValueError("代码脱敏后为空，不能保存配方")
+        try:
+            ast.parse(safe_code)
+        except SyntaxError as exc:
+            raise ValueError("脱敏代码语法无效，跳过配方保存") from exc
         recipe_id = self._recipe_id(safe_code)
         root = self._ensure_root()
         safe_renderer = re.sub(r"[^A-Za-z0-9_.-]", "_", _safe_label(renderer, limit=20))[:20]

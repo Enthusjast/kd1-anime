@@ -96,3 +96,13 @@ def test_refresh_recipe_reembeds_only_new_chunks(tmp_path: Path, monkeypatch):
     assert result.chunk_count == 2
     assert len(calls) == 1
     assert len(calls[0]) == 1
+
+
+def test_anonymized_scene_preserves_python_indentation():
+    import ast
+
+    code = (
+        "from manim import *\nclass Demo(Scene):\n    def construct(self):\n        self.wait()\n"
+    )
+    ast.parse(anonymize_code(code))
+    assert "        self.wait()" in anonymize_code(code)

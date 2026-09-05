@@ -571,3 +571,30 @@ class Demo(ThreeDScene):
     result = validate_animation_lifecycle(code, technical_spec)
 
     assert result.is_valid is True, result.errors
+
+
+def test_marker_cannot_introduce_an_object_not_used_by_animation():
+    code = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        other = Square()
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeIn(other))
+"""
+    result = validate_animation_lifecycle(code, _semantic_spec())
+    assert not result.is_valid
+
+
+def test_update_marker_cannot_hide_actual_removal():
+    technical = _semantic_spec("update")
+    technical.objects[0].initially_active = True
+    code = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeOut(formula))
+"""
+    assert not validate_animation_lifecycle(code, technical).is_valid
