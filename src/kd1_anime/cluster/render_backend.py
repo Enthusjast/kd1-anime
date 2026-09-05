@@ -137,9 +137,23 @@ class LocalRenderBackend(SlurmDispatcher):
             )
         )
         for directory in resolved:
+            if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+                raise RuntimeError(f"本地渲染目录不是可信的真实目录: {directory}")
             directory.mkdir(parents=True, exist_ok=True)
             directory.chmod(0o700)
         return resolved  # type: ignore[return-value]
+
+    @staticmethod
+    def _open_log(path: Path):
+        if path.is_symlink():
+            raise RuntimeError(f"本地渲染日志不能是符号链接: {path}")
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "w", encoding="utf-8")
 
     def submit_scene(
         self,
@@ -165,6 +179,8 @@ class LocalRenderBackend(SlurmDispatcher):
         attempt = uuid4().hex[:12]
         job_id = self._local_job_id()
         media_dir = videos_root / f"scene_{scene_id}" / f"attempt_{attempt}"
+        if media_dir.is_symlink():
+            raise RuntimeError(f"本地渲染媒体目录不能是符号链接: {media_dir}")
         media_dir.mkdir(parents=True, exist_ok=True)
         media_dir.chmod(0o700)
         log_out = logs_root / f"scene_{scene_id}_{job_id}.out"
@@ -188,8 +204,8 @@ class LocalRenderBackend(SlurmDispatcher):
         out_handle = None
         err_handle = None
         try:
-            out_handle = log_out.open("w", encoding="utf-8")
-            err_handle = log_err.open("w", encoding="utf-8")
+            out_handle = self._open_log(log_out)
+            err_handle = self._open_log(log_err)
             process = subprocess.Popen(
                 command,
                 cwd=source.parent,
@@ -199,11 +215,13 @@ class LocalRenderBackend(SlurmDispatcher):
                 text=True,
                 start_new_session=True,
             )
-        except OSError:
+        except (OSError, RuntimeError):
             with suppress(OSError):
-                out_handle.close()  # type: ignore[union-attr]
+                if out_handle is not None:
+                    out_handle.close()
             with suppress(OSError):
-                err_handle.close()  # type: ignore[union-attr]
+                if err_handle is not None:
+                    err_handle.close()
             raise
         submitted_at = time.time()
         job = SlurmJob(
