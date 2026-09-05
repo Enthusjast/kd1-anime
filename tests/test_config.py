@@ -229,9 +229,10 @@ def test_llm_timeout_and_silent_stream_validation():
         Settings(_env_file=None, LLM_EMPTY_RETRY_MAX_TOKENS=100)  # 低于下限
 
 
-def test_max_fix_attempts_default_and_upper_bound():
+def test_review_and_fix_attempts_defaults_and_upper_bound():
     config = Settings(_env_file=None)
-    assert config.MAX_FIX_ATTEMPTS == 5
+    assert config.MAX_REVIEW_ROUNDS == 8
+    assert config.MAX_FIX_ATTEMPTS == 8
     # 超过上限 le=20 会被拒绝
     with pytest.raises(ValueError):
         Settings(_env_file=None, MAX_FIX_ATTEMPTS=21)

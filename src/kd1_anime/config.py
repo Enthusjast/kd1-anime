@@ -557,7 +557,7 @@ class Settings(BaseSettings):
     VIDEOS_DIR: Path = DEFAULT_VIDEOS_DIR
 
     # --- Agent 与监控 ---
-    MAX_REVIEW_ROUNDS: int = Field(default=5, ge=1, le=10)
+    MAX_REVIEW_ROUNDS: int = Field(default=8, ge=1, le=10)
     MAX_LOW_RISK_REVIEW_ROUNDS: int = Field(
         default=2,
         ge=1,
@@ -593,7 +593,7 @@ class Settings(BaseSettings):
         description="渲染修复没有改变代码或错误指纹多少次后切换确定性回退",
     )
     # 渲染失败后的最大自动修复次数。autofixer 每轮会调用 LLM 重写代码并重新提交 Slurm。
-    MAX_FIX_ATTEMPTS: int = Field(default=5, ge=0, le=20)
+    MAX_FIX_ATTEMPTS: int = Field(default=8, ge=0, le=20)
     # Slurm 节点故障/抢占等与代码无关的终态，允许自动重新排队的次数。
     MAX_INFRA_RETRIES: int = Field(default=2, ge=0, le=10)
     # 连续 N 次渲染错误日志指纹相同 → 提前放弃, 避免 LLM 反复"修复"同一个
