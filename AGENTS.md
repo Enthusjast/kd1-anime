@@ -36,10 +36,13 @@ Do not run a real LLM request, submit Slurm jobs, or execute generated code duri
 Settings are defined in `src/kd1_anime/config.py` and loaded in this order:
 
 ```text
-process environment > ./.env > ~/.kd1-anime/.env
+process environment > ~/.kd1-anime/config.toml > ./.env > ~/.kd1-anime/.env
 ```
 
-Never commit `.env` or print API keys. The API is provider-neutral: `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` must work with any OpenAI-compatible endpoint. Visual evaluation uses the separate `VISUAL_LLM_*` profile and must never silently inherit the main endpoint.
+Never commit `config.toml`/`.env` or print API keys. The API is provider-neutral:
+`LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` must work with any OpenAI-compatible
+endpoint. Visual evaluation uses the separate `VISUAL_LLM_*` profile and must never
+silently inherit the main endpoint.
 
 ## Pipeline
 
@@ -119,7 +122,7 @@ Key invariants:
 - work when downloaded alone;
 - install remote source through a temporary GitHub ZIP, never clone the repository into cwd or `$HOME`;
 - preserve an existing user config instead of overwriting it.
-- support x86_64 and aarch64 TeX Live platforms, and protect user `.env` with mode `0600`.
+- support x86_64 and aarch64 TeX Live platforms, and protect user `config.toml`/`.env` with mode `0600`.
 
 The wheel contains only Python runtime code. Keep host/environment provisioning in `install.sh` and documentation.
 

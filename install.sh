@@ -786,6 +786,7 @@ toml_config_tool() {
 import json
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -834,7 +835,7 @@ def location(field):
 
 path = Path(os.environ["CONFIG_PATH"])
 field = os.environ["CONFIG_FIELD"]
-operation = os.sys.argv[1]
+operation = sys.argv[1]
 section, key = location(field)
 
 if path.is_file():

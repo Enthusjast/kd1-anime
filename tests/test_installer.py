@@ -2,6 +2,7 @@ import hashlib
 import os
 import shlex
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -369,8 +370,17 @@ def test_installer_migrates_legacy_user_config_without_overwriting_it(tmp_path):
     )
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(INSTALLER.parent / "src"), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    python_env = Path(sys.executable).parent.parent
+    script = f"""
+source {shlex.quote(str(INSTALLER))}
+CONDA_ENV_DIR={shlex.quote(str(python_env))}
+write_user_config
+"""
     result = subprocess.run(
-        ["bash", "-c", f"source {shlex.quote(str(INSTALLER))}; write_user_config"],
+        ["bash", "-c", script],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -381,10 +391,12 @@ def test_installer_migrates_legacy_user_config_without_overwriting_it(tmp_path):
 
     assert result.returncode == 0, result.stderr
     migrated = tmp_path / ".kd1-anime" / "config.toml"
-    assert migrated.read_text(encoding="utf-8") == (
-        "# kd1-anime runtime configuration.\n"
-        "# Environment variables take precedence over this file.\n"
-    )
+    migrated_content = migrated.read_text(encoding="utf-8")
+    assert "[llm]" in migrated_content
+    assert 'model = "legacy-model"' in migrated_content
+    assert f'index_path = "{tmp_path}/.kd1-anime/rag/index.sqlite3"' in migrated_content
+    assert f'docs_dir = "{tmp_path}/.kd1-anime/knowledge/docs"' in migrated_content
+    assert 'workspace_dir = "' in migrated_content
     assert migrated.stat().st_mode & 0o777 == 0o600
     assert legacy_file.read_text(encoding="utf-8") == (
         "RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3\n"

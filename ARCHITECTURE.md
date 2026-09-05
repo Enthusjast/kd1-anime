@@ -312,7 +312,7 @@ run 根目录权限为 `0700`，prompt、manifest、锁文件和生成代码为 
 加载顺序：
 
 ```text
-进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env
+进程环境变量 > ~/.kd1-anime/config.toml > 当前目录 .env > ~/.kd1-anime/.env
 ```
 
 早期版本的用户配置和默认 RAG 索引会以非破坏方式复制到新目录；旧文件保留作为
