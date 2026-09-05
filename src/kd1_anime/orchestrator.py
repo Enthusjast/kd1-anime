@@ -667,6 +667,9 @@ class Orchestrator:
             scene.inherited_elements_code = ""
             scene.exported_elements_code = ""
             scene.exported_elements = []
+            scene.static_verification = StaticVerification(status="not_run")
+            scene.execution_verification = ExecutionVerification(status="not_run")
+            scene.visual_verification = VisualVerification(status="not_run")
             scene.unknown_animation_detected = False
             scene.unknown_animation_details = []
             scene.visual_status = "pending" if manifest.visual_eval_profile.enabled else "skipped"
