@@ -13,7 +13,9 @@ from typing import Literal
 from kd1_anime.rag.models import RagChunk
 
 ALLOWED_SUFFIXES = frozenset({".md", ".rst", ".py"})
-CHUNKER_VERSION = "1"
+# v2 将稳定的 source_path 纳入 chunk_id，允许不同文件包含相同内容而不互相
+# 覆盖；旧索引由 RagIndex 的 schema/version 检查强制重建。
+CHUNKER_VERSION = "2"
 DEFAULT_CHUNK_SIZE = 1_800
 DEFAULT_CHUNK_OVERLAP = 200
 EXCLUDED_PARTS = frozenset(
@@ -287,12 +289,17 @@ def chunk_file(
 
 def to_rag_chunk(item: SourceChunk) -> RagChunk:
     content_sha256 = hashlib.sha256(item.text.encode("utf-8")).hexdigest()
-    chunk_id = hashlib.sha256(
-        f"{item.source_sha256}:{item.source_kind}:{item.ordinal}:{content_sha256}".encode()
-    ).hexdigest()
+    source_path = item.display_path or item.path.as_posix()
+    chunk_id = chunk_id_for(
+        source_path,
+        item.source_sha256,
+        item.source_kind,
+        item.ordinal,
+        content_sha256,
+    )
     return RagChunk(
         chunk_id=chunk_id,
-        source_path=item.display_path or item.path.name,
+        source_path=source_path,
         source_kind=item.source_kind,
         source_sha256=item.source_sha256,
         content_sha256=content_sha256,
@@ -300,3 +307,17 @@ def to_rag_chunk(item: SourceChunk) -> RagChunk:
         text=item.text,
         metadata=item.metadata,
     )
+
+
+def chunk_id_for(
+    source_path: str,
+    source_sha256: str,
+    source_kind: SourceKind,
+    ordinal: int,
+    content_sha256: str,
+) -> str:
+    """为一个分块生成跨文件稳定且不会因内容重复而冲突的 ID。"""
+
+    return hashlib.sha256(
+        f"{source_kind}:{source_path}:{source_sha256}:{ordinal}:{content_sha256}".encode()
+    ).hexdigest()

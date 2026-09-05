@@ -18,11 +18,13 @@ from kd1_anime.rag.chunker import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
     SourceChunk,
+    chunk_id_for,
     to_rag_chunk,
 )
 from kd1_anime.rag.models import RagChunk, RagIndexInfo, RetrievedChunk
 
-INDEX_SCHEMA_VERSION = 3
+# v4 的 chunk_id 包含 source_path；v3 及更早索引必须重建。
+INDEX_SCHEMA_VERSION = 4
 _SCHEMA = """
 CREATE TABLE meta (
     key TEXT PRIMARY KEY NOT NULL,
@@ -106,10 +108,14 @@ def _index_digest(
     return digest.hexdigest()
 
 
-def _chunk_id(source_sha256: str, source_kind: str, ordinal: int, content_sha256: str) -> str:
-    return hashlib.sha256(
-        f"{source_sha256}:{source_kind}:{ordinal}:{content_sha256}".encode()
-    ).hexdigest()
+def _chunk_id_with_source_path(
+    source_path: str,
+    source_sha256: str,
+    source_kind: str,
+    ordinal: int,
+    content_sha256: str,
+) -> str:
+    return chunk_id_for(source_path, source_sha256, source_kind, ordinal, content_sha256)
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +168,15 @@ class RagIndex:
         if len(chunks) != len(embeddings):
             raise ValueError("知识库分块数量与 Embedding 数量不一致")
         rag_chunks = [to_rag_chunk(chunk) for chunk in chunks]
+        seen_chunk_ids: dict[str, RagChunk] = {}
+        for chunk in rag_chunks:
+            previous = seen_chunk_ids.get(chunk.chunk_id)
+            if previous is not None:
+                raise ValueError(
+                    "知识库输入包含重复 chunk_id："
+                    f"{chunk.chunk_id}（来源 {previous.source_path} 与 {chunk.source_path}）"
+                )
+            seen_chunk_ids[chunk.chunk_id] = chunk
         vectors = [_pack_vector(vector) for vector in embeddings]
         dimension = len(embeddings[0])
         if dimension < 1 or any(len(vector) != dimension for vector in embeddings):
@@ -302,7 +317,12 @@ class RagIndex:
                     content_sha256 = hashlib.sha256(str(row[6]).encode("utf-8")).hexdigest()
                     if content_sha256 != row[4]:
                         raise ValueError("分块内容哈希不一致")
-                    if _chunk_id(row[3], row[2], int(row[5]), content_sha256) != row[0]:
+                    if (
+                        _chunk_id_with_source_path(
+                            row[1], row[3], row[2], int(row[5]), content_sha256
+                        )
+                        != row[0]
+                    ):
                         raise ValueError("分块 ID 与内容哈希不一致")
                     chunks.append(
                         RagChunk(

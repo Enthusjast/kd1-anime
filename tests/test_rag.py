@@ -12,6 +12,7 @@ from kd1_anime.rag.chunker import (
     chunk_file,
     iter_source_files,
     source_manifest_digest,
+    to_rag_chunk,
 )
 from kd1_anime.rag.clients import EmbeddingClient, RagClientError, RerankerClient
 from kd1_anime.rag.store import RagIndex
@@ -329,9 +330,40 @@ def test_rag_index_records_chunker_identity(tmp_path):
         chunk_overlap=40,
     )
 
-    assert info.chunker_version == "1"
+    assert info.chunker_version == "2"
     assert info.chunk_size == 400
     assert info.chunk_overlap == 40
+
+
+def test_rag_index_allows_same_content_in_different_source_files(tmp_path):
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("# Same\nidentical content", encoding="utf-8")
+    second.write_text("# Same\nidentical content", encoding="utf-8")
+    chunks = chunk_file(first, "recipe", display_path="recipe/first.md")
+    chunks += chunk_file(second, "recipe", display_path="recipe/second.md")
+
+    info = RagIndex.build(
+        tmp_path / "index.sqlite3",
+        chunks,
+        [[1.0, 0.0], [1.0, 0.0]],
+        embedding_model="embed-test",
+    )
+
+    assert info.chunk_count == 2
+    assert len({to_rag_chunk(chunk).chunk_id for chunk in chunks}) == 2
+
+
+def test_rag_index_reports_duplicate_input_chunks_before_sqlite(tmp_path):
+    chunk = _source_chunk("duplicate")
+
+    with pytest.raises(ValueError, match="重复 chunk_id"):
+        RagIndex.build(
+            tmp_path / "index.sqlite3",
+            [chunk, chunk],
+            [[1.0, 0.0], [1.0, 0.0]],
+            embedding_model="embed-test",
+        )
 
 
 def test_rag_index_rejects_tampered_chunk(tmp_path):
