@@ -7806,6 +7806,7 @@ class Orchestrator:
             except ValueError as exc:
                 continuity_error = str(exc)
             lifecycle_error = ""
+            candidate_acceptance_error = ""
             if state.technical_spec is not None and validation.is_valid and not continuity_error:
                 lifecycle_result = validate_animation_lifecycle(
                     candidate,
@@ -7814,7 +7815,23 @@ class Orchestrator:
                 )
                 if not lifecycle_result.is_valid:
                     lifecycle_error = "\n".join(lifecycle_result.errors)
-            if not validation.is_valid or continuity_error or lifecycle_error:
+            try:
+                self.candidate_acceptor.inspect(
+                    candidate,
+                    state.plan,
+                    technical_spec=state.technical_spec,
+                    renderer=ctx.render_profile.renderer,
+                    expected_class_name=state.class_name or None,
+                    validator=self._validate,
+                )
+            except CandidateRejected as exc:
+                candidate_acceptance_error = str(exc)
+            if (
+                not validation.is_valid
+                or continuity_error
+                or lifecycle_error
+                or candidate_acceptance_error
+            ):
                 candidate, class_name = self._generate_validated_code(
                     state.plan,
                     feedback=(
@@ -7826,6 +7843,11 @@ class Orchestrator:
                             else ""
                         )
                         + (f"动画生命周期错误：\n{lifecycle_error}\n" if lifecycle_error else "")
+                        + (
+                            f"候选统一接纳错误：\n{candidate_acceptance_error}\n"
+                            if candidate_acceptance_error
+                            else ""
+                        )
                         + f"\n精准 traceback 证据：\n{error_evidence.prompt_text()}\n"
                         + f"\n原始渲染错误：\n{error_log}"
                     ),
