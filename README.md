@@ -485,7 +485,7 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
         └── output_final.mp4      # 默认最终视频
 ```
 
-每个 run 使用独立目录和运行锁。manifest 会原子写入，并保存阶段、代码 SHA-256、精确 Slurm Job、Render/Merge Profile、视频哈希和 ffprobe 元数据。恢复时不会用共享目录扫描猜测视频，也不会复用不匹配的旧产物。
+每个 run 使用独立目录和运行锁。manifest 会原子写入，并保存阶段、渲染后端、代码 SHA-256、精确 Job、Render/Merge Profile、视频哈希和 ffprobe 元数据；每个场景还分别记录静态、执行和视觉验证结论。恢复时不会用共享目录扫描猜测视频，也不会复用不匹配的旧产物。
 
 运行 ID 可通过 `status` 获取；中断后显式恢复：
 
@@ -535,7 +535,7 @@ EOF
 kd1-anime batch prompts.json --dry-run
 ```
 
-`--max-parallel` 限制项目级并行数；所有项目还共享进程级 `LLM_PARALLEL_WORKERS`、`RAG_PARALLEL_WORKERS`、`VISUAL_LLM_PARALLEL_WORKERS` 和 `SLURM_MAX_IN_FLIGHT` 配额。使用 `--output-dir` 时，输出文件会按任务编号写入该目录；重复目标和不允许覆盖的文件会在执行前被拒绝。
+`--max-parallel` 限制项目级并行数；所有项目还共享进程级 `LLM_PARALLEL_WORKERS`、`RAG_PARALLEL_WORKERS`、`VISUAL_LLM_PARALLEL_WORKERS`、`SLURM_MAX_IN_FLIGHT` 和本地渲染配额。使用 `--backend local` 时，批量任务仍以前台子进程运行；使用 `--output-dir` 时，输出文件会按任务编号写入该目录；重复目标和不允许覆盖的文件会在执行前被拒绝。
 
 ## 渲染器、转场与视频合并
 

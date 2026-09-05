@@ -2707,8 +2707,8 @@ class Orchestrator:
         except KeyError:
             return fallback
 
+    @staticmethod
     def _preflight_environment(
-        self,
         profile: RenderProfile | None = None,
         *,
         backend: RenderBackendName | None = None,
@@ -2716,11 +2716,10 @@ class Orchestrator:
         """在创建/提交渲染任务前验证对应后端需要的本地工具。"""
 
         profile = profile or RenderProfile.current()
-        selected_backend = backend or self._backend_name
-        if selected_backend != self._backend_name:
-            self._set_backend(selected_backend)
-        self.rendering_service.set_backend(self.slurm, selected_backend)
-        self.rendering_service.preflight(profile)
+        selected_backend = backend or settings.RENDER_BACKEND
+        RenderingService(create_render_backend(selected_backend), selected_backend).preflight(
+            profile
+        )
 
     def _local_smoke_render(
         self,
@@ -3535,7 +3534,8 @@ class Orchestrator:
                     details=list(state.unknown_animation_details),
                 )
 
-    def _planning_cycle_signature(self, ctx: PipelineContext) -> str:
+    @staticmethod
+    def _planning_cycle_signature(ctx: PipelineContext) -> str:
         """计算当前计划/发现的指纹，防止审查器在同一输入上来回空转。"""
 
         payload = {
@@ -3553,7 +3553,7 @@ class Orchestrator:
             "plan_status": ctx.plan_review_status,
             "continuity_status": ctx.continuity_review_status,
         }
-        return self.planning_service.cycle_signature(payload)
+        return PlanningService.cycle_signature(payload)
 
     def _adapt_renderer_for_plans(self, ctx: PipelineContext) -> None:
         """在首次提交前为明确需要 Cairo 运镜的计划切换 renderer。"""
