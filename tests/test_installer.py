@@ -509,6 +509,8 @@ configure_user_models
     assert 'rerank_base_url = "https://rerank.example/v1"' in content
     assert 'rerank_api_key = "rerank-secret"' in content
     assert 'rerank_model = "rerank-model"' in content
+    assert not (tmp_path / ".kd1-anime" / ".env").exists()
+    assert (tmp_path / ".kd1-anime" / "config.toml").stat().st_mode & 0o777 == 0o600
     assert marker.read_text(encoding="utf-8") == "built\n"
 
 

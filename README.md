@@ -77,7 +77,9 @@ curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.s
 
 安装器会创建或复用 `manim_env`，安装 Manim CE `0.20.1`、FFmpeg、CJK 字体和 Manim 所需的最小 XeLaTeX 依赖，并将 Manim 文档和示例放入 `~/.kd1-anime/knowledge/`。
 
-交互式终端中，安装器最后会启动模型配置向导，依次配置主模型、视觉模型、Embedding 和 Reranker。非交互环境默认跳过向导：
+交互式终端中，安装器最后会启动模型配置向导，依次配置主模型、视觉模型、Embedding 和 Reranker，
+并将回答写入 `~/.kd1-anime/config.toml` 的对应 TOML 分组。未启用的可选服务不会写入配置分组。
+非交互环境默认跳过向导：
 
 ```bash
 # 显式启动向导

@@ -28,6 +28,10 @@ src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，旧版
 ~/.kd1-anime/config.toml；旧文件不会自动删除。若转换失败，程序仍会读取
 旧 .env 作为兼容回退。
 
+交互式安装向导会依次配置主模型、视觉模型、Embedding 和 Reranker，并直接更新
+`config.toml` 对应分组；未启用的可选服务不会写入配置。非交互安装默认跳过向导，
+可通过 `KD1_ANIME_CONFIGURE_MODE=interactive` 显式开启。
+
 相对路径通常按当前工作目录解析；默认路径全部位于 ~/.kd1-anime/。运行目录由
 WORKSPACE_DIR 控制，单个 run 仍会使用自己的私有子目录。
 
