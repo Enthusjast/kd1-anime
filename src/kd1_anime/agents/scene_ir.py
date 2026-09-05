@@ -282,6 +282,7 @@ def compile_scene_program(program: SceneProgram, scene_plan: ScenePlan) -> str:
             f"        title = Text({_quote(scene_plan.title[:120])}, font_size=32)",
             f"        summary = Text({_quote(program.summary[:240])}, font_size=24)",
             "        summary.next_to(title, DOWN, buff=0.5)",
+            "        # KD1_ANIMATION_EVENT: __auto_aux_title_summary",
             "        self.play(FadeIn(title), FadeIn(summary), run_time=0.5)",
         ]
     )
@@ -296,15 +297,21 @@ def compile_scene_program(program: SceneProgram, scene_plan: ScenePlan) -> str:
         if animation.operation == "add":
             lines.append(f"        self.add({', '.join(source_vars)})")
         elif animation.operation == "fade_out":
-            lines.append(
-                f"        self.play(FadeOut({', '.join(source_vars)}), run_time={animation.run_time:g})"
+            lines.extend(
+                [
+                    "        # KD1_ANIMATION_EVENT: __auto_remove_program",
+                    f"        self.play(FadeOut({', '.join(source_vars)}), run_time={animation.run_time:g})",
+                ]
             )
         elif animation.operation in {"fade_in", "create", "write"}:
             constructor = {"fade_in": "FadeIn", "create": "Create", "write": "Write"}[
                 animation.operation
             ]
-            lines.append(
-                f"        self.play({', '.join(f'{constructor}({name})' for name in source_vars)}, run_time={animation.run_time:g})"
+            lines.extend(
+                [
+                    "        # KD1_ANIMATION_EVENT: __auto_introduce_program",
+                    f"        self.play({', '.join(f'{constructor}({name})' for name in source_vars)}, run_time={animation.run_time:g})",
+                ]
             )
         else:
             raise SceneProgramCompileError(f"后备编译器暂不支持动画: {animation.operation}")

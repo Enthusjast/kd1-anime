@@ -23,6 +23,7 @@ def _config(tmp_path: Path, **overrides) -> Settings:
         "RAG_INDEX_PATH": tmp_path / "index.sqlite3",
         "RAG_DOCS_DIR": tmp_path / "docs",
         "RAG_EXAMPLES_DIR": tmp_path / "examples",
+        "RAG_RECIPES_DIR": None,
         "RAG_EMBEDDING_BASE_URL": "https://embedding.invalid/v1",
         "RAG_EMBEDDING_MODEL": "embed-test",
         "RAG_RERANK_BASE_URL": "https://rerank.invalid/v1",

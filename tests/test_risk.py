@@ -42,7 +42,7 @@ def test_complex_three_d_scene_is_high_risk():
                 "event_id": f"a{i}",
                 "start_seconds": float(i),
                 "end_seconds": float(i) + 0.5,
-                "operation": "wait",
+                "semantic_action": "hold",
             }
             for i in range(12)
         ],

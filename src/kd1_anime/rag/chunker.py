@@ -256,6 +256,8 @@ def chunk_file(
                 "renderer": (
                     "opengl"
                     if "opengl" in relative_name
+                    else "cairo"
+                    if "cairo" in relative_name
                     else "both"
                     if any(marker in relative_name for marker in ("3d", "three_d", "surface"))
                     else "cairo"

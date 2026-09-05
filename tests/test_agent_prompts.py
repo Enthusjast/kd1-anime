@@ -1,5 +1,6 @@
 from kd1_anime.agents.auto_fixer import AUTO_FIXER_SYSTEM_PROMPT, AutoFixerAgent
 from kd1_anime.agents.coder import CODER_SYSTEM_PROMPT, build_coder_system_prompt
+from kd1_anime.agents.technical_planner import TECHNICAL_PLANNER_SYSTEM_PROMPT
 from kd1_anime.config import settings
 
 
@@ -47,9 +48,16 @@ def test_coder_prompt_has_continuity_contract():
     assert "导出区只能有一个" in CODER_SYSTEM_PROMPT
     assert "同时完成“接管”和“导出”" in CODER_SYSTEM_PROMPT
     assert "仅仅写入导出区不等于对象已经 active" in CODER_SYSTEM_PROMPT
+    assert "VGroup" in CODER_SYSTEM_PROMPT
     assert "单独 FadeIn 其子对象不会使 group active" in CODER_SYSTEM_PROMPT
     assert "initially_active=true" in CODER_SYSTEM_PROMPT
     assert "未经验证的碎片移动" in CODER_SYSTEM_PROMPT
+
+
+def test_technical_prompt_uses_semantic_actions_not_animation_catalog():
+    assert '"contract_version": 2' in TECHNICAL_PLANNER_SYSTEM_PROMPT
+    assert '"semantic_action"' in TECHNICAL_PLANNER_SYSTEM_PROMPT
+    assert '"operation"' not in TECHNICAL_PLANNER_SYSTEM_PROMPT
 
 
 def test_experimental_template_prompt_is_opt_in(monkeypatch):

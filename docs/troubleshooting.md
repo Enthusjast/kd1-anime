@@ -64,7 +64,7 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
 1. RAG_ENABLED 是否真的为 true；
 2. RAG_EMBEDDING_BASE_URL/MODEL/KEY 是否属于独立 Embedding 服务；
 3. RAG_RERANK_BASE_URL/MODEL/KEY 是否属于独立 Reranker 服务；
-4. RAG_DOCS_DIR 和 RAG_EXAMPLES_DIR 是否存在且包含 md、rst 或 py 文件；
+4. RAG_DOCS_DIR、RAG_EXAMPLES_DIR 或 RAG_RECIPES_DIR 是否存在且包含 md、rst 或 py 文件；
 5. 知识库文件、Embedding 模型或分块参数变化后是否重新建立索引；
 6. 当前网络是否被代理变量影响。
 
@@ -73,6 +73,17 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
     RAG_TRUST_ENV=false kd1-anime doctor --probe-rag
 
 rag status 只读取本地状态，不联网；doctor --probe-rag 才会发送最小 Embedding 和 Reranker 请求。
+
+正式渲染成功后，系统可能在 `RAG_RECIPES_DIR` 生成按代码哈希去重的匿名配方；它不包含
+原始提示词或服务凭据。配方索引采用增量 Embedding，刷新失败只显示 warning，可稍后手动
+执行 `kd1-anime rag index` 重试。
+
+## 3.1 未识别动画 warning
+
+TechnicalSpec v2 不再要求预先列举所有动画类。每个 `self.play` 前应有对应的
+`# KD1_ANIMATION_EVENT: <event_id>`，事件的 `semantic_action` 负责描述对象状态。
+静态分析器无法识别的新动画会记录 warning 而不是直接判错；在 `--dry-run` 中，包含这类
+调用的场景会自动执行低质量 frame 和短视频 Smoke Render，及早发现实际运行时错误。
 
 ## 4. Clarifier 或 READY 解析异常
 

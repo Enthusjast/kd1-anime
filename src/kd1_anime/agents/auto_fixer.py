@@ -180,6 +180,8 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
    继承元素定义和全局颜色/字体配置；除非错误日志直接涉及导出区，否则不要删除或重命名它们。
 10. TechnicalSpec 是只读的技术合同。修复后必须继续满足对象生命周期、动画源/目标、
     renderer 和最终导出清单，不能用删除动画或重建整场景掩盖错误。
+    contract_version=2 的每个 `self.play` 前都必须保留或补齐对应的
+    `# KD1_ANIMATION_EVENT: <event_id>`，不得把具体动画类名当成状态合同。
 11. LessonSpec/TeachingGraph 是只读数学合同。只修复运行时错误；不得因为渲染日志
     自行改写公式、推导结论或定义域。若错误来自计划，应交回计划阶段。
 

@@ -774,6 +774,26 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]Smoke Render 通过 ✓[/]")
 
+            case "scene_unknown_animation_detected":
+                scene_id = data.get("scene_id", "?")
+                count = len(data.get("details", [])) or 1
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]发现 {count} 个未识别动画，"
+                    "已强制 Smoke Render[/]"
+                )
+
+            case "recipe_saved":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [dim]已保存匿名动画配方[/]")
+
+            case "recipe_index_warning":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]配方已保存，RAG 索引待刷新[/]{suffix}"
+                )
+
             case "scene_submitted":
                 scene_id = data.get("scene_id", "?")
                 job_id = data.get("job_id", "?")

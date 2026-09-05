@@ -14,6 +14,7 @@ from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import FailureRoute, classify_failure
 from kd1_anime.agents.lifecycle import (
     LifecycleValidationResult,
+    detect_unknown_animations,
     repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
     repair_required_export_replacement_lifecycle,
@@ -69,6 +70,9 @@ from kd1_anime.agents.state_ledger import (
     validate_boundary_handoff,
 )
 from kd1_anime.agents.technical_planner import (
+    SemanticAnimationAction,
+    TechnicalAnimation,
+    TechnicalObject,
     TechnicalPlannerAgent,
     TechnicalSpec,
     TechnicalValidationResult,
@@ -113,9 +117,12 @@ __all__ = [
     "SceneBoundaryIR",
     "SceneBoundaryState",
     "SceneRisk",
+    "SemanticAnimationAction",
     "StateLedger",
     "TeachingEdge",
     "TeachingGraph",
+    "TechnicalAnimation",
+    "TechnicalObject",
     "TechnicalPlannerAgent",
     "TechnicalSpec",
     "TechnicalValidationResult",
@@ -128,6 +135,7 @@ __all__ = [
     "classify_progress",
     "compile_technical_spec",
     "dedupe_plan_review_issues",
+    "detect_unknown_animations",
     "deterministic_plan_issues",
     "extract_render_error",
     "filter_verified_plan_issues",

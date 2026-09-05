@@ -123,7 +123,7 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | RAG_INDEX_PATH | ~/.kd1-anime/rag/index.sqlite3 | SQLite 索引路径 |
 | RAG_DOCS_DIR | ~/.kd1-anime/knowledge/docs | 文档源目录 |
 | RAG_EXAMPLES_DIR | ~/.kd1-anime/knowledge/examples | 示例源目录 |
-| RAG_RECIPES_DIR | ~/.kd1-anime/knowledge/recipes | 版本化 Manim Recipe 目录 |
+| RAG_RECIPES_DIR | ~/.kd1-anime/knowledge/recipes | 内置及本地匿名 Recipe 目录 |
 | RAG_EMBEDDING_API_KEY | 空 | Embedding API Key |
 | RAG_EMBEDDING_BASE_URL | 空 | OpenAI-compatible Embedding 端点 |
 | RAG_EMBEDDING_MODEL | 空 | Embedding 模型名 |
@@ -140,6 +140,11 @@ RAG 默认关闭。开启后必须配置独立 Embedding、Reranker 和未过期
 | RAG_CHUNK_SIZE | 1800 | 文本分块大小 |
 | RAG_CHUNK_OVERLAP | 200 | 分块重叠大小，必须小于 chunk size |
 | RAG_PARALLEL_WORKERS | 2 | 进程内 RAG 请求并发上限 |
+
+TechnicalSpec 使用 v2 语义动作合同：`introduce`、`update`、`remove`、`camera` 和 `hold`。
+Coder 在每个 `self.play` 前写 `# KD1_ANIMATION_EVENT: <event_id>`，静态检查器据此校验
+对象状态；具体使用哪一种 Manim 动画由 Coder 自主选择。无法识别的动画调用只记录 warning，
+但 dry-run 会对包含这类调用的场景强制执行低质量 frame+短视频 Smoke Render。
 
 索引构建需要 Embedding 服务；完整生成还需要 Reranker。源文件、Embedding 模型、
 分块参数变化后，执行：

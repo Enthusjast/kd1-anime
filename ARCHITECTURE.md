@@ -38,6 +38,7 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/failure_router.py 确定性失败分类与修复路径
        ├── agents/validator.py     AST 确定性校验
        ├── agents/auto_fixer.py    根据渲染日志修复代码
+       ├── rag/recipes.py          本地匿名配方保存与去重
        ├── agents/render_error_parser.py 精确 traceback/稳定错误指纹
        ├── agents/progress.py      修复进度与停滞检测
        ├── agents/risk.py          场景风险评分与候选预算
@@ -88,7 +89,7 @@ CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用�
 
 `ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。顶层检查点使用显式转移表；并发 worker 或恢复入口产生的非典型回退只写入 `fsm_warnings`，不把可恢复的运行误判为失败。
 
-RAG 索引使用 SQLite 保存文本分块、元数据和 Embedding BLOB。Markdown 和 reStructuredText 按标题/段落切分，Python 按顶层定义切分；索引构建通过临时数据库原子替换。运行时先做本地余弦初排，再调用独立 Reranker；服务故障只记录 `degraded` 并继续原有流水线。Planner、Technical Planner、Coder 和 AutoFixer 收到的检索内容均标记为不可信资料，且每次注入都保存查询、索引和分块哈希收据。
+RAG 索引使用 SQLite 保存文本分块、元数据和 Embedding BLOB。Markdown 和 reStructuredText 按标题/段落切分，Python 按顶层定义切分；索引构建通过临时数据库原子替换，并按文本哈希复用未变化分块的向量。运行时先做本地余弦初排，再调用独立 Reranker；服务故障只记录 `degraded` 并继续原有流水线。Planner、Technical Planner、Coder 和 AutoFixer 收到的检索内容均标记为不可信资料，且每次注入都保存查询、索引和分块哈希收据。正式渲染成功的场景可在本地保存不含用户提示词、运行身份和凭据的匿名配方，配方也作为 `recipe` 来源参与后续检索。
 
 ### 3.1 PLANNING / DETAILING
 
@@ -106,22 +107,23 @@ Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。Sc
 ### 3.2 CODING / REVIEWING
 
 TechnicalSpec 是 CODING 内部的强制前置阶段，不改变顶层 FSM 的兼容状态集合。它把
-ScenePlan 的对象声明映射为变量名、构造器、动画事件、Transform 语义、LaTeX 分段、布局
-约束和导出清单；编译器会模拟 active 状态，阻断对已退出对象的继续使用。它和输入哈希、
-规范化 JSON 一起写入 `artifacts/scene_<id>_technical_spec.json` 与 `manifest.json`，计划或
-继承代码变化后自动失效，恢复时校验哈希后才会复用。
+ScenePlan 的对象声明映射为变量名、构造器、语义动作、LaTeX 分段、布局约束和导出清单；
+合同版本 2 的动作只有 `introduce`、`update`、`remove`、`camera`、`hold`，不把某个
+Manim 动画类名当成协议。编译器会模拟 active 状态，阻断对已退出对象的继续使用。它和
+输入哈希、规范化 JSON 一起写入 `artifacts/scene_<id>_technical_spec.json` 与 `manifest.json`，
+计划或继承代码变化后自动失效，恢复时校验哈希后才会复用。
 
-TechnicalSpec 编译前会做有限的确定性归一化：把缺失且可从 active 对象/依赖关系推断的
-Transform source 补齐，把 Transform 中误列出的新对象拆成独立的 introducer，把边界必须
-保留的 source 从 ReplacementTransform 收敛为原地 Transform，并为已退出但确实重新创建的
-对象建立显式生命周期事件。无法证明安全的情况仍然返回编译错误，不会用猜测替代合同。
+TechnicalSpec 编译前只做能够从 ScenePlan 机械证明的归一化：补齐 active source、拆出
+复合事件中的新对象引入、过滤过期边界引用和补齐必需导出对象的语义事件。无法证明安全的
+情况仍然返回编译错误，不会用具体动画类的猜测替代合同。
 
 Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文件读写、shell、subprocess 和动态执行。Coder、Reviewer 和 AutoFixer 都收到当前 renderer 能力说明：
 
 - OpenGL 禁止 `self.camera.frame`、`MovingCameraScene` 运镜和自定义 Mobject 根类子类；
 - Cairo 只有 `MovingCameraScene` 可使用 frame API；
 - 3D Scene 使用专用相机 API；
-- introducer、Transform、FadeOut 等必须遵守对象生命周期。
+- 每个 `self.play` 前必须写 `# KD1_ANIMATION_EVENT: <event_id>`，由语义事件绑定对象生命周期；
+  Coder 可自由选择当前 Manim 版本支持的具体动画实现。
 
 生成结果先通过 `validate_manim_code()`：
 
@@ -132,7 +134,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Scene 类必须实现 `construct()`；
 - 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；失败反馈交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
+若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；失败反馈交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。每个 `self.play` 的标记必须对应合同事件；静态分析器无法识别的具体动画调用只记录 warning，不因此拒绝候选。包含未知调用的 dry-run 场景会自动强制低质量 frame+短视频 Smoke Render。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
 
 - valid / `info`：通过；
 - `minor`：至少一条可精确唯一匹配的查找替换；

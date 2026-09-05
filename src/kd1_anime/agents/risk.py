@@ -72,7 +72,7 @@ def assess_scene_risk(
         if len(technical_spec.animations) >= 12:
             score += 2
             reasons.append("动画事件较多")
-        if any(item.operation == "animate" for item in technical_spec.animations):
+        if any(item.semantic_action == "update" for item in technical_spec.animations):
             score += 1
             reasons.append("TechnicalSpec 含连续属性动画")
         if technical_spec.latex.required:

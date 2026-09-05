@@ -58,17 +58,14 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 14. 每个 Tex/MathTex 调用都必须显式传入同一个 `tex_template`。
 
 ## D. Manim 动画逻辑（严重）
-15. Create/Write/FadeIn 会负责引入对象；不得对尚未引入且不是 introducer 目标的对象，
-    或已被 ReplacementTransform/FadeOut 移除的对象继续动画。
-16. Transform 后的变量引用、VGroup 成员关系和 z-index 应保持一致。
-    VGroup 本身只有在被加入或引入后才是 active；但不要把“对子对象分别淡入”与“对未引入的
-    group 做 Transform”混为一谈，必须以当前代码中实际的 active 状态为依据。
-    生命周期判断以结构化 TechnicalSpec 的 `initially_active`、动画 source/target、
-    `export_element_ids` 和 `removed_element_ids` 为准；不要让与这些字段冲突的
-    transition_out/persistent_elements 自由文本迫使代码同时执行互相矛盾的保留和移除动作。
-    若结构化合同与自由文本本身冲突，这是计划问题，应作为可定位的计划层 finding，不能
-    把其中一套动作误判成代码错误。
-17. ValueTracker、Axes.c2p、plot、Surface 等 API 参数应符合 ManimCE。
+15. TechnicalSpec 的 `contract_version=2` 使用语义动作而非动画类名。每个 `self.play`
+    前都应有 `# KD1_ANIMATION_EVENT: <event_id>`，事件的 source/target/create/remove
+    与代码引用的对象应一致。`introduce` 引入对象，`update` 只修改 active source，
+    `remove` 退出对象，`camera` 不改变 Mobject 状态，`hold` 不改变状态。
+16. 不要对尚未引入或已退出的对象继续动画；复合 Mobject 只有整体加入场景后才是 active。
+    不要仅凭具体动画类名是否出现在提示词中做判断，未知动画类可作为 warning，重点检查
+    它是否遵守对应事件的语义合同。
+17. ValueTracker、Axes.c2p、plot、Surface 等 API 参数应符合当前 ManimCE。
 18. 动画顺序应可执行，不能同时对同一对象施加冲突动画。
 
 ## E. 视觉与布局（建议，非阻塞）
@@ -625,16 +622,6 @@ def filter_contradictory_review_findings(
             contradiction = "当前代码已经配置并使用 TexTemplate"
         elif "未将其赋给 config.tex_template" in text and "config.tex_template" in lowered:
             contradiction = "当前代码已经将模板赋给 config.tex_template"
-        elif (
-            finding.category == "lifecycle"
-            and "replacementtransform(" in finding.evidence.lower()
-            and any(marker in text for marker in ("未引入", "未在场景", "目标对象"))
-            and "source 未 active" not in text
-        ):
-            # ReplacementTransform 的 target 不需要预先 self.add；它会
-            # 在动画完成时替换 source 并成为 Scene 中的 active 对象。
-            # source 的 active 状态仍由确定性生命周期检查负责。
-            contradiction = "ReplacementTransform 会使 target 成为 active 对象"
         elif technical_spec is not None and finding.category == "continuity":
             removed_variables = {
                 item.variable_name
@@ -657,6 +644,17 @@ def filter_contradictory_review_findings(
                 )
             ):
                 contradiction = "TechnicalSpec 明确要求该对象在本场景退出"
+        elif (
+            technical_spec is None
+            and finding.category == "lifecycle"
+            and "replacementtransform(" in finding.evidence.lower()
+            and any(marker in text for marker in ("未引入", "未在场景", "目标对象"))
+            and "source 未 active" not in text
+        ):
+            # 没有语义 TechnicalSpec 时，保留旧版的一个确定性事实过滤：
+            # ReplacementTransform 会让 target 接管场景身份。正式技术
+            # 合同存在时不再使用此规则，避免覆盖 semantic_action=update。
+            contradiction = "ReplacementTransform 会使 target 成为 active 对象"
         elif "create 后未" in text and "create(" in lowered:
             # Manim 的 Create/FadeIn/Write introducer 会把目标加入 Scene；
             # 不应要求在其后再用 self.add，否则会制造重复引入。

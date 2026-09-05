@@ -115,6 +115,7 @@ class RagService:
             max(1, self.config.RAG_PARALLEL_WORKERS)
         )
         self._cache_lock = threading.Lock()
+        self._index_build_lock = threading.Lock()
         self._query_cache: dict[tuple[object, ...], RagSearchResult] = {}
         self._verified_snapshot: tuple[tuple[int, int, int], VerifiedIndexSnapshot] | None = None
 
@@ -549,6 +550,24 @@ class RagService:
         recipes_dir: Path | None = None,
         rebuild: bool = False,
     ) -> RagIndexBuildResult:
+        """串行构建索引，避免并发场景完成时丢失彼此新增的 Recipe。"""
+
+        with self._index_build_lock:
+            return self._build_index(
+                docs_dir=docs_dir,
+                examples_dir=examples_dir,
+                recipes_dir=recipes_dir,
+                rebuild=rebuild,
+            )
+
+    def _build_index(
+        self,
+        *,
+        docs_dir: Path | None = None,
+        examples_dir: Path | None = None,
+        recipes_dir: Path | None = None,
+        rebuild: bool = False,
+    ) -> RagIndexBuildResult:
         """构建本地索引；未变化时复用，``rebuild`` 强制重新 Embedding。"""
 
         self.embedding.require()
@@ -597,16 +616,34 @@ class RagService:
         if not chunks:
             raise ValueError("所有知识库源文件均无法产生有效分块")
 
-        embeddings: list[list[float]] = []
+        reusable_vectors = self._reusable_chunk_vectors(
+            docs_root,
+            examples_root,
+            recipes_root,
+            enabled=not rebuild,
+        )
+        embeddings: list[list[float] | None] = [None] * len(chunks)
+        pending_indexes: list[int] = []
+        for index, chunk in enumerate(chunks):
+            vector = reusable_vectors.get(_sha256(chunk.text))
+            if vector is None:
+                pending_indexes.append(index)
+            else:
+                embeddings[index] = list(vector)
         batch_size = self.config.RAG_EMBEDDING_BATCH_SIZE
-        for start in range(0, len(chunks), batch_size):
-            batch = chunks[start : start + batch_size]
+        for start in range(0, len(pending_indexes), batch_size):
+            indexes = pending_indexes[start : start + batch_size]
+            batch = [chunks[index] for index in indexes]
             with self._semaphore:
-                embeddings.extend(self.embedding.embed([item.text for item in batch]))
+                vectors = self.embedding.embed([item.text for item in batch])
+            for index, vector in zip(indexes, vectors, strict=True):
+                embeddings[index] = vector
+        if any(vector is None for vector in embeddings):
+            raise RuntimeError("RAG Embedding 数量与知识库分块数量不一致")
         info = RagIndex.build(
             self.index_path,
             chunks,
-            embeddings,
+            [vector for vector in embeddings if vector is not None],
             embedding_model=self.config.RAG_EMBEDDING_MODEL,
             source_docs_dir=docs_root,
             source_examples_dir=examples_root,
@@ -621,6 +658,65 @@ class RagService:
             chunk_count=len(chunks),
             skipped_files=tuple(skipped),
         )
+
+    def _reusable_chunk_vectors(
+        self,
+        docs_root: Path | None,
+        examples_root: Path | None,
+        recipes_root: Path | None,
+        *,
+        enabled: bool,
+    ) -> dict[str, tuple[float, ...]]:
+        """按文本哈希复用未变化分块的向量，避免新增配方触发全量 Embedding。"""
+
+        if not enabled:
+            return {}
+        try:
+            snapshot = self._load_verified_snapshot(RagIndex(self.index_path))
+            info = snapshot.info
+            if info.embedding_model != self.config.RAG_EMBEDDING_MODEL:
+                return {}
+            if (
+                info.chunker_version != CHUNKER_VERSION
+                or info.chunk_size != self.config.RAG_CHUNK_SIZE
+                or info.chunk_overlap != self.config.RAG_CHUNK_OVERLAP
+            ):
+                return {}
+            indexed_roots = (
+                Path(info.source_docs_dir).expanduser().resolve()
+                if info.source_docs_dir
+                else docs_root,
+                Path(info.source_examples_dir).expanduser().resolve()
+                if info.source_examples_dir
+                else examples_root,
+                Path(info.source_recipes_dir).expanduser().resolve()
+                if info.source_recipes_dir
+                else recipes_root,
+            )
+            if indexed_roots != (docs_root, examples_root, recipes_root):
+                return {}
+            return {
+                chunk.content_sha256: vector
+                for chunk, vector in zip(snapshot.chunks, snapshot.vectors, strict=True)
+            }
+        except (OSError, ValueError):
+            return {}
+
+    def refresh_recipe(self, recipe_path: Path) -> RagIndexBuildResult:
+        """保存配方后增量刷新索引；路径必须位于配置的 Recipe 根目录。"""
+
+        recipes_root = self.config.RAG_RECIPES_DIR
+        if recipes_root is None:
+            raise ValueError("未配置 RAG_RECIPES_DIR")
+        root = recipes_root.expanduser().resolve()
+        candidate = recipe_path.expanduser().resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("Recipe 文件不在配置的 RAG_RECIPES_DIR 内") from exc
+        if not candidate.is_file() or candidate.is_symlink():
+            raise ValueError("Recipe 文件不存在或不安全")
+        return self.build_index(rebuild=False)
 
     def _reusable_index_info(
         self,

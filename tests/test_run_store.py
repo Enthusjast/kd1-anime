@@ -166,6 +166,33 @@ def test_checkpoint_round_trip_persists_technical_spec_identity(tmp_path):
     assert manifest.integrity_errors() == []
 
 
+def test_legacy_technical_spec_is_readable_but_cannot_resume():
+    legacy = StoredSceneState.model_validate(
+        {
+            "plan": make_plan(),
+            "technical_spec": {
+                "scene_id": 1,
+                "renderer": "cairo",
+                "objects": [],
+                "animations": [],
+                "export_element_ids": [],
+                "removed_element_ids": [],
+            },
+        }
+    )
+
+    assert legacy.technical_spec is None
+    assert legacy.technical_contract_stale is True
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        scenes={1: legacy},
+    )
+    with pytest.raises(ValueError, match="旧版 TechnicalSpec"):
+        manifest.validate_for_resume()
+
+
 def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():
     manifest = RunManifest(
         run_id=RUN_ID,

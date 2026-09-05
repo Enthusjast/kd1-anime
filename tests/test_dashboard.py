@@ -178,6 +178,19 @@ class TestSceneDashboard:
         assert dash.scenes[1].icon == "⚠"
         assert "未知" in dash.scenes[1].message
 
+    def test_unknown_animation_warning_is_visible_without_failing_scene(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_unknown_animation_detected",
+            {"scene_id": 1, "details": ["第 10 行 unknown:Reveal"]},
+        )
+
+        assert dash.scenes[1].state == "warning"
+        assert dash.scenes[1].icon == "⚠"
+        assert "Smoke Render" in dash.scenes[1].message
+
     def test_safe_fallback_is_visible_without_marking_scene_complete(self):
         dash = SceneDashboard()
         dash.live = MagicMock()

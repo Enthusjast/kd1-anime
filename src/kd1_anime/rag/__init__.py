@@ -11,6 +11,7 @@ from kd1_anime.rag.models import (
     RagStatus,
     RetrievedChunk,
 )
+from kd1_anime.rag.recipes import RecipeRecord, RecipeStore, anonymize_code
 from kd1_anime.rag.service import RagService
 
 __all__ = [
@@ -24,6 +25,9 @@ __all__ = [
     "RagSearchResult",
     "RagService",
     "RagStatus",
+    "RecipeRecord",
+    "RecipeStore",
     "RerankerClient",
     "RetrievedChunk",
+    "anonymize_code",
 ]

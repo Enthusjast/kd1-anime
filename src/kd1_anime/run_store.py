@@ -15,7 +15,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kd1_anime.agents.capability import CapabilityContract
 from kd1_anime.agents.planner import (
@@ -315,6 +315,35 @@ class StoredCodeCandidate(BaseModel):
 class StoredSceneState(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def mark_legacy_technical_contract(cls, value: object) -> object:
+        """读取旧技术合同但绝不按新语义猜测其生命周期。
+
+        旧清单仍可用于 ``status`` 诊断；恢复会由 ``validate_for_resume``
+        明确拒绝，避免旧的 concrete operation 被静默解释为 semantic_action。
+        """
+
+        if not isinstance(value, dict):
+            return value
+        technical = value.get("technical_spec")
+        if technical is None:
+            return value
+        version = (
+            technical.get("contract_version")
+            if isinstance(technical, dict)
+            else getattr(technical, "contract_version", None)
+        )
+        if version == 2:
+            return value
+        updated = dict(value)
+        updated["technical_spec"] = None
+        updated["technical_spec_sha256"] = ""
+        updated["technical_input_sha256"] = ""
+        updated["technical_status"] = "pending"
+        updated["technical_contract_stale"] = True
+        return updated
+
     plan: ScenePlan
     code_file: str = ""
     code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
@@ -330,6 +359,9 @@ class StoredSceneState(BaseModel):
     plan_review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
     identical_plan_review_count: int = Field(default=0, ge=0)
     technical_spec: TechnicalSpec | None = None
+    technical_contract_stale: bool = False
+    unknown_animation_detected: bool = False
+    unknown_animation_details: list[str] = Field(default_factory=list, max_length=30)
     technical_spec_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     technical_input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     technical_status: TechnicalStatus = "pending"
@@ -478,6 +510,8 @@ class RunManifest(BaseModel):
                 errors.append(f"Scene key {scene_id} 与 plan.scene_id {scene.plan.scene_id} 不一致")
             if scene.plan_reviewed and not scene.plan_ready:
                 errors.append(f"Scene {scene_id} 标记为 plan_reviewed 但 plan_ready=false")
+            if scene.technical_contract_stale:
+                errors.append(f"Scene {scene_id} 使用旧版 TechnicalSpec 合同，不能按当前语义恢复")
             if scene.technical_status == "passed":
                 if scene.technical_spec is None:
                     errors.append(f"Scene {scene_id} 标记为 technical passed 但缺少 TechnicalSpec")

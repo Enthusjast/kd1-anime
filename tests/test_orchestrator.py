@@ -1441,6 +1441,44 @@ def test_explicit_smoke_override_enables_dry_run_canary(tmp_path):
     assert Orchestrator._local_smoke_enabled(ctx) is True
 
 
+def test_unknown_animation_forces_dry_run_smoke_canary(tmp_path):
+    ctx = PipelineContext("x", paths=paths(tmp_path), dry_run=True)
+    state = SceneState(plan=plan(), unknown_animation_detected=True)
+
+    assert Orchestrator._local_smoke_enabled(ctx, state) is True
+
+
+def test_resume_invalidation_discards_legacy_technical_contract(tmp_path):
+    run_root = paths(tmp_path).root
+    run_root.mkdir(parents=True)
+    legacy = StoredSceneState.model_validate(
+        {
+            "plan": plan(),
+            "technical_spec": {
+                "scene_id": 1,
+                "renderer": "cairo",
+                "objects": [],
+                "animations": [],
+                "export_element_ids": [],
+                "removed_element_ids": [],
+            },
+        }
+    )
+    manifest = RunManifest(
+        run_id="20260728-120000-1234abcd",
+        user_prompt="prompt",
+        output_path=str(run_root / "out.mp4"),
+        scenes={1: legacy},
+    )
+    orchestrator = Orchestrator()
+
+    assert orchestrator._invalidate_legacy_technical_contracts(manifest, run_root) is True
+    assert manifest.scenes[1].technical_contract_stale is False
+    assert manifest.scenes[1].technical_spec is None
+    assert manifest.scenes[1].reviewed is False
+    assert manifest.state == "CODING"
+
+
 def test_stagnation_fallback_produces_a_different_valid_candidate(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     state = SceneState(plan=plan(), code="old code", plan_ready=True)
@@ -1907,7 +1945,7 @@ def test_code_generation_explains_single_export_definition_on_lifecycle_failure(
                 element_id="formula",
                 variable_name="formula",
                 constructor="Circle",
-                lifecycle=["define", "create", "keep"],
+                lifecycle=["define", "introduce", "keep"],
                 exported=True,
             )
         ],
@@ -1916,7 +1954,7 @@ def test_code_generation_explains_single_export_definition_on_lifecycle_failure(
                 event_id="show_formula",
                 start_seconds=0,
                 end_seconds=1,
-                operation="create",
+                semantic_action="introduce",
                 target_element_ids=["formula"],
                 create_element_ids=["formula"],
             )
@@ -1927,6 +1965,7 @@ def test_code_generation_explains_single_export_definition_on_lifecycle_failure(
 class Demo(Scene):
     def construct(self):
         formula = Circle()
+        # KD1_ANIMATION_EVENT: show_formula
         self.play(Create(formula))
         # KD1_CONTINUITY_EXPORT_BEGIN
         # element_id: formula
@@ -1940,6 +1979,7 @@ class Demo(Scene):
         # element_id: formula
         formula = Circle()
         # KD1_CONTINUITY_EXPORT_END
+        # KD1_ANIMATION_EVENT: show_formula
         self.play(Create(formula))
 """
 

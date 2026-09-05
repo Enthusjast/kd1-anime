@@ -40,7 +40,7 @@ def test_compile_technical_spec_accepts_create_and_keep_timeline():
                 element_id="formula",
                 variable_name="formula",
                 constructor="MathTex",
-                lifecycle=["define", "fade_in", "keep"],
+                lifecycle=["define", "introduce", "keep"],
                 exported=True,
             )
         ],
@@ -49,7 +49,7 @@ def test_compile_technical_spec_accepts_create_and_keep_timeline():
                 event_id="show_formula",
                 start_seconds=0,
                 end_seconds=2,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["formula"],
                 create_element_ids=["formula"],
             ),
@@ -57,7 +57,7 @@ def test_compile_technical_spec_accepts_create_and_keep_timeline():
                 event_id="hold_formula",
                 start_seconds=2,
                 end_seconds=10,
-                operation="keep",
+                semantic_action="hold",
                 source_element_ids=["formula"],
             ),
         ],
@@ -86,14 +86,14 @@ def test_compile_technical_spec_catches_transform_after_source_was_removed():
                 event_id="remove_old",
                 start_seconds=0,
                 end_seconds=1,
-                operation="fade_out",
+                semantic_action="remove",
                 source_element_ids=["old"],
             ),
             TechnicalAnimation(
                 event_id="transform_old",
                 start_seconds=1,
                 end_seconds=2,
-                operation="transform",
+                semantic_action="update",
                 source_element_ids=["old"],
                 target_element_ids=["new"],
             ),
@@ -117,7 +117,7 @@ def test_compile_technical_spec_rejects_unknown_animation_reference():
                 event_id="bad",
                 start_seconds=0,
                 end_seconds=1,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["missing"],
                 create_element_ids=["missing"],
             )
@@ -188,7 +188,7 @@ def test_normalize_technical_spec_repairs_common_lifecycle_hallucinations():
                 event_id="show_title",
                 start_seconds=0,
                 end_seconds=1,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["title"],
                 create_element_ids=["title"],
             ),
@@ -196,7 +196,7 @@ def test_normalize_technical_spec_repairs_common_lifecycle_hallucinations():
                 event_id="show_before",
                 start_seconds=1,
                 end_seconds=2,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["before"],
                 create_element_ids=["before"],
             ),
@@ -204,7 +204,7 @@ def test_normalize_technical_spec_repairs_common_lifecycle_hallucinations():
                 event_id="replace",
                 start_seconds=2,
                 end_seconds=3,
-                operation="transform",
+                semantic_action="update",
                 source_element_ids=["before"],
                 target_element_ids=["after"],
                 create_element_ids=["after"],
@@ -213,7 +213,7 @@ def test_normalize_technical_spec_repairs_common_lifecycle_hallucinations():
                 event_id="show_result",
                 start_seconds=3,
                 end_seconds=4,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["result"],
                 create_element_ids=["result"],
             ),
@@ -221,14 +221,14 @@ def test_normalize_technical_spec_repairs_common_lifecycle_hallucinations():
                 event_id="cleanup",
                 start_seconds=4,
                 end_seconds=5,
-                operation="fade_out",
+                semantic_action="remove",
                 remove_element_ids=["step", "before", "after", "title", "result"],
             ),
             TechnicalAnimation(
                 event_id="hold",
                 start_seconds=5,
                 end_seconds=10,
-                operation="wait",
+                semantic_action="hold",
             ),
         ],
         export_element_ids=["title", "result"],
@@ -240,8 +240,8 @@ def test_normalize_technical_spec_repairs_common_lifecycle_hallucinations():
 
     cleanup = next(item for item in normalized.animations if item.event_id == "cleanup")
     replace = next(item for item in normalized.animations if item.event_id == "replace")
-    assert replace.operation == "replacement_transform"
-    assert cleanup.remove_element_ids == ["after"]
+    assert replace.semantic_action == "update"
+    assert cleanup.remove_element_ids == ["after", "before"]
     assert result.is_valid is True
     assert repairs
 
@@ -279,7 +279,7 @@ def test_normalize_replacement_transform_preserves_exported_source_identity():
                 event_id="apply_shear",
                 start_seconds=0,
                 end_seconds=2,
-                operation="replacement_transform",
+                semantic_action="update",
                 source_element_ids=["j_hat"],
                 target_element_ids=["j_hat_transformed"],
                 create_element_ids=["j_hat_transformed"],
@@ -291,10 +291,11 @@ def test_normalize_replacement_transform_preserves_exported_source_identity():
     normalized, repairs = normalize_technical_spec_contract(plan, spec)
     result = compile_technical_spec(plan, normalized)
 
-    assert normalized.animations[0].operation == "transform"
-    assert normalized.animations[0].create_element_ids == []
+    event = next(item for item in normalized.animations if item.event_id == "apply_shear")
+    assert event.semantic_action == "update"
+    assert event.create_element_ids == []
     assert result.is_valid is True, result.errors
-    assert any("保留必需边界对象" in repair for repair in repairs)
+    assert any("拆分新对象引入" in repair for repair in repairs)
 
 
 def test_normalize_transform_splits_unrelated_new_objects_into_fade_in():
@@ -330,7 +331,7 @@ def test_normalize_transform_splits_unrelated_new_objects_into_fade_in():
                 event_id="apply_transform",
                 start_seconds=0,
                 end_seconds=5,
-                operation="transform",
+                semantic_action="update",
                 source_element_ids=["grid"],
                 target_element_ids=["grid"],
                 create_element_ids=["vector"],
@@ -339,7 +340,7 @@ def test_normalize_transform_splits_unrelated_new_objects_into_fade_in():
                 event_id="highlight",
                 start_seconds=5,
                 end_seconds=10,
-                operation="animate",
+                semantic_action="update",
                 source_element_ids=["vector"],
             ),
         ],
@@ -349,7 +350,7 @@ def test_normalize_transform_splits_unrelated_new_objects_into_fade_in():
     normalized, repairs = normalize_technical_spec_contract(plan, spec)
     result = compile_technical_spec(plan, normalized)
 
-    assert any(item.operation == "fade_in" for item in normalized.animations)
+    assert any(item.semantic_action == "introduce" for item in normalized.animations)
     assert normalized.animations[1].event_id == "apply_transform"
     assert normalized.animations[1].create_element_ids == []
     assert result.is_valid is True, result.errors
@@ -380,7 +381,7 @@ def test_compile_allows_inherited_object_to_reenter_after_explicit_exit():
                 event_id="fade_out_previous",
                 start_seconds=0,
                 end_seconds=1,
-                operation="fade_out",
+                semantic_action="remove",
                 source_element_ids=["grid"],
                 remove_element_ids=["grid"],
             ),
@@ -388,7 +389,7 @@ def test_compile_allows_inherited_object_to_reenter_after_explicit_exit():
                 event_id="fade_in_grid",
                 start_seconds=1,
                 end_seconds=2,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["grid"],
                 create_element_ids=["grid"],
             ),
@@ -396,7 +397,7 @@ def test_compile_allows_inherited_object_to_reenter_after_explicit_exit():
                 event_id="fade_out_final",
                 start_seconds=2,
                 end_seconds=10,
-                operation="fade_out",
+                semantic_action="remove",
                 source_element_ids=["grid"],
                 remove_element_ids=["grid"],
             ),
@@ -433,7 +434,7 @@ def test_compile_rejects_removed_object_creation_before_exit():
                 event_id="duplicate_create",
                 start_seconds=0,
                 end_seconds=1,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["grid"],
                 create_element_ids=["grid"],
             )
@@ -471,7 +472,7 @@ def test_normalize_infers_missing_transform_source_from_active_target():
                 event_id="apply",
                 start_seconds=0,
                 end_seconds=5,
-                operation="transform",
+                semantic_action="update",
                 target_element_ids=["grid"],
             )
         ],
@@ -527,7 +528,7 @@ def test_normalize_infers_transform_source_from_matching_plan_timeline():
                 event_id="reset_grid",
                 start_seconds=0,
                 end_seconds=5,
-                operation="transform",
+                semantic_action="update",
             )
         ],
         export_element_ids=["grid"],
@@ -539,7 +540,7 @@ def test_normalize_infers_transform_source_from_matching_plan_timeline():
     reset_event = next(item for item in normalized.animations if item.event_id == "reset_grid")
     assert reset_event.source_element_ids == ["grid"]
     assert result.is_valid is True, result.errors
-    assert any("从时间线补齐 source_element_ids" in repair for repair in repairs)
+    assert any("事件 reset_grid 补齐 source_element_ids" in repair for repair in repairs)
 
 
 def test_normalize_infers_replacement_source_from_target_dependency():
@@ -572,7 +573,7 @@ def test_normalize_infers_replacement_source_from_target_dependency():
                 event_id="replace",
                 start_seconds=0,
                 end_seconds=2,
-                operation="replacement_transform",
+                semantic_action="update",
                 target_element_ids=["old_transformed"],
             )
         ],
@@ -582,8 +583,9 @@ def test_normalize_infers_replacement_source_from_target_dependency():
     normalized, repairs = normalize_technical_spec_contract(plan, spec)
     result = compile_technical_spec(plan, normalized)
 
-    assert normalized.animations[0].source_element_ids == ["old"]
-    assert normalized.animations[0].operation == "transform"
+    event = next(item for item in normalized.animations if item.event_id == "replace")
+    assert event.source_element_ids == ["old"]
+    assert normalized.animations[0].semantic_action == "update"
     assert result.is_valid is True, result.errors
     assert any("补齐 source_element_ids" in repair for repair in repairs)
 
@@ -613,7 +615,7 @@ def test_normalize_removes_inactive_source_also_declared_as_new_target():
                 event_id="apply",
                 start_seconds=0,
                 end_seconds=2,
-                operation="replacement_transform",
+                semantic_action="update",
                 source_element_ids=["old", "new_grid"],
                 target_element_ids=["old", "new_grid"],
                 create_element_ids=["new_grid"],
@@ -625,7 +627,8 @@ def test_normalize_removes_inactive_source_also_declared_as_new_target():
     normalized, repairs = normalize_technical_spec_contract(plan, spec)
     result = compile_technical_spec(plan, normalized)
 
-    assert normalized.animations[0].source_element_ids == ["old"]
+    event = next(item for item in normalized.animations if item.event_id == "apply")
+    assert event.source_element_ids == ["old"]
     assert result.is_valid is True, result.errors
     assert any("删除 inactive source" in repair for repair in repairs)
 
@@ -647,7 +650,7 @@ def test_normalize_degrades_source_less_transform_to_safe_introduction():
                 event_id="missing_source",
                 start_seconds=0,
                 end_seconds=2,
-                operation="transform",
+                semantic_action="update",
                 target_element_ids=["target"],
             )
         ],
@@ -656,10 +659,10 @@ def test_normalize_degrades_source_less_transform_to_safe_introduction():
     normalized, repairs = normalize_technical_spec_contract(plan, spec)
     result = compile_technical_spec(plan, normalized)
 
-    assert normalized.animations[0].operation == "fade_in"
+    assert normalized.animations[0].semantic_action == "introduce"
     assert normalized.animations[0].create_element_ids == ["target"]
     assert result.is_valid is True, result.errors
-    assert any("降级为 fade_in" in repair for repair in repairs)
+    assert any("降级为 introduce" in repair for repair in repairs)
 
 
 def test_normalize_converts_new_object_used_as_transform_source_to_fade_in():
@@ -687,7 +690,7 @@ def test_normalize_converts_new_object_used_as_transform_source_to_fade_in():
                 event_id="scale_eigen_vector",
                 start_seconds=1,
                 end_seconds=3,
-                operation="transform",
+                semantic_action="update",
                 source_element_ids=["eigen_vector"],
                 target_element_ids=["eigen_vector"],
                 create_element_ids=["eigen_vector"],
@@ -700,11 +703,11 @@ def test_normalize_converts_new_object_used_as_transform_source_to_fade_in():
     result = compile_technical_spec(plan, normalized)
 
     event = normalized.animations[0]
-    assert event.operation == "fade_in"
+    assert event.semantic_action == "introduce"
     assert event.source_element_ids == []
     assert event.target_element_ids == ["eigen_vector"]
     assert result.is_valid is True, result.errors
-    assert any("删除 inactive source 后改为 fade_in" in repair for repair in repairs)
+    assert any("删除 inactive source 后改为 introduce" in repair for repair in repairs)
 
 
 def test_normalize_converts_new_object_used_as_animate_source_to_fade_in():
@@ -723,7 +726,7 @@ def test_normalize_converts_new_object_used_as_animate_source_to_fade_in():
                 event_id="highlight_error",
                 start_seconds=1,
                 end_seconds=3,
-                operation="animate",
+                semantic_action="update",
                 source_element_ids=["error_highlight"],
                 create_element_ids=["error_highlight"],
             )
@@ -734,11 +737,11 @@ def test_normalize_converts_new_object_used_as_animate_source_to_fade_in():
     result = compile_technical_spec(plan, normalized)
 
     event = normalized.animations[0]
-    assert event.operation == "fade_in"
+    assert event.semantic_action == "introduce"
     assert event.source_element_ids == []
     assert event.create_element_ids == ["error_highlight"]
     assert result.is_valid is True, result.errors
-    assert any("inactive source 规范为 fade_in" in repair for repair in repairs)
+    assert any("删除 inactive source" in repair for repair in repairs)
 
 
 def test_normalize_adds_missing_plan_object_declaration():
@@ -756,7 +759,7 @@ def test_normalize_adds_missing_plan_object_declaration():
                 event_id="show_formula",
                 start_seconds=0,
                 end_seconds=2,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["formula_label"],
                 create_element_ids=["formula_label"],
             )
@@ -798,7 +801,7 @@ def test_normalize_uses_api_notes_to_recover_missing_transform_target():
                 event_id="update_title",
                 start_seconds=0,
                 end_seconds=2,
-                operation="transform",
+                semantic_action="update",
                 api_notes="使用 Transform 将 title 更新为新的标题",
             )
         ],
@@ -832,7 +835,7 @@ def test_normalize_drops_source_less_transform_without_any_target():
                 event_id="missing_source_and_target",
                 start_seconds=0,
                 end_seconds=2,
-                operation="transform",
+                semantic_action="update",
             )
         ],
     )
@@ -840,9 +843,9 @@ def test_normalize_drops_source_less_transform_without_any_target():
     normalized, repairs = normalize_technical_spec_contract(plan, spec)
     result = compile_technical_spec(plan, normalized)
 
-    assert normalized.animations[0].operation == "wait"
+    assert normalized.animations[0].semantic_action == "hold"
     assert result.is_valid is True, result.errors
-    assert any("按 wait 处理" in repair for repair in repairs)
+    assert any("按 hold 处理" in repair for repair in repairs)
 
 
 def test_compile_technical_spec_requires_xelatex_contract_for_mathtex():
@@ -898,7 +901,7 @@ def test_normalize_technical_spec_introduces_missing_required_export():
         for event in normalized.animations
         if event.event_id.startswith("ensure_required_exports")
     )
-    assert introduction.operation == "fade_in"
+    assert introduction.semantic_action == "introduce"
     assert introduction.create_element_ids == ["formula"]
     assert normalized.export_element_ids == ["formula"]
     assert result.is_valid is True, result.errors
@@ -916,7 +919,7 @@ def test_normalize_technical_spec_filters_stale_animation_claim_ids():
                 event_id="show_formula",
                 start_seconds=0,
                 end_seconds=2,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["formula"],
                 create_element_ids=["formula"],
                 claim_ids=["claim_1", "claim_2"],
@@ -947,7 +950,7 @@ def test_normalize_technical_spec_introduces_inactive_animate_target():
                 event_id="highlight",
                 start_seconds=0,
                 end_seconds=1,
-                operation="animate",
+                semantic_action="update",
                 target_element_ids=["highlight"],
             )
         ],
@@ -957,10 +960,10 @@ def test_normalize_technical_spec_introduces_inactive_animate_target():
     result = compile_technical_spec(plan, normalized)
 
     event = next(item for item in normalized.animations if item.event_id == "highlight")
-    assert event.operation == "fade_in"
+    assert event.semantic_action == "introduce"
     assert event.create_element_ids == ["highlight"]
     assert result.is_valid is True, result.errors
-    assert any("inactive target" in repair for repair in repairs)
+    assert any("降级为 introduce" in repair for repair in repairs)
 
 
 def test_normalize_technical_spec_adds_missing_inherited_removal_event():
@@ -979,7 +982,7 @@ def test_normalize_technical_spec_adds_missing_inherited_removal_event():
                 event_id="show_formula",
                 start_seconds=0,
                 end_seconds=2,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["formula"],
                 create_element_ids=["formula"],
             )
@@ -995,10 +998,10 @@ def test_normalize_technical_spec_adds_missing_inherited_removal_event():
         for event in normalized.animations
         if event.event_id.startswith("remove_planned_elements")
     )
-    assert removal.operation == "fade_out"
+    assert removal.semantic_action == "remove"
     assert removal.source_element_ids == ["old"]
     assert result.is_valid is True, result.errors
-    assert any("补齐 fade_out" in repair for repair in repairs)
+    assert any("补齐语义退出事件" in repair for repair in repairs)
 
 
 def test_normalize_technical_spec_downgrades_create_of_active_target_to_animation():
@@ -1016,7 +1019,7 @@ def test_normalize_technical_spec_downgrades_create_of_active_target_to_animatio
                 event_id="show_formula",
                 start_seconds=0,
                 end_seconds=1,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["formula"],
                 create_element_ids=["formula"],
             ),
@@ -1024,7 +1027,7 @@ def test_normalize_technical_spec_downgrades_create_of_active_target_to_animatio
                 event_id="draw_tangent",
                 start_seconds=1,
                 end_seconds=2,
-                operation="create",
+                semantic_action="introduce",
                 target_element_ids=["point"],
             ),
         ],
@@ -1034,7 +1037,7 @@ def test_normalize_technical_spec_downgrades_create_of_active_target_to_animatio
     result = compile_technical_spec(plan, normalized)
 
     event = next(item for item in normalized.animations if item.event_id == "draw_tangent")
-    assert event.operation == "animate"
+    assert event.semantic_action == "update"
     assert event.source_element_ids == ["point"]
     assert result.is_valid is True, result.errors
     assert any("重复 active 对象" in repair for repair in repairs)
@@ -1051,13 +1054,13 @@ def test_normalize_technical_spec_turns_empty_exit_into_wait():
                 event_id="fade_out_3d",
                 start_seconds=0,
                 end_seconds=2,
-                operation="fade_out",
+                semantic_action="remove",
             ),
             TechnicalAnimation(
                 event_id="show_formula",
                 start_seconds=2,
                 end_seconds=4,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["formula"],
                 create_element_ids=["formula"],
             ),
@@ -1067,9 +1070,9 @@ def test_normalize_technical_spec_turns_empty_exit_into_wait():
     normalized, repairs = normalize_technical_spec_contract(plan, spec)
     result = compile_technical_spec(plan, normalized)
 
-    assert normalized.animations[0].operation == "wait"
+    assert normalized.animations[0].semantic_action == "hold"
     assert result.is_valid is True, result.errors
-    assert any("空退出操作" in repair for repair in repairs)
+    assert any("空 remove" in repair for repair in repairs)
 
 
 def test_normalize_technical_spec_drops_stale_objects_after_plan_rewrite():
@@ -1087,14 +1090,14 @@ def test_normalize_technical_spec_drops_stale_objects_after_plan_rewrite():
                 event_id="fade_old_title",
                 start_seconds=0,
                 end_seconds=1,
-                operation="fade_out",
+                semantic_action="remove",
                 source_element_ids=["old_title"],
             ),
             TechnicalAnimation(
                 event_id="show_transition_title",
                 start_seconds=1,
                 end_seconds=2,
-                operation="fade_in",
+                semantic_action="introduce",
                 target_element_ids=["transition_title"],
                 create_element_ids=["transition_title"],
             ),
@@ -1105,7 +1108,7 @@ def test_normalize_technical_spec_drops_stale_objects_after_plan_rewrite():
     result = compile_technical_spec(plan, normalized)
 
     assert [item.element_id for item in normalized.objects] == ["transition_title"]
-    assert normalized.animations[0].operation == "wait"
+    assert normalized.animations[0].semantic_action == "hold"
     assert not result.errors
     assert any("old_title" in repair for repair in repairs)
 
@@ -1128,3 +1131,13 @@ def test_compile_technical_spec_rejects_stale_object_declaration():
 def test_technical_spec_is_closed():
     with pytest.raises(ValueError):
         TechnicalSpec(scene_id=1, unknown_field=True)
+
+
+def test_technical_animation_rejects_legacy_concrete_operation_field():
+    with pytest.raises(ValueError):
+        TechnicalAnimation(
+            event_id="legacy",
+            start_seconds=0,
+            end_seconds=1,
+            operation="fade_in",
+        )

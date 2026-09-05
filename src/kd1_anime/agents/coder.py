@@ -56,22 +56,23 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 
 ## 运行时正确性
 - 不盲目对 split、get_part_by_tex、get_parts_by_tex 或 VGroup 的结果取 `[0]`/`[1]`；先检查 `len()` 或显式构造元素，避免 IndexError。
-- TransformMatchingTex 两端必须有可匹配子串；不确定时使用 Transform。
+- 不确定公式子串是否可匹配时，使用不依赖子串匹配的稳健变换。
 - updater 不形成递归引用，用完后 clear_updaters。
-- 使用 ManimCE 的现行关键字参数和类名。
-- TechnicalSpec 是只读的技术执行合同；每个 `self.play` 的对象、源/目标和生命周期
-  必须与其中的动画事件对应。`Transform` 原地修改 source，target 不能在后续被当作
-  已加入场景的对象；需要 target 成为活动对象时使用 `ReplacementTransform` 或显式引入。
+- 使用当前 ManimCE 版本的现行关键字参数和类名；新的动画实现可以直接使用，
+  不要因为它没有出现在提示词示例里而自行发明 API。
+- TechnicalSpec 是只读的语义执行合同；每个 `self.play` 前必须写一行
+  `# KD1_ANIMATION_EVENT: <event_id>`，并引用对应事件声明的对象。事件的
+  `semantic_action` 决定状态：`introduce` 引入新对象，`update` 修改 active source，
+  `remove` 退出对象，`camera` 只处理相机，`hold` 不改变状态。具体用哪一种
+  Manim Animation 由你根据画面选择，不要修改合同或伪造 Python 别名。
+- `target_element_ids` 在 update 中只是目标快照；若目标需要以新身份留在场景，
+  必须另有 introduce 事件。不要把一个事件同时写成引入、更新和移除。
 - 生命周期字段的优先级高于 transition_in/transition_out、persistent_elements 等自由文本：
   `export_element_ids`/`required=true` 表示场景末尾必须 active，`removed_element_ids`/`[Elements To Remove]`
-  表示必须退出。自然语言若与这些结构化字段冲突，不要试图同时满足两套相反动作，按结构化
-  TechnicalSpec 实现并保持唯一的 FadeOut/导出结果。
-- `VGroup` 只有在整个 group 本身通过 `self.add` 或 introducer 动画加入场景后，才算该
-  group active；单独 FadeIn 其子对象不会使 group active。不要先逐个引入子对象，再对
-  一个新建的 group 调用 `Transform(group, target)`；要么从一开始就 FadeIn/Write 整个
-  group，要么始终对已经 active 的子对象分别执行动画。
-- 辅助方法只能构造并返回 Mobject；`self.play`、`self.add`、`self.remove`、`self.clear`
-  只能出现在 `construct()` 中，以便静态生命周期校验覆盖完整动画流程。
+  表示必须退出。自然语言若与这些结构化字段冲突，按结构化 TechnicalSpec 实现。
+- 复合 Mobject 只有在整体加入场景后才算 active；辅助方法只能构造并返回 Mobject，
+  Scene 副作用应直接位于 `construct()`，以便事件标记和静态检查覆盖完整流程。
+- VGroup 本身只有在被加入或引入后才是 active，单独 FadeIn 其子对象不会使 group active。
 
 ## 数学与几何正确性
 - 不要盲目实现未经验证的“切割后无缝拼接”：每个碎片的顶点、尺寸、旋转和目标位置必须实际覆盖目标区域，面积也必须守恒。
@@ -84,7 +85,7 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - 长公式和文字主动分行或缩放；颜色应与背景有对比并保持数学语义一致。
 
 ## 视觉与节奏
-- 内容逐步出现，不要一次铺满；优先连续 Transform 而不是无意义地反复淡入淡出。
+- 内容逐步出现，不要一次铺满；优先使用连续的状态变化，而不是无意义地反复重建对象。
 - 简单动画 0.5–1 秒，文字/公式与变换 1–2 秒，复杂动画 2–4 秒，并留 0.5–1 秒吸收停顿。
 - run_time 总量应大致匹配分镜时长，数学内容必须严格符合 computation。
 
@@ -106,11 +107,10 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   放入当前 Scene，除非该技术合同明确为它安排了 introducer；`self.add` 本身不是重复引入。
   不要为了删除 `self.add` 而让继承对象既没有加入场景、也没有对应的 FadeIn/Create。
 - 必须保留每个元素的 `element_id` 和语义状态。需要改变位置、内容、大小、颜色或形状时，
-  优先对已定义对象使用 `Transform`/`ReplacementTransform`，不得无理由删除后重画。
-- 如果使用临时 target（如 `grid_target`/`j_hat_target`）完成变换，必需导出对象必须仍由合同
-  变量承接：优先使用 `Transform(contract_variable, target)`；若使用
-  `ReplacementTransform`，必须随后将临时 target 的活动身份安全收敛到合同变量，并且不能
-  在最后把合同变量再次 FadeOut。不要只做 Python 重绑定来假装对象仍在场景中。
+  优先对已定义对象使用合适的 update 动画，不得无理由删除后重画。
+- 如果使用临时 target（如 `grid_target`/`j_hat_target`）完成变化，必须让合同中的
+  active source 保持唯一身份；不要只用 Python 重绑定伪造对象交接。若目标需要成为
+  新的边界对象，应按 TechnicalSpec 另行实现 introduce 事件。
 - 只有 `[Elements To Remove]` 明确列出的对象才能 `FadeOut`；持续元素在场景结尾必须真实存在，
   并重新写入连续性导出区，交给下一个场景。
 - `[Global Visual State]` 是只读配置。所有颜色、字体、字号、线宽和布局锚点必须由其中的
@@ -143,17 +143,13 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   marker 末尾复制一遍。对于 `[Elements To Remove]` 中只需淡出的元素，才把它的唯一
   定义放在 marker 外，并保留对应的 FadeOut。每个 Mobject 变量在 `construct()` 中只能
   定义一次，绝不能在动画流程结束时再次重建 active 对象。
-- required 的新元素也只在同一个 marker 内定义，但必须在动画流程中用 `Create`、`Write`
-  或 `FadeIn` 等 introducer 实际引入；仅仅写入导出区不等于对象已经 active。若用分阶段
-  目标对象演示变化，优先对 required 变量本身使用 `Transform`，或确保最终 active 的
-  变量名就是合同中的 `variable_name`，不要只让带 `_initial`/`_shrunk` 后缀的临时变量
-  活跃而遗漏 required 对象。
-- **必需导出对象的唯一活动身份**：例如合同变量是 `v1` 时，直接在导出区定义 `v1`，
-  然后先执行 `self.play(FadeIn(v1))`（或 `Create/Write(v1)`），再执行
-  `v1.animate...`/`Transform(v1, target)`。不要先引入 `v1_initial`、
-  `v1_base` 等后缀对象，再用 `v1 = v1_initial` 做 Python 别名；变量重绑定不会把
-  后缀对象变成 `v1`，也不会满足边界导出。若确实要从临时对象替换为导出对象，必须
-  使用 `ReplacementTransform(v1_initial, v1)`，并且之后只能操作 active 的 `v1`。
+- required 的新元素也只在同一个 marker 内定义，但必须在动画流程中用一个入场动画
+  实际引入；仅仅写入导出区不等于对象已经 active。若用分阶段 target 演示变化，
+  必须保持合同中的 variable_name 为最终 active 身份，不要用后缀变量和 Python 重绑定
+  代替 introduce/update 事件。
+- **必需导出对象的唯一活动身份**：直接在导出区定义合同变量，并在对应
+  `introduce` 事件中引入，之后只对该变量执行 `update` 或 `hold`。每个 `self.play`
+  都必须使用与 TechnicalSpec 相同的事件标记；不要让临时对象绕过事件合同。
 - 当反馈要求采用保守教学方案时，禁止恢复未经验证的碎片移动、旋转或无缝拼接，改用基础图形、
   面积标签、等式变换和公式定格表达核心概念。
 - 导出区中的变量名必须与 `[Inherited Elements State]`/`[New Elements]` 的 `variable_name` 对应；
@@ -311,8 +307,8 @@ class CoderAgent(BaseAgent):
             sections.append(
                 PromptSection(
                     "TechnicalSpec（只读执行合同）",
-                    "下面的对象、生命周期、动画源/目标、时间线、LaTeX 分段和最终导出清单必须逐项实现。\n"
-                    "不要自行增加未声明的跨场景对象，也不要改变 operation 的语义。\n"
+                    "下面的对象、语义动作、动画源/目标、时间线、LaTeX 分段和最终导出清单必须逐项实现。\n"
+                    "不要自行增加未声明的跨场景对象，也不要改变 semantic_action 的语义。\n"
                     f"```json\n{technical_contract}\n```",
                     required=True,
                     priority=110,
@@ -455,7 +451,10 @@ class CoderAgent(BaseAgent):
             )
         sections.append(
             PromptSection(
-                "输出要求", "请输出完整的 Manim Python 代码：", required=True, priority=100
+                "输出要求",
+                "请输出完整的 Manim Python 代码；每个 self.play 前都要有对应的 KD1_ANIMATION_EVENT 标记：",
+                required=True,
+                priority=100,
             )
         )
         user_msg = build_bounded_prompt(sections, max_chars=settings.LLM_MAX_CONTEXT_CHARS)

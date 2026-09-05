@@ -1,6 +1,7 @@
 """生成代码对象生命周期校验测试。"""
 
 from kd1_anime.agents.lifecycle import (
+    detect_unknown_animations,
     repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
     repair_required_export_replacement_lifecycle,
@@ -478,3 +479,95 @@ class Demo(Scene):
 
     assert result.is_valid is False
     assert any("辅助函数" in error and "self.play" in error for error in result.errors)
+
+
+def _semantic_spec(action="introduce"):
+    return TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                constructor="MathTex",
+                exported=True,
+            )
+        ],
+        animations=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": action,
+                "target_element_ids": ["formula"] if action == "introduce" else [],
+                "create_element_ids": ["formula"] if action == "introduce" else [],
+                "source_element_ids": ["formula"] if action != "introduce" else [],
+            }
+        ],
+        export_element_ids=["formula"],
+    )
+
+
+def test_semantic_marker_allows_an_animation_not_in_static_name_list():
+    technical_spec = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(CustomReveal(formula))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is True, result.errors
+    assert result.unknown_animations
+    assert any("unknown-animation" in warning for warning in result.warnings)
+    assert detect_unknown_animations(code, technical_spec) == result.unknown_animations
+
+
+def test_semantic_marker_is_required_and_must_reference_contract_event():
+    technical_spec = _semantic_spec()
+    missing_marker = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.play(FadeIn(formula))
+"""
+    unknown_marker = missing_marker.replace(
+        "self.play", "# KD1_ANIMATION_EVENT: wrong\n        self.play"
+    )
+
+    missing_result = validate_animation_lifecycle(missing_marker, technical_spec)
+    unknown_result = validate_animation_lifecycle(unknown_marker, technical_spec)
+
+    assert not missing_result.is_valid
+    assert any("缺少语义事件标记" in error for error in missing_result.errors)
+    assert not unknown_result.is_valid
+    assert any("未在 TechnicalSpec 中声明" in error for error in unknown_result.errors)
+
+
+def test_camera_semantic_event_does_not_require_mobject_lifecycle():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        animations=[
+            {
+                "event_id": "camera_move",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "camera",
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_ANIMATION_EVENT: camera_move
+        self.play(self.camera.animate.set_euler_angles(theta=1.0, phi=0.8))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is True, result.errors

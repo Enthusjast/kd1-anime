@@ -495,6 +495,23 @@ class SceneDashboard:
                 status.started_at = 0.0
                 status.message = "Smoke Render 通过"
 
+        elif event == "scene_unknown_animation_detected":
+            if status:
+                status.state = "warning"
+                status.stage = ""
+                status.started_at = 0.0
+                count = len(data.get("details", []))
+                status.message = f"发现 {count or 1} 个未识别动画，已强制 Smoke Render"
+
+        elif event == "recipe_saved":
+            if status:
+                status.message = "已保存匿名动画配方"
+
+        elif event == "recipe_index_warning":
+            if status:
+                status.state = "warning"
+                status.message = "配方已保存，RAG 索引待刷新"
+
         elif event in ("scene_review_pass", "scene_review_skipped"):
             if status:
                 status.state = "running"

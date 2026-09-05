@@ -13,51 +13,29 @@ from dataclasses import dataclass
 
 from kd1_anime.agents.technical_planner import TechnicalSpec
 
-_INTRODUCERS = {
-    "AddTextLetterByLetter",
-    "AddTextWordByWord",
-    "Create",
-    "DrawBorderThenFill",
-    "FadeIn",
-    "GrowArrow",
-    "GrowFromCenter",
-    "GrowFromEdge",
-    "GrowFromPoint",
-    "ShowIncreasingSubsets",
-    "ShowSubmobjectsOneByOne",
-    "SpinInFromNothing",
-    "Write",
-}
-_REMOVERS = {
-    "DisappearToPoint",
-    "FadeOut",
-    "FadeOutToPoint",
-    "ShrinkToCenter",
-    "Uncreate",
-}
-_TRANSFORMS = {
-    "Transform",
-    "ReplacementTransform",
-    "TransformMatchingTex",
-    "TransformMatchingShapes",
-}
+# 这些集合只用于识别少量能安全推断参数角色的常见调用，以及兼容修复
+# 函数。它们不是技术合同的能力白名单；未知调用会进入 warning。
+_INTRODUCERS = {"Create", "Write", "FadeIn"}
+_REMOVERS = {"FadeOut", "Uncreate"}
+_TRANSFORMS = {"Transform", "ReplacementTransform"}
 _IN_PLACE_ANIMATIONS = {
     "ApplyMethod",
     "ApplyPointwiseFunction",
-    "ApplyWave",
     "Circumscribe",
     "Flash",
-    "FocusOn",
     "Indicate",
     "MoveToTarget",
     "Restore",
-    "ShowPassingFlash",
-    "ShowPassingFlashAround",
     "UpdateFromFunc",
     "Wiggle",
 }
 _CONTAINER_ANIMATIONS = {"AnimationGroup", "LaggedStart", "Succession", "Group"}
 _SCENE_SIDE_EFFECTS = {"play", "add", "remove", "clear"}
+_EVENT_MARKER_RE = re.compile(
+    r"^\s*#\s*KD1_ANIMATION_EVENT:\s*"
+    r"(?P<event_id>[A-Za-z_][A-Za-z0-9_.-]{0,99})\s*$"
+)
+_AUTO_EVENT_PREFIX = "__auto_"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +45,7 @@ class LifecycleValidationResult:
     is_valid: bool
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    unknown_animations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +53,7 @@ class _AnimationInvocation:
     operation: str
     source_names: tuple[str, ...] = ()
     target_names: tuple[str, ...] = ()
+    unknown: bool = False
 
 
 def repair_required_export_alias_lifecycle(
@@ -555,7 +535,10 @@ def repair_removed_active_lifecycle(
     )
     first_body_line = lines[construct.body[0].lineno - 1] if lines else ""
     indentation = first_body_line[: len(first_body_line) - len(first_body_line.lstrip())]
-    cleanup = f"{indentation}self.play(FadeOut({', '.join(variables)}), run_time=0.5)\n"
+    cleanup = (
+        f"{indentation}# KD1_ANIMATION_EVENT: __auto_remove_active\n"
+        f"{indentation}self.play(FadeOut({', '.join(variables)}), run_time=0.5)\n"
+    )
     source_bytes = code.encode("utf-8")
     if insert_at == 0 or (insert_at > 0 and source_bytes[insert_at - 1 : insert_at] != b"\n"):
         cleanup = "\n" + cleanup
@@ -620,11 +603,59 @@ def _animate_source_names(node: ast.AST) -> set[str]:
     return _root_names(node)
 
 
+def _contains_camera_animate(node: ast.AST) -> bool:
+    """判断一段动画表达式是否只是在驱动 Scene 相机。"""
+
+    return any(
+        isinstance(child, ast.Attribute)
+        and child.attr == "animate"
+        and _is_self_camera_path(child.value)
+        for child in ast.walk(node)
+    )
+
+
+def _contains_camera_reference(node: ast.AST) -> bool:
+    """判断表达式是否引用 ``self.camera``/``self.camera.frame``。"""
+
+    return any(
+        isinstance(child, ast.Attribute) and _is_self_camera_path(child) for child in ast.walk(node)
+    )
+
+
+def _event_markers(code: str) -> list[tuple[int, str]]:
+    """读取源代码中的语义动画事件标记。"""
+
+    markers: list[tuple[int, str]] = []
+    for line_number, line in enumerate(code.splitlines(), start=1):
+        match = _EVENT_MARKER_RE.match(line)
+        if match:
+            markers.append((line_number, match.group("event_id")))
+    return markers
+
+
+def _marker_before_line(lines: list[str], line_number: int) -> str | None:
+    """返回 self.play 前最近的事件标记，允许空行和普通注释。"""
+
+    index = line_number - 2
+    while index >= 0:
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            match = _EVENT_MARKER_RE.match(lines[index])
+            if match:
+                return match.group("event_id")
+            index -= 1
+            continue
+        break
+    return None
+
+
 def _animation_invocations(node: ast.AST) -> list[_AnimationInvocation]:
     """从 self.play 参数中提取动画操作，忽略普通参数表达式。"""
 
     if isinstance(node, ast.Call):
         name = _call_name(node)
+        if _contains_camera_reference(node):
+            return [_AnimationInvocation("camera")]
         if name in _INTRODUCERS or name in _REMOVERS:
             source: set[str] = set()
             arguments = node.args if name == "FadeOut" else node.args[:1]
@@ -647,12 +678,25 @@ def _animation_invocations(node: ast.AST) -> list[_AnimationInvocation]:
             )
             return [_AnimationInvocation("animate", tuple(sorted(source)))]
         if _contains_animate(node):
-            return [_AnimationInvocation("animate", tuple(sorted(_animate_source_names(node))))]
-        return []
+            source_names = _animate_source_names(node)
+            operation = (
+                "camera" if not source_names and _contains_camera_animate(node) else "animate"
+            )
+            return [_AnimationInvocation(operation, tuple(sorted(source_names)))]
+        # 未知的动画工厂不应被当成非法 API。调用方会通过语义事件标记
+        # 提供状态解释，这里仅提取可能的对象根名并记录 warning。
+        source: set[str] = set()
+        for argument in node.args:
+            source.update(_root_names(argument))
+        return [
+            _AnimationInvocation(f"unknown:{name or 'call'}", tuple(sorted(source)), unknown=True)
+        ]
     if isinstance(node, ast.Attribute) and node.attr == "animate":
         if _is_self_camera_path(node.value):
-            return []
+            return [_AnimationInvocation("camera")]
         return [_AnimationInvocation("animate", tuple(sorted(_root_names(node.value))))]
+    if isinstance(node, ast.Name):
+        return [_AnimationInvocation(f"unknown:{node.id}", (node.id,), unknown=True)]
     return []
 
 
@@ -738,10 +782,17 @@ def validate_animation_lifecycle(
     *,
     renderer: str | None = None,
 ) -> LifecycleValidationResult:
-    """以保守规则检查代码中的对象生命周期。"""
+    """以语义事件合同检查代码中的对象生命周期。
+
+    具体动画类不是稳定的能力边界。代码只需要在每个 ``self.play`` 前写
+    ``# KD1_ANIMATION_EVENT: <event_id>``，其状态变化由 TechnicalSpec 的
+    ``semantic_action`` 决定；无法识别的动画调用只产生 warning。这样
+    新的 Manim 动画可以先用于实验，而不会被旧的名称列表阻断。
+    """
 
     errors: list[str] = []
     warnings: list[str] = []
+    unknown_animations: list[str] = []
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
@@ -752,12 +803,21 @@ def validate_animation_lifecycle(
         return LifecycleValidationResult(False, ("生命周期检查找不到 construct()",))
 
     errors.extend(_side_effects_outside_construct(tree, construct))
+    lines = code.splitlines()
+    event_by_id = {event.event_id: event for event in technical_spec.animations}
+    markers = _event_markers(code)
+    marker_ids = [event_id for _, event_id in markers]
+    for event_id in sorted({item for item in marker_ids if marker_ids.count(item) > 1}):
+        errors.append(f"动画事件标记重复: {event_id}")
 
     object_by_variable = {
         item.variable_name: item for item in technical_spec.objects if item.variable_name
     }
     element_by_variable = {
         item.variable_name: item.element_id for item in technical_spec.objects if item.variable_name
+    }
+    variable_by_element = {
+        item.element_id: item.variable_name for item in technical_spec.objects if item.variable_name
     }
     required_export_variables = {
         item.variable_name
@@ -779,6 +839,8 @@ def validate_animation_lifecycle(
         if item.initially_active and item.variable_name
     }
     seen_assignments: set[str] = set()
+    used_event_ids: set[str] = set()
+    markers_required = bool(technical_spec.animations)
 
     def mapped(names: set[str]) -> set[str]:
         result: set[str] = set()
@@ -794,19 +856,24 @@ def validate_animation_lifecycle(
             pending.extend(aliases.get(name, ()))
         return result
 
-    def require_defined(names: set[str], location: int, operation: str) -> None:
+    def require_defined(names: set[str], location: int, description: str) -> None:
         missing = names - defined
         if missing:
             errors.append(
-                f"第 {location} 行 {operation} 使用了尚未定义的对象: " + ", ".join(sorted(missing))
+                f"第 {location} 行 {description} 使用了尚未定义的对象: "
+                + ", ".join(sorted(missing))
             )
+
+    def contract_variables(event, field_name: str) -> set[str]:
+        ids = getattr(event, field_name)
+        return {
+            variable_by_element[element_id]
+            for element_id in ids
+            if element_id in variable_by_element
+        }
 
     for node in _statement_nodes(construct):
         if isinstance(node, (ast.For, ast.AsyncFor)):
-            # 循环变量在 Python 中会在第一次迭代前绑定。生成代码中常用
-            # ``for formula in formulas: Write(formula)``，忽略这个绑定
-            # 会把合法的循环体误报为“Write 使用未定义对象”。这里只
-            # 记录变量名，不执行迭代器或循环体。
             loop_names = _root_names(node.target)
             defined.update(loop_names)
             seen_assignments.update(loop_names)
@@ -853,48 +920,160 @@ def validate_animation_lifecycle(
 
         if method != "play":
             continue
+
+        marker_id = _marker_before_line(lines, node.lineno)
+        event = event_by_id.get(marker_id or "")
+        if marker_id is None and markers_required:
+            errors.append(
+                f"第 {node.lineno} 行 self.play() 缺少语义事件标记；"
+                "请在上一行写 # KD1_ANIMATION_EVENT: <event_id>"
+            )
+        elif marker_id is not None:
+            if marker_id in used_event_ids:
+                errors.append(f"第 {node.lineno} 行重复使用动画事件标记: {marker_id}")
+            used_event_ids.add(marker_id)
+            if event is None and not marker_id.startswith(_AUTO_EVENT_PREFIX):
+                errors.append(
+                    f"第 {node.lineno} 行动画事件标记未在 TechnicalSpec 中声明: {marker_id}"
+                )
+
+        invocations: list[_AnimationInvocation] = []
         for argument in node.args:
-            for invocation in _animation_invocations(argument):
-                source_names = set(invocation.source_names)
-                target_names = set(invocation.target_names)
-                require_defined(source_names | target_names, node.lineno, invocation.operation)
+            invocations.extend(_animation_invocations(argument))
+        if not invocations and node.args:
+            invocations.append(_AnimationInvocation("unknown:expression", unknown=True))
+
+        for invocation in invocations:
+            source_names = set(invocation.source_names)
+            target_names = set(invocation.target_names)
+            if invocation.operation == "camera":
+                continue
+            require_defined(
+                source_names | target_names,
+                node.lineno,
+                invocation.operation,
+            )
+            if invocation.unknown:
+                detail = f"第 {node.lineno} 行 {invocation.operation}"
+                unknown_animations.append(detail)
+                warnings.append(
+                    f"[unknown-animation] {detail} 未被生命周期分析器识别，"
+                    f"按事件 {marker_id or '未标记'} 的语义合同继续"
+                )
+
+            # 对少量能可靠识别参数角色的调用保留安全检查；未知调用
+            # 不猜测 source/target，不因新动画名称而误报。
+            if not invocation.unknown and invocation.operation in _REMOVERS | _TRANSFORMS | {
+                "animate"
+            }:
                 source_mapped = mapped(source_names)
-                target_mapped = mapped(target_names)
-                if invocation.operation in _INTRODUCERS:
-                    duplicate = target_mapped & active
-                    if duplicate:
-                        errors.append(
-                            f"第 {node.lineno} 行 {invocation.operation} 重复引入 active 对象: "
-                            + ", ".join(sorted(duplicate))
-                        )
-                    active.update(target_mapped or source_mapped)
-                elif invocation.operation in _REMOVERS:
-                    missing = source_mapped - active
-                    if missing:
-                        errors.append(
-                            f"第 {node.lineno} 行 {invocation.operation} 作用于未 active 对象: "
-                            + ", ".join(sorted(missing))
-                        )
-                    active.difference_update(source_mapped)
-                elif invocation.operation in _TRANSFORMS:
-                    missing = source_mapped - active
-                    if missing:
-                        errors.append(
+                missing = source_mapped - active
+                if missing:
+                    if invocation.operation == "animate":
+                        message = f"第 {node.lineno} 行 animate 作用于未 active 对象: "
+                    else:
+                        message = (
                             f"第 {node.lineno} 行 {invocation.operation} 的 source 未 active: "
-                            + ", ".join(sorted(missing))
                         )
-                    if invocation.operation == "ReplacementTransform":
+                    errors.append(message + ", ".join(sorted(missing)))
+
+        if event is None:
+            # 仅用于没有技术事件的独立生命周期检查，或窄范围自动修复。
+            # 有事件的正式候选在上面已经报告未声明 marker；不再猜测状态。
+            if marker_id is None and not markers_required:
+                for invocation in invocations:
+                    source_mapped = mapped(set(invocation.source_names))
+                    target_mapped = mapped(set(invocation.target_names))
+                    if invocation.operation in _INTRODUCERS:
+                        active.update(target_mapped or source_mapped)
+                    elif invocation.operation in _REMOVERS:
+                        active.difference_update(source_mapped)
+                    elif invocation.operation == "ReplacementTransform":
                         active.difference_update(source_mapped)
                         active.update(target_mapped)
-                    # Transform 原地修改 source；target 是目标快照，不能在
-                    # 后续事件中当成已经加入 Scene 的对象。
-                elif invocation.operation == "animate":
-                    missing = source_mapped - active
+                    elif invocation.unknown:
+                        # 没有技术事件时无法判断未知动画是入场还是原地
+                        # 更新；保守地把它的参数视为可能被引入的对象。
+                        active.update(source_mapped)
+            elif marker_id is not None and marker_id.startswith(_AUTO_EVENT_PREFIX):
+                # 后备代码/窄范围自动修复使用的 marker 不属于技术计划，
+                # 但其状态变化仍按实际参数做最小、可验证的模拟。
+                auto_sources = mapped(
+                    {name for invocation in invocations for name in invocation.source_names}
+                )
+                if marker_id.startswith("__auto_remove"):
+                    missing = auto_sources - active
                     if missing:
                         errors.append(
-                            f"第 {node.lineno} 行 animate 作用于未 active 对象: "
+                            f"第 {node.lineno} 行自动 remove 作用于未 active 对象: "
                             + ", ".join(sorted(missing))
                         )
+                    active.difference_update(auto_sources)
+                elif marker_id.startswith("__auto_introduce"):
+                    active.update(auto_sources)
+                elif marker_id.startswith("__auto_update"):
+                    missing = auto_sources - active
+                    if missing:
+                        errors.append(
+                            f"第 {node.lineno} 行自动 update 作用于未 active 对象: "
+                            + ", ".join(sorted(missing))
+                        )
+            continue
+
+        action = event.semantic_action
+        event_sources = contract_variables(event, "source_element_ids")
+        event_targets = contract_variables(event, "target_element_ids")
+        event_creates = contract_variables(event, "create_element_ids")
+        event_removes = contract_variables(event, "remove_element_ids")
+        if action == "introduce":
+            missing = event_sources & active
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 introduce source 已 active: " + ", ".join(sorted(missing))
+                )
+            introduced = event_targets | event_creates
+            if introduced - defined:
+                require_defined(introduced - defined, node.lineno, "introduce")
+            active.update(introduced)
+        elif action == "update":
+            missing = event_sources - active
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 update source 未 active: " + ", ".join(sorted(missing))
+                )
+            if event_creates:
+                errors.append(
+                    f"第 {node.lineno} 行 update 不能引入对象: " + ", ".join(sorted(event_creates))
+                )
+            if event_removes:
+                errors.append(
+                    f"第 {node.lineno} 行 update 不能移除对象: " + ", ".join(sorted(event_removes))
+                )
+        elif action == "remove":
+            exit_names = event_sources | event_removes
+            missing = exit_names - active
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 remove 作用于未 active 对象: "
+                    + ", ".join(sorted(missing))
+                )
+            active.difference_update(exit_names)
+        elif action == "hold":
+            missing = event_sources - active
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 hold source 未 active: " + ", ".join(sorted(missing))
+                )
+        elif action == "camera":
+            # 相机事件不改变 Mobject 状态。
+            pass
+
+    if markers_required:
+        unused = set(event_by_id) - used_event_ids
+        if unused:
+            warnings.append(
+                "TechnicalSpec 中没有在代码中找到对应 marker 的事件: " + ", ".join(sorted(unused))
+            )
 
     missing_exports = required_export_variables - active
     if missing_exports:
@@ -930,4 +1109,34 @@ def validate_animation_lifecycle(
 
     deduped_errors = tuple(dict.fromkeys(errors))
     deduped_warnings = tuple(dict.fromkeys(warnings))
-    return LifecycleValidationResult(not deduped_errors, deduped_errors, deduped_warnings)
+    return LifecycleValidationResult(
+        not deduped_errors,
+        deduped_errors,
+        deduped_warnings,
+        tuple(dict.fromkeys(unknown_animations)),
+    )
+
+
+def detect_unknown_animations(
+    code: str,
+    technical_spec: TechnicalSpec,
+    *,
+    renderer: str | None = None,
+) -> tuple[str, ...]:
+    """返回无法由静态分析器识别的动画调用位置。
+
+    这是诊断信息，不代表代码无效；调用方可据此开启额外 Smoke Render。
+    """
+
+    return validate_animation_lifecycle(code, technical_spec, renderer=renderer).unknown_animations
+
+
+__all__ = [
+    "LifecycleValidationResult",
+    "detect_unknown_animations",
+    "repair_removed_active_lifecycle",
+    "repair_required_export_alias_lifecycle",
+    "repair_required_export_replacement_lifecycle",
+    "repair_required_export_transform_alias_lifecycle",
+    "validate_animation_lifecycle",
+]

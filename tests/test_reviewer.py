@@ -34,7 +34,7 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "ThreeDScene" in REVIEWER_SYSTEM_PROMPT
     assert "结构化" in REVIEWER_SYSTEM_PROMPT
     assert "initially_active=true" in REVIEWER_SYSTEM_PROMPT
-    assert "VGroup 本身只有在被加入或引入后才是 active" in REVIEWER_SYSTEM_PROMPT
+    assert "VGroup" in REVIEWER_SYSTEM_PROMPT
     assert "证据优先于行号" in REVIEWER_SYSTEM_PROMPT
     assert "只报告确定的问题" in REVIEWER_SYSTEM_PROMPT
     assert "confidence" in REVIEWER_SYSTEM_PROMPT

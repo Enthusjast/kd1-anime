@@ -24,7 +24,10 @@ def renderer_guidance(renderer: Literal["cairo", "opengl"] | None = None) -> str
 
 def animation_lifecycle_guidance() -> str:
     return """## 动画对象生命周期
-- `Create`、`Write`、`FadeIn` 等 introducer 动画会把对象加入场景，不要为了它们预先 `self.add()`。
-- 对 `obj.animate`、Transform 的源对象等已有对象执行动画前，确保对象当前仍在场景中。
-- `FadeOut`、`ReplacementTransform` 后源对象通常已移除，不要继续对旧引用执行动画。
+- 以 TechnicalSpec 的 `semantic_action` 和 `KD1_ANIMATION_EVENT` 标记为状态合同，
+  不以某个具体动画类是否出现在示例中作为能力边界。
+- `introduce` 只能让新对象进入场景；`update`/`hold` 的 source 必须已经 active；
+  `remove` 后不要继续使用退出对象；`camera` 不改变 Mobject 状态。
+- 每个 `self.play` 前写对应的 `# KD1_ANIMATION_EVENT: <event_id>`，未知动画调用
+  可以使用，但必须遵守标记事件的对象语义并接受额外 Smoke Render。
 - 不同时对同一对象施加互相冲突的动画。"""

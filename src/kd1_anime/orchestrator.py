@@ -45,6 +45,7 @@ from kd1_anime.agents.continuity import (
 from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
+    detect_unknown_animations,
     repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
     repair_required_export_replacement_lifecycle,
@@ -126,6 +127,7 @@ from kd1_anime.exceptions import (
 from kd1_anime.logging import get_logger
 from kd1_anime.media.merger import VideoMerger
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
+from kd1_anime.rag.recipes import RecipeStore
 from kd1_anime.rag.service import RagService
 from kd1_anime.rendering import (
     MergeProfile,
@@ -305,6 +307,9 @@ class SceneState:
     plan_review_signature: str = ""
     identical_plan_review_count: int = 0
     technical_spec: TechnicalSpec | None = None
+    technical_contract_stale: bool = False
+    unknown_animation_detected: bool = False
+    unknown_animation_details: list[str] = field(default_factory=list)
     technical_spec_sha256: str = ""
     technical_input_sha256: str = ""
     technical_status: str = "pending"
@@ -446,6 +451,7 @@ class Orchestrator:
         self.rag = RagService(
             rag_semaphore=(resource_coordinator.rag if resource_coordinator is not None else None)
         )
+        self.recipe_store = RecipeStore()
         self.failure_cases = FailureCaseStore()
 
     @staticmethod
@@ -486,13 +492,114 @@ class Orchestrator:
         """计划或继承上下文变化后使旧 TechnicalSpec 失效。"""
 
         state.technical_spec = None
+        state.technical_contract_stale = False
         state.technical_spec_sha256 = ""
         state.technical_input_sha256 = ""
         state.technical_status = "pending"
         state.technical_error = ""
+        state.unknown_animation_detected = False
+        state.unknown_animation_details = []
         state.capability_contract = None
         state.capability_status = "pending"
         state.candidates = []
+
+    def _invalidate_legacy_technical_contracts(
+        self,
+        manifest: RunManifest,
+        root: Path,
+    ) -> bool:
+        """安全丢弃旧版 TechnicalSpec 及其全部下游派生状态。
+
+        技术合同已从具体动画操作替换为语义动作，旧代码/视频不能直接
+        复用。若旧清单仍有未结束的 Slurm Job，先确认取消成功，再清空
+        代码、产物和视觉收据；这样 resume 不会遗留一个继续写媒体目录的
+        孤儿作业，也不会把旧代码当成新合同候选。
+        """
+
+        stale_scenes = [
+            (scene_id, scene)
+            for scene_id, scene in sorted(manifest.scenes.items())
+            if scene.technical_contract_stale
+        ]
+        if not stale_scenes:
+            return False
+        if manifest.schema_version != 7:
+            return False
+        terminal_statuses = {"COMPLETED", "CANCELLED", *FAILURE_STATES}
+        for scene_id, scene in stale_scenes:
+            job = scene.slurm_job
+            if (
+                job is not None
+                and job.status not in terminal_statuses
+                and not job.cancelled
+                and not self.slurm.cancel_job(job.job_id)
+            ):
+                raise RuntimeError(
+                    f"Scene {scene_id} 的旧 TechnicalSpec Job {job.job_id} 取消失败，"
+                    "拒绝按新合同重复提交"
+                )
+            old_code_file = scene.code_file
+            if old_code_file:
+                with suppress(OSError, ValueError):
+                    restore_run_path(root, old_code_file).unlink(missing_ok=True)
+            scene.code_file = ""
+            scene.code_sha256 = ""
+            scene.class_name = ""
+            scene.review_round = 0
+            scene.fix_attempts = 0
+            scene.infra_retries = 0
+            scene.reviewed = False
+            scene.rendered = False
+            scene.slurm_job = None
+            scene.artifact = None
+            scene.phase = (
+                "plan_reviewed"
+                if scene.plan_reviewed
+                else ("detailed" if scene.plan_ready else "pending")
+            )
+            scene.give_up = False
+            scene.failed = False
+            scene.failure_reason = ""
+            scene.failure_category = ""
+            scene.technical_contract_stale = False
+            scene.technical_spec = None
+            scene.technical_spec_sha256 = ""
+            scene.technical_input_sha256 = ""
+            scene.technical_status = "pending"
+            scene.technical_error = ""
+            scene.capability_contract = None
+            scene.capability_status = "pending"
+            scene.local_smoke_status = "pending"
+            scene.rewrite_feedback = ""
+            scene.review_signature = ""
+            scene.identical_review_count = 0
+            scene.last_error_fp = ""
+            scene.identical_error_count = 0
+            scene.last_repair_code_sha256 = ""
+            scene.last_repair_error_fp = ""
+            scene.stagnant_repair_count = 0
+            scene.inherited_elements_code = ""
+            scene.exported_elements_code = ""
+            scene.exported_elements = []
+            scene.unknown_animation_detected = False
+            scene.unknown_animation_details = []
+            scene.visual_status = "pending" if manifest.visual_eval_profile.enabled else "skipped"
+            scene.visual_fix_attempts = 0
+            scene.visual_score = None
+            scene.visual_report_file = ""
+            scene.visual_report_sha256 = ""
+            scene.visual_artifact_sha256 = ""
+            scene.visual_feedback = ""
+            scene.visual_best_candidate = None
+            scene.candidates = []
+        manifest.final_video = None
+        manifest.final_video_sha256 = ""
+        manifest.status = "running"
+        manifest.state = "CODING"
+        manifest.error = ""
+        manifest.revision += 1
+        write_manifest(root / MANIFEST_NAME, manifest)
+        return True
 
     def _cancel_unfinished_scene_job(self, state: SceneState, *, reason: str) -> None:
         """在丢弃场景代码/计划前取消仍可能执行的旧 Job。
@@ -909,6 +1016,9 @@ class Orchestrator:
                     plan_review_signature=scene.plan_review_signature,
                     identical_plan_review_count=scene.identical_plan_review_count,
                     technical_spec=scene.technical_spec,
+                    technical_contract_stale=scene.technical_contract_stale,
+                    unknown_animation_detected=scene.unknown_animation_detected,
+                    unknown_animation_details=scene.unknown_animation_details[-30:],
                     technical_spec_sha256=scene.technical_spec_sha256,
                     technical_input_sha256=scene.technical_input_sha256,
                     technical_status=scene.technical_status,
@@ -1232,6 +1342,9 @@ class Orchestrator:
                 plan_review_signature=getattr(stored, "plan_review_signature", ""),
                 identical_plan_review_count=getattr(stored, "identical_plan_review_count", 0),
                 technical_spec=getattr(stored, "technical_spec", None),
+                technical_contract_stale=getattr(stored, "technical_contract_stale", False),
+                unknown_animation_detected=getattr(stored, "unknown_animation_detected", False),
+                unknown_animation_details=list(getattr(stored, "unknown_animation_details", [])),
                 technical_spec_sha256=getattr(stored, "technical_spec_sha256", ""),
                 technical_input_sha256=getattr(stored, "technical_input_sha256", ""),
                 technical_status=getattr(stored, "technical_status", "pending"),
@@ -1548,14 +1661,12 @@ class Orchestrator:
                         "也不要在动画结束位置再次重建同名对象。需要淡出的继承元素"
                         "才定义在 marker 外，并保留唯一的 FadeOut。\n"
                     )
-                if "必须导出的对象不 active" in lifecycle_error:
-                    feedback_parts.append(
-                        "\n导出对象激活规则：required=true 的导出变量必须在动画流程中"
-                        "使用 Create、Write、FadeIn 等 introducer 实际引入，并在结尾"
-                        "保持 active；不要只定义该变量或只让带 _initial、_shrunk 等"
-                        "后缀的临时变量参与动画。若使用 Transform 阶段目标，需保证"
-                        "最终仍由合同中的 variable_name 对象承接。\n"
-                    )
+                    if "必须导出的对象不 active" in lifecycle_error:
+                        feedback_parts.append(
+                            "\n导出对象激活规则：required=true 的导出变量必须在动画流程中"
+                            "使用对应 semantic_action=introduce 的事件实际引入，并在结尾"
+                            "保持 active；不要只定义该变量或只让带后缀的临时变量参与动画。\n"
+                        )
                 if "animate 作用于未 active 对象" in lifecycle_error:
                     feedback_parts.append(
                         "\n本次错误通常表示把 required 导出变量和 *_initial 临时变量混用了。"
@@ -1565,13 +1676,16 @@ class Orchestrator:
                         "若必须从临时对象交接到 v1，只能使用 ReplacementTransform(v1_initial, v1)，"
                         "并删除之后对 v1_initial 的动画。\n"
                     )
-                if "Transform 的 source 未 active" in lifecycle_error:
-                    feedback_parts.append(
-                        "\nTransform 源对象修复规则：VGroup 本身只有在整体通过 self.add、"
-                        "FadeIn/Create 等方式引入后才是 active；单独引入它的子对象不等于"
-                        "引入 VGroup。请不要先 FadeIn 子对象再 Transform 一个后创建的 group，"
-                        "应整体引入该 group，或改为对已经 active 的子对象分别执行动画。\n"
-                    )
+                    if (
+                        "Transform 的 source 未 active" in lifecycle_error
+                        or "update source 未 active" in lifecycle_error
+                    ):
+                        feedback_parts.append(
+                            "\nupdate 源对象修复规则：复合 Mobject 本身只有在整体加入或由"
+                            "introduce 事件引入后才是 active；单独引入子对象不等于引入 group。"
+                            "请把 update 事件的 source 改为此前已 active 的合同对象，或先安排"
+                            "一个 introduce 事件，不要用 Python 重绑定代替状态交接。\n"
+                        )
 
             # 如果是 TexTemplate 相关错误，提供正确示例
             if any("TexTemplate" in err or "tex_template" in err for err in validation.errors):
@@ -1838,6 +1952,7 @@ class Orchestrator:
             raise FileNotFoundError(f"找不到运行清单: {run_id}")
         with lock_run(root):
             manifest = repository.load(run_id)
+            self._invalidate_legacy_technical_contracts(manifest, root)
             manifest.validate_for_resume()
             self._callback = callback
             self._cancel_requested.clear()
@@ -2451,7 +2566,7 @@ class Orchestrator:
     ) -> None:
         """运行并持久化本地 Smoke Render 状态。"""
 
-        enabled = self._local_smoke_enabled(ctx)
+        enabled = self._local_smoke_enabled(ctx, state)
         with self._state_lock:
             state.local_smoke_status = "running" if enabled else "skipped"
         if not enabled:
@@ -2475,11 +2590,38 @@ class Orchestrator:
         self._emit("scene_smoke_rendered", scene_id=state.plan.scene_id)
 
     @staticmethod
-    def _local_smoke_enabled(ctx: PipelineContext) -> bool:
-        """判断当前运行是否明确允许执行本地 Smoke/Frame Canary。"""
+    def _unknown_animation_details(
+        ctx: PipelineContext,
+        state: SceneState,
+        code: str,
+    ) -> list[str]:
+        """提取候选中的未知动画诊断；未知调用本身不是阻断错误。"""
+
+        if state.technical_spec is None:
+            return []
+        return list(
+            detect_unknown_animations(
+                code,
+                state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+            )
+        )
+
+    @staticmethod
+    def _local_smoke_enabled(
+        ctx: PipelineContext,
+        state: SceneState | None = None,
+    ) -> bool:
+        """判断当前运行是否明确允许执行本地 Smoke/Frame Canary。
+
+        未知动画调用是允许继续生成的 warning，但 dry-run 不能只靠 AST
+        猜测其运行时行为；这类场景自动追加一次低质量 Smoke Render。
+        """
 
         return bool(
-            ctx.local_smoke_enabled or (not ctx.dry_run and settings.LOCAL_SMOKE_RENDER_ENABLED)
+            ctx.local_smoke_enabled
+            or (not ctx.dry_run and settings.LOCAL_SMOKE_RENDER_ENABLED)
+            or (ctx.dry_run and state is not None and state.unknown_animation_detected)
         )
 
     def _local_smoke_render_impl(
@@ -2503,7 +2645,11 @@ class Orchestrator:
             smoke_height = max(16, (ctx.render_profile.pixel_height // 8) // 2 * 2)
             smoke_fps = min(ctx.render_profile.frame_rate, 15)
             local_smoke_mode = settings.LOCAL_SMOKE_RENDER_MODE
-            if settings.ADAPTIVE_SMOKE_RENDER:
+            if ctx.dry_run and state.unknown_animation_detected:
+                # 未知动画必须同时通过导入、最后一帧和短视频检查；
+                # 使用已有低质量配置，不改变正式渲染 profile。
+                local_smoke_mode = "both"
+            elif settings.ADAPTIVE_SMOKE_RENDER:
                 local_smoke_mode = (
                     "both"
                     if assess_scene_risk(state.plan, state.technical_spec).level == "high"
@@ -3158,6 +3304,12 @@ class Orchestrator:
                 self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason or "")
             elif state.slurm_job is not None:
                 self._emit("scene_submitted", scene_id=scene_id, job_id=state.slurm_job.job_id)
+            if state.unknown_animation_detected and not state.failed and not state.give_up:
+                self._emit(
+                    "scene_unknown_animation_detected",
+                    scene_id=scene_id,
+                    details=list(state.unknown_animation_details),
+                )
 
     @staticmethod
     def _planning_cycle_signature(ctx: PipelineContext) -> str:
@@ -3504,7 +3656,10 @@ class Orchestrator:
                     if not state.code or state.rewrite_feedback:
                         self._phase_emit("coding")
                         self._scene_code(ctx, scene_id, state)
-                    elif self._local_smoke_enabled(ctx) and state.local_smoke_status != "passed":
+                    elif (
+                        self._local_smoke_enabled(ctx, state)
+                        and state.local_smoke_status != "passed"
+                    ):
                         self._local_smoke_render(ctx, state)
                     self._phase_emit("reviewing")
                     self._scene_review(ctx, scene_id, state)
@@ -3845,6 +4000,7 @@ class Orchestrator:
                 f"scene_{scene_id}_technical_spec.json",
                 {
                     "schema_version": 1,
+                    "contract_version": spec.contract_version,
                     "scene_id": scene_id,
                     "input_sha256": input_sha256,
                     "spec_sha256": spec_sha256,
@@ -5597,7 +5753,7 @@ class Orchestrator:
                     self._scene_code(ctx, scene_id, state)
                     if state.failed or state.give_up:
                         return
-                elif self._local_smoke_enabled(ctx) and state.local_smoke_status != "passed":
+                elif self._local_smoke_enabled(ctx, state) and state.local_smoke_status != "passed":
                     self._local_smoke_render(ctx, state)
                 self._phase_emit("reviewing")
                 self._scene_review(ctx, scene_id, state)
@@ -5644,7 +5800,10 @@ class Orchestrator:
                     if state.rewrite_feedback:
                         self._phase_emit("coding")
                         self._scene_code(ctx, scene_id, state)
-                    elif self._local_smoke_enabled(ctx) and state.local_smoke_status != "passed":
+                    elif (
+                        self._local_smoke_enabled(ctx, state)
+                        and state.local_smoke_status != "passed"
+                    ):
                         self._local_smoke_render(ctx, state)
                     self._phase_emit("reviewing")
                     self._scene_review(ctx, scene_id, state)
@@ -6193,6 +6352,7 @@ class Orchestrator:
                     raise
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         self._write_private(path, code)
+        unknown_animation_details = self._unknown_animation_details(ctx, state, code)
         with self._state_lock:
             state.code = code
             state.class_name = class_name
@@ -6205,6 +6365,8 @@ class Orchestrator:
             state.rendered = False
             state.exported_elements_code = ""
             state.exported_elements = []
+            state.unknown_animation_detected = bool(unknown_animation_details)
+            state.unknown_animation_details = unknown_animation_details[-30:]
             state.local_smoke_status = "pending"
             self._reset_repair_progress(state)
             if code_fallback_used:
@@ -6216,6 +6378,12 @@ class Orchestrator:
             self._reset_visual_receipt(ctx, state)
             self._record_code_candidate(ctx, state, verification="validated")
             self._checkpoint(ctx, State.CODING)
+        if unknown_animation_details:
+            self._emit(
+                "scene_unknown_animation_detected",
+                scene_id=scene_id,
+                details=unknown_animation_details,
+            )
         self._local_smoke_render(ctx, state)
         api_result = lint_manim_api(
             code,
@@ -6551,6 +6719,8 @@ class Orchestrator:
                 self._update_state_ledger(ctx, state)
                 self._checkpoint(ctx, State.MONITORING)
             self._emit("scene_rendered", scene_id=job.scene_id)
+            if not ctx.visual_eval_profile.enabled:
+                self._maybe_store_recipe(ctx, state, verification="rendered")
             # 不再等整个渲染批次结束：最先完成的场景立即接受视觉检查。
             # 视觉修复若改变上游交接，会设置 stop_event 并取消后继任务。
             if ctx.visual_eval_profile.enabled:
@@ -6886,6 +7056,7 @@ class Orchestrator:
         """统一写入经过确定性校验的 AutoFix/回退候选。"""
 
         code_changed = candidate != state.code
+        unknown_animation_details = self._unknown_animation_details(ctx, state, candidate)
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
         with self._state_lock:
             state.code = candidate
@@ -6903,6 +7074,8 @@ class Orchestrator:
             state.rendered = False
             state.exported_elements_code = ""
             state.exported_elements = []
+            state.unknown_animation_detected = bool(unknown_animation_details)
+            state.unknown_animation_details = unknown_animation_details[-30:]
             state.local_smoke_status = "pending"
             state.last_repair_code_sha256 = sha256_text(candidate)
             state.last_repair_error_fp = error_fingerprint
@@ -6912,6 +7085,12 @@ class Orchestrator:
             self._record_code_candidate(ctx, state, verification="validated")
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.FIXING)
+        if unknown_animation_details:
+            self._emit(
+                "scene_unknown_animation_detected",
+                scene_id=scene_id,
+                details=unknown_animation_details,
+            )
         return code_changed
 
     def _request_continuity_rebuild(
@@ -7520,6 +7699,8 @@ class Orchestrator:
             if not lifecycle_result.is_valid:
                 return False
 
+        unknown_animation_details = self._unknown_animation_details(ctx, state, candidate)
+
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
         with self._state_lock:
             state.code = candidate
@@ -7533,6 +7714,8 @@ class Orchestrator:
             state.rendered = False
             state.exported_elements_code = ""
             state.exported_elements = []
+            state.unknown_animation_detected = bool(unknown_animation_details)
+            state.unknown_animation_details = unknown_animation_details[-30:]
             state.local_smoke_status = "pending"
             self._reset_repair_progress(state)
             self._remove_element_manifest_scene(ctx, scene_id)
@@ -7544,6 +7727,12 @@ class Orchestrator:
             file_path=str(ctx.paths.scenes / f"scene_{scene_id}.py"),
         )
         self._emit("scene_review_fix_applied", scene_id=scene_id, severity=result.severity)
+        if unknown_animation_details:
+            self._emit(
+                "scene_unknown_animation_detected",
+                scene_id=scene_id,
+                details=unknown_animation_details,
+            )
         return True
 
     def _apply_review_result(
@@ -7880,6 +8069,75 @@ class Orchestrator:
             raise RuntimeError(f"Scene {artifact.scene_id} 的渲染产物哈希不一致")
         return video
 
+    def _maybe_store_recipe(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+        *,
+        verification: str,
+    ) -> None:
+        """为成功渲染的场景保存本地匿名配方；配方失败不影响主流水线。"""
+
+        if ctx.dry_run or ctx.direct_render:
+            return
+        with self._state_lock:
+            if (
+                not state.rendered
+                or not state.reviewed
+                or state.artifact is None
+                or not state.artifact.verified
+                or not state.code
+            ):
+                return
+            code = state.code
+            plan = state.plan
+            technical_spec = state.technical_spec
+        object_kinds = [item.kind for item in [*plan.inherited_elements, *plan.new_elements]]
+        capabilities = []
+        if technical_spec is not None:
+            capabilities.extend(item.constructor for item in technical_spec.objects)
+            if technical_spec.latex.required:
+                capabilities.append("latex")
+        try:
+            record, path, created = self.recipe_store.save(
+                code,
+                renderer=ctx.render_profile.renderer,
+                semantic_intent=plan.math_concept,
+                object_kinds=object_kinds,
+                capabilities=capabilities,
+                verification=verification,
+            )
+        except Exception as exc:
+            self._emit("recipe_warning", scene_id=plan.scene_id, reason=str(exc)[:2_000])
+            return
+        if not created:
+            return
+        self._emit(
+            "recipe_saved",
+            scene_id=plan.scene_id,
+            recipe_id=record.recipe_id,
+            verification=verification,
+        )
+        # 已经存在索引时才自动增量刷新。没有索引意味着用户尚未启用
+        # 自动构建流程，保存配方本身仍然成功且可在下次手动 index 时使用。
+        if not (
+            self.rag.enabled and self.rag.embedding_configured and self.rag.index_path.is_file()
+        ):
+            return
+        try:
+            result = self.rag.refresh_recipe(path)
+        except Exception as exc:
+            warning = f"配方已保存，但 RAG 索引未刷新：{str(exc)[:1_500]}"
+            with self._state_lock:
+                ctx.rag_warnings.append(warning)
+            self._emit("recipe_index_warning", scene_id=plan.scene_id, reason=warning)
+            return
+        self._emit(
+            "recipe_index_refreshed",
+            scene_id=plan.scene_id,
+            chunk_count=result.chunk_count,
+        )
+
     @staticmethod
     def _scene_visual_context(ctx: PipelineContext, state: SceneState) -> str:
         payload = {
@@ -8036,6 +8294,7 @@ class Orchestrator:
                 raise RuntimeError(f"Scene {scene_id} 的视觉候选类名与视频产物不一致")
             code_changed = candidate.code != state.code
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate.code)
+        unknown_animation_details = self._unknown_animation_details(ctx, state, candidate.code)
         with self._state_lock:
             state.code = candidate.code
             state.class_name = candidate.class_name
@@ -8056,6 +8315,8 @@ class Orchestrator:
             state.visual_report_sha256 = candidate.report_sha256
             state.visual_artifact_sha256 = candidate.artifact.video_sha256
             state.visual_feedback = ""
+            state.unknown_animation_detected = bool(unknown_animation_details)
+            state.unknown_animation_details = unknown_animation_details[-30:]
             self._reset_repair_progress(state)
             self._record_code_candidate(
                 ctx,
@@ -8063,6 +8324,12 @@ class Orchestrator:
                 verification="rendered",
                 artifact=candidate.artifact,
                 visual_score=candidate.score,
+            )
+        if unknown_animation_details:
+            self._emit(
+                "scene_unknown_animation_detected",
+                scene_id=scene_id,
+                details=unknown_animation_details,
             )
         return code_changed
 
@@ -8302,6 +8569,7 @@ class Orchestrator:
                     scene_id=scene_id,
                     score=score,
                 )
+                self._maybe_store_recipe(ctx, state, verification="visual_pass")
                 continue
 
             with self._state_lock:

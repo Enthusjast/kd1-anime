@@ -28,36 +28,8 @@ from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
 from kd1_anime.config import settings
 
-LifecycleAction = Literal[
-    "define",
-    "add",
-    "create",
-    "write",
-    "fade_in",
-    "transform",
-    "replacement_transform",
-    "animate",
-    "keep",
-    "fade_out",
-    "uncreate",
-    "remove",
-]
-
-TechnicalOperation = Literal[
-    "define",
-    "add",
-    "create",
-    "write",
-    "fade_in",
-    "transform",
-    "replacement_transform",
-    "animate",
-    "keep",
-    "fade_out",
-    "uncreate",
-    "remove",
-    "wait",
-]
+LifecycleAction = Literal["define", "introduce", "update", "keep", "remove"]
+SemanticAnimationAction = Literal["introduce", "update", "remove", "camera", "hold"]
 
 
 class TechnicalObject(BaseModel):
@@ -81,14 +53,19 @@ class TechnicalObject(BaseModel):
 
 
 class TechnicalAnimation(BaseModel):
-    """一条可执行的动画/状态事件。"""
+    """一条与具体 Manim 动画类解耦的状态事件。
+
+    Coder 可以自由选择适合当前画面的 Animation 或 ``.animate`` 调用；
+    这里仅描述对象状态如何变化。这样新增的 Manim 动画无需先加入
+    技术计划的枚举表，也不会因为名称未被静态分析器认识而被错误拒绝。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     event_id: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,99}$")
     start_seconds: float = Field(ge=0, le=600)
     end_seconds: float = Field(gt=0, le=600)
-    operation: TechnicalOperation
+    semantic_action: SemanticAnimationAction
     source_element_ids: list[str] = Field(default_factory=list, max_length=50)
     target_element_ids: list[str] = Field(default_factory=list, max_length=50)
     create_element_ids: list[str] = Field(default_factory=list, max_length=50)
@@ -135,6 +112,9 @@ class TechnicalSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # 该字段是直接替换旧技术合同的明确版本闸门。旧合同没有该字段，
+    # 恢复时会被标记为 stale 而不是悄悄按新语义解释。
+    contract_version: Literal[2] = 2
     scene_id: int = Field(ge=1)
     renderer: Literal["cairo", "opengl"] = "cairo"
     objects: list[TechnicalObject] = Field(default_factory=list, max_length=200)
@@ -207,16 +187,15 @@ def _normalise_technical_lifecycle(
     required_boundary_ids: set[str],
     timeline_element_ids: dict[str, set[str]] | None = None,
 ) -> tuple[TechnicalSpec, tuple[str, ...]]:
-    """修复技术模型最常见的生命周期歧义。
+    """修复可以从对象边界合同确定的语义生命周期歧义。
 
-    模型经常把 ``Transform`` 的目标同时放进 ``create_element_ids``，并在
-    收尾事件里列出从未淡入的可选步骤标签。前者实际表达的是
-    ``ReplacementTransform``；后者是安全的空操作。两种情况都能由当前
-    TechnicalSpec 的状态合同确定，不应浪费有限的 LLM 重试次数。
+    这里不尝试猜测具体的 Manim 动画类。``semantic_action`` 只表达
+    状态变化；Coder 可以用任意合适的 Animation 实现同一事件。
     """
 
     active = {item.element_id for item in spec.objects if item.initially_active}
     object_by_id = {item.element_id: item for item in spec.objects}
+    known_ids = set(object_by_id)
     normalized_events: dict[int, TechnicalAnimation] = {}
     synthetic_events: dict[int, list[TechnicalAnimation]] = {}
     repairs: list[str] = []
@@ -226,40 +205,34 @@ def _normalise_technical_lifecycle(
         enumerate(spec.animations),
         key=lambda pair: (pair[1].start_seconds, pair[1].event_id, pair[0]),
     )
+
+    def unique_event_id(base: str) -> str:
+        candidate = base[:100]
+        suffix = 2
+        while candidate in existing_event_ids:
+            suffix_text = f"_{suffix}"
+            candidate = f"{base[: 100 - len(suffix_text)]}{suffix_text}"
+            suffix += 1
+        existing_event_ids.add(candidate)
+        return candidate
+
     for index, original in ordered_events:
         event = original
+        action = event.semantic_action
+        source_ids = set(event.source_element_ids)
         target_ids = set(event.target_element_ids)
         create_ids = set(event.create_element_ids)
+        remove_ids = set(event.remove_element_ids)
 
-        if (
-            event.operation in {"transform", "replacement_transform"}
-            and not event.source_element_ids
-        ):
+        if action == "update" and not source_ids:
             timeline_ids = set((timeline_element_ids or {}).get(event.event_id, ()))
-            inferred_from_timeline = timeline_ids & active
-            if inferred_from_timeline:
-                event = event.model_copy(
-                    update={
-                        "source_element_ids": sorted(inferred_from_timeline),
-                        "api_notes": _append_api_repair_note(
-                            event.api_notes,
-                            "已从同名 ScenePlan.timeline 事件的 active 元素推断 source_element_ids",
-                        ),
-                    }
-                )
-                repairs.append(
-                    f"事件 {event.event_id} 从时间线补齐 source_element_ids: "
-                    + ", ".join(sorted(inferred_from_timeline))
-                )
-                changed = True
-
-        if (
-            event.operation in {"transform", "replacement_transform"}
-            and not event.source_element_ids
-        ):
-            inferred_sources = target_ids & active
-            if not inferred_sources:
-                inferred_sources = {
+            inferred = timeline_ids & active
+            inference_note = "已从同名 ScenePlan.timeline 事件的 active 元素"
+            if not inferred:
+                inferred = target_ids & active
+                inference_note = "已从当前 active target"
+            if not inferred:
+                inferred = {
                     dependency
                     for target_id in target_ids
                     for dependency in (
@@ -267,14 +240,16 @@ def _normalise_technical_lifecycle(
                     )
                     if dependency in active
                 }
-            if not inferred_sources:
-                inferred_sources = {
+                inference_note = "已从对象依赖关系"
+            if not inferred:
+                inferred = {
                     candidate
                     for target_id in target_ids
                     for candidate in active
                     if target_id.startswith(f"{candidate}_")
                 }
-            if not inferred_sources:
+                inference_note = "已从对象命名关系"
+            if not inferred:
                 mentioned_ids = {
                     element_id
                     for element_id in object_by_id
@@ -283,233 +258,226 @@ def _normalise_technical_lifecycle(
                         event.api_notes,
                     )
                 }
-                inferred_sources = mentioned_ids & active
+                inferred = mentioned_ids & active
+                inference_note = "已从 api_notes 中的对象引用"
                 if not target_ids and mentioned_ids:
                     target_ids = mentioned_ids
-                    event = event.model_copy(update={"target_element_ids": sorted(mentioned_ids)})
-            if not inferred_sources and target_ids:
-                # source 仍然缺失且 target 全部是已声明对象时，原始
-                # TechnicalSpec 已经无法表达一次真实的“从 A 到 B”变换。
-                # 不要让无 source 的 transform 把整个场景挡死：将其
-                # 降级为明确的首次引入。若 target 当前 active，下面的
-                # introducer 规范会进一步收敛为 animate；若 inactive，
-                # 则由 fade_in 正确建立对象状态。
-                known_targets = target_ids & set(object_by_id)
-                if known_targets == target_ids:
+            if inferred:
+                source_ids = inferred
+                event = event.model_copy(
+                    update={
+                        "source_element_ids": sorted(source_ids),
+                        "target_element_ids": sorted(target_ids),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            f"{inference_note}补齐 source_element_ids",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 补齐 source_element_ids: " + ", ".join(sorted(inferred))
+                )
+                changed = True
+            elif target_ids and target_ids <= known_ids:
+                # 没有可靠的变换源时，首次展示是唯一可验证的解释；
+                # 不再把某个未声明的具体动画类写入技术合同。
+                action = "introduce"
+                source_ids = set()
+                create_ids = set(target_ids)
+                event = event.model_copy(
+                    update={
+                        "semantic_action": action,
+                        "source_element_ids": [],
+                        "target_element_ids": sorted(target_ids),
+                        "create_element_ids": sorted(create_ids),
+                        "remove_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "缺少可确定的 update source，按保守首次引入处理",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 缺少 source，降级为 introduce: "
+                    + ", ".join(sorted(target_ids))
+                )
+                changed = True
+            else:
+                action = "hold"
+                event = event.model_copy(
+                    update={
+                        "semantic_action": action,
+                        "source_element_ids": [],
+                        "target_element_ids": [],
+                        "create_element_ids": [],
+                        "remove_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "缺少可确定的 update source，按空操作处理",
+                        ),
+                    }
+                )
+                source_ids = target_ids = create_ids = remove_ids = set()
+                repairs.append(f"事件 {event.event_id} 缺少 source，按 hold 处理")
+                changed = True
+
+        if action == "update":
+            inactive_sources = source_ids - active
+            # 模型有时会把新对象同时放进 source 和 target/create；
+            # 新对象不能作为 update 源，保留已有 active 源即可。
+            removable = inactive_sources & (target_ids | create_ids)
+            if removable:
+                source_ids -= removable
+                event = event.model_copy(
+                    update={
+                        "source_element_ids": sorted(source_ids),
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "已移除同时作为新对象声明的 inactive source",
+                        ),
+                    }
+                )
+                repairs.append(
+                    f"事件 {event.event_id} 删除 inactive source: " + ", ".join(sorted(removable))
+                )
+                changed = True
+            if not source_ids:
+                candidates = (target_ids | create_ids) & known_ids
+                if candidates:
+                    action = "introduce"
+                    source_ids = set()
+                    target_ids = candidates
+                    create_ids = candidates
                     event = event.model_copy(
                         update={
-                            "operation": "fade_in",
+                            "semantic_action": action,
                             "source_element_ids": [],
                             "target_element_ids": sorted(target_ids),
-                            "create_element_ids": sorted(target_ids),
+                            "create_element_ids": sorted(create_ids),
+                            "remove_element_ids": [],
                             "api_notes": _append_api_repair_note(
                                 event.api_notes,
-                                "缺少可确定的 transform source，按保守首次引入处理",
+                                "没有 active update source，剩余对象按首次引入处理",
                             ),
                         }
                     )
-                    create_ids = set(target_ids)
                     repairs.append(
-                        f"事件 {event.event_id} 缺少 source，降级为 fade_in: "
-                        + ", ".join(sorted(target_ids))
+                        f"事件 {event.event_id} 删除 inactive source 后改为 introduce: "
+                        + ", ".join(sorted(candidates))
                     )
                     changed = True
-            if inferred_sources:
-                event = event.model_copy(
-                    update={
-                        "source_element_ids": sorted(inferred_sources),
-                        "api_notes": _append_api_repair_note(
-                            event.api_notes,
-                            "缺少 source_element_ids，已从 active target/依赖关系推断",
-                        ),
-                    }
-                )
-                repairs.append(
-                    f"事件 {event.event_id} 补齐 source_element_ids: "
-                    + ", ".join(sorted(inferred_sources))
-                )
-                changed = True
-
-        if (
-            event.operation in {"transform", "replacement_transform"}
-            and not event.source_element_ids
-        ):
-            # 没有任何可确定的 source 时，继续保留 transform 只会让
-            # 编译器在同一错误上重试。它既没有可执行的动画源，也不应
-            # 让 Coder 猜测一个对象；降级为空操作并保留时间线区间，
-            # 由其它事件继续完成场景。若 target 已被上面的安全路径
-            # 转成 fade_in，这里不会触发。
-            event = event.model_copy(
-                update={
-                    "operation": "wait",
-                    "source_element_ids": [],
-                    "target_element_ids": [],
-                    "create_element_ids": [],
-                    "remove_element_ids": [],
-                    "api_notes": _append_api_repair_note(
-                        event.api_notes,
-                        "缺少可确定的 source，按空操作处理，避免让 Coder 猜测对象",
-                    ),
-                }
-            )
-            target_ids = set()
-            create_ids = set()
-            repairs.append(f"事件 {event.event_id} 缺少 source，按 wait 处理")
-            changed = True
-
-        if event.operation in {"transform", "replacement_transform"}:
-            inactive_sources = set(event.source_element_ids) - active
-            removable_sources = inactive_sources & (target_ids | create_ids)
-            if removable_sources:
-                # 模型有时把“新网格/新标签”同时写进
-                # source、target、create。新对象还没有 active 状态，
-                # 不能作为 Transform source；它应由 target/create
-                # 负责引入，而已有 active source 继续完成变换。
-                remaining_sources = [
-                    item for item in event.source_element_ids if item not in removable_sources
-                ]
-                event = event.model_copy(
-                    update={
-                        "source_element_ids": remaining_sources,
-                        "api_notes": _append_api_repair_note(
-                            event.api_notes,
-                            "已移除同时作为新 target/create 的 inactive source",
-                        ),
-                    }
-                )
-                repairs.append(
-                    f"事件 {event.event_id} 删除 inactive source: "
-                    + ", ".join(sorted(removable_sources))
-                )
-                changed = True
-
-        if (
-            event.operation in {"transform", "replacement_transform"}
-            and not event.source_element_ids
-        ):
-            # 上面的兼容修复会把“新对象既是 source 又是 target/create”中的
-            # inactive source 删除。此时原事件已经不再是 Transform：它表达
-            # 的是把一组尚未进入 Scene 的对象首次展示出来。若仍保留
-            # transform，编译器只能报告一个没有 source 的错误；按一次明确
-            # 的 fade_in 处理既符合剩余字段，也让后续事件可以使用这些对象。
-            candidate_ids = target_ids | create_ids
-            known_candidates = candidate_ids & set(object_by_id)
-            if candidate_ids and known_candidates == candidate_ids:
-                event = event.model_copy(
-                    update={
-                        "operation": "fade_in",
-                        "source_element_ids": [],
-                        "target_element_ids": sorted(candidate_ids),
-                        "create_element_ids": sorted(candidate_ids),
-                        "api_notes": _append_api_repair_note(
-                            event.api_notes,
-                            "inactive source 已删除，剩余对象按首次 fade_in 引入",
-                        ),
-                    }
-                )
-                target_ids = set(candidate_ids)
-                create_ids = set(candidate_ids)
-                repairs.append(
-                    f"事件 {event.event_id} 删除 inactive source 后改为 fade_in: "
-                    + ", ".join(sorted(candidate_ids))
-                )
-                changed = True
-
-        if event.operation in {"transform", "replacement_transform"}:
-            # Transform 的 create_element_ids 不能依附在同一个
-            # Transform 上：Manim 只会变换 source，target 是快照，
-            # 其它 create 对象不会自动进入 Scene。模型常把“同步淡入
-            # 特征向量”写进 apply_transform 事件，随后在 highlight
-            # 阶段引用一个从未 active 的对象。拆成一条明确的 fade_in
-            # 事件，保留原变换事件的 source/target 语义。
-            extra_create_ids = create_ids - target_ids
-            if extra_create_ids:
-                base_event_id = f"{event.event_id}_create"[:100]
-                synthetic_id = base_event_id
-                suffix = 2
-                while synthetic_id in existing_event_ids:
-                    suffix_text = f"_{suffix}"
-                    synthetic_id = f"{base_event_id[: 100 - len(suffix_text)]}{suffix_text}"
-                    suffix += 1
-                existing_event_ids.add(synthetic_id)
+                else:
+                    action = "hold"
+                    event = event.model_copy(
+                        update={
+                            "semantic_action": action,
+                            "source_element_ids": [],
+                            "target_element_ids": [],
+                            "create_element_ids": [],
+                            "remove_element_ids": [],
+                            "api_notes": _append_api_repair_note(
+                                event.api_notes,
+                                "没有可确定的 update source，按空操作处理",
+                            ),
+                        }
+                    )
+                    source_ids = target_ids = create_ids = remove_ids = set()
+                    repairs.append(f"事件 {event.event_id} 没有 source，按 hold 处理")
+                    changed = True
+            # ``create_element_ids`` 在语义层表示新对象的活动身份。
+            # update 不应同时承担引入；拆为独立的 introduce 事件。
+            if action == "update" and create_ids:
+                introduced_ids = set(create_ids)
+                synthetic_id = unique_event_id(f"{event.event_id}_introduce")
                 synthetic_events[index] = [
                     TechnicalAnimation(
                         event_id=synthetic_id,
                         start_seconds=event.start_seconds,
                         end_seconds=event.end_seconds,
-                        operation="fade_in",
-                        target_element_ids=sorted(extra_create_ids),
-                        create_element_ids=sorted(extra_create_ids),
+                        semantic_action="introduce",
+                        target_element_ids=sorted(create_ids),
+                        create_element_ids=sorted(create_ids),
                         claim_ids=list(event.claim_ids),
                         api_notes=(
-                            "从复合 transform 事件拆出的新对象引入："
-                            + ", ".join(sorted(extra_create_ids))
+                            "从复合 update 事件拆出的新对象引入：" + ", ".join(sorted(create_ids))
                         ),
                     )
                 ]
                 event = event.model_copy(
                     update={
-                        "create_element_ids": sorted(create_ids - extra_create_ids),
+                        "create_element_ids": [],
                         "api_notes": _append_api_repair_note(
                             event.api_notes,
-                            "新对象已拆分为独立 fade_in 事件",
+                            "新对象已拆分为独立 introduce 事件",
                         ),
                     }
                 )
-                target_ids = set(event.target_element_ids)
-                create_ids = set(event.create_element_ids)
+                create_ids = set()
                 repairs.append(
-                    f"事件 {event.event_id} 拆分新对象引入: " + ", ".join(sorted(extra_create_ids))
+                    f"事件 {event.event_id} 拆分新对象引入: " + ", ".join(sorted(introduced_ids))
                 )
                 changed = True
 
-        # 模型有时把已经处于 active 的继承对象误填到一个 ``create``
-        # 事件的 target 中（例如“绘制切线”却把 point_P 当成目标）。
-        # 这不是重新创建对象；按现有对象执行 animate 才符合生命周期，
-        # 否则编译器会在不涉及新对象的事件上报重复创建。
-        if event.operation in {"create", "write", "fade_in", "add"}:
+        if action == "introduce":
+            converted_to_update = False
+            if source_ids:
+                source_ids = set()
+                event = event.model_copy(
+                    update={
+                        "source_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "introduce 事件不使用 source_element_ids",
+                        ),
+                    }
+                )
+                repairs.append(f"事件 {event.event_id} 清空 introduce 的 source")
+                changed = True
             introduced = target_ids | create_ids
             duplicate_active = introduced & active
             if duplicate_active:
-                remaining_targets = target_ids - duplicate_active
-                remaining_creates = create_ids - duplicate_active
-                source_ids = list(
-                    dict.fromkeys([*event.source_element_ids, *sorted(duplicate_active)])
-                )
-                if remaining_targets or remaining_creates:
+                fresh = introduced - duplicate_active
+                if fresh:
+                    target_ids &= fresh
+                    create_ids &= fresh
+                    update_id = unique_event_id(f"{event.event_id}_update")
+                    synthetic_events[index] = [
+                        TechnicalAnimation(
+                            event_id=update_id,
+                            start_seconds=event.start_seconds,
+                            end_seconds=event.end_seconds,
+                            semantic_action="update",
+                            source_element_ids=sorted(duplicate_active),
+                            claim_ids=list(event.claim_ids),
+                            api_notes="从复合 introduce 事件拆出的 active 对象更新："
+                            + ", ".join(sorted(duplicate_active)),
+                        )
+                    ]
                     event = event.model_copy(
                         update={
-                            "target_element_ids": sorted(remaining_targets),
-                            "create_element_ids": sorted(remaining_creates),
-                            "source_element_ids": source_ids,
+                            "target_element_ids": sorted(target_ids),
+                            "create_element_ids": sorted(create_ids),
                             "api_notes": _append_api_repair_note(
                                 event.api_notes,
-                                "已移除 introducer 中重复的 active 对象",
-                            ),
-                        }
-                    )
-                elif source_ids:
-                    event = event.model_copy(
-                        update={
-                            "operation": "animate",
-                            "source_element_ids": source_ids,
-                            "target_element_ids": [],
-                            "create_element_ids": [],
-                            "api_notes": _append_api_repair_note(
-                                event.api_notes,
-                                "目标对象已 active，按 animate 处理而非重复创建",
+                                "已移除 introduce 中重复的 active 对象",
                             ),
                         }
                     )
                 else:
+                    action = "update"
+                    converted_to_update = True
+                    source_ids = duplicate_active
+                    target_ids = set()
+                    create_ids = set()
                     event = event.model_copy(
                         update={
-                            "operation": "wait",
+                            "semantic_action": action,
+                            "source_element_ids": sorted(source_ids),
                             "target_element_ids": [],
                             "create_element_ids": [],
                             "api_notes": _append_api_repair_note(
                                 event.api_notes,
-                                "目标对象已 active 且没有新增对象，按空操作处理",
+                                "目标对象已 active，按 update 处理而非重复引入",
                             ),
                         }
                     )
@@ -518,242 +486,148 @@ def _normalise_technical_lifecycle(
                     + ", ".join(sorted(duplicate_active))
                 )
                 changed = True
-
-        # ``create_element_ids`` 是 target 变成后续 active 对象的明确声明；
-        # 对 transform 来说，这等价于 ReplacementTransform，而不是原地
-        # Transform。修正 operation 并清除重复的 create 标记，避免状态
-        # 模拟把同一个 target 计入两次。
-        if (
-            event.operation == "transform"
-            and target_ids
-            and create_ids
-            and create_ids <= target_ids
-        ):
-            event = event.model_copy(
-                update={
-                    "operation": "replacement_transform",
-                    "create_element_ids": [],
-                    "api_notes": _append_api_repair_note(
-                        event.api_notes,
-                        "Technical Planner 已按 target 成为 active 的声明改用 ReplacementTransform",
-                    ),
-                }
-            )
-            repairs.append(f"事件 {event.event_id} 的 transform 已规范为 replacement_transform")
-            changed = True
-        elif event.operation == "replacement_transform" and (
-            (set(event.source_element_ids) & required_boundary_ids) - target_ids
-        ):
-            # 如果一个 ReplacementTransform 的 source 是场景边界必须
-            # 继续交接的对象，而 target 却只是临时展示对象（例如
-            # ``j_hat -> j_hat_transformed``），替换语义会把 source 从
-            # Scene 中移除，导致最终导出缺失。边界对象的身份优先于模型
-            # 对“替换”的措辞：改为原地 Transform，让 target 只作为
-            # 目标快照，保留 source 的 active 身份。
-            preserved_sources = (set(event.source_element_ids) & required_boundary_ids) - target_ids
-            if preserved_sources:
+            if not (target_ids | create_ids) and not converted_to_update:
+                action = "hold"
                 event = event.model_copy(
                     update={
-                        "operation": "transform",
-                        "create_element_ids": [],
-                        "api_notes": _append_api_repair_note(
-                            event.api_notes,
-                            "边界导出对象必须保留原身份，已将 replacement_transform 规范为原地 transform",
-                        ),
-                    }
-                )
-                repairs.append(
-                    f"事件 {event.event_id} 保留必需边界对象: "
-                    + ", ".join(sorted(preserved_sources))
-                )
-                changed = True
-        elif event.operation == "replacement_transform" and create_ids:
-            event = event.model_copy(
-                update={
-                    "create_element_ids": [],
-                    "api_notes": _append_api_repair_note(
-                        event.api_notes,
-                        "ReplacementTransform 的 target 已由 operation 管理",
-                    ),
-                }
-            )
-            repairs.append(f"事件 {event.event_id} 删除了重复的 create_element_ids")
-            changed = True
-
-        if event.operation in {"animate", "keep"} and not event.source_element_ids:
-            inactive_targets = target_ids - active
-            if inactive_targets:
-                # 模型有时把“显示/高亮一个新元素”写成没有 source
-                # 的 animate/keep。对于没有 source 的事件，唯一可执行
-                # 的语义就是首次引入；将其规范为 fade_in，避免在编译
-                # 时把一个从未 active 的对象当作已存在对象使用。
-                event = event.model_copy(
-                    update={
-                        "operation": "fade_in",
-                        "target_element_ids": sorted(inactive_targets),
-                        "create_element_ids": sorted(inactive_targets),
-                        "api_notes": _append_api_repair_note(
-                            event.api_notes,
-                            "无 source 的新对象按首次 fade_in 引入",
-                        ),
-                    }
-                )
-                repairs.append(
-                    f"事件 {event.event_id} 将 inactive target 规范为 fade_in: "
-                    + ", ".join(sorted(inactive_targets))
-                )
-                changed = True
-
-        if event.operation in {"animate", "keep"} and event.source_element_ids:
-            inactive_sources = set(event.source_element_ids) - active
-            declared_introducers = target_ids | create_ids
-            recoverable_sources = inactive_sources & declared_introducers & set(object_by_id)
-            if recoverable_sources and recoverable_sources == inactive_sources:
-                # 模型有时把首次高亮/闪烁写成 animate，同时把对象放进
-                # create_element_ids。它还没有 active 身份，不能直接执行
-                # animate；将这一条规范为首次 fade_in，避免后续相同的
-                # “尚未 active”错误。只有 source 同时明确属于 target/create
-                # 且已在计划对象表中时才做这个无歧义修复。
-                remaining_active_sources = set(event.source_element_ids) - recoverable_sources
-                if remaining_active_sources:
-                    # 混合 active/inactive source 的复杂复合动画不在这里
-                    # 拆分，保留给编译器和 Technical Planner 反馈处理。
-                    pass
-                else:
-                    event = event.model_copy(
-                        update={
-                            "operation": "fade_in",
-                            "source_element_ids": [],
-                            "target_element_ids": sorted(recoverable_sources),
-                            "create_element_ids": sorted(recoverable_sources),
-                            "api_notes": _append_api_repair_note(
-                                event.api_notes,
-                                "inactive source 同时声明为 create，按首次 fade_in 引入",
-                            ),
-                        }
-                    )
-                    target_ids = set(recoverable_sources)
-                    create_ids = set(recoverable_sources)
-                    repairs.append(
-                        f"事件 {event.event_id} 的 inactive source 规范为 fade_in: "
-                        + ", ".join(sorted(recoverable_sources))
-                    )
-                    changed = True
-
-        if event.operation in {"fade_out", "uncreate", "remove"}:
-            source_ids = set(event.source_element_ids)
-            remove_ids = set(event.remove_element_ids)
-            referenced_exit_ids = source_ids | remove_ids
-            if not referenced_exit_ids:
-                event = event.model_copy(
-                    update={
-                        "operation": "wait",
+                        "semantic_action": action,
                         "target_element_ids": [],
                         "create_element_ids": [],
                         "api_notes": _append_api_repair_note(
                             event.api_notes,
-                            "退出事件没有对象引用，按空操作处理",
+                            "introduce 没有新对象，按空操作处理",
                         ),
                     }
                 )
-                repairs.append(f"事件 {event.event_id} 的空退出操作已规范为 wait")
-                changed = True
-                # 空退出事件不改变 active 集合，直接进入后续统一的事件
-                # 规范化和状态模拟。
-                source_ids = set()
-                remove_ids = set()
-                referenced_exit_ids = set()
-            inactive = referenced_exit_ids - active
-            protected = referenced_exit_ids & required_boundary_ids
-            optional_inactive = inactive - required_boundary_ids
-            if optional_inactive or protected:
-                # 过滤从未 active 的临时对象，同时保护计划要求交接的
-                # 边界对象。required 对象若本来就未 active，则不在这里
-                # 静默修复，后续编译器仍会报告真正的缺失。
-                kept_sources = [
-                    item
-                    for item in event.source_element_ids
-                    if item in active and item not in required_boundary_ids
-                ]
-                kept_removes = [
-                    item
-                    for item in event.remove_element_ids
-                    if item in active and item not in required_boundary_ids
-                ]
-                if protected:
-                    repairs.append(
-                        f"事件 {event.event_id} 保留必需边界对象: " + ", ".join(sorted(protected))
-                    )
-                if not kept_sources and not kept_removes:
-                    event = event.model_copy(
-                        update={
-                            "operation": "wait",
-                            "source_element_ids": [],
-                            "target_element_ids": [],
-                            "create_element_ids": [],
-                            "remove_element_ids": [],
-                            "api_notes": _append_api_repair_note(
-                                event.api_notes,
-                                "清理事件没有可退出的非边界对象，按空操作处理",
-                            ),
-                        }
-                    )
-                else:
-                    event = event.model_copy(
-                        update={
-                            "source_element_ids": kept_sources,
-                            "remove_element_ids": kept_removes,
-                            "api_notes": _append_api_repair_note(
-                                event.api_notes,
-                                "已过滤无效或不可退出的对象引用",
-                            ),
-                        }
-                    )
-                repairs.append(
-                    f"事件 {event.event_id} 已规范化退出对象: "
-                    + ", ".join(sorted(optional_inactive | protected))
-                )
+                repairs.append(f"事件 {event.event_id} 的空 introduce 已规范为 hold")
                 changed = True
 
-        if event.operation in {"fade_out", "uncreate", "remove"} and event.target_element_ids:
+        if action == "remove":
+            referenced = source_ids | remove_ids
+            if target_ids or create_ids:
+                event = event.model_copy(
+                    update={
+                        "target_element_ids": [],
+                        "create_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "remove 事件不使用 target/create",
+                        ),
+                    }
+                )
+                target_ids = create_ids = set()
+                repairs.append(f"事件 {event.event_id} 清空 remove 的 target/create")
+                changed = True
+            if not referenced:
+                action = "hold"
+                event = event.model_copy(
+                    update={
+                        "semantic_action": action,
+                        "source_element_ids": [],
+                        "remove_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "remove 没有对象引用，按空操作处理",
+                        ),
+                    }
+                )
+                source_ids = remove_ids = set()
+                repairs.append(f"事件 {event.event_id} 的空 remove 已规范为 hold")
+                changed = True
+            else:
+                inactive = referenced - active
+                protected = referenced & required_boundary_ids
+                optional_inactive = inactive - required_boundary_ids
+                if optional_inactive or protected:
+                    source_ids = {
+                        item
+                        for item in source_ids
+                        if item in active and item not in required_boundary_ids
+                    }
+                    remove_ids = {
+                        item
+                        for item in remove_ids
+                        if item in active and item not in required_boundary_ids
+                    }
+                    if not (source_ids | remove_ids):
+                        action = "hold"
+                        event = event.model_copy(
+                            update={
+                                "semantic_action": action,
+                                "source_element_ids": [],
+                                "remove_element_ids": [],
+                                "api_notes": _append_api_repair_note(
+                                    event.api_notes,
+                                    "没有可退出的非边界对象，按空操作处理",
+                                ),
+                            }
+                        )
+                    else:
+                        event = event.model_copy(
+                            update={
+                                "source_element_ids": sorted(source_ids),
+                                "remove_element_ids": sorted(remove_ids),
+                                "api_notes": _append_api_repair_note(
+                                    event.api_notes,
+                                    "已过滤无效或不可退出的对象引用",
+                                ),
+                            }
+                        )
+                    repairs.append(
+                        f"事件 {event.event_id} 已规范化退出对象: "
+                        + ", ".join(sorted(optional_inactive | protected))
+                    )
+                    changed = True
+
+        if action == "hold" and (target_ids or create_ids or remove_ids):
             event = event.model_copy(
                 update={
                     "target_element_ids": [],
+                    "create_element_ids": [],
+                    "remove_element_ids": [],
                     "api_notes": _append_api_repair_note(
                         event.api_notes,
-                        "退出操作不使用 target_element_ids",
+                        "hold 事件只保留可选的 active source",
                     ),
                 }
             )
-            repairs.append(f"事件 {event.event_id} 清空了退出操作中的 target_element_ids")
+            target_ids = create_ids = remove_ids = set()
             changed = True
 
+        if action == "camera" and (source_ids or target_ids or create_ids or remove_ids):
+            # 相机不是 Mobject 边界状态；保留引用让编译器明确报错，
+            # 不把它静默解释成普通对象动画。
+            repairs.append(f"事件 {event.event_id} 的 camera 事件含对象引用，保留交给编译器检查")
+
+        event = event.model_copy(
+            update={
+                "semantic_action": action,
+                "source_element_ids": sorted(source_ids),
+                "target_element_ids": sorted(target_ids),
+                "create_element_ids": sorted(create_ids),
+                "remove_element_ids": sorted(remove_ids),
+            }
+        )
         normalized_events[index] = event
 
-        # 与 compile_technical_spec 的生命周期语义保持完全一致。
-        if event.operation in {"create", "write", "fade_in", "add"}:
-            active.update(set(event.create_element_ids) | set(event.target_element_ids))
-            if not event.create_element_ids and not event.target_element_ids:
-                active.update(event.source_element_ids)
-        elif event.operation == "replacement_transform":
-            active.difference_update(event.source_element_ids)
-            active.update(event.target_element_ids)
-        elif event.operation in {"fade_out", "uncreate", "remove"}:
-            active.difference_update(set(event.source_element_ids) or set(event.remove_element_ids))
-        active.difference_update(event.remove_element_ids)
+        # 与 compile_technical_spec 使用完全相同的语义模拟；拆出的
+        # introduce 先生效，再处理原 update。
         for synthetic in synthetic_events.get(index, []):
-            active.update(set(synthetic.target_element_ids) | set(synthetic.create_element_ids))
+            if synthetic.semantic_action == "introduce":
+                active.update(synthetic.target_element_ids or synthetic.create_element_ids)
+        if action == "introduce":
+            active.update(set(event.target_element_ids) | set(event.create_element_ids))
+        elif action == "remove":
+            active.difference_update(set(event.source_element_ids) | set(event.remove_element_ids))
+        active.difference_update(event.remove_element_ids)
 
     if not changed:
         return spec, ()
-    # ``ordered_events`` 只影响状态模拟，不改变模型输出的原始事件顺序；
-    # 使用原始下标而不是 event_id，避免错误的重复 ID 被兼容层悄悄合并，
-    # 让后续确定性编译器仍能报告重复事件。
     animations: list[TechnicalAnimation] = []
     for index, event in enumerate(spec.animations):
         animations.extend(synthetic_events.get(index, []))
         animations.append(normalized_events.get(index, event))
-    return spec.model_copy(update={"animations": animations}), tuple(repairs)
+    return spec.model_copy(update={"animations": animations}), tuple(dict.fromkeys(repairs))
 
 
 def _ensure_planned_removals_exit(
@@ -765,7 +639,7 @@ def _ensure_planned_removals_exit(
     """为计划明确要求退出、但 Technical Planner 漏写的对象补退出事件。
 
     ``elements_to_remove`` 是场景边界合同，不应因为模型漏填一个
-    ``fade_out`` 事件而把对象错误地带到场景末尾。这里仅补机械上确定的
+    ``remove`` 事件而把对象错误地带到场景末尾。这里仅补机械上确定的
     inherited 对象；非法的移除声明仍交给编译器报告，避免掩盖计划错误。
     """
 
@@ -779,7 +653,7 @@ def _ensure_planned_removals_exit(
     exited_ids = {
         element_id
         for event in spec.animations
-        if event.operation in {"fade_out", "uncreate", "remove"}
+        if event.semantic_action == "remove"
         for element_id in {*event.source_element_ids, *event.remove_element_ids}
     }
     missing = removable_ids - exited_ids
@@ -798,14 +672,14 @@ def _ensure_planned_removals_exit(
         event_id=event_id,
         start_seconds=max(0.0, end_seconds - tail),
         end_seconds=end_seconds,
-        operation="fade_out",
+        semantic_action="remove",
         source_element_ids=sorted(missing),
         remove_element_ids=sorted(missing),
         api_notes="根据 ScenePlan.elements_to_remove 补齐 inherited 对象的退出动画",
     )
     return (
         spec.model_copy(update={"animations": [*spec.animations, event]}),
-        ("为计划移除但未声明退出事件的元素补齐 fade_out: " + ", ".join(sorted(missing)),),
+        ("为计划移除但未声明退出事件的元素补齐语义退出事件: " + ", ".join(sorted(missing)),),
     )
 
 
@@ -821,17 +695,15 @@ def _ensure_required_export_introductions(
     ``export_element_ids`` 是场景边界合同。模型偶尔会把必需的新元素列入
     objects/export，却完全忘记在 animations 中引入它，导致生命周期编译器
     在最终状态报告“没有保留导出元素”。元素本身和其导出资格都来自
-    ScenePlan，因此补一条 ``fade_in`` 只是在恢复同一合同的确定性动作，
+    ScenePlan，因此补一条 ``introduce`` 只是在恢复同一合同的确定性动作，
     不会创造新的教学对象或数学内容。
     """
 
     introduced: set[str] = set()
     for event in spec.animations:
-        if event.operation in {"create", "write", "fade_in", "add"}:
+        if event.semantic_action == "introduce":
             introduced.update(event.target_element_ids)
             introduced.update(event.create_element_ids)
-        elif event.operation == "replacement_transform":
-            introduced.update(event.target_element_ids)
     missing = required_exports - inherited_ids - introduced
     if not missing:
         return spec, ()
@@ -845,14 +717,14 @@ def _ensure_required_export_introductions(
         event_id=event_id,
         start_seconds=0.0,
         end_seconds=min(2.0, max(0.1, duration_seconds)),
-        operation="fade_in",
+        semantic_action="introduce",
         target_element_ids=sorted(missing),
         create_element_ids=sorted(missing),
         api_notes="根据 ScenePlan 必需导出合同补齐遗漏的元素引入",
     )
     return (
         spec.model_copy(update={"animations": [event, *spec.animations]}),
-        ("为必需导出元素补齐 fade_in: " + ", ".join(sorted(missing)),),
+        ("为必需导出元素补齐 introduce: " + ", ".join(sorted(missing)),),
     )
 
 
@@ -967,8 +839,8 @@ def normalize_technical_spec_contract(
 
     ``removed_element_ids``、``export_element_ids`` 和继承对象的
     ``initially_active`` 不应由模型自由发挥；它们是边界合同的机械投影。
-    同时修复明确的 renderer/生命周期歧义（例如把带 active target 的
-    transform 规范为 replacement_transform），其余动画/导出错误仍交给
+    同时修复明确的 renderer/生命周期歧义（例如把复合 update 拆成
+    独立的 introduce 事件），其余动画/导出错误仍交给
     编译器和有限反馈重生成，避免用“自动修复”掩盖真正的技术设计错误。
     """
 
@@ -1040,10 +912,10 @@ def normalize_technical_spec_contract(
                 )
                 for element_id in getattr(normalized_event, field_name)
             }
-            if event_updates and not referenced_ids and normalized_event.operation != "wait":
+            if event_updates and not referenced_ids and normalized_event.semantic_action != "hold":
                 normalized_event = normalized_event.model_copy(
                     update={
-                        "operation": "wait",
+                        "semantic_action": "hold",
                         "api_notes": _append_api_repair_note(
                             normalized_event.api_notes,
                             "过期对象已移除，该事件按空操作处理",
@@ -1103,7 +975,7 @@ def normalize_technical_spec_contract(
             if any(claim_id not in allowed_claim_ids for claim_id in event.claim_ids)
             else event
         )
-        for event in spec.animations
+        for event in (updates.get("animations", spec.animations))
     )
     if normalized_animations != list(spec.animations):
         updates["animations"] = normalized_animations
@@ -1117,7 +989,7 @@ def normalize_technical_spec_contract(
             target_index = max(
                 range(len(normalized_animations)),
                 key=lambda index: (
-                    normalized_animations[index].operation != "wait",
+                    normalized_animations[index].semantic_action != "hold",
                     normalized_animations[index].end_seconds,
                 ),
             )
@@ -1175,6 +1047,10 @@ def compile_technical_spec(
     warnings: list[str] = []
     effective_renderer = renderer or spec.renderer
 
+    if spec.contract_version != 2:
+        errors.append(
+            f"TechnicalSpec.contract_version={spec.contract_version} 不受支持，当前版本为 2"
+        )
     if spec.scene_id != plan.scene_id:
         errors.append(
             f"TechnicalSpec.scene_id={spec.scene_id} 与 ScenePlan.scene_id={plan.scene_id} 不一致"
@@ -1336,7 +1212,7 @@ def compile_technical_spec(
     # ScenePlan 中的继承元素是场景开头已经存在的对象；这是边界合同的权威事实。
     # 上面的检查要求 TechnicalSpec 明确记录这一点，避免 Coder 与编译器理解不一致。
     active.update(inherited)
-    # 被声明为 remove 的继承对象仍可在开场处于 active，必须由 remove/fade_out 事件退出。
+    # 被声明为 remove 的继承对象仍可在开场处于 active，必须由 remove 事件退出。
     for event in sorted(spec.animations, key=lambda item: (item.start_seconds, item.event_id)):
         sources = set(event.source_element_ids)
         targets = set(event.target_element_ids)
@@ -1353,53 +1229,69 @@ def compile_technical_spec(
             errors.append(
                 f"事件 {event.event_id} 移除了最终导出元素: " + ", ".join(sorted(removes & exports))
             )
-        if event.operation == "define":
-            # define 只代表 Python 变量已经构造，不等同于加入 Scene。
-            continue
-        if event.operation in {"create", "write", "fade_in", "add"}:
+        action = event.semantic_action
+        if action == "introduce":
+            if sources:
+                errors.append(f"事件 {event.event_id} 的 introduce 不应填写 source_element_ids")
+            if removes:
+                errors.append(f"事件 {event.event_id} 的 introduce 不应填写 remove_element_ids")
             introduced = creates | targets
-            if introduced & active:
+            if not introduced:
+                errors.append(f"事件 {event.event_id} 的 introduce 缺少 target/create_element_ids")
+            duplicate = introduced & active
+            if duplicate:
                 errors.append(
-                    f"事件 {event.event_id} 重复创建已处于 active 的元素: "
-                    + ", ".join(sorted(introduced & active))
+                    f"事件 {event.event_id} 重复引入已处于 active 的元素: "
+                    + ", ".join(sorted(duplicate))
                 )
-            active.update(introduced or sources)
-        elif event.operation in {"transform", "replacement_transform"}:
+            active.update(introduced)
+        elif action == "update":
             if not sources:
-                errors.append(f"事件 {event.event_id} 的 {event.operation} 缺少 source_element_ids")
-            if sources - active:
+                errors.append(f"事件 {event.event_id} 的 update 缺少 source_element_ids")
+            if creates:
                 errors.append(
-                    f"事件 {event.event_id} 变换了尚未 active 的 source: "
-                    + ", ".join(sorted(sources - active))
+                    f"事件 {event.event_id} 的 update 不能同时引入对象，请拆出 introduce: "
+                    + ", ".join(sorted(creates))
                 )
-            if event.operation == "replacement_transform":
-                active.difference_update(sources)
-                exited.update(sources)
-                active.update(targets)
-            # Transform 会原地改变 source Mobject；target 只是目标快照，
-            # 不会自动成为 Scene 中可继续操作的对象。
-        elif event.operation in {"fade_out", "uncreate", "remove"}:
+            if removes:
+                errors.append(
+                    f"事件 {event.event_id} 的 update 不能同时移除对象，请拆出 remove: "
+                    + ", ".join(sorted(removes))
+                )
+            missing_sources = sources - active
+            if missing_sources:
+                errors.append(
+                    f"事件 {event.event_id} 更新了尚未 active 的 source: "
+                    + ", ".join(sorted(missing_sources))
+                )
+            # target 是目标快照，不会自动成为后续可操作对象；若需要
+            # 新身份，必须另建 introduce 事件。
+        elif action == "remove":
+            if targets or creates:
+                errors.append(f"事件 {event.event_id} 的 remove 不应填写 target/create_element_ids")
             if not sources and not removes:
-                errors.append(f"事件 {event.event_id} 的退出操作缺少对象")
-            exit_ids = sources or removes
-            if exit_ids - active:
+                errors.append(f"事件 {event.event_id} 的 remove 缺少对象")
+            exit_ids = sources | removes
+            missing_exit = exit_ids - active
+            if missing_exit:
                 errors.append(
                     f"事件 {event.event_id} 退出了尚未 active 的对象: "
-                    + ", ".join(sorted(exit_ids - active))
+                    + ", ".join(sorted(missing_exit))
                 )
             active.difference_update(exit_ids)
             exited.update(exit_ids)
-        elif event.operation in {"animate", "keep"}:
-            if sources - active:
+        elif action == "hold":
+            if targets or creates or removes:
+                errors.append(f"事件 {event.event_id} 的 hold 只能引用 source_element_ids")
+            missing_sources = sources - active
+            if missing_sources:
                 errors.append(
-                    f"事件 {event.event_id} 使用了尚未 active 的对象: "
-                    + ", ".join(sorted(sources - active))
+                    f"事件 {event.event_id} 保持了尚未 active 的 source: "
+                    + ", ".join(sorted(missing_sources))
                 )
-        # wait 没有对象状态变化。create_element_ids 只对引入类操作生效；
-        # Transform 的 target 是快照，不能因为模型误填 create 字段而被
-        # 当成已经加入场景的对象（兼容修复会优先把这种事件改成
-        # replacement_transform）。
-        active.difference_update(removes)
+        elif action == "camera":
+            if sources or targets or creates or removes:
+                errors.append(f"事件 {event.event_id} 的 camera 不应引用 Mobject")
 
     missing_final = exports - active
     if missing_final:
@@ -1421,7 +1313,7 @@ def compile_technical_spec(
             errors.append(f"TechnicalSpec 事件 {event.event_id} 超出场景时长")
         previous_end = max(previous_end, event.end_seconds)
     if spec.animations and previous_end < plan.duration_seconds - 0.05:
-        warnings.append("TechnicalSpec 动画事件没有覆盖到场景结束，应补充 keep/wait 事件")
+        warnings.append("TechnicalSpec 动画事件没有覆盖到场景结束，应补充 hold 事件")
 
     return TechnicalValidationResult(not errors, tuple(errors), tuple(warnings))
 
@@ -1430,50 +1322,50 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
 你的任务是把已经通过数学和教学审查的 ScenePlan 编译成 TechnicalSpec，供另一个 Agent 写代码。
 不要重新设计教学内容，不要输出 Python，不要输出 Markdown，只输出一个 JSON 对象。
 
-## 必须遵守
-1. 所有对象使用稳定的 element_id 和 variable_name；继承对象设置 initially_active=true；
-   临时步骤也要列入 objects，但 exported=false。
-   同时填写 visual_role、z_index 和可估算的宽高，供布局审查使用。
-   `objects[].element_id` 必须严格来自当前 ScenePlan 的 inherited_elements、new_elements
-   或 elements_to_remove；计划重规划后不得保留上一版的旧标题、旧对象或其他过期 ID。
-2. export_element_ids 只能包含场景结束时仍存在、且 ScenePlan 合同要求交接的对象。
-   removed_element_ids 必须逐项对应 ScenePlan.elements_to_remove；不能自行推断、遗漏或新增。
-3. 每个动画事件必须明确 source_element_ids、target_element_ids、create_element_ids 和
-   remove_element_ids；Transform/ReplacementTransform 不能引用不存在或尚未出现的对象。
-   如果事件对应 ScenePlan.timeline 中同名的 element_ids，变换事件必须将其中当前
-   active 的元素填写到 source_element_ids；不能只把对象写在自然语言 api_notes 中。
-   新对象不能同时出现在 Transform 的 source 中；若要在同一时间段引入新对象，
-   请另建一个 fade_in/create 事件，或只把它放在 target/create 字段。
-4. 已经 FadeOut、Uncreate 或 ReplacementTransform 移除的对象不能在后续事件中继续使用。
-   Transform 是原地变换：source 仍然是 active 对象，target 只是目标快照；只有
-   ReplacementTransform 才会让 target 成为后续可操作对象。使用 ReplacementTransform
-   时 operation 必须写 replacement_transform，且不要把 target 重复放入 create_element_ids。
-   不得在同一事件或后续事件中移除 export_element_ids；若最后的 visual_flow 写“淡出”，
-   只能淡出非导出临时对象。
-5. fade_out/uncreate/remove 的 source/remove 列表只能包含该事件之前已经 active 的对象；
-   不要把没有淡入或已被替换移除的步骤标签列入收尾清理。退出事件不要填写
-   target_element_ids。
-6. 仅使用当前 renderer 支持的相机 API。OpenGL 禁止 camera.frame 和 MovingCameraScene。
-   在 implementation_notes 中复述这一禁止规则是允许的，不要把禁止语句当成使用要求。
-7. 使用 Tex/MathTex 时必须说明 xelatex、.xdv、ctex 和子对象分段策略；不要凭空假设
-   MathTex 一定包含某个下标，必须提供 substrings_to_isolate 或 expected_part_counts。
-8. 时间线必须覆盖从 0 到场景结束的完整区间；末尾没有交接的临时对象必须退出或标记为非导出。
-9. 不要把 ScenePlan 中没有要求的章节、音频、插件或动画效果加入技术合同。
-10. 如果 ScenePlan 声明了 claim_ids，每个断言至少要绑定一个动画事件的 claim_ids；
-   不得让数学结论只存在于文字描述而没有对应画面事件。
+## 核心原则
+技术合同描述“对象状态如何变化”，不枚举具体动画类。Coder 可以根据画面选择
+当前 Manim 版本支持的任意安全 Animation 或 `.animate` 实现，但必须用
+`semantic_action` 与稳定的 element_id 说明其状态效果。
 
-## 输出字段
+## 必须遵守
+1. 输出 `contract_version: 2`。所有对象使用稳定的 element_id 和 variable_name；
+   继承对象设置 initially_active=true，临时步骤也列入 objects 但 exported=false。
+   `objects[].element_id` 必须严格来自当前 ScenePlan 的 inherited_elements、new_elements
+   或 elements_to_remove；计划重规划后不得保留旧对象。
+2. `export_element_ids` 只能包含场景结束时仍存在、且 ScenePlan 合同要求交接的对象。
+   `removed_element_ids` 必须逐项对应 ScenePlan.elements_to_remove。
+3. 每个 animations 事件必须选择一个语义动作：
+   - `introduce`：首次让 target/create 对象进入画面；不填写 source/remove；
+   - `update`：对已经 active 的 source 做连续变化；target 只是目标快照，不会自动成为新身份；
+   - `remove`：让 source/remove 对象退出；不填写 target/create；
+   - `camera`：只改变相机，不引用 Mobject；
+   - `hold`：保持状态或表示停顿，可选地引用 active source。
+   如果需要“旧对象变成新对象”，请拆成明确的 remove + introduce，或继续使用同一个
+   source 的 update；不要依赖 Python 重绑定来伪造 active 状态。
+4. 每个事件的对象引用必须已在 objects 声明，且与事件语义一致。事件对应
+   ScenePlan.timeline 时，将当前 active 的元素填写到 source_element_ids；不要只写在 api_notes。
+5. 已退出对象不能在后续事件继续作为 source；不得移除 export_element_ids。末尾的临时对象
+   必须 remove，或明确保持 exported=false。
+6. 仅使用当前 renderer 支持的相机 API。OpenGL 禁止 camera.frame 和 MovingCameraScene；
+   在 implementation_notes 中复述禁止规则不会被当成实际调用。
+7. 使用 Tex/MathTex 时说明 xelatex、.xdv、ctex 和子对象分段策略；不要凭空假设
+   MathTex 一定包含某个下标，必要时提供 substrings_to_isolate 或 expected_part_counts。
+8. 时间线覆盖从 0 到场景结束的完整区间；不要为了填满时间线添加 ScenePlan 未要求的教学内容。
+9. 如果 ScenePlan 声明 claim_ids，每个断言至少绑定一个动画事件的 claim_ids。
+
+## 输出字段示例
 {
+  "contract_version": 2,
   "scene_id": 1,
-  "renderer": "cairo|opengl",
-    "objects": [{
+  "renderer": "cairo",
+  "objects": [{
     "element_id": "formula",
     "variable_name": "formula",
     "constructor": "MathTex",
     "dependencies": [],
-    "initial_state": "...",
-    "final_state": "...",
-    "lifecycle": ["define", "transform", "keep"],
+    "initial_state": "公式初始形态",
+    "final_state": "公式结论",
+    "lifecycle": ["define", "introduce", "update", "keep"],
     "initially_active": false,
     "exported": true
   }],
@@ -1481,16 +1373,16 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
     "event_id": "show_formula",
     "start_seconds": 0,
     "end_seconds": 2,
-    "operation": "fade_in",
+    "semantic_action": "introduce",
     "source_element_ids": [],
     "target_element_ids": ["formula"],
     "create_element_ids": ["formula"],
     "remove_element_ids": [],
     "claim_ids": ["claim_1"],
-    "api_notes": "使用 FadeIn，run_time=1"
+    "api_notes": "用合适的入场动画，run_time=1"
   }],
   "layout": {
-    "strategy": "使用 next_to/arrange/to_edge 等相对定位",
+    "strategy": "使用相对定位和稳定锚点",
     "anchors": {"formula": "center"},
     "constraints": ["不越过安全区"],
     "safe_margin": 0.5,
