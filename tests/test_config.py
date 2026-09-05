@@ -42,6 +42,7 @@ def test_default_storage_is_under_private_application_home():
 
     assert config_module.Path.home() / ".kd1-anime" == config_module.APP_HOME
     assert config_module.USER_CONFIG_DIR == config_module.APP_HOME
+    assert config_module.USER_TOML_FILE == config_module.APP_HOME / "config.toml"
     assert config_module.USER_ENV_FILE == config_module.APP_HOME / ".env"
     assert config.RAG_INDEX_PATH == config_module.DEFAULT_RAG_INDEX_PATH
     assert config.RAG_DOCS_DIR == config_module.DEFAULT_RAG_DOCS_DIR
@@ -51,6 +52,74 @@ def test_default_storage_is_under_private_application_home():
     assert config.SCENES_DIR == config_module.DEFAULT_SCENES_DIR
     assert config.LOGS_DIR == config_module.DEFAULT_LOGS_DIR
     assert config.VIDEOS_DIR == config_module.DEFAULT_VIDEOS_DIR
+
+
+def test_nested_toml_loads_and_has_higher_priority_than_dotenv(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text(
+        "[llm]\n"
+        "model = 'toml-model'\n"
+        "base_url = 'https://toml.example/v1'\n"
+        "\n"
+        "[rag]\n"
+        "enabled = true\n"
+        "top_k = 11\n",
+        encoding="utf-8",
+    )
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text(
+        "LLM_MODEL=dotenv-model\nLLM_BASE_URL=https://dotenv.example/v1\nRAG_TOP_K=3\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+
+    config = Settings(_env_file=dotenv_file)
+
+    assert config.LLM_MODEL == "toml-model"
+    assert config.LLM_BASE_URL == "https://toml.example/v1"
+    assert config.RAG_ENABLED is True
+    assert config.RAG_TOP_K == 11
+
+    monkeypatch.setenv("LLM_MODEL", "environment-model")
+    assert Settings(_env_file=dotenv_file).LLM_MODEL == "environment-model"
+
+
+def test_toml_rejects_unknown_fields_and_malformed_syntax(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+
+    toml_file.write_text("[pipeline]\nnot_a_setting = true\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="未知字段"):
+        Settings()
+
+    toml_file.write_text("[llm\nmodel = 'broken'\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+def test_user_env_is_migrated_to_nested_toml_without_overwriting(tmp_path):
+    source = tmp_path / ".env"
+    target = tmp_path / "config.toml"
+    source.write_text(
+        'LLM_API_KEY="secret-value"\n'
+        "LLM_BASE_URL=https://example.invalid/v1\n"
+        "LLM_MODEL=demo-model\n"
+        "RAG_ENABLED=true\n"
+        "RAG_TOP_K=9\n",
+        encoding="utf-8",
+    )
+
+    assert config_module.migrate_user_env_to_toml(source, target) == target
+    assert target.stat().st_mode & 0o777 == 0o600
+    content = target.read_text(encoding="utf-8")
+    assert "[llm]" in content
+    assert 'api_key = "secret-value"' in content
+    assert "[rag]" in content
+    assert "top_k = 9" in content
+
+    target.write_text("[llm]\nmodel = 'edited'\n", encoding="utf-8")
+    assert config_module.migrate_user_env_to_toml(source, target) is None
+    assert "edited" in target.read_text(encoding="utf-8")
 
 
 def test_legacy_user_config_is_migrated_without_overwriting_custom_paths(tmp_path):

@@ -1,23 +1,30 @@
-"""全局配置：从用户级配置、当前目录 .env 和系统环境变量加载。"""
+"""全局配置：从 TOML、兼容 .env 和系统环境变量加载。"""
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
+
+logger = logging.getLogger(__name__)
 
 # 应用产生的配置、知识库和运行产物统一放在一个私有目录中。
 # 不跟随 XDG_CONFIG_HOME：集群上不同 shell/module 配置的 XDG 值经常不一致，
 # 而单一固定根目录更容易备份、迁移和排查。
 APP_HOME = Path.home() / ".kd1-anime"
 USER_CONFIG_DIR = APP_HOME
+USER_TOML_FILE = APP_HOME / "config.toml"
 USER_ENV_FILE = APP_HOME / ".env"
 
 # 仅用于从早期版本平滑迁移；新文件永远只写入 APP_HOME。
@@ -96,6 +103,35 @@ def _write_private_text(path: Path, content: str) -> None:
         # 使用同目录硬链接实现“仅当目标不存在时创建”。相比 os.replace，
         # 并发启动时不会把用户刚创建的新配置覆盖掉。
         os.link(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _replace_private_text(path: Path, content: str) -> None:
+    """以 0600 原子替换私有文本文件。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -205,17 +241,180 @@ def resolve_runtime_path(path: Path) -> Path:
     return (base / expanded).resolve()
 
 
+_TOML_PATH_FIELDS = frozenset(
+    {"WORKSPACE_DIR", "OUTPUT_FILE", "SCENES_DIR", "LOGS_DIR", "VIDEOS_DIR"}
+)
+_TOML_EVALUATION_FIELDS = frozenset(
+    {
+        "ENABLE_AUTO_EVAL",
+        "ENABLE_VISUAL_EVAL",
+        "EVAL_THRESHOLD",
+        "MAX_EVAL_ROUNDS",
+        "EVAL_VISUAL_MODEL",
+        "VISUAL_EVAL_FRAME_COUNT",
+        "VISUAL_EVAL_THRESHOLD",
+        "MAX_VISUAL_FIX_ATTEMPTS",
+    }
+)
+
+
+def _toml_field_location(field_name: str) -> tuple[str, str]:
+    """Return the public TOML section/key for an existing Settings field.
+
+    Settings intentionally keeps its historical flat environment-variable names.
+    This mapping is the single boundary between that API and the more readable
+    nested TOML representation.
+    """
+
+    if field_name.startswith("VISUAL_LLM_"):
+        return "visual_llm", field_name[11:].lower()
+    if field_name.startswith("LLM_"):
+        return "llm", field_name[4:].lower()
+    if field_name.startswith("RAG_"):
+        return "rag", field_name[4:].lower()
+    if field_name.startswith("SLURM_"):
+        return "slurm", field_name[6:].lower()
+    if field_name == "RENDER_BACKEND":
+        return "render", "backend"
+    if (
+        field_name.startswith("LOCAL_RENDER_")
+        or field_name.startswith("LOCAL_SMOKE_RENDER_")
+        or field_name.startswith("SMOKE_RENDER_")
+        or field_name.startswith("MANIM_")
+        or field_name in {"ALLOW_PARTIAL_OUTPUT", "OVERWRITE_OUTPUT"}
+    ):
+        return "render", field_name.lower()
+    if field_name.startswith("MERGE_") or field_name.startswith("TRANSITION_"):
+        return "merge", field_name.lower()
+    if field_name in _TOML_PATH_FIELDS:
+        return "paths", field_name.lower()
+    if field_name.startswith("MONITOR_") or field_name == "LOG_TAIL_LINES":
+        return "monitor", field_name.lower()
+    if field_name in _TOML_EVALUATION_FIELDS:
+        return "evaluation", field_name.lower()
+    return "pipeline", field_name.lower()
+
+
+def _toml_field_locations(settings_cls: type[BaseSettings]) -> dict[tuple[str, str], str]:
+    locations: dict[tuple[str, str], str] = {}
+    for field_name in settings_cls.model_fields:
+        location = _toml_field_location(field_name)
+        if location in locations:
+            raise RuntimeError(
+                "TOML 配置映射冲突: "
+                f"{location[0]}.{location[1]} ({locations[location]} / {field_name})"
+            )
+        locations[location] = field_name
+    return locations
+
+
+def _flatten_toml_settings(
+    data: Mapping[str, Any], settings_cls: type[BaseSettings]
+) -> dict[str, Any]:
+    """Flatten and validate the shape of nested TOML before Pydantic validation."""
+
+    locations = _toml_field_locations(settings_cls)
+    flattened: dict[str, Any] = {}
+    for raw_section, raw_values in data.items():
+        section = str(raw_section).lower()
+        if not isinstance(raw_values, Mapping):
+            raise ValueError(f"TOML 配置节 [{section}] 必须是表格")
+        for raw_key, value in raw_values.items():
+            key = str(raw_key).lower()
+            field_name = locations.get((section, key))
+            if field_name is None:
+                raise ValueError(f"TOML 配置包含未知字段: [{section}] {key}")
+            if field_name in flattened:
+                raise ValueError(f"TOML 配置字段重复: {field_name}")
+            flattened[field_name] = value
+    return flattened
+
+
+class _NestedTomlSettingsSource(TomlConfigSettingsSource):
+    """Pydantic source adapter for the project's nested TOML schema."""
+
+    def __init__(self, settings_cls: type[BaseSettings], toml_file: Path | None):
+        super().__init__(settings_cls, toml_file=toml_file)
+        self.init_kwargs = _flatten_toml_settings(self.toml_data, settings_cls)
+
+
+def _toml_literal(value: Any) -> str | None:
+    """Serialize the scalar values emitted by Settings into valid TOML."""
+
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        value = str(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("TOML 配置不能写入非有限浮点数")
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        items = [_toml_literal(item) for item in value]
+        if any(item is None for item in items):
+            raise ValueError("TOML 数组不能包含 null")
+        return "[" + ", ".join(item for item in items if item is not None) + "]"
+    raise TypeError(f"不支持写入 TOML 的配置值类型: {type(value).__name__}")
+
+
+def settings_to_toml(config: BaseSettings) -> str:
+    """Render a Settings object using the canonical nested TOML layout."""
+
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for field_name in type(config).model_fields:
+        section, key = _toml_field_location(field_name)
+        literal = _toml_literal(getattr(config, field_name))
+        if literal is None:
+            continue
+        groups.setdefault(section, []).append((key, literal))
+
+    lines = [
+        "# kd1-anime runtime configuration. This file may contain API keys; keep mode 0600.",
+        "# Environment variables take precedence over this file.",
+        "",
+    ]
+    for section, values in groups.items():
+        lines.append(f"[{section}]")
+        lines.extend(f"{key} = {literal}" for key, literal in values)
+        lines.append("")
+    return "\n".join(lines)
+
+
 class Settings(BaseSettings):
-    """全局配置；系统环境变量优先于当前目录和用户级 .env。"""
+    """全局配置；环境变量 > 用户 TOML > 兼容 .env。"""
 
     model_config = SettingsConfigDict(
-        # 后面的文件优先级更高，因此项目目录 .env 可覆盖用户级默认配置。
-        # 旧文件只作为迁移失败时的只读回退；新配置优先级高于旧配置。
+        # dotenv_settings 内部仍按“用户文件、项目文件”的顺序合并；自定义
+        # TOML source 放在其前面，因此 TOML 会覆盖两种旧 .env 配置。
         env_file=_settings_env_files(),
         env_file_encoding="utf-8",
+        toml_file=USER_TOML_FILE,
         extra="ignore",
         validate_assignment=True,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        # `_env_file=None` 是项目测试和调用方禁用所有文件配置的既有约定；
+        # 同时关闭 TOML，避免测试意外读取开发者机器上的用户配置。
+        toml_file = (
+            USER_TOML_FILE if getattr(dotenv_settings, "env_file", None) is not None else None
+        )
+        toml_settings = _NestedTomlSettingsSource(settings_cls, toml_file=toml_file)
+        return init_settings, env_settings, toml_settings, dotenv_settings, file_secret_settings
 
     # --- LLM API ---
     LLM_API_KEY: str = ""
@@ -722,6 +921,10 @@ class Settings(BaseSettings):
         return USER_CONFIG_DIR
 
     @property
+    def user_config_file(self) -> Path:
+        return USER_TOML_FILE
+
+    @property
     def user_env_file(self) -> Path:
         return USER_ENV_FILE
 
@@ -738,8 +941,8 @@ class Settings(BaseSettings):
             missing.append("LLM_MODEL")
 
         if missing:
-            config_path = self.user_env_file
-            example_path = Path.cwd() / ".env.example"
+            config_path = self.user_config_file
+            example_path = Path.cwd() / "config.toml.example"
 
             error_msg = f"""LLM 配置不完整（缺少或仍为占位值：{", ".join(missing)}）
 
@@ -752,7 +955,7 @@ class Settings(BaseSettings):
 2. 编辑配置文件：
    {config_path}
 
-3. 在项目目录创建 .env：
+3. 旧版也支持在项目目录创建 .env：
    {Path.cwd() / ".env"}
 
 配置示例见：{example_path}
@@ -852,4 +1055,67 @@ class Settings(BaseSettings):
         )
 
 
+def _parse_legacy_env(content: str) -> dict[str, str]:
+    """Parse the simple KEY=VALUE syntax used by the project's old .env files."""
+
+    values: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            if value[0] == '"':
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    value = value[1:-1]
+            else:
+                value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def migrate_user_env_to_toml(
+    source_file: Path | None = None,
+    target_file: Path | None = None,
+) -> Path | None:
+    """Non-destructively migrate the user .env into the canonical TOML file.
+
+    Only the application-owned user file is migrated automatically. A project
+    directory `.env` remains a compatibility override and is never copied into
+    the user's private config directory.
+    """
+
+    source = source_file or USER_ENV_FILE
+    target = target_file or USER_TOML_FILE
+    if target.exists() or not source.is_file():
+        return None
+    try:
+        values = _parse_legacy_env(source.read_text(encoding="utf-8"))
+        if not values:
+            return None
+        validated = Settings(_env_file=None, **values)
+        _write_private_text(target, settings_to_toml(validated))
+    except FileExistsError:
+        # Another process won the create-only race; its TOML is authoritative.
+        return None
+    except (OSError, TypeError, UnicodeError, ValueError) as exc:
+        logger.warning(
+            "无法将用户 .env 迁移为 TOML，将继续使用兼容配置（错误类型：%s）",
+            type(exc).__name__,
+        )
+        return None
+    return target
+
+
+migrate_user_env_to_toml()
 settings = Settings()
