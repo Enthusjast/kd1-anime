@@ -113,29 +113,31 @@ python -m pip install -e '.[dev]'
 
 ### 2. 配置主模型
 
-安装器会创建 `~/.kd1-anime/.env`。也可以复制模板后编辑：
+安装器会创建 `~/.kd1-anime/config.toml`。也可以复制 TOML 模板后编辑：
 
 ```bash
-cp .env.example ~/.kd1-anime/.env
-chmod 600 ~/.kd1-anime/.env
-$EDITOR ~/.kd1-anime/.env
+mkdir -p ~/.kd1-anime
+cp config.toml.example ~/.kd1-anime/config.toml
+chmod 600 ~/.kd1-anime/config.toml
+$EDITOR ~/.kd1-anime/config.toml
 ```
 
 最少需要配置一个主模型：
 
-```dotenv
-LLM_API_KEY=your-api-key
-LLM_BASE_URL=https://your-openai-compatible-endpoint/v1
-LLM_MODEL=your-model-name
+```toml
+[llm]
+api_key = "your-api-key"
+base_url = "https://your-openai-compatible-endpoint/v1"
+model = "your-model-name"
 ```
 
 配置优先级为：
 
 ```text
-进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env
+进程环境变量 > ~/.kd1-anime/config.toml > 当前目录 .env > ~/.kd1-anime/.env
 ```
 
-API Key 不会写入运行清单或事件日志。不要把 `.env` 提交到 Git。
+API Key 不会写入运行清单或事件日志。`config.toml` 和旧版 `.env` 都不要提交到 Git。
 
 ### 3. 检查环境
 
@@ -306,7 +308,7 @@ kd1-anime test-llm --no-json-mode --verbose
 
 ## 配置
 
-完整配置参考见 [`docs/configuration.md`](docs/configuration.md)，模板见 [`.env.example`](.env.example)。常用配置如下：
+完整配置参考见 [`docs/configuration.md`](docs/configuration.md)，模板见 [`config.toml.example`](config.toml.example)。旧版 `.env` 模板 [`.env.example`](.env.example) 仍保留用于兼容。常用配置如下：
 
 | 配置项 | 默认值 | 作用 |
 | --- | ---: | --- |
@@ -359,27 +361,31 @@ kd1-anime test-llm --no-json-mode --verbose
 
 视觉评估必须使用独立的多模态端点，不会继承主模型的 URL、Key 或模型：
 
-```dotenv
-ENABLE_VISUAL_EVAL=true
-VISUAL_LLM_API_KEY=your-visual-api-key
-VISUAL_LLM_BASE_URL=https://your-visual-endpoint/v1
-VISUAL_LLM_MODEL=your-multimodal-model
+```toml
+[evaluation]
+enable_visual_eval = true
+
+[visual_llm]
+api_key = "your-visual-api-key"
+base_url = "https://your-visual-endpoint/v1"
+model = "your-multimodal-model"
 ```
 
 RAG 的 Embedding 和 Reranker 同样完全独立。Embedding 使用 OpenAI-compatible `/embeddings`，Reranker 使用 Cohere-compatible `/rerank`：
 
-```dotenv
-RAG_ENABLED=true
-RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
-RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
-RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
-RAG_RECIPES_DIR=~/.kd1-anime/knowledge/recipes
-RAG_EMBEDDING_API_KEY=your-embedding-key
-RAG_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
-RAG_EMBEDDING_MODEL=your-embedding-model
-RAG_RERANK_API_KEY=your-rerank-key
-RAG_RERANK_BASE_URL=https://your-reranker-endpoint/v1
-RAG_RERANK_MODEL=your-reranker-model
+```toml
+[rag]
+enabled = true
+index_path = "~/.kd1-anime/rag/index.sqlite3"
+docs_dir = "~/.kd1-anime/knowledge/docs"
+examples_dir = "~/.kd1-anime/knowledge/examples"
+recipes_dir = "~/.kd1-anime/knowledge/recipes"
+embedding_api_key = "your-embedding-key"
+embedding_base_url = "https://your-embedding-endpoint/v1"
+embedding_model = "your-embedding-model"
+rerank_api_key = "your-rerank-key"
+rerank_base_url = "https://your-reranker-endpoint/v1"
+rerank_model = "your-reranker-model"
 ```
 
 启用 RAG 后，生成入口会检查索引存在且未过期，并在开始 Agent 调用前探测两个服务；缺配置、索引过期或启动探测失败会直接退出。运行中的单次检索异常则记录为 `degraded`，并尽可能继续使用无 RAG 的流程。
@@ -451,8 +457,9 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 
 ```text
 ~/.kd1-anime/
-├── .env                         # 私有配置（0600）
-├── .env.example                 # 配置模板
+├── config.toml                  # 主配置（0600）
+├── config.toml.example          # 配置模板
+├── .env                         # 旧版兼容配置（0600，可选）
 ├── knowledge/                   # Manim 文档和示例
 ├── rag/index.sqlite3            # 本地知识索引
 ├── diagnostics/failure_cases.sqlite3 # 脱敏渲染失败案例
@@ -482,7 +489,7 @@ kd1-anime status
 kd1-anime resume 20260831-120000-1234abcd
 ```
 
-旧版本的 `~/.config/kd1-anime/.env` 会非破坏地迁移到 `~/.kd1-anime/.env`；旧文件不会删除。旧项目目录中的相对 `workspace/` 不会自动搬迁，以避免启动时复制大型视频。
+旧版本的 `~/.config/kd1-anime/.env` 会先非破坏地迁移并转换为 `~/.kd1-anime/config.toml`；旧文件不会删除。若 TOML 转换暂时失败，程序仍会兼容读取旧 `.env`。旧项目目录中的相对 `workspace/` 不会自动搬迁，以避免启动时复制大型视频。
 
 ## 增量渲染与批量处理
 

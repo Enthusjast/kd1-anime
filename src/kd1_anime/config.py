@@ -256,6 +256,7 @@ _TOML_EVALUATION_FIELDS = frozenset(
         "MAX_VISUAL_FIX_ATTEMPTS",
     }
 )
+_TOML_EMPTY_NULL_FIELDS = frozenset({"RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", "RAG_RECIPES_DIR"})
 
 
 def _toml_field_location(field_name: str) -> tuple[str, str]:
@@ -363,13 +364,19 @@ def _toml_literal(value: Any) -> str | None:
     raise TypeError(f"不支持写入 TOML 的配置值类型: {type(value).__name__}")
 
 
-def settings_to_toml(config: BaseSettings) -> str:
+def settings_to_toml(
+    config: BaseSettings,
+    *,
+    preserve_empty_fields: set[str] | frozenset[str] = frozenset(),
+) -> str:
     """Render a Settings object using the canonical nested TOML layout."""
 
     groups: dict[str, list[tuple[str, str]]] = {}
     for field_name in type(config).model_fields:
         section, key = _toml_field_location(field_name)
         literal = _toml_literal(getattr(config, field_name))
+        if literal is None and field_name in preserve_empty_fields:
+            literal = '""'
         if literal is None:
             continue
         groups.setdefault(section, []).append((key, literal))
@@ -384,6 +391,24 @@ def settings_to_toml(config: BaseSettings) -> str:
         lines.extend(f"{key} = {literal}" for key, literal in values)
         lines.append("")
     return "\n".join(lines)
+
+
+def update_toml_setting(path: Path, field_name: str, raw_value: Any) -> None:
+    """Validate and atomically update one TOML setting.
+
+    The installer uses this helper for its interactive wizard so it does not
+    need to duplicate TOML quoting or type conversion in shell code.
+    """
+
+    if field_name not in Settings.model_fields:
+        raise ValueError(f"未知配置字段: {field_name}")
+    values: dict[str, Any] = {}
+    if path.is_file():
+        source = _NestedTomlSettingsSource(Settings, toml_file=path)
+        values.update(source())
+    values[field_name] = raw_value
+    validated = Settings(_env_file=None, **values)
+    _replace_private_text(path, settings_to_toml(validated))
 
 
 class Settings(BaseSettings):
@@ -1104,7 +1129,11 @@ def migrate_user_env_to_toml(
         if not values:
             return None
         validated = Settings(_env_file=None, **values)
-        _write_private_text(target, settings_to_toml(validated))
+        preserve_empty = set(values) & _TOML_EMPTY_NULL_FIELDS
+        _write_private_text(
+            target,
+            settings_to_toml(validated, preserve_empty_fields=preserve_empty),
+        )
     except FileExistsError:
         # Another process won the create-only race; its TOML is authoritative.
         return None

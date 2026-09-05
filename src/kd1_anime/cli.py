@@ -280,7 +280,7 @@ def _ensure_generation_apis(*, dry_run: bool) -> None:
 def main_callback(
     ctx: typer.Context,
     api_key: str = typer.Option(
-        None, "--api-key", "-k", help="LLM API Key (也可通过 .env 文件设置)"
+        None, "--api-key", "-k", help="LLM API Key (也可通过 config.toml 或 .env 设置)"
     ),
     model: str = typer.Option(None, "--model", "-m", help="LLM 模型名称"),
     dry_run: bool = typer.Option(
@@ -402,7 +402,7 @@ def generate(
             settings.MAX_FIX_ATTEMPTS = max_fix
         if output:
             settings.OUTPUT_FILE = output
-        # 不要让 Typer 的默认 False 覆盖 .env 中显式配置的 true；只有用户
+        # 不要让 Typer 的默认 False 覆盖配置文件中显式配置的 true；只有用户
         # 明确传入 --force 时才开启覆盖。
         if force:
             settings.OVERWRITE_OUTPUT = True
@@ -1907,7 +1907,7 @@ def test_llm(
             console.print(f"    解析结果: status={result.status}, message={result.message}")
         except Exception as e:
             console.print(f"  [yellow]⚠ JSON 模式异常: {e}[/]")
-            console.print("    建议: 在 .env 中设置 LLM_USE_JSON_MODE=false")
+            console.print("    建议: 在 config.toml 的 [llm] 中设置 use_json_mode=false")
             failed = True
 
     console.print()

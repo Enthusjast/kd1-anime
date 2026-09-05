@@ -32,7 +32,7 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
 1. LLM_API_KEY、LLM_BASE_URL、LLM_MODEL 是否都已填写；
 2. Base URL 是否为 OpenAI-compatible 地址，通常包含 /v1；
 3. 模型名是否是服务端实际支持的名称；
-4. 当前 shell 是否读取了正确的配置文件。优先级是进程环境变量、当前目录 .env、用户配置；
+4. 当前 shell 是否读取了正确的配置文件。优先级是进程环境变量、用户 config.toml、当前目录 .env、用户 .env；
 5. 集群或登录节点是否需要代理。
 
 不使用 HTTP 代理时：

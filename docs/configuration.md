@@ -1,33 +1,42 @@
 # 配置参考
 
 本文是 kd1-anime 当前配置的完整说明。配置字段由
-src/kd1_anime/config.py 校验；模板见 ../.env.example。
+src/kd1_anime/config.py 校验；TOML 模板见 ../config.toml.example，旧版
+.env 模板 ../.env.example 仍用于兼容。
 
 ## 配置文件与优先级
 
 程序按以下优先级读取配置，越靠前优先级越高：
 
-    进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env
+    进程环境变量 > ~/.kd1-anime/config.toml > 当前目录 .env > ~/.kd1-anime/.env
 
-推荐把用户配置放在 ~/.kd1-anime/.env，并限制权限：
+推荐把用户配置放在 ~/.kd1-anime/config.toml，并限制权限：
 
     mkdir -p ~/.kd1-anime
     chmod 700 ~/.kd1-anime
-    chmod 600 ~/.kd1-anime/.env
+    cp config.toml.example ~/.kd1-anime/config.toml
+    chmod 600 ~/.kd1-anime/config.toml
 
 安装器会保留已有用户配置，不会用模板覆盖它。早期版本的
-~/.config/kd1-anime/.env 会非破坏地迁移到新目录；旧文件不会自动删除。
+~/.config/kd1-anime/.env 会非破坏地迁移并转换为
+~/.kd1-anime/config.toml；旧文件不会自动删除。若转换失败，程序仍会读取
+旧 .env 作为兼容回退。
 
 相对路径通常按当前工作目录解析；默认路径全部位于 ~/.kd1-anime/。运行目录由
 WORKSPACE_DIR 控制，单个 run 仍会使用自己的私有子目录。
+
+下文表格中的大写名称是环境变量兼容名；TOML 使用对应的分组和小写下划线键。
+例如 `LLM_MODEL` 对应 `[llm] model`，`MAX_REVIEW_ROUNDS` 对应
+`[pipeline] max_review_rounds`，`RAG_TOP_K` 对应 `[rag] top_k`。
 
 ## 最小配置
 
 完整生成至少需要主模型：
 
-    LLM_API_KEY=your-api-key
-    LLM_BASE_URL=https://your-openai-compatible-endpoint/v1
-    LLM_MODEL=your-model-name
+    [llm]
+    api_key = "your-api-key"
+    base_url = "https://your-openai-compatible-endpoint/v1"
+    model = "your-model-name"
 
 LLM_BASE_URL 必须是带 http:// 或 https:// 的 URL，不能把用户名、密码或换行写入
 URL。API Key 不会写入 manifest 或事件日志。
@@ -100,10 +109,13 @@ URL。API Key 不会写入 manifest 或事件日志。
 | VISUAL_LLM_DEBUG | false | 是否输出视觉调试信息 |
 | VISUAL_LLM_TRUST_ENV | true | 是否读取代理环境变量 |
 
-    ENABLE_VISUAL_EVAL=true
-    VISUAL_LLM_API_KEY=your-visual-api-key
-    VISUAL_LLM_BASE_URL=https://your-visual-endpoint/v1
-    VISUAL_LLM_MODEL=your-multimodal-model
+    [evaluation]
+    enable_visual_eval = true
+
+    [visual_llm]
+    api_key = "your-visual-api-key"
+    base_url = "https://your-visual-endpoint/v1"
+    model = "your-multimodal-model"
 
 EVAL_VISUAL_MODEL 是旧版模型名兼容别名，新配置请使用 VISUAL_LLM_MODEL。普通
 流水线中的视觉网络故障会将结果记为 unknown 并继续；缺少视觉配置或显式
@@ -299,19 +311,23 @@ OpenGL 代码不能使用 self.camera.frame 或 MovingCameraScene 的 Cairo 运�
 
 ### 开启 RAG
 
-    RAG_ENABLED=true
-    RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
-    RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
-    # 填写 RAG_EMBEDDING_* 和 RAG_RERANK_* 后：
+    [rag]
+    enabled = true
+    docs_dir = "~/.kd1-anime/knowledge/docs"
+    examples_dir = "~/.kd1-anime/knowledge/examples"
+    # 填写 embedding_* 和 rerank_* 后：
     kd1-anime rag index
     kd1-anime doctor --probe-rag
 
 ### 开启视觉评估
 
-    ENABLE_VISUAL_EVAL=true
-    VISUAL_LLM_API_KEY=your-visual-api-key
-    VISUAL_LLM_BASE_URL=https://your-visual-endpoint/v1
-    VISUAL_LLM_MODEL=your-multimodal-model
+    [evaluation]
+    enable_visual_eval = true
+
+    [visual_llm]
+    api_key = "your-visual-api-key"
+    base_url = "https://your-visual-endpoint/v1"
+    model = "your-multimodal-model"
     kd1-anime doctor --probe-visual-llm
 
 ## 如何确认配置生效
@@ -323,5 +339,5 @@ OpenGL 代码不能使用 self.camera.frame 或 MovingCameraScene 的 Cairo 运�
     kd1-anime doctor --probe-rag
     kd1-anime version
 
-诊断输出会显示模型名和 URL，但不会显示 API Key。若怀疑读取了错误的 .env，可
+诊断输出会显示模型名和 URL，但不会显示 API Key。若怀疑读取了错误的配置，可
 暂时使用进程环境变量覆盖并重新运行 doctor；不要在日志或 issue 中粘贴完整配置文件。

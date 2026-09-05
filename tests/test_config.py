@@ -105,6 +105,7 @@ def test_user_env_is_migrated_to_nested_toml_without_overwriting(tmp_path):
         "LLM_BASE_URL=https://example.invalid/v1\n"
         "LLM_MODEL=demo-model\n"
         "RAG_ENABLED=true\n"
+        "RAG_DOCS_DIR=\n"
         "RAG_TOP_K=9\n",
         encoding="utf-8",
     )
@@ -116,6 +117,7 @@ def test_user_env_is_migrated_to_nested_toml_without_overwriting(tmp_path):
     assert 'api_key = "secret-value"' in content
     assert "[rag]" in content
     assert "top_k = 9" in content
+    assert 'docs_dir = ""' in content
 
     target.write_text("[llm]\nmodel = 'edited'\n", encoding="utf-8")
     assert config_module.migrate_user_env_to_toml(source, target) is None

@@ -619,7 +619,7 @@ class SlurmDispatcher:
             if not Path(image).is_file():
                 raise RuntimeError(
                     f"Apptainer 镜像不存在: {image}\n"
-                    f"请检查 .env 中的 SLURM_CONTAINER_IMAGE 配置。\n"
+                    f"请检查 config.toml（或兼容 .env）中的 SLURM_CONTAINER_IMAGE 配置。\n"
                     f"如果不需要容器，请设置 SLURM_CONTAINER_IMAGE 为空或注释掉该行。"
                 )
             container_cmd = [

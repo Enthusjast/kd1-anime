@@ -299,7 +299,7 @@ missing_tex_packages {shlex.quote(str(tex_bin))}
 
 
 def test_completion_message_renders_ansi_escape_sequences(tmp_path):
-    config_file = tmp_path / "config" / ".env"
+    config_file = tmp_path / "config" / "config.toml"
     user_bin = tmp_path / "bin"
     script = f"""
 source {shlex.quote(str(INSTALLER))}
@@ -338,18 +338,18 @@ def test_installer_uses_private_application_home_for_user_storage(tmp_path):
 
     assert result.returncode == 0, result.stderr
     config_dir = tmp_path / ".kd1-anime"
-    config_file = config_dir / ".env"
+    config_file = config_dir / "config.toml"
     assert config_file.is_file()
     assert config_file.stat().st_mode & 0o777 == 0o600
     content = config_file.read_text(encoding="utf-8")
-    assert "RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3" in content
-    assert "RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs" in content
-    assert "RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples" in content
-    assert "WORKSPACE_DIR=~/.kd1-anime/workspace" in content
-    assert "MAX_PLAN_REVIEW_ROUNDS=2" in content
-    assert "MAX_PLAN_REPLAN_ATTEMPTS=3" in content
-    assert "SAFE_FALLBACK_ENABLED=true" in content
-    assert "MAX_IDENTICAL_REVIEW_ATTEMPTS=2" in content
+    assert 'index_path = "~/.kd1-anime/rag/index.sqlite3"' in content
+    assert 'docs_dir = "~/.kd1-anime/knowledge/docs"' in content
+    assert 'examples_dir = "~/.kd1-anime/knowledge/examples"' in content
+    assert 'workspace_dir = "~/.kd1-anime/workspace"' in content
+    assert "max_plan_review_rounds = 2" in content
+    assert "max_plan_replan_attempts = 3" in content
+    assert "safe_fallback_enabled = true" in content
+    assert "max_identical_review_attempts = 2" in content
     assert (config_dir / "knowledge" / "docs").is_dir()
     assert (config_dir / "knowledge" / "examples").is_dir()
     assert not (tmp_path / ".config" / "kd1-anime").exists()
@@ -380,14 +380,12 @@ def test_installer_migrates_legacy_user_config_without_overwriting_it(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    migrated = tmp_path / ".kd1-anime" / ".env"
+    migrated = tmp_path / ".kd1-anime" / "config.toml"
     assert migrated.read_text(encoding="utf-8") == (
-        "RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3\n"
-        "RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs\n"
-        "RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples\n"
-        "WORKSPACE_DIR=~/.kd1-anime/workspace\n"
-        "LLM_MODEL=legacy-model\n"
+        "# kd1-anime runtime configuration.\n"
+        "# Environment variables take precedence over this file.\n"
     )
+    assert migrated.stat().st_mode & 0o777 == 0o600
     assert legacy_file.read_text(encoding="utf-8") == (
         "RAG_INDEX_PATH=~/.cache/kd1-anime/rag/index.sqlite3\n"
         "RAG_DOCS_DIR=\n"
@@ -431,7 +429,7 @@ def test_interactive_model_configuration_wizard_writes_all_profiles(tmp_path):
     script = f"""
 source {shlex.quote(str(INSTALLER))}
 CONFIG_DIR={shlex.quote(str(tmp_path / ".kd1-anime"))}
-CONFIG_FILE="$CONFIG_DIR/.env"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
 CONFIGURE_MODE=interactive
 write_user_config
 build_rag_index_from_installer() {{ printf 'built\\n' > {shlex.quote(str(marker))}; }}
@@ -475,21 +473,21 @@ configure_user_models
     assert "visual-secret" not in result.stdout + result.stderr
     assert "embedding-secret" not in result.stdout + result.stderr
     assert "rerank-secret" not in result.stdout + result.stderr
-    content = (tmp_path / ".kd1-anime" / ".env").read_text(encoding="utf-8")
-    assert "LLM_BASE_URL=https://main.example/v1" in content
-    assert "LLM_API_KEY=main-secret" in content
-    assert "LLM_MODEL=main-model" in content
-    assert "ENABLE_VISUAL_EVAL=true" in content
-    assert "VISUAL_LLM_BASE_URL=https://visual.example/v1" in content
-    assert "VISUAL_LLM_API_KEY=visual-secret" in content
-    assert "VISUAL_LLM_MODEL=visual-model" in content
-    assert "RAG_ENABLED=true" in content
-    assert "RAG_EMBEDDING_BASE_URL=https://embedding.example/v1" in content
-    assert "RAG_EMBEDDING_API_KEY=embedding-secret" in content
-    assert "RAG_EMBEDDING_MODEL=embedding-model" in content
-    assert "RAG_RERANK_BASE_URL=https://rerank.example/v1" in content
-    assert "RAG_RERANK_API_KEY=rerank-secret" in content
-    assert "RAG_RERANK_MODEL=rerank-model" in content
+    content = (tmp_path / ".kd1-anime" / "config.toml").read_text(encoding="utf-8")
+    assert 'base_url = "https://main.example/v1"' in content
+    assert 'api_key = "main-secret"' in content
+    assert 'model = "main-model"' in content
+    assert "enable_visual_eval = true" in content
+    assert 'base_url = "https://visual.example/v1"' in content
+    assert 'api_key = "visual-secret"' in content
+    assert 'model = "visual-model"' in content
+    assert "enabled = true" in content
+    assert 'embedding_base_url = "https://embedding.example/v1"' in content
+    assert 'embedding_api_key = "embedding-secret"' in content
+    assert 'embedding_model = "embedding-model"' in content
+    assert 'rerank_base_url = "https://rerank.example/v1"' in content
+    assert 'rerank_api_key = "rerank-secret"' in content
+    assert 'rerank_model = "rerank-model"' in content
     assert marker.read_text(encoding="utf-8") == "built\n"
 
 
@@ -497,7 +495,7 @@ def test_model_configuration_wizard_skips_non_tty_by_default(tmp_path):
     script = f"""
 source {shlex.quote(str(INSTALLER))}
 CONFIG_DIR={shlex.quote(str(tmp_path / ".kd1-anime"))}
-CONFIG_FILE="$CONFIG_DIR/.env"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
 write_user_config
 configure_user_models
 """
