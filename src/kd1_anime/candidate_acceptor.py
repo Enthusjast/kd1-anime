@@ -128,4 +128,13 @@ class CandidateAcceptor:
         return tuple(detect_unknown_animations(code, technical_spec, renderer=renderer))
 
 
-__all__ = ["AcceptedCandidate", "CandidateAcceptor", "CandidateRejected"]
+class CandidateAcceptanceService(CandidateAcceptor):
+    """面向组合层的命名别名；保留 CandidateAcceptor 兼容简短调用。"""
+
+
+__all__ = [
+    "AcceptedCandidate",
+    "CandidateAcceptanceService",
+    "CandidateAcceptor",
+    "CandidateRejected",
+]

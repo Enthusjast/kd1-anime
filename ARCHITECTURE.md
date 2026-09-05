@@ -10,12 +10,13 @@
 ## 1. 设计目标
 
 - 使用原生 Python、Pydantic 和显式有限状态机，不引入重型 Agent 框架。
-- 让场景分镜可并行生成、代码按顺序交接，随后独立完成 Slurm 渲染与修复。
+- 让场景分镜可并行生成、代码按顺序交接，随后独立完成 Slurm 或本地渲染与修复。
 - 对模型输出同时执行 LLM 语义审查与确定性 AST 校验。
 - 让每次运行拥有隔离的代码、日志、媒体和输出目录。
 - 用可验证的产物身份避免旧视频、错误配置和错误 Job 被误复用。
 - 在集群故障、LLM 格式错误、渲染失败和视频编码差异下提供清晰失败边界。
-- 让没有 Slurm 的环境也能通过 dry-run 验证规划、技术合同、代码校验和审查流程。
+- 让没有 Slurm 的环境也能通过 dry-run 验证规划、技术合同、代码校验和审查流程；必要时
+  也可以显式选择本地前台正式渲染。
 
 ## 2. 组件
 
@@ -25,6 +26,13 @@ kd1_anime.cli / kd1_anime.tui
        ▼
 kd1_anime.orchestrator ───── callback events ───────────▶ TUI/Rich
        │
+       ├── services/rendering.py 后端预检、提交、监控边界
+       ├── services/planning.py 计划指纹与纯计划辅助
+       ├── services/recovery.py 恢复时的进程/Job 接管策略
+       ├── services/visual_evaluation.py 独立视觉调用边界
+       ├── services/recipe_learning.py 匿名配方学习边界
+       ├── candidate_acceptor.py 所有代码候选的统一接纳入口
+       ├── verification.py       静态/执行/视觉三层验证收据
        ├── agents/planner.py       概要规划 + 详细分镜
        ├── agents/plan_compiler.py  确定性计划编译（时间线/等式/几何/生命周期）
        ├── agents/plan_reviewer.py 计划正确性、数学与可实现性审查
@@ -82,7 +90,7 @@ Scene 1 技术设计 → CODING → 代码 REVIEWING → Scene 2 技术设计 �
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-FSM 枚举同时用于清单检查点和 TUI 阶段提示。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜仍然并行，但编码/代码审查按场景顺序执行：Scene N 先由 Technical Planner 生成结构化 TechnicalSpec，确定性编译通过后才允许 Coder 工作；代码通过生命周期校验和 Reviewer 后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，并且必须遵守明确的对象生命周期，而不是仅凭 Planner 描述猜测状态。所有代码就绪后，Slurm 渲染继续并行；每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。
+FSM 枚举同时用于清单检查点和 TUI 阶段提示。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜仍然并行，但编码/代码审查按场景顺序执行：Scene N 先由 Technical Planner 生成结构化 TechnicalSpec，确定性编译通过后才允许 Coder 工作；代码通过生命周期校验和 Reviewer 后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，并且必须遵守明确的对象生命周期，而不是仅凭 Planner 描述猜测状态。所有代码就绪后，渲染后端继续并行；默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则以前台本地进程执行（默认一个在途任务）。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。后端边界统一执行产物定位、ffprobe 和哈希验证。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会确认索引存在且未过期，并探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
@@ -238,6 +246,7 @@ v7 清单只接受当前教学合同、StateLedger、结构化计划、能力合
 - COMPLETED/GONE 只有产物验证成功才恢复为 rendered；
 - 已完成、失败、在途场景的事件快照会补发给 TUI；
 - 两个进程不能同时恢复同一 run。
+本地后端不把 PID 写入清单；恢复时不会认领旧本地进程，而是安全重启未完成场景。
 直接 `render --wait` 创建的运行会持久化 `direct_render` 标记；这类运行在等待和恢复时都
 跳过所有 Planner、Technical Planner、Coder 和 Reviewer 调用，只执行渲染监控与合并。
 
@@ -247,7 +256,13 @@ Slurm Job；任一 Job 取消失败都会保留运行目录。
 
 ### 3.6 MERGING 与增量复用
 
-VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个 `SceneArtifact` 解析精确路径，再核对 scene ID、类名、代码哈希、渲染配置（含 Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
+`CandidateAcceptor` 是所有候选代码的唯一静态接纳入口：Coder、AutoFix、精确替换、回滚、
+结构化编译和视觉候选恢复都要重新通过 AST、安全、Manim API、连续性和生命周期检查，再由
+Orchestrator 原子写入状态。`SceneState`/manifest 分别记录 `static_verification`、
+`execution_verification` 和 `visual_verification`；三者的 `unknown`、`warning` 和
+`failed` 语义不互相替代。VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个
+`SceneArtifact` 解析精确路径，再核对 scene ID、类名、代码哈希、渲染配置（含
+Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
 
 按 scene ID 合并：
 

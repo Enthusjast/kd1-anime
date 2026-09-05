@@ -162,6 +162,11 @@ from kd1_anime.run_store import (
     write_manifest,
 )
 from kd1_anime.security import redact_jsonable, redact_text, redact_value
+from kd1_anime.services.planning import PlanningService
+from kd1_anime.services.recipe_learning import RecipeLearningService
+from kd1_anime.services.recovery import RecoveryService
+from kd1_anime.services.rendering import RenderingService
+from kd1_anime.services.visual_evaluation import VisualEvaluationService
 from kd1_anime.verification import (
     ExecutionVerification,
     StaticVerification,
@@ -445,6 +450,10 @@ class Orchestrator:
         self.planner = PlannerAgent()
         self.slurm = create_render_backend()
         self._backend_name: RenderBackendName = settings.RENDER_BACKEND
+        self.rendering_service = RenderingService(self.slurm, self._backend_name)
+        self.planning_service = PlanningService()
+        self.recovery_service = RecoveryService()
+        self.visual_evaluation_service = VisualEvaluationService()
         self.merger = VideoMerger()
         self._callback: Callback | None = None
         self._ctx: PipelineContext | None = None
@@ -467,6 +476,7 @@ class Orchestrator:
             rag_semaphore=(resource_coordinator.rag if resource_coordinator is not None else None)
         )
         self.recipe_store = RecipeStore()
+        self.recipe_learning_service = RecipeLearningService(self.recipe_store)
         self.failure_cases = FailureCaseStore()
         self.candidate_acceptor = CandidateAcceptor()
 
@@ -479,6 +489,13 @@ class Orchestrator:
             return
         self.slurm = create_render_backend(backend)
         self._backend_name = backend  # type: ignore[assignment]
+        self.rendering_service.set_backend(self.slurm, self._backend_name)
+
+    def _render_service(self) -> RenderingService:
+        """同步外部替换的 backend，兼容测试/插件注入。"""
+
+        self.rendering_service.set_backend(self.slurm, self._backend_name)
+        return self.rendering_service
 
     @staticmethod
     def _configured_visual_profile(*, enabled: bool | None = None) -> VisualEvalProfile:
@@ -601,7 +618,7 @@ class Orchestrator:
                 job is not None
                 and job.status not in terminal_statuses
                 and not job.cancelled
-                and not self.slurm.cancel_job(job.job_id)
+                and not self._render_service().cancel_job(job.job_id)
             ):
                 raise RuntimeError(
                     f"Scene {scene_id} 的旧 TechnicalSpec Job {job.job_id} 取消失败，"
@@ -691,7 +708,7 @@ class Orchestrator:
             job_id = job.job_id
         if terminal:
             return
-        if not self.slurm.cancel_job(job_id):
+        if not self._render_service().cancel_job(job_id):
             raise RuntimeError(
                 f"Scene {state.plan.scene_id} 的旧 Job {job_id} {reason}，"
                 "取消失败，禁止清空状态并重复提交"
@@ -936,7 +953,7 @@ class Orchestrator:
                 and not state.rendered
                 and not job.cancelled
                 and job.status not in {"COMPLETED", "CANCELLED", *FAILURE_STATES}
-                and self.slurm.cancel_job(job.job_id)
+                and self._render_service().cancel_job(job.job_id)
             ):
                 with self._state_lock:
                     job.cancelled = True
@@ -2115,7 +2132,7 @@ class Orchestrator:
                         "COMPLETED",
                         "CANCELLED",
                         *FAILURE_STATES,
-                    } and not self.slurm.cancel_job(job.job_id):
+                    } and not self._render_service().cancel_job(job.job_id):
                         raise RuntimeError(
                             f"Scene {retry_scene_id} 的 Job {job.job_id} 取消失败，拒绝重复提交"
                         )
@@ -2682,8 +2699,8 @@ class Orchestrator:
         except KeyError:
             return fallback
 
-    @staticmethod
     def _preflight_environment(
+        self,
         profile: RenderProfile | None = None,
         *,
         backend: RenderBackendName | None = None,
@@ -2691,41 +2708,11 @@ class Orchestrator:
         """在创建/提交渲染任务前验证对应后端需要的本地工具。"""
 
         profile = profile or RenderProfile.current()
-        selected_backend = backend or settings.RENDER_BACKEND
-        if selected_backend == "local":
-            missing = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
-            try:
-                import importlib.util
-
-                manim_available = importlib.util.find_spec("manim") is not None
-            except (ImportError, ModuleNotFoundError, ValueError):
-                manim_available = False
-            if not manim_available:
-                missing.append("manim")
-            if missing:
-                raise RuntimeError(
-                    "本地渲染环境缺少命令/模块: " + ", ".join(dict.fromkeys(missing))
-                )
-            # 本地 OpenGL 由 EGL/GLX 自己选择设备，不要求 Slurm GPU 类型；
-            # 正式命令仍显式固定 PYOPENGL_PLATFORM。
-            return
-
-        missing = [name for name in ("sbatch", "ffmpeg", "ffprobe") if not shutil.which(name)]
-        container = settings.SLURM_CONTAINER_IMAGE
-        if settings.SLURM_REQUIRE_CONTAINER and not container:
-            raise RuntimeError("SLURM_REQUIRE_CONTAINER=true，但未配置 SLURM_CONTAINER_IMAGE")
-        if container:
-            image = Path(container).expanduser()
-            if not image.is_file():
-                raise RuntimeError(f"Apptainer 镜像不存在: {image}")
-            if not shutil.which("apptainer"):
-                missing.append("apptainer")
-        if profile.renderer == "opengl" and not settings.SLURM_GPU_TYPE:
-            raise RuntimeError(
-                "MANIM_RENDERER=opengl 时必须配置 SLURM_GPU_TYPE；否则无法保证 Slurm 分配 GPU 节点"
-            )
-        if missing:
-            raise RuntimeError("运行环境缺少命令: " + ", ".join(dict.fromkeys(missing)))
+        selected_backend = backend or self._backend_name
+        if selected_backend != self._backend_name:
+            self._set_backend(selected_backend)
+        self.rendering_service.set_backend(self.slurm, selected_backend)
+        self.rendering_service.preflight(profile)
 
     def _local_smoke_render(
         self,
@@ -3365,37 +3352,28 @@ class Orchestrator:
             # 本地进程句柄不会写入 manifest。恢复只能复用代码和审查结果，
             # 不能凭一个旧 PID/Job ID 认领另一个进程；将未完成的旧任务重新
             # 排队，避免出现“监控状态未知→取消失败”的假失败路径。
-            for scene_id, state in sorted(ctx.scene_states.items()):
-                job = state.slurm_job
-                if job is None or state.rendered:
-                    continue
-                state.slurm_job = None
-                if not state.failed and not state.give_up:
-                    state.failure_reason = (
-                        f"恢复时不认领旧本地渲染任务 {job.job_id}，将使用相同代码重新启动"
-                    )
-                    state.failure_category = "infrastructure"
-                self._emit(
-                    "local_job_not_resumed",
-                    scene_id=scene_id,
-                    job_id=job.job_id,
-                    reason="本地进程句柄未持久化，恢复时安全重启",
-                )
+            self.recovery_service.detach_unresumable_local_jobs(ctx, self._emit)
             return
         for scene_id, state in sorted(ctx.scene_states.items()):
             job = state.slurm_job
             if job is None or state.rendered or state.failed or state.give_up:
                 continue
             try:
-                status = self.slurm.poll_all_statuses([job.job_id]).get(job.job_id, "UNKNOWN")
+                status = (
+                    self._render_service()
+                    .backend.poll_all_statuses([job.job_id])
+                    .get(job.job_id, "UNKNOWN")
+                )
             except Exception:
                 continue  # 集群查询异常 → 保守保留, 交给监控处理
-            start_time = getattr(self.slurm, "last_start_times", {}).get(job.job_id)
+            start_time = getattr(self._render_service().backend, "last_start_times", {}).get(
+                job.job_id
+            )
             if start_time is not None:
                 job.started_at = start_time
             job.status = status
             if status == "COMPLETED":
-                if self.slurm.validate_completed_job(job):
+                if self._render_service().backend.validate_completed_job(job):
                     state.artifact = self._artifact_from_job(ctx, state, job)
                     state.rendered = True
                     self._reset_visual_receipt(ctx, state)
@@ -3405,7 +3383,7 @@ class Orchestrator:
                     # JobMonitor 会在共享文件系统宽限期内继续重验。
                     job.status = "COMPLETED"
             elif status == "GONE":
-                outcome = self.slurm._classify_gone(job)
+                outcome = self._render_service().classify_gone(job)
                 if outcome == "COMPLETED":
                     state.artifact = self._artifact_from_job(ctx, state, job)
                     state.rendered = True
@@ -3530,8 +3508,7 @@ class Orchestrator:
                     details=list(state.unknown_animation_details),
                 )
 
-    @staticmethod
-    def _planning_cycle_signature(ctx: PipelineContext) -> str:
+    def _planning_cycle_signature(self, ctx: PipelineContext) -> str:
         """计算当前计划/发现的指纹，防止审查器在同一输入上来回空转。"""
 
         payload = {
@@ -3549,7 +3526,7 @@ class Orchestrator:
             "plan_status": ctx.plan_review_status,
             "continuity_status": ctx.continuity_review_status,
         }
-        return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return self.planning_service.cycle_signature(payload)
 
     def _adapt_renderer_for_plans(self, ctx: PipelineContext) -> None:
         """在首次提交前为明确需要 Cairo 运镜的计划切换 renderer。"""
@@ -3715,7 +3692,7 @@ class Orchestrator:
             return
 
         self._slurm_monitor = SlurmMonitorCoordinator(
-            self.slurm,
+            self._render_service().backend,
             run_timeout=(settings.LOCAL_RENDER_TIMEOUT if ctx.backend == "local" else None),
             on_job_update=lambda job: self._checkpoint_slurm_job_update(ctx, job),
         )
@@ -3794,7 +3771,7 @@ class Orchestrator:
                 if previous_context != state.inherited_elements_code and state.code:
                     # 恢复旧运行或上游重写后，不能继续使用基于旧交接状态生成的代码。
                     if state.slurm_job is not None and not state.rendered:
-                        if not self.slurm.cancel_job(state.slurm_job.job_id):
+                        if not self._render_service().cancel_job(state.slurm_job.job_id):
                             raise RuntimeError(
                                 f"Scene {scene_id} 的旧 Slurm Job {state.slurm_job.job_id} "
                                 "仍在使用旧连续性上下文，取消失败，禁止重复提交"
@@ -6863,9 +6840,9 @@ class Orchestrator:
                 "code_sha256": sha256_text(state.code),
                 "render_profile": ctx.render_profile,
             }
-            if self._supports_keyword(self.slurm.submit_scene, "resource_profile"):
+            if self._supports_keyword(self._render_service().submit_scene, "resource_profile"):
                 submit_kwargs["resource_profile"] = resource_profile
-            job = self.slurm.submit_scene(
+            job = self._render_service().submit_scene(
                 scene_id,
                 source_path,
                 state.class_name,
@@ -6941,7 +6918,7 @@ class Orchestrator:
             # 的行为不因监控实现切换而改变。
             monitor = None
         else:
-            monitor = JobMonitor(self.slurm)
+            monitor = JobMonitor(self._render_service().backend)
             monitor.add_job(job)
             while monitor.pending:
                 if (
@@ -7528,7 +7505,7 @@ class Orchestrator:
         # 与 Coder/Reviewer 一样每个 worker 独立构造 Agent，避免并发修复
         # 共享 OpenAI client/流式状态。
         fixer = AutoFixerAgent()
-        error_log = self.slurm.get_error_log(job=job)
+        error_log = self._render_service().get_error_log(job=job)
         if not error_log:
             if self._rollback_to_best_candidate(ctx, scene_id, state):
                 return
@@ -8361,7 +8338,7 @@ class Orchestrator:
     ) -> SceneArtifact:
         if (
             job.output_path is None or job.output_metadata is None
-        ) and not self.slurm.validate_completed_job(job):
+        ) and not self._render_service().backend.validate_completed_job(job):
             raise RuntimeError(job.failure_reason or "渲染产物验证失败")
         if job.output_path is None or job.output_metadata is None:
             raise RuntimeError("渲染产物缺少路径或媒体元数据")
@@ -8439,7 +8416,7 @@ class Orchestrator:
             if technical_spec.latex.required:
                 capabilities.append("latex")
         try:
-            record, path, created = self.recipe_store.save(
+            record, path, created = self.recipe_learning_service.save(
                 code,
                 renderer=ctx.render_profile.renderer,
                 semantic_intent=plan.math_concept,
@@ -9178,7 +9155,8 @@ class Orchestrator:
                     },
                 )
             with self._visual_llm_slot():
-                result = evaluator.visual_evaluator.evaluate_video_frames(
+                result = self.visual_evaluation_service.evaluate_frames(
+                    evaluator.visual_evaluator,
                     samples,
                     ctx.original_prompt or ctx.user_prompt,
                     scene_context=json.dumps(
@@ -9363,7 +9341,8 @@ class Orchestrator:
             if not samples:
                 raise RuntimeError("没有可用于成片视觉评估的关键帧")
             with self._visual_llm_slot():
-                result = evaluator.visual_evaluator.evaluate_video_frames(
+                result = self.visual_evaluation_service.evaluate_frames(
+                    evaluator.visual_evaluator,
                     samples,
                     ctx.original_prompt or ctx.user_prompt,
                     scene_context=json.dumps(
