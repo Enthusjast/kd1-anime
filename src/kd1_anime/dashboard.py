@@ -183,7 +183,6 @@ class SceneDashboard:
         self.total: int = 0
         self.visual_enabled: bool = False
         self.rag_status: str = "disabled"
-        self.rag_models: str = ""
         self.backend: str = "slurm"
         # Rich 的自动刷新线程会和 Orchestrator 的事件线程同时读取/修改
         # 场景状态。使用可重入锁：_render() 需要持锁读取状态，而事件
@@ -288,12 +287,6 @@ class SceneDashboard:
 
         elif event == "rag_status":
             self.rag_status = data.get("status", "disabled") or "disabled"
-            warning = (data.get("warning", "") or "").strip()
-            embedding = data.get("embedding_model", "") or "未配置"
-            reranker = data.get("reranker_model", "") or "未配置"
-            self.rag_models = f"E:{embedding} R:{reranker}"
-            if warning and self.rag_status == "degraded":
-                self.rag_models += " · degraded"
 
         elif event == "scene_safe_fallback":
             if status:
@@ -757,8 +750,6 @@ class SceneDashboard:
                 f"  RAG:{self.rag_status}",
                 style="yellow" if self.rag_status == "degraded" else "cyan",
             )
-            if self.rag_models:
-                header.append(f" ({self.rag_models})", style="dim")
         header.append(f"  后端:{self.backend}", style="dim")
         if self.started_at:
             header.append(f"  用时 {int(time.time() - self.started_at)}s", style="dim")

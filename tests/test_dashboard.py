@@ -465,8 +465,16 @@ class TestSceneDashboardEvents:
         )
 
         assert dash.rag_status == "active"
-        assert dash.rag_models == "E:embedding R:reranker"
-        assert "degraded" not in str(dash._render())
+        import io
+
+        from rich.console import Console as RichConsole
+
+        buffer = io.StringIO()
+        RichConsole(file=buffer, width=120, force_terminal=False).print(dash._render())
+        rendered = buffer.getvalue()
+        assert "embedding" not in rendered
+        assert "reranker" not in rendered
+        assert "RAG:active" in rendered
 
         dash.on_event(
             "rag_status",
@@ -477,7 +485,12 @@ class TestSceneDashboardEvents:
                 "reranker_model": "reranker",
             },
         )
-        assert "degraded" in dash.rag_models
+        buffer = io.StringIO()
+        RichConsole(file=buffer, width=120, force_terminal=False).print(dash._render())
+        rendered = buffer.getvalue()
+        assert "embedding" not in rendered
+        assert "reranker" not in rendered
+        assert "RAG:degraded" in rendered
 
     def test_rendering_scene_shows_elapsed(self):
         import time
