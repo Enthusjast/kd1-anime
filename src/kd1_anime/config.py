@@ -453,6 +453,28 @@ class Settings(BaseSettings):
             raise ValueError("RAG_CHUNK_OVERLAP 必须小于 RAG_CHUNK_SIZE")
         return self
 
+    # --- 渲染后端 ---
+    # Slurm 仍是默认后端；local 只在用户明确选择时运行生成代码。
+    RENDER_BACKEND: Literal["slurm", "local"] = "slurm"
+    LOCAL_RENDER_MAX_IN_FLIGHT: int = Field(
+        default=1,
+        ge=1,
+        le=64,
+        description="本地正式渲染的最大并发数；默认串行，避免登录节点过载",
+    )
+    LOCAL_RENDER_TIMEOUT: int = Field(
+        default=3_600,
+        ge=10,
+        le=86_400,
+        description="单个本地正式渲染的最长运行时间（秒）",
+    )
+    LOCAL_RENDER_MEMORY_MB: int = Field(
+        default=16_384,
+        ge=256,
+        le=131_072,
+        description="本地正式渲染的地址空间上限（MB）",
+    )
+
     # --- Slurm 集群 ---
     SLURM_PARTITION: str = ""
     SLURM_ACCOUNT: str = ""

@@ -45,12 +45,24 @@
 | 使用方式 | 必需条件 | 是否提交 Slurm |
 | --- | --- | --- |
 | `generate --dry-run` | 主模型、Python 依赖；启用 RAG 时还需 RAG 服务和索引 | 否 |
-| 完整生成 | 主模型、Manim、XeLaTeX、FFmpeg、Slurm | 是 |
+| 完整生成（默认） | 主模型、Manim、XeLaTeX、FFmpeg、Slurm | 是 |
+| 完整生成 `--backend local` | 主模型、Manim、XeLaTeX、FFmpeg | 否，本地前台执行 |
 | `render scene.py` | Manim、XeLaTeX、FFmpeg、Slurm | 是（除非使用全局 `--dry-run`） |
+| `render scene.py --backend local --wait` | Manim、XeLaTeX、FFmpeg | 否，本地前台执行 |
 | 视觉评估 | 独立的多模态视觉模型 | 不一定，取决于评估的运行 |
 | RAG | 独立 Embedding、Reranker 和本地索引 | 否，索引保存在本地 |
 
 完整渲染还需要目标集群提供可用的 `sbatch`、`squeue`、`sacct` 和 `scancel`。没有 Slurm 时，可以用 `--dry-run` 验证规划、技术合同、代码生成和代码审查流程；它不会提交作业。默认不会执行生成代码，但检测到未识别动画调用时会按安全策略强制执行一次低质量 Smoke Render。
+
+如果当前主机已安装 Manim、XeLaTeX 和 FFmpeg，可显式选择本地正式渲染：
+
+```bash
+kd1-anime generate --file prompt.md --backend local
+kd1-anime render scene.py --class MyScene --backend local --wait
+```
+
+本地后端以前台进程运行，默认最多并发一个场景；Ctrl-C 会终止整个进程组。
+本地 Job 的进程句柄不会写入 manifest，`resume` 不会凭 PID 认领旧进程，而是使用相同代码安全重新启动未完成场景。
 
 ## 快速开始
 
@@ -175,7 +187,7 @@ INIT
   → PLAN_REVIEWING（确定性编译 + 计划审查 + 连续性审查）
   → CODING（TechnicalSpec v2 → Coder，按场景顺序交接）
   → REVIEWING（AST/生命周期 + 代码语义审查）
-  → DISPATCHING / MONITORING（场景级 Slurm 并行）
+  → DISPATCHING / MONITORING（场景级 Slurm 或本地并行）
   → FIXING → REVIEWING → …
   → VISUAL_EVALUATING（可选）
   → MERGING
@@ -242,6 +254,7 @@ kd1-anime --dry-run render scene.py --class MyScene
 ```
 
 `render` 是直接渲染模式，不调用 Planner、Technical Planner、Coder 或 Reviewer；它只执行确定性代码校验、渲染监控和合并。
+`--backend local` 必须配合 `--wait`，因为本地进程不能通过后台 Job ID 跨进程恢复。
 
 ### 查询、恢复和清理
 
@@ -321,6 +334,10 @@ kd1-anime cache clear --yes
 | `MANIM_PIXEL_WIDTH` / `HEIGHT` | `1920/1080` | 输出分辨率 |
 | `MANIM_FRAME_RATE` | `60` | 输出帧率 |
 | `MANIM_OPENGL_PLATFORM` | `egl` | OpenGL 上下文后端；无显示的 HPC 通常使用 `egl` |
+| `RENDER_BACKEND` | `slurm` | 正式渲染后端：`slurm` 或 `local` |
+| `LOCAL_RENDER_MAX_IN_FLIGHT` | `1` | 本地正式渲染最大并发数 |
+| `LOCAL_RENDER_TIMEOUT` | `3600` | 单个本地正式渲染超时秒数 |
+| `LOCAL_RENDER_MEMORY_MB` | `16384` | 本地正式渲染地址空间上限 |
 | `SMOKE_RENDER_ENABLED` | `true` | 正式 Slurm 渲染前执行同 renderer 的轻量探针 |
 | `SMOKE_RENDER_MODE` | `both` | 预检模式：frame、短视频或两者 |
 | `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外运行时预检 |
@@ -522,7 +539,7 @@ kd1-anime batch prompts.json --dry-run
 
 ## 渲染器、转场与视频合并
 
-- `MANIM_RENDERER=cairo` 是默认 CPU 渲染器；`MANIM_RENDERER=opengl` 需要有效 GPU。只有 OpenGL 模式才会申请 `SLURM_GPU_TYPE`。
+- `MANIM_RENDERER=cairo` 是默认 CPU 渲染器；`MANIM_RENDERER=opengl` 需要有效图形上下文。只有 Slurm/OpenGL 模式才会申请 `SLURM_GPU_TYPE`。
 - `MANIM_OPENGL_PLATFORM` 只决定 PyOpenGL 上下文后端：`egl` 适合无显示的 headless 节点，`glx` 需要可用显示服务。它不等同于选择 Cairo/OpenGL 渲染器。
 - OpenGL 不支持 `self.camera.frame`/`MovingCameraScene` 这类 Cairo 运镜 API；3D 场景应使用专用相机 API。遇到 `OpenGLCamera ... frame` 错误，应修改代码或切换 Cairo，而不是只重复提交任务。
 - 正式渲染前默认执行 import-only、frame 和风险自适应的短视频 Smoke Render；本地预检需要显式设置 `LOCAL_SMOKE_RENDER_ENABLED=true` 或使用 `--smoke`。dry-run 默认不执行生成代码，但若代码使用静态分析器未识别的动画调用，会自动强制一次低质量 frame+短视频 Smoke Render，并把结果写入运行清单。

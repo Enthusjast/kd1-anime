@@ -256,6 +256,11 @@ Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因�
 6. 适当调整阶段级 LLM_*_MAX_TOKENS，不要盲目提高所有阶段的预算；
 7. 设置 MONITOR_QUEUE_TIMEOUT、MONITOR_RUN_TIMEOUT 和 MONITOR_UNKNOWN_TIMEOUT，避免无限等待。
 
+选择 `RENDER_BACKEND=local` 时，检查 `status <run-id>` 中的 backend、运行目录下的
+`logs/scene_*_local-*.out/.err`，以及 `LOCAL_RENDER_TIMEOUT` 和
+`LOCAL_RENDER_MEMORY_MB`。本地渲染必须前台等待；中断后不要期待旧 PID 被认领，直接
+执行 `kd1-anime resume <run-id>` 即可安全重启未完成场景。
+
 如果任务在 Slurm 中仍为 PENDING，通常是队列、分区、账户、QoS 或 GPU 资源问题，不是 Coder
 问题。先检查 sbatch 提交输出和集群队列，不要反复触发代码修复。
 

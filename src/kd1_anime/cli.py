@@ -269,6 +269,10 @@ def _cancel_jobs_before_clean(manifest: RunManifest) -> None:
     ]
     if not jobs:
         return
+    if getattr(manifest, "backend", "slurm") == "local":
+        # 本地进程句柄不持久化；不能在新进程中凭 Job ID/PID 猜测并删除其
+        # 正在写入的 run 目录。正常完成/取消的本地 Job 不会进入 jobs。
+        raise RuntimeError("运行包含未完成的本地渲染任务，无法安全确认并删除；请先恢复或停止它")
     dispatcher = SlurmDispatcher()
     try:
         statuses = dispatcher.poll_all_statuses([job.job_id for job in jobs])
@@ -396,6 +400,11 @@ def generate(
         dir_okay=False,
         readable=True,
     ),
+    backend: str = typer.Option(
+        None,
+        "--backend",
+        help="渲染后端：slurm（默认）或 local（本地前台渲染）",
+    ),
 ):
     """直接生成模式 (无需求澄清)"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
@@ -404,6 +413,15 @@ def generate(
     if plan_file and (prompt or file or resume or incremental):
         console.print(
             "[bold red]错误:[/] --plan 不能与 prompt、--file、--resume 或 --incremental 混用"
+        )
+        raise typer.Exit(1)
+    if backend and backend not in {"slurm", "local"}:
+        console.print("[bold red]错误:[/] --backend 只能是 slurm 或 local", markup=False)
+        raise typer.Exit(1)
+    if resume and backend:
+        console.print(
+            "[bold red]错误:[/] resume 必须使用运行清单中的渲染后端，不能覆盖 --backend",
+            markup=False,
         )
         raise typer.Exit(1)
     if not prompt and not resume and not plan_file:
@@ -422,6 +440,8 @@ def generate(
         # 明确传入 --force 时才开启覆盖。
         if force:
             settings.OVERWRITE_OUTPUT = True
+        if backend:
+            settings.RENDER_BACKEND = backend
     except ValueError as e:
         console.print(f"[bold red]配置错误:[/] {e}", markup=False)
         raise typer.Exit(1) from e
@@ -470,6 +490,7 @@ def generate(
                 output_path=output,
                 approve_plan=approve_plan,
                 smoke=smoke,
+                backend=backend,
             )
         elif incremental:
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
@@ -478,6 +499,7 @@ def generate(
                 incremental,
                 dry_run=dry_run,
                 smoke=smoke,
+                backend=backend,
             )
         else:
             run_kwargs = {"dry_run": dry_run}
@@ -485,6 +507,8 @@ def generate(
                 run_kwargs["approve_plan"] = True
             if smoke:
                 run_kwargs["smoke"] = True
+            if backend:
+                run_kwargs["backend"] = backend
             final_video = orchestrator.run(prompt, **run_kwargs)
 
         if dry_run:
@@ -596,12 +620,23 @@ def render(
     class_name: str = typer.Option(None, "--class", "-c", help="Manim Scene 类名 (默认自动识别)"),
     scene_id: int = typer.Option(1, "--scene-id", "-s", min=1, help="场景 ID, 用于命名"),
     wait: bool = typer.Option(False, "--wait", "-w", help="等待任务完成并显示进度"),
+    backend: str = typer.Option(
+        None,
+        "--backend",
+        help="渲染后端：slurm（默认）或 local（本地前台渲染）",
+    ),
 ):
     """直接提交单个 .py 文件到 Slurm 渲染 (跳过 pipeline)"""
     from kd1_anime.agents.validator import validate_manim_code
     from kd1_anime.orchestrator import Orchestrator
 
     sid = scene_id
+    if backend and backend not in {"slurm", "local"}:
+        console.print("[bold red]错误:[/] --backend 只能是 slurm 或 local", markup=False)
+        raise typer.Exit(1)
+    if backend == "local" and not wait and not bool((ctx.obj or {}).get("dry_run")):
+        console.print("[bold red]错误:[/] 本地渲染后端必须使用 --wait 前台运行", markup=False)
+        raise typer.Exit(1)
     source_code = file.read_text(encoding="utf-8")
     validation = validate_manim_code(source_code, renderer=settings.MANIM_RENDERER)
     if not validation.is_valid:
@@ -628,6 +663,7 @@ def render(
             selected_class,
             scene_id=sid,
             wait=wait,
+            backend=backend,
         )
     except Exception as e:
         console.print(f"[bold red]渲染任务失败:[/] {e}", markup=False)
@@ -666,6 +702,7 @@ def _print_run_details(manifest: RunManifest) -> None:
     console.print(f"Created:      {manifest.created_at.astimezone().isoformat(timespec='seconds')}")
     console.print(f"Updated:      {manifest.updated_at.astimezone().isoformat(timespec='seconds')}")
     console.print(f"Output:       {manifest.final_video or manifest.output_path}", markup=False)
+    console.print(f"Backend:      {getattr(manifest, 'backend', 'slurm')}", markup=False)
     integrity_errors = manifest.integrity_errors()
     if integrity_errors:
         console.print(
@@ -689,6 +726,19 @@ def _print_run_details(manifest: RunManifest) -> None:
             f"{scene.review_round}/{scene.fix_attempts}",
         )
     console.print(table)
+    verification = Table(title="Verification")
+    verification.add_column("Scene")
+    verification.add_column("Static")
+    verification.add_column("Execution")
+    verification.add_column("Visual")
+    for scene_id, scene in sorted(manifest.scenes.items()):
+        verification.add_row(
+            str(scene_id),
+            scene.static_verification.status,
+            scene.execution_verification.status,
+            scene.visual_verification.status,
+        )
+    console.print(verification)
     if manifest.error:
         console.print("Last error:", style="bold red")
         console.print(manifest.error, markup=False)
@@ -1057,9 +1107,17 @@ def batch(
         "-o",
         help="输出目录",
     ),
+    backend: str = typer.Option(
+        None,
+        "--backend",
+        help="渲染后端：slurm（默认）或 local（本地前台渲染）",
+    ),
 ):
     """批量并行处理多个动画项目。"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
+    if backend and backend not in {"slurm", "local"}:
+        console.print("[bold red]错误:[/] --backend 只能是 slurm 或 local", markup=False)
+        raise typer.Exit(1)
     _ensure_generation_apis(dry_run=dry_run)
 
     from kd1_anime.batch import BatchConfig, BatchProcessor
@@ -1070,6 +1128,7 @@ def batch(
             max_parallel=max_parallel,
             dry_run=dry_run,
             output_dir=output_dir,
+            backend=backend,
         )
         processor = BatchProcessor(config)
         processor.load_tasks_from_file(prompts_file)

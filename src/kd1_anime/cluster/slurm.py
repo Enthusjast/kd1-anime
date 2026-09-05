@@ -15,6 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from rich.console import Console
@@ -63,6 +64,7 @@ MONITOR_ABORT_STATES = {
 
 @dataclass
 class SlurmJob:
+    # 名字沿用旧 API；现在它也承载 LocalRenderBackend 创建的本地作业。
     job_id: str
     scene_id: int
     script_path: Path
@@ -85,6 +87,7 @@ class SlurmJob:
     cancelled: bool = False
     environment_fingerprint: dict[str, str] = field(default_factory=dict)
     environment_warning: str = ""
+    backend: Literal["slurm", "local"] = "slurm"
 
 
 @dataclass(frozen=True, slots=True)

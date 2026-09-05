@@ -104,6 +104,11 @@ from kd1_anime.agents.technical_planner import (
     normalize_technical_spec_contract,
 )
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
+from kd1_anime.candidate_acceptor import CandidateAcceptor, CandidateRejected
+from kd1_anime.cluster.render_backend import (
+    RenderBackendName,
+    create_render_backend,
+)
 from kd1_anime.cluster.resource_estimator import (
     RenderResourceProfile,
     estimate_render_resources,
@@ -111,7 +116,6 @@ from kd1_anime.cluster.resource_estimator import (
 from kd1_anime.cluster.slurm import (
     FAILURE_STATES,
     JobMonitor,
-    SlurmDispatcher,
     SlurmJob,
     SlurmMonitorCoordinator,
 )
@@ -158,6 +162,11 @@ from kd1_anime.run_store import (
     write_manifest,
 )
 from kd1_anime.security import redact_jsonable, redact_text, redact_value
+from kd1_anime.verification import (
+    ExecutionVerification,
+    StaticVerification,
+    VisualVerification,
+)
 
 logger = get_logger(__name__)
 console = Console()
@@ -317,6 +326,9 @@ class SceneState:
     capability_contract: CapabilityContract | None = None
     capability_status: str = "pending"
     resource_profile: RenderResourceProfile | None = None
+    static_verification: StaticVerification = field(default_factory=StaticVerification)
+    execution_verification: ExecutionVerification = field(default_factory=ExecutionVerification)
+    visual_verification: VisualVerification = field(default_factory=VisualVerification)
     # 本地 Smoke Render 的恢复凭据；未通过或未完成时，恢复/AutoFix 后
     # 必须在 Reviewer 前重新执行，不能只依赖旧的内存状态。
     local_smoke_status: str = "pending"
@@ -372,6 +384,8 @@ class PipelineContext:
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    # 本次运行固定使用的渲染后端；恢复时只能使用 manifest 中的值。
+    backend: RenderBackendName = field(default_factory=lambda: settings.RENDER_BACKEND)
     # 显式 --smoke 可让 dry-run 执行一次本地低质量预检；该开关写入
     # manifest，恢复时继续沿用，不能因 CLI 省略参数而悄悄跳过。
     local_smoke_enabled: bool = False
@@ -429,7 +443,8 @@ class PipelineContext:
 class Orchestrator:
     def __init__(self, resource_coordinator: ResourceCoordinator | None = None) -> None:
         self.planner = PlannerAgent()
-        self.slurm = SlurmDispatcher()
+        self.slurm = create_render_backend()
+        self._backend_name: RenderBackendName = settings.RENDER_BACKEND
         self.merger = VideoMerger()
         self._callback: Callback | None = None
         self._ctx: PipelineContext | None = None
@@ -453,6 +468,17 @@ class Orchestrator:
         )
         self.recipe_store = RecipeStore()
         self.failure_cases = FailureCaseStore()
+        self.candidate_acceptor = CandidateAcceptor()
+
+    def _set_backend(self, backend: str) -> None:
+        """固定当前 Orchestrator 的渲染后端。"""
+
+        if backend not in {"slurm", "local"}:
+            raise ValueError(f"不支持的渲染后端: {backend!r}")
+        if backend == self._backend_name:
+            return
+        self.slurm = create_render_backend(backend)
+        self._backend_name = backend  # type: ignore[assignment]
 
     @staticmethod
     def _configured_visual_profile(*, enabled: bool | None = None) -> VisualEvalProfile:
@@ -477,6 +503,9 @@ class Orchestrator:
         """使当前视频的视觉收据失效，同时可保留跨修复的最佳候选。"""
 
         state.visual_status = "pending" if ctx.visual_eval_profile.enabled else "skipped"
+        state.visual_verification = VisualVerification(
+            status="not_run",
+        )
         state.visual_score = None
         state.visual_report_file = ""
         state.visual_report_sha256 = ""
@@ -502,6 +531,46 @@ class Orchestrator:
         state.capability_contract = None
         state.capability_status = "pending"
         state.candidates = []
+        state.static_verification = StaticVerification(status="not_run")
+
+    @staticmethod
+    def _mark_static_verification(
+        state: SceneState,
+        *,
+        status: str,
+        error: str = "",
+    ) -> None:
+        state.static_verification = StaticVerification(
+            status=status,
+            code_sha256=sha256_text(state.code) if state.code else "",
+            technical_spec_sha256=(
+                sha256_text(state.technical_spec.model_dump_json())
+                if state.technical_spec is not None
+                else ""
+            ),
+            checked_at=datetime.now().astimezone().isoformat(),
+            error=error[:10_000],
+        )
+
+    @staticmethod
+    def _mark_execution_verification(
+        state: SceneState,
+        *,
+        status: str,
+        scope: str | None = None,
+        artifact_sha256: str = "",
+        duration_seconds: float | None = None,
+        error: str = "",
+    ) -> None:
+        state.execution_verification = ExecutionVerification(
+            status=status,
+            scope=scope,
+            code_sha256=sha256_text(state.code) if state.code else "",
+            artifact_sha256=artifact_sha256,
+            duration_seconds=duration_seconds,
+            checked_at=datetime.now().astimezone().isoformat(),
+            error=error[:10_000],
+        )
 
     def _invalidate_legacy_technical_contracts(
         self,
@@ -1026,6 +1095,9 @@ class Orchestrator:
                     capability_contract=scene.capability_contract,
                     capability_status=scene.capability_status,
                     resource_profile=scene.resource_profile,
+                    static_verification=scene.static_verification,
+                    execution_verification=scene.execution_verification,
+                    visual_verification=scene.visual_verification,
                     local_smoke_status=scene.local_smoke_status,
                     rewrite_feedback=scene.rewrite_feedback,
                     review_signature=scene.review_signature,
@@ -1071,6 +1143,7 @@ class Orchestrator:
                 dry_run=ctx.dry_run,
                 interactive=ctx.interactive,
                 auto_fix=ctx.auto_fix,
+                backend=ctx.backend,
                 local_smoke_enabled=ctx.local_smoke_enabled,
                 direct_render=ctx.direct_render,
                 approve_plan=ctx.approve_plan,
@@ -1268,6 +1341,8 @@ class Orchestrator:
                     raise ValueError(f"Scene {scene_id} 的 Slurm Job 场景身份不一致")
                 if job.code_sha256 != stored.code_sha256:
                     raise ValueError(f"Scene {scene_id} 的 Slurm Job 代码哈希不一致")
+                if job.backend != getattr(manifest, "backend", "slurm"):
+                    raise ValueError(f"Scene {scene_id} 的 Job 后端与运行清单不一致")
                 if job.render_profile.digest() != manifest.render_profile.digest():
                     raise ValueError(f"Scene {scene_id} 的 Slurm Job 渲染配置不一致")
             artifact = stored.artifact
@@ -1280,6 +1355,8 @@ class Orchestrator:
                     raise ValueError(f"Scene {scene_id} 的渲染产物身份不一致")
                 if artifact.render_profile_sha256 != manifest.render_profile.digest():
                     raise ValueError(f"Scene {scene_id} 的渲染产物配置不一致")
+                if artifact.backend != getattr(manifest, "backend", "slurm"):
+                    raise ValueError(f"Scene {scene_id} 的渲染产物后端与运行清单不一致")
             if stored.rendered and artifact is None:
                 raise ValueError(f"Scene {scene_id} 标记为已渲染但缺少产物凭据")
             visual_status = stored.visual_status
@@ -1314,6 +1391,40 @@ class Orchestrator:
                     visual_report_sha256 = ""
                     visual_artifact_sha256 = ""
                     visual_feedback = ""
+            static_verification = getattr(stored, "static_verification", StaticVerification())
+            if static_verification.status == "not_run" and stored.reviewed and code:
+                static_verification = StaticVerification(
+                    status="passed",
+                    code_sha256=sha256_text(code),
+                    technical_spec_sha256=stored.technical_spec_sha256,
+                )
+            execution_verification = getattr(
+                stored,
+                "execution_verification",
+                ExecutionVerification(),
+            )
+            if execution_verification.status == "not_run" and stored.rendered and artifact:
+                execution_verification = ExecutionVerification(
+                    status="passed",
+                    scope="formal_video",
+                    code_sha256=sha256_text(code) if code else "",
+                    artifact_sha256=artifact.video_sha256,
+                    duration_seconds=artifact.metadata.duration_seconds,
+                )
+            visual_verification = getattr(stored, "visual_verification", VisualVerification())
+            if visual_verification.status == "not_run" and visual_status in {
+                "passed",
+                "warning",
+                "unknown",
+            }:
+                visual_verification = VisualVerification(
+                    status=visual_status,
+                    code_sha256=sha256_text(code) if code else "",
+                    artifact_sha256=visual_artifact_sha256,
+                    report_sha256=visual_report_sha256,
+                    score=visual_score,
+                    feedback=visual_feedback,
+                )
             scene_states[scene_id] = SceneState(
                 plan=stored.plan,
                 code=code,
@@ -1355,6 +1466,9 @@ class Orchestrator:
                     getattr(stored, "resource_profile", None)
                     or (getattr(job, "resource_profile", None) if job is not None else None)
                 ),
+                static_verification=static_verification,
+                execution_verification=execution_verification,
+                visual_verification=visual_verification,
                 local_smoke_status=getattr(stored, "local_smoke_status", "pending"),
                 rewrite_feedback=getattr(stored, "rewrite_feedback", ""),
                 review_signature=getattr(stored, "review_signature", ""),
@@ -1392,6 +1506,7 @@ class Orchestrator:
             dry_run=manifest.dry_run,
             interactive=manifest.interactive,
             auto_fix=manifest.auto_fix,
+            backend=getattr(manifest, "backend", "slurm"),
             local_smoke_enabled=getattr(manifest, "local_smoke_enabled", False),
             direct_render=direct_render,
             approve_plan=getattr(manifest, "approve_plan", False),
@@ -1737,6 +1852,7 @@ class Orchestrator:
         output_path: Path | None = None,
         approve_plan: bool = False,
         smoke: bool = False,
+        backend: RenderBackendName | None = None,
     ) -> Path | None:
         """增量渲染：只重新渲染受 prompt 变化影响的场景。"""
         # CLI 会在进入流水线前做真实网络探测；库调用方至少也必须通过
@@ -1760,6 +1876,14 @@ class Orchestrator:
             raise RunNotFoundError(f"无法加载基础运行 {base_run_id}: {exc}") from exc
         base_manifest.validate_for_resume()
 
+        selected_backend = backend or getattr(base_manifest, "backend", settings.RENDER_BACKEND)
+        if selected_backend != getattr(base_manifest, "backend", "slurm"):
+            raise RunError(
+                "增量运行必须使用基础运行相同的渲染后端："
+                f"{getattr(base_manifest, 'backend', 'slurm')} != {selected_backend}"
+            )
+        self._set_backend(selected_backend)
+
         if base_manifest.status not in ("completed", "dry_run_complete"):
             raise RunError(f"基础运行 {base_run_id} 未完成（状态：{base_manifest.status}）")
 
@@ -1770,6 +1894,7 @@ class Orchestrator:
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
+            backend=selected_backend,
             dry_run=dry_run,
             interactive=interactive,
             local_smoke_enabled=smoke,
@@ -1799,6 +1924,7 @@ class Orchestrator:
         output_path: Path | None = None,
         approve_plan: bool = False,
         smoke: bool = False,
+        backend: RenderBackendName | None = None,
     ) -> Path | None:
         # 保持 programmatic API 与 CLI 的配置门槛一致。网络可用性由 CLI
         # 的启动探测负责，底层 Agent 仍会在真正调用时给出详细错误。
@@ -1811,6 +1937,8 @@ class Orchestrator:
             raise ValueError(
                 f"用户需求过长：{len(user_prompt)} 字符，最大允许 {settings.MAX_PROMPT_CHARS} 字符\n提示：可以将需求拆分为多个较短的动画，或使用更简洁的描述"
             )
+        selected_backend = backend or settings.RENDER_BACKEND
+        self._set_backend(selected_backend)
         self._callback = callback
         self._manifest = None
         self._cancel_requested.clear()
@@ -1818,6 +1946,7 @@ class Orchestrator:
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
+            backend=selected_backend,
             dry_run=dry_run,
             interactive=interactive,
             paths=RunPaths.create(output_path),
@@ -1841,16 +1970,26 @@ class Orchestrator:
         *,
         scene_id: int = 1,
         wait: bool = False,
+        backend: RenderBackendName | None = None,
     ) -> tuple[SlurmJob, Path | None, str]:
         """提交用户已有的单 Scene 文件，并让它拥有完整的运行清单。"""
 
         self._cancel_requested.clear()
         self._stop_event.clear()
+        selected_backend = backend or settings.RENDER_BACKEND
+        if selected_backend == "local" and not wait:
+            raise ValueError("本地渲染后端只支持前台等待，不能使用 --no-wait")
+        self._set_backend(selected_backend)
         profile = RenderProfile.current()
         validation = self._validate(source_code, renderer=profile.renderer)
         if not validation.is_valid or class_name not in validation.scene_classes:
             raise ValueError("直接渲染代码未通过确定性校验")
-        self._preflight_environment(profile)
+        preflight = self._preflight_environment
+        if self._supports_keyword(preflight, "backend"):
+            preflight(profile, backend=selected_backend)
+        else:
+            # 兼容外部集成替换的旧版只接收 profile 的预检函数。
+            preflight(profile)
         paths = RunPaths.create()
         for directory in (
             paths.root,
@@ -1891,6 +2030,7 @@ class Orchestrator:
             original_prompt=prompt,
             paths=paths,
             auto_fix=False,
+            backend=selected_backend,
             direct_render=True,
             scenes=[plan],
             scene_states={scene_id: scene_state},
@@ -1952,6 +2092,7 @@ class Orchestrator:
             raise FileNotFoundError(f"找不到运行清单: {run_id}")
         with lock_run(root):
             manifest = repository.load(run_id)
+            self._set_backend(getattr(manifest, "backend", "slurm"))
             self._invalidate_legacy_technical_contracts(manifest, root)
             manifest.validate_for_resume()
             self._callback = callback
@@ -2270,6 +2411,7 @@ class Orchestrator:
         output_path: Path | None = None,
         approve_plan: bool = False,
         smoke: bool = False,
+        backend: RenderBackendName | None = None,
     ) -> Path | None:
         """从 ``kd1-anime plan --output`` 生成的计划文件继续执行。"""
 
@@ -2296,6 +2438,8 @@ class Orchestrator:
             settings.require_visual_llm()
         if self.rag.enabled:
             self.rag.require_ready()
+        selected_backend = backend or settings.RENDER_BACKEND
+        self._set_backend(selected_backend)
         self._callback = callback
         self._manifest = None
         self._cancel_requested.clear()
@@ -2303,6 +2447,7 @@ class Orchestrator:
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
+            backend=selected_backend,
             paths=RunPaths.create(output_path),
             dry_run=dry_run,
             interactive=interactive,
@@ -2538,10 +2683,33 @@ class Orchestrator:
             return fallback
 
     @staticmethod
-    def _preflight_environment(profile: RenderProfile | None = None) -> None:
-        """在创建/提交渲染任务前验证本地控制端和渲染配置。"""
+    def _preflight_environment(
+        profile: RenderProfile | None = None,
+        *,
+        backend: RenderBackendName | None = None,
+    ) -> None:
+        """在创建/提交渲染任务前验证对应后端需要的本地工具。"""
 
         profile = profile or RenderProfile.current()
+        selected_backend = backend or settings.RENDER_BACKEND
+        if selected_backend == "local":
+            missing = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
+            try:
+                import importlib.util
+
+                manim_available = importlib.util.find_spec("manim") is not None
+            except (ImportError, ModuleNotFoundError, ValueError):
+                manim_available = False
+            if not manim_available:
+                missing.append("manim")
+            if missing:
+                raise RuntimeError(
+                    "本地渲染环境缺少命令/模块: " + ", ".join(dict.fromkeys(missing))
+                )
+            # 本地 OpenGL 由 EGL/GLX 自己选择设备，不要求 Slurm GPU 类型；
+            # 正式命令仍显式固定 PYOPENGL_PLATFORM。
+            return
+
         missing = [name for name in ("sbatch", "ffmpeg", "ffprobe") if not shutil.which(name)]
         container = settings.SLURM_CONTAINER_IMAGE
         if settings.SLURM_REQUIRE_CONTAINER and not container:
@@ -2575,9 +2743,19 @@ class Orchestrator:
             with self._state_lock:
                 self._checkpoint(ctx, State.CODING)
             self._local_smoke_render_impl(ctx, state)
-        except Exception:
+        except Exception as exc:
             with self._state_lock:
                 state.local_smoke_status = "failed"
+                self._mark_execution_verification(
+                    state,
+                    status="failed",
+                    scope=(
+                        "short_video"
+                        if settings.LOCAL_SMOKE_RENDER_MODE in {"video", "both"}
+                        else "frame"
+                    ),
+                    error=str(exc),
+                )
                 try:
                     self._checkpoint(ctx, State.CODING)
                 except Exception as checkpoint_error:
@@ -2585,9 +2763,25 @@ class Orchestrator:
             raise
         with self._state_lock:
             state.local_smoke_status = "passed"
+            self._mark_execution_verification(
+                state,
+                status="passed",
+                scope=(
+                    "short_video"
+                    if settings.LOCAL_SMOKE_RENDER_MODE in {"video", "both"}
+                    or (ctx.dry_run and state.unknown_animation_detected)
+                    else "frame"
+                ),
+            )
             self._record_code_candidate(ctx, state, verification="smoke")
             self._checkpoint(ctx, State.CODING)
         self._emit("scene_smoke_rendered", scene_id=state.plan.scene_id)
+        self._emit(
+            "scene_execution_verified",
+            scene_id=state.plan.scene_id,
+            status=state.execution_verification.status,
+            scope=state.execution_verification.scope,
+        )
 
     @staticmethod
     def _unknown_animation_details(
@@ -2841,7 +3035,11 @@ class Orchestrator:
                     self._emit("security_warning", message=warning)
                 else:
                     console.print(f"[bold yellow]安全警告:[/] {warning}")
-            self._preflight_environment(ctx.render_profile)
+            preflight = self._preflight_environment
+            if self._supports_keyword(preflight, "backend"):
+                preflight(ctx.render_profile, backend=ctx.backend)
+            else:
+                preflight(ctx.render_profile)
 
         # 增量渲染分析
         if ctx.incremental:
@@ -3163,6 +3361,27 @@ class Orchestrator:
         - FAILED/CANCELLED 等终态 → 保留, 交给监控触发自动修复
         - RUNNING/PENDING → 保留, 继续监控
         """
+        if ctx.backend == "local":
+            # 本地进程句柄不会写入 manifest。恢复只能复用代码和审查结果，
+            # 不能凭一个旧 PID/Job ID 认领另一个进程；将未完成的旧任务重新
+            # 排队，避免出现“监控状态未知→取消失败”的假失败路径。
+            for scene_id, state in sorted(ctx.scene_states.items()):
+                job = state.slurm_job
+                if job is None or state.rendered:
+                    continue
+                state.slurm_job = None
+                if not state.failed and not state.give_up:
+                    state.failure_reason = (
+                        f"恢复时不认领旧本地渲染任务 {job.job_id}，将使用相同代码重新启动"
+                    )
+                    state.failure_category = "infrastructure"
+                self._emit(
+                    "local_job_not_resumed",
+                    scene_id=scene_id,
+                    job_id=job.job_id,
+                    reason="本地进程句柄未持久化，恢复时安全重启",
+                )
+            return
         for scene_id, state in sorted(ctx.scene_states.items()):
             job = state.slurm_job
             if job is None or state.rendered or state.failed or state.give_up:
@@ -3497,6 +3716,7 @@ class Orchestrator:
 
         self._slurm_monitor = SlurmMonitorCoordinator(
             self.slurm,
+            run_timeout=(settings.LOCAL_RENDER_TIMEOUT if ctx.backend == "local" else None),
             on_job_update=lambda job: self._checkpoint_slurm_job_update(ctx, job),
         )
         threads: list[threading.Thread] = []
@@ -3832,6 +4052,8 @@ class Orchestrator:
             state.slurm_job = None
             state.exported_elements_code = ""
             state.exported_elements = []
+            state.static_verification = StaticVerification(status="not_run")
+            state.execution_verification = ExecutionVerification(status="not_run")
             self._reset_repair_progress(state)
             self._remove_element_manifest_scene(ctx, state.plan.scene_id)
             self._reset_visual_receipt(ctx, state, clear_candidate=True, reset_attempts=True)
@@ -5835,8 +6057,17 @@ class Orchestrator:
 
     def _try_acquire_slot(self) -> bool:
         if self._resource_coordinator:
-            return self._resource_coordinator.try_acquire_slurm()
-        limit = settings.SLURM_MAX_IN_FLIGHT
+            return (
+                self._resource_coordinator.try_acquire_local()
+                if self._ctx is not None and self._ctx.backend == "local"
+                else self._resource_coordinator.try_acquire_slurm()
+            )
+        ctx = self._ctx
+        limit = (
+            settings.LOCAL_RENDER_MAX_IN_FLIGHT
+            if ctx is not None and ctx.backend == "local"
+            else settings.SLURM_MAX_IN_FLIGHT
+        )
         with self._slot_lock:
             if limit and self._in_flight >= limit:
                 return False
@@ -5847,7 +6078,10 @@ class Orchestrator:
         """让 resume 时已存在的远程作业先占用名额，防止继续超量提交。"""
 
         if self._resource_coordinator:
-            self._resource_coordinator.register_existing_slurm()
+            if self._ctx is not None and self._ctx.backend == "local":
+                self._resource_coordinator.register_existing_local()
+            else:
+                self._resource_coordinator.register_existing_slurm()
         else:
             with self._slot_lock:
                 self._in_flight += 1
@@ -5855,7 +6089,10 @@ class Orchestrator:
 
     def _release_slot(self) -> None:
         if self._resource_coordinator:
-            self._resource_coordinator.release_slurm()
+            if self._ctx is not None and self._ctx.backend == "local":
+                self._resource_coordinator.release_local()
+            else:
+                self._resource_coordinator.release_slurm()
             return
         with self._slot_lock:
             self._in_flight = max(0, self._in_flight - 1)
@@ -6351,8 +6588,30 @@ class Orchestrator:
                 if not program_used and settings.CODEGEN_MODE == "python":
                     raise
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
-        self._write_private(path, code)
-        unknown_animation_details = self._unknown_animation_details(ctx, state, code)
+        try:
+            accepted = self.candidate_acceptor.accept(
+                code,
+                state.plan,
+                technical_spec=state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+                expected_class_name=class_name,
+                destination=path,
+                validator=self._validate,
+            )
+        except CandidateRejected as exc:
+            raise ValidationError(
+                f"统一候选接纳入口拒绝 Coder 候选: {exc}",
+                hint="根据确定性校验反馈重新生成代码",
+            ) from exc
+        code = accepted.code
+        class_name = accepted.class_name
+        unknown_animation_details = list(
+            self.candidate_acceptor.unknown_animation_details(
+                code,
+                state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+            )
+        )
         with self._state_lock:
             state.code = code
             state.class_name = class_name
@@ -6363,6 +6622,8 @@ class Orchestrator:
             state.infra_retries = 0
             state.artifact = None
             state.rendered = False
+            self._mark_static_verification(state, status="passed")
+            self._mark_execution_verification(state, status="not_run")
             state.exported_elements_code = ""
             state.exported_elements = []
             state.unknown_animation_detected = bool(unknown_animation_details)
@@ -6384,6 +6645,12 @@ class Orchestrator:
                 scene_id=scene_id,
                 details=unknown_animation_details,
             )
+        self._emit(
+            "scene_static_verified",
+            scene_id=scene_id,
+            status=state.static_verification.status,
+            code_sha256=state.static_verification.code_sha256,
+        )
         self._local_smoke_render(ctx, state)
         api_result = lint_manim_api(
             code,
@@ -6698,6 +6965,12 @@ class Orchestrator:
             ok = monitor.results.get(job.job_id)
         if ok is None:
             with self._state_lock:
+                self._mark_execution_verification(
+                    state,
+                    status="unknown",
+                    scope="formal_video",
+                    error="渲染作业状态或产物无法确认",
+                )
                 state.give_up = True
                 state.failure_category = "infrastructure"
                 state.failure_reason = "渲染作业状态未知，已放弃"
@@ -6707,6 +6980,13 @@ class Orchestrator:
             with self._state_lock:
                 state.artifact = self._artifact_from_job(ctx, state, job)
                 state.rendered = True
+                self._mark_execution_verification(
+                    state,
+                    status="passed",
+                    scope="formal_video",
+                    artifact_sha256=state.artifact.video_sha256,
+                    duration_seconds=state.artifact.metadata.duration_seconds,
+                )
                 state.failure_reason = ""
                 state.failure_category = ""
                 self._record_code_candidate(
@@ -6719,6 +6999,12 @@ class Orchestrator:
                 self._update_state_ledger(ctx, state)
                 self._checkpoint(ctx, State.MONITORING)
             self._emit("scene_rendered", scene_id=job.scene_id)
+            self._emit(
+                "scene_execution_verified",
+                scene_id=job.scene_id,
+                status=state.execution_verification.status,
+                scope=state.execution_verification.scope,
+            )
             if not ctx.visual_eval_profile.enabled:
                 self._maybe_store_recipe(ctx, state, verification="rendered")
             # 不再等整个渲染批次结束：最先完成的场景立即接受视觉检查。
@@ -6728,6 +7014,15 @@ class Orchestrator:
             return True
         # 基础设施终态与业务代码无关，即使关闭 AutoFix 也应直接重新排队；
         # 不能因为 direct render 使用 auto_fix=False 就把节点故障交给用户手工重提。
+        with self._state_lock:
+            self._mark_execution_verification(
+                state,
+                status="unknown"
+                if job.status in {"UNKNOWN", "GONE", "CANCEL_FAILED"}
+                else "failed",
+                scope="formal_video",
+                error=job.failure_reason or job.status,
+            )
         if job.status in RETRYABLE_INFRA_STATES:
             with self._state_lock:
                 if state.infra_retries < settings.MAX_INFRA_RETRIES:
@@ -6917,25 +7212,13 @@ class Orchestrator:
                 code = path.read_text(encoding="utf-8")
                 if sha256_text(code) != candidate.code_sha256:
                     continue
-                validation = self._validate(code, renderer=ctx.render_profile.renderer)
-                if not validation.is_valid or candidate.class_name not in validation.scene_classes:
-                    continue
-                api_result = lint_manim_api(
+                self.candidate_acceptor.inspect(
                     code,
+                    state.plan,
+                    technical_spec=state.technical_spec,
                     renderer=ctx.render_profile.renderer,
-                    scene_plan=state.plan,
+                    expected_class_name=candidate.class_name,
                 )
-                if not api_result.is_valid:
-                    continue
-                extract_scene_continuity_elements(code, state.plan)
-                if state.technical_spec is not None:
-                    lifecycle = validate_animation_lifecycle(
-                        code,
-                        state.technical_spec,
-                        renderer=ctx.render_profile.renderer,
-                    )
-                    if not lifecycle.is_valid:
-                        continue
                 if candidate.artifact is not None:
                     self._artifact_video_path(ctx, candidate.artifact)
             except (OSError, UnicodeError, ValueError, RuntimeError):
@@ -6956,22 +7239,44 @@ class Orchestrator:
             return False
         path = restore_run_path(ctx.paths.root, candidate.code_file)
         code = path.read_text(encoding="utf-8")
-        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", code)
+        try:
+            accepted = self.candidate_acceptor.accept(
+                code,
+                state.plan,
+                technical_spec=state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+                expected_class_name=candidate.class_name,
+                validator=self._validate,
+                destination=ctx.paths.scenes / f"scene_{scene_id}.py",
+            )
+        except CandidateRejected:
+            return False
+        code = accepted.code
         with self._state_lock:
             state.code = code
-            state.class_name = candidate.class_name
+            state.class_name = accepted.class_name
             state.rewrite_feedback = ""
             state.review_signature = ""
             state.identical_review_count = 0
             state.review_round = 0
             state.slurm_job = None
+            state.artifact = candidate.artifact
+            state.rendered = candidate.artifact is not None and candidate.verification == "rendered"
             state.local_smoke_status = (
                 "passed" if candidate.verification in {"smoke", "rendered"} else "pending"
             )
+            self._mark_static_verification(state, status="passed")
+            self._mark_execution_verification(
+                state,
+                status="passed" if state.rendered else "not_run",
+                scope="formal_video" if state.rendered else None,
+                artifact_sha256=(state.artifact.video_sha256 if state.artifact else ""),
+                duration_seconds=(
+                    state.artifact.metadata.duration_seconds if state.artifact else None
+                ),
+            )
             state.exported_elements_code = candidate.exported_elements_code
             state.exported_elements = list(candidate.exported_elements)
-            state.artifact = candidate.artifact
-            state.rendered = candidate.artifact is not None and candidate.verification == "rendered"
             state.reviewed = state.rendered
             state.failure_reason = ""
             state.failure_category = ""
@@ -7016,30 +7321,19 @@ class Orchestrator:
                 )
             candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
         for candidate in candidates:
-            validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
-            if not validation.is_valid:
-                continue
-            api_result = lint_manim_api(
-                candidate,
-                renderer=ctx.render_profile.renderer,
-                scene_plan=state.plan,
-            )
-            if not api_result.is_valid:
-                continue
             try:
-                extract_scene_continuity_elements(candidate, state.plan)
-            except ValueError:
-                continue
-            if state.technical_spec is not None:
-                lifecycle = validate_animation_lifecycle(
+                accepted = self.candidate_acceptor.inspect(
                     candidate,
-                    state.technical_spec,
+                    state.plan,
+                    technical_spec=state.technical_spec,
                     renderer=ctx.render_profile.renderer,
+                    expected_class_name=state.class_name or None,
+                    validator=self._validate,
                 )
-                if not lifecycle.is_valid:
-                    continue
+            except CandidateRejected:
+                continue
             if candidate != state.code:
-                return candidate, validation.scene_classes[0]
+                return accepted.code, accepted.class_name
         return None
 
     def _install_repair_candidate(
@@ -7055,9 +7349,30 @@ class Orchestrator:
     ) -> bool:
         """统一写入经过确定性校验的 AutoFix/回退候选。"""
 
+        try:
+            accepted = self.candidate_acceptor.accept(
+                candidate,
+                state.plan,
+                technical_spec=state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+                expected_class_name=class_name,
+                destination=ctx.paths.scenes / f"scene_{scene_id}.py",
+            )
+        except CandidateRejected as exc:
+            raise ValidationError(
+                f"统一候选接纳入口拒绝修复候选: {exc}",
+                hint="保留最近可信候选或重新生成代码",
+            ) from exc
+        candidate = accepted.code
+        class_name = accepted.class_name
         code_changed = candidate != state.code
-        unknown_animation_details = self._unknown_animation_details(ctx, state, candidate)
-        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
+        unknown_animation_details = list(
+            self.candidate_acceptor.unknown_animation_details(
+                candidate,
+                state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+            )
+        )
         with self._state_lock:
             state.code = candidate
             state.class_name = class_name
@@ -7072,6 +7387,8 @@ class Orchestrator:
             state.slurm_job = None
             state.artifact = None
             state.rendered = False
+            self._mark_static_verification(state, status="passed")
+            self._mark_execution_verification(state, status="not_run")
             state.exported_elements_code = ""
             state.exported_elements = []
             state.unknown_animation_detected = bool(unknown_animation_details)
@@ -7141,6 +7458,8 @@ class Orchestrator:
                 state.inherited_elements_code = ""
                 state.exported_elements_code = ""
                 state.exported_elements = []
+                state.static_verification = StaticVerification(status="not_run")
+                state.execution_verification = ExecutionVerification(status="not_run")
                 self._reset_technical_spec(state)
                 self._remove_element_manifest_scene(ctx, sid)
                 state.safe_fallback_used = False
@@ -7683,23 +8002,26 @@ class Orchestrator:
         if applied == 0 or candidate == state.code:
             return False
 
-        validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
-        if not validation.is_valid:
-            return False
         try:
-            extract_scene_continuity_elements(candidate, state.plan)
-        except ValueError:
+            accepted = self.candidate_acceptor.inspect(
+                candidate,
+                state.plan,
+                technical_spec=state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+                expected_class_name=state.class_name or None,
+                validator=self._validate,
+            )
+        except CandidateRejected:
             return False
-        if state.technical_spec is not None:
-            lifecycle_result = validate_animation_lifecycle(
+        candidate = accepted.code
+        validation = accepted.validation
+        unknown_animation_details = list(
+            self.candidate_acceptor.unknown_animation_details(
                 candidate,
                 state.technical_spec,
                 renderer=ctx.render_profile.renderer,
             )
-            if not lifecycle_result.is_valid:
-                return False
-
-        unknown_animation_details = self._unknown_animation_details(ctx, state, candidate)
+        )
 
         self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate)
         with self._state_lock:
@@ -7712,6 +8034,8 @@ class Orchestrator:
             state.rewrite_feedback = ""
             state.artifact = None
             state.rendered = False
+            self._mark_static_verification(state, status="passed")
+            self._mark_execution_verification(state, status="not_run")
             state.exported_elements_code = ""
             state.exported_elements = []
             state.unknown_animation_detected = bool(unknown_animation_details)
@@ -7758,6 +8082,7 @@ class Orchestrator:
                 state.review_signature = ""
                 state.identical_review_count = 0
                 state.reviewed = True
+                self._mark_static_verification(state, status="passed")
                 state.failure_reason = ""
                 state.failure_category = ""
                 self._apply_incremental_for_scene(ctx, scene_id, state)
@@ -7766,6 +8091,12 @@ class Orchestrator:
                     ctx.continuity_warnings.extend(warning_messages)
                 self._checkpoint(ctx, State.REVIEWING)
             self._emit("scene_review_pass", scene_id=scene_id)
+            self._emit(
+                "scene_static_verified",
+                scene_id=scene_id,
+                status=state.static_verification.status,
+                code_sha256=state.static_verification.code_sha256,
+            )
             if warning_messages:
                 self._emit(
                     "scene_review_warning",
@@ -7963,12 +8294,20 @@ class Orchestrator:
                     relative_video = copied_video.relative_to(ctx.paths.root).as_posix()
                     state.rendered = True
                     state.slurm_job = None
+                    self._mark_execution_verification(
+                        state,
+                        status="passed",
+                        scope="formal_video",
+                        artifact_sha256=artifact.video_sha256,
+                        duration_seconds=artifact.metadata.duration_seconds,
+                    )
                     state.artifact = SceneArtifact(
                         origin="reused",
                         # 复用视频已复制到当前 run；清理 base run 后当前 run
                         # 仍必须能够恢复和重新合并，因此凭据路径也归属于当前 run。
                         source_run_id=ctx.paths.run_id,
                         job_id=artifact.job_id,
+                        backend=ctx.backend,
                         scene_id=scene_id,
                         scene_class_name=artifact.scene_class_name,
                         code_sha256=artifact.code_sha256,
@@ -8041,6 +8380,7 @@ class Orchestrator:
             origin="rendered",
             source_run_id=ctx.paths.run_id,
             job_id=job.job_id,
+            backend=job.backend,
             scene_id=job.scene_id,
             scene_class_name=job.scene_class_name,
             code_sha256=code_hash,
@@ -8284,20 +8624,45 @@ class Orchestrator:
         # 候选代码和报告，否则视频被删除/替换后仍会把 rendered=True 写入
         # manifest，直到合并阶段才暴露问题。
         self._artifact_video_path(ctx, candidate.artifact)
+        try:
+            accepted = self.candidate_acceptor.inspect(
+                candidate.code,
+                state.plan,
+                technical_spec=state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+                expected_class_name=candidate.class_name,
+                validator=self._validate,
+            )
+        except CandidateRejected as exc:
+            raise RuntimeError(f"Scene {scene_id} 的视觉候选未通过统一接纳检查: {exc}") from exc
         with self._state_lock:
             inherited_hash = sha256_text(state.inherited_elements_code)
             if candidate.inherited_elements_sha256 != inherited_hash:
                 raise RuntimeError(f"Scene {scene_id} 的视觉候选基于不同的继承上下文，拒绝恢复")
-            if candidate.artifact.code_sha256 != sha256_text(candidate.code):
+            if candidate.artifact.code_sha256 != accepted.code_sha256:
                 raise RuntimeError(f"Scene {scene_id} 的视觉候选代码哈希与视频产物不一致")
             if candidate.artifact.scene_class_name != candidate.class_name:
                 raise RuntimeError(f"Scene {scene_id} 的视觉候选类名与视频产物不一致")
-            code_changed = candidate.code != state.code
-        self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", candidate.code)
-        unknown_animation_details = self._unknown_animation_details(ctx, state, candidate.code)
+            code_changed = accepted.code != state.code
+        self.candidate_acceptor.accept(
+            accepted.code,
+            state.plan,
+            technical_spec=state.technical_spec,
+            renderer=ctx.render_profile.renderer,
+            expected_class_name=accepted.class_name,
+            destination=ctx.paths.scenes / f"scene_{scene_id}.py",
+            validator=self._validate,
+        )
+        unknown_animation_details = list(
+            self.candidate_acceptor.unknown_animation_details(
+                accepted.code,
+                state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+            )
+        )
         with self._state_lock:
-            state.code = candidate.code
-            state.class_name = candidate.class_name
+            state.code = accepted.code
+            state.class_name = accepted.class_name
             state.slurm_job = candidate.slurm_job
             state.artifact = candidate.artifact
             state.rendered = True
@@ -8315,6 +8680,22 @@ class Orchestrator:
             state.visual_report_sha256 = candidate.report_sha256
             state.visual_artifact_sha256 = candidate.artifact.video_sha256
             state.visual_feedback = ""
+            state.visual_verification = VisualVerification(
+                status="passed" if candidate.passed else "warning",
+                code_sha256=accepted.code_sha256,
+                artifact_sha256=candidate.artifact.video_sha256,
+                report_sha256=candidate.report_sha256,
+                score=candidate.score,
+                checked_at=datetime.now().astimezone().isoformat(),
+            )
+            self._mark_static_verification(state, status="passed")
+            self._mark_execution_verification(
+                state,
+                status="passed",
+                scope="formal_video",
+                artifact_sha256=candidate.artifact.video_sha256,
+                duration_seconds=candidate.artifact.metadata.duration_seconds,
+            )
             state.unknown_animation_detected = bool(unknown_animation_details)
             state.unknown_animation_details = unknown_animation_details[-30:]
             self._reset_repair_progress(state)
@@ -8357,6 +8738,7 @@ class Orchestrator:
             with self._state_lock:
                 for state in ctx.scene_states.values():
                     state.visual_status = "skipped"
+                    state.visual_verification = VisualVerification(status="not_run")
             return False
 
         # 若视觉修复链路自身失败，恢复此前得分最高且可验证的候选，避免丢掉
@@ -8520,6 +8902,14 @@ class Orchestrator:
                     state.visual_status = "unknown"
                     state.visual_score = None
                     state.visual_feedback = error
+                    state.visual_verification = VisualVerification(
+                        status="unknown",
+                        code_sha256=artifact.code_sha256,
+                        artifact_sha256=artifact.video_sha256,
+                        report_sha256=report_hash,
+                        feedback=error,
+                        checked_at=datetime.now().astimezone().isoformat(),
+                    )
                 self._emit("scene_visual_unknown", scene_id=scene_id, reason=error)
                 continue
 
@@ -8546,6 +8936,15 @@ class Orchestrator:
                 state.visual_artifact_sha256 = artifact.video_sha256
                 state.visual_score = score
                 state.visual_feedback = feedback
+                state.visual_verification = VisualVerification(
+                    status="passed" if passed else "failed",
+                    code_sha256=artifact.code_sha256,
+                    artifact_sha256=artifact.video_sha256,
+                    report_sha256=report_hash,
+                    score=score,
+                    feedback=feedback,
+                    checked_at=datetime.now().astimezone().isoformat(),
+                )
                 previous = state.visual_best_candidate
                 candidate_rank = (
                     candidate.passed,
@@ -8564,6 +8963,9 @@ class Orchestrator:
                 with self._state_lock:
                     state.visual_status = "passed"
                     state.visual_feedback = ""
+                    state.visual_verification = state.visual_verification.model_copy(
+                        update={"status": "passed", "feedback": ""}
+                    )
                 self._emit(
                     "scene_visual_pass",
                     scene_id=scene_id,
@@ -9283,6 +9685,8 @@ class Orchestrator:
                 state.inherited_elements_code = ""
                 state.exported_elements_code = ""
                 state.exported_elements = []
+                state.static_verification = StaticVerification(status="not_run")
+                state.execution_verification = ExecutionVerification(status="not_run")
                 state.local_smoke_status = "pending"
                 self._reset_repair_progress(state)
                 # 代码和交接上下文同时失效；否则后续场景会从旧的

@@ -77,6 +77,9 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
             "fix_attempts": scene.fix_attempts,
             "candidate_count": len(getattr(scene, "candidates", [])),
             "smoke_status": scene.local_smoke_status,
+            "static_verification": scene.static_verification.model_dump(mode="json"),
+            "execution_verification": scene.execution_verification.model_dump(mode="json"),
+            "visual_verification": scene.visual_verification.model_dump(mode="json"),
             "capability_status": getattr(scene, "capability_status", "pending"),
             "resource_profile": (
                 scene.resource_profile.model_dump(mode="json")
@@ -102,6 +105,16 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
             "give_up": sum(bool(scene.give_up) for scene in scenes),
             "safe_fallback": sum(bool(scene.safe_fallback_used) for scene in scenes),
             "visual_passed": sum(scene.visual_status == "passed" for scene in scenes),
+            "static_verified": sum(
+                scene.static_verification.status == "passed" for scene in scenes
+            ),
+            "execution_verified": sum(
+                scene.execution_verification.status == "passed" for scene in scenes
+            ),
+            "visual_verified": sum(
+                scene.visual_verification.status in {"passed", "warning", "unknown"}
+                for scene in scenes
+            ),
         },
         "review_attempts": review_artifacts,
         "plan_review_attempts": plan_review_artifacts,

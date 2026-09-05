@@ -189,6 +189,10 @@ Cairo 不申请 GPU；只有 MANIM_RENDERER=opengl 时才使用 GPU 配置。所
 | MANIM_PIXEL_HEIGHT | 1080 | 输出高度，必须为偶数 |
 | MANIM_FRAME_RATE | 60 | 输出帧率 |
 | MANIM_OPENGL_PLATFORM | egl | OpenGL 后端：egl 或 glx |
+| RENDER_BACKEND | slurm | 正式渲染后端：slurm 或 local |
+| LOCAL_RENDER_MAX_IN_FLIGHT | 1 | 本地正式渲染最大并发数 |
+| LOCAL_RENDER_TIMEOUT | 3600 | 单个本地正式渲染超时秒数 |
+| LOCAL_RENDER_MEMORY_MB | 16384 | 本地正式渲染地址空间上限 |
 | SMOKE_RENDER_ENABLED | true | 正式 Slurm 渲染前执行轻量探针 |
 | SMOKE_RENDER_MODE | both | 预检模式：frame、video 或 both |
 | SMOKE_RENDER_QUALITY | l | Smoke Render 质量：l 或 m |
@@ -271,8 +275,13 @@ MONITOR_TIMEOUT 是旧配置兼容项。新配置应分别设置 queue、run 和
 
 ### 本地/无 Slurm
 
+    RENDER_BACKEND=local
     MANIM_RENDERER=cairo
-    kd1-anime generate --file prompt.md --dry-run
+    kd1-anime generate --file prompt.md --backend local
+
+本地正式渲染在当前进程的前台执行，`render` 命令必须使用 `--wait`；本地任务不会把
+PID 写入 manifest，恢复时会重新启动未完成任务，不会认领旧 PID。若只想验证计划和代码，
+使用 `--dry-run`，它不会提交正式本地任务。
 
 ### HPC：Cairo
 

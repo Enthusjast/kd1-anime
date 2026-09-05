@@ -150,7 +150,8 @@ class SceneArtifact(BaseModel):
 
     origin: Literal["rendered", "reused"]
     source_run_id: str = Field(pattern=r"^\d{8}-\d{6}-[0-9a-f]{8}$")
-    job_id: str | None = Field(default=None, pattern=r"^\d+$")
+    job_id: str | None = Field(default=None, pattern=r"^(?:\d+|local-[0-9a-f]{12})$")
+    backend: Literal["slurm", "local"] = "slurm"
     scene_id: int = Field(ge=1)
     scene_class_name: str = Field(min_length=1, max_length=200)
     code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
