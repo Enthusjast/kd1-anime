@@ -252,9 +252,8 @@ Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因�
 2. 用 logs 查看远端 stdout/stderr；
 3. 降低 MANIM_QUALITY 或 Smoke Render 质量进行排查；
 4. 设置合理的 SLURM_MAX_IN_FLIGHT，避免共享队列拥堵；
-5. 对重复调试请求使用 cache status，确认是否命中了旧响应；
-6. 适当调整阶段级 LLM_*_MAX_TOKENS，不要盲目提高所有阶段的预算；
-7. 设置 MONITOR_QUEUE_TIMEOUT、MONITOR_RUN_TIMEOUT 和 MONITOR_UNKNOWN_TIMEOUT，避免无限等待。
+5. 适当调整阶段级 LLM_*_MAX_TOKENS，不要盲目提高所有阶段的预算；
+6. 设置 MONITOR_QUEUE_TIMEOUT、MONITOR_RUN_TIMEOUT 和 MONITOR_UNKNOWN_TIMEOUT，避免无限等待。
 
 选择 `RENDER_BACKEND=local` 时，检查 `status <run-id>` 中的 backend、运行目录下的
 `logs/scene_*_local-*.out/.err`，以及 `LOCAL_RENDER_TIMEOUT` 和

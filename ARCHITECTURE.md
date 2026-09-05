@@ -61,7 +61,6 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── media/merger.py         精确输入列表、FFmpeg xfade/acrossfade 原子合并
        ├── rag/                    SQLite 索引、独立 Embedding/Reranker 检索
        ├── eval/                   代码/效率评估、边界帧健康检查与视觉质量门
-       ├── llm_cache.py            SQLite LLM 响应缓存与安全限额
        ├── stats.py                清单/事件日志离线统计
        ├── agents/state_ledger.py  场景边界语义账本与渲染证据
        ├── security.py             脱敏和 JSON-safe 诊断序列化
@@ -237,7 +236,7 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v7 清单只接受当前教学合同、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置；v4–v6 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 非流式完整响应默认写入用户私有 SQLite 缓存；缓存键包含端点、模型、提示词、模式、代理策略和生成参数，不含 API Key，条目数受 LLM_CACHE_MAX_ENTRIES 限制。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
+v7 清单只接受当前教学合同、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置；v4–v6 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
 
 `resume` 在持有 `.run.lock` 后读取清单：
 

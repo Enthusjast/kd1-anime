@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 应用产生的配置、知识库、缓存和运行产物统一放在一个私有目录中。
+# 应用产生的配置、知识库和运行产物统一放在一个私有目录中。
 # 不跟随 XDG_CONFIG_HOME：集群上不同 shell/module 配置的 XDG 值经常不一致，
 # 而单一固定根目录更容易备份、迁移和排查。
 APP_HOME = Path.home() / ".kd1-anime"
@@ -303,14 +303,6 @@ class Settings(BaseSettings):
         default=True,
         description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级",
     )
-    # 非流式业务请求的本地响应缓存。缓存只保存去除 API Key 后的请求指纹和
-    # 完整文本响应，默认位于用户私有目录；流式交互请求永不写入缓存。
-    LLM_CACHE_ENABLED: bool = Field(
-        default=True,
-        description="是否启用本地 LLM 响应缓存（不缓存流式交互请求）",
-    )
-    LLM_CACHE_PATH: Path = APP_HOME / "cache" / "llm.sqlite3"
-    LLM_CACHE_MAX_ENTRIES: int = Field(default=512, ge=0, le=100_000)
     FAILURE_CASES_PATH: Path = APP_HOME / "diagnostics" / "failure_cases.sqlite3"
     FAILURE_CASE_MAX_PER_CATEGORY: int = Field(default=100, ge=1, le=1_000)
     # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
@@ -691,13 +683,6 @@ class Settings(BaseSettings):
             return None
         if isinstance(value, str) and not value.strip():
             return None
-        return value
-
-    @field_validator("LLM_CACHE_PATH", mode="before")
-    @classmethod
-    def normalize_llm_cache_path(cls, value):
-        if value is None or (isinstance(value, str) and not value.strip()):
-            return APP_HOME / "cache" / "llm.sqlite3"
         return value
 
     @field_validator("SLURM_CONDA_BASE", mode="before")

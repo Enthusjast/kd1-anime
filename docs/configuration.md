@@ -30,7 +30,7 @@ WORKSPACE_DIR 控制，单个 run 仍会使用自己的私有子目录。
     LLM_MODEL=your-model-name
 
 LLM_BASE_URL 必须是带 http:// 或 https:// 的 URL，不能把用户名、密码或换行写入
-URL。API Key 不会写入 manifest、事件日志或缓存键。
+URL。API Key 不会写入 manifest 或事件日志。
 
 ## 主模型
 
@@ -64,9 +64,6 @@ URL。API Key 不会写入 manifest、事件日志或缓存键。
 | LLM_DEBUG | false | 是否输出调试信息 |
 | LLM_TRUST_ENV | true | 是否读取 HTTP(S)_PROXY 等代理环境变量 |
 | LLM_USE_JSON_MODE | true | 是否请求 response_format=json_object |
-| LLM_CACHE_ENABLED | true | 是否启用完整非流式响应缓存 |
-| LLM_CACHE_PATH | ~/.kd1-anime/cache/llm.sqlite3 | 缓存数据库路径 |
-| LLM_CACHE_MAX_ENTRIES | 512 | 最大缓存条目数；0 等同关闭写入 |
 | FAILURE_CASES_PATH | ~/.kd1-anime/diagnostics/failure_cases.sqlite3 | 脱敏失败案例库路径 |
 | FAILURE_CASE_MAX_PER_CATEGORY | 100 | 每类失败案例最大保存数 |
 | LLM_MAX_CONTEXT_CHARS | 120000 | Agent 输入总字符预算 |

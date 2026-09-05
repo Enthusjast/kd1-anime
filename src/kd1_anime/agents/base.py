@@ -29,7 +29,6 @@ from rich.console import Console
 from rich.panel import Panel
 
 from kd1_anime.config import LLMRuntimeProfile, settings
-from kd1_anime.llm_cache import LLMResponseCache, make_cache_key
 from kd1_anime.security import redact_text
 
 T = TypeVar("T", bound=BaseModel)
@@ -210,7 +209,6 @@ class BaseAgent:
         messages: list[dict] | None = None,
         stream: bool = False,
         allow_truncated: bool = False,
-        cache_namespace: str = "",
     ) -> str:
         """
         调用 LLM API,内置指数退避重试
@@ -245,45 +243,10 @@ class BaseAgent:
         else:
             # 兼容性降级（去掉 response_format、追加 JSON 提示等）会在
             # 重试过程中修改 messages。调用方可能复用同一个列表，甚至
-            # 在并发 worker 间共享它；必须在进入缓存和请求前断开引用。
+            # 在并发 worker 间共享它；必须在请求前断开引用。
             messages = self._clone_messages(messages) or []
 
-        # 只对调用方明确要求的非流式请求启用缓存。交互式流式输出包含
-        # 用户取消、实时显示等语义，不能被缓存；静默流式传输仍属于可缓存的
-        # 非流式业务调用。缓存命中直接跳过网络和重试，不会绕过 profile.require。
-        cache: LLMResponseCache | None = None
-        cache_key: str | None = None
         started_at = time.monotonic()
-        uses_default_client = getattr(type(self), "client", None) is BaseAgent.client
-        if not stream and settings.LLM_CACHE_ENABLED and uses_default_client:
-            cache = LLMResponseCache()
-            cache_key = make_cache_key(
-                self.profile,
-                messages,
-                temperature=temp,
-                max_tokens=tokens,
-                json_mode=json_mode,
-                allow_truncated=allow_truncated,
-                extra=(
-                    f"{self.name}:{type(self).__module__}.{type(self).__qualname__}:"
-                    f"{cache_namespace}"
-                ),
-            )
-            cached = cache.get(cache_key)
-            if cached is not None:
-                cache.record_call(
-                    cache_key,
-                    cache_hit=True,
-                    latency_ms=0.0,
-                    model=self.model,
-                )
-                self.last_call_metrics = {
-                    "cache_hit": True,
-                    "latency_ms": 0.0,
-                    "attempts": 0,
-                    "model": self.model,
-                }
-                return cached
 
         kwargs: dict = {
             "model": self.model,
@@ -416,24 +379,7 @@ class BaseAgent:
                     continue
                 if finish_reason == "length":
                     if allow_truncated:
-                        if cache is not None and cache_key is not None:
-                            cache.set(
-                                cache_key,
-                                content,
-                                latency_ms=(time.monotonic() - started_at) * 1000,
-                                prompt_tokens=self._last_usage.get("prompt_tokens"),
-                                completion_tokens=self._last_usage.get("completion_tokens"),
-                            )
-                            cache.record_call(
-                                cache_key,
-                                cache_hit=False,
-                                latency_ms=(time.monotonic() - started_at) * 1000,
-                                prompt_tokens=self._last_usage.get("prompt_tokens"),
-                                completion_tokens=self._last_usage.get("completion_tokens"),
-                                model=self.model,
-                            )
                         self.last_call_metrics = {
-                            "cache_hit": False,
                             "latency_ms": (time.monotonic() - started_at) * 1000,
                             "attempts": attempt,
                             "model": self.model,
@@ -462,24 +408,7 @@ class BaseAgent:
                 if self.profile.debug and (not use_stream_transport or not stream):
                     preview = content[:500] + ("..." if len(content) > 500 else "")
                     console.print(f"[dim]DEBUG [response]: {preview}[/]", markup=False)
-                if cache is not None and cache_key is not None:
-                    cache.set(
-                        cache_key,
-                        content,
-                        latency_ms=(time.monotonic() - started_at) * 1000,
-                        prompt_tokens=self._last_usage.get("prompt_tokens"),
-                        completion_tokens=self._last_usage.get("completion_tokens"),
-                    )
-                    cache.record_call(
-                        cache_key,
-                        cache_hit=False,
-                        latency_ms=(time.monotonic() - started_at) * 1000,
-                        prompt_tokens=self._last_usage.get("prompt_tokens"),
-                        completion_tokens=self._last_usage.get("completion_tokens"),
-                        model=self.model,
-                    )
                 self.last_call_metrics = {
-                    "cache_hit": False,
                     "latency_ms": (time.monotonic() - started_at) * 1000,
                     "attempts": attempt,
                     "model": self.model,
@@ -756,10 +685,6 @@ class BaseAgent:
                 "json_mode": True,
                 "messages": self._clone_messages(current_messages),
             }
-            if getattr(type(self), "call_llm", None) is BaseAgent.call_llm:
-                call_kwargs["cache_namespace"] = (
-                    f"{response_model.__module__}.{response_model.__qualname__}"
-                )
             if allow_truncated:
                 call_kwargs["allow_truncated"] = True
             raw = self.call_llm(
@@ -865,10 +790,6 @@ class BaseAgent:
                 "max_tokens": max_tokens,
                 "json_mode": True,
             }
-            if getattr(type(self), "call_llm", None) is BaseAgent.call_llm:
-                call_kwargs["cache_namespace"] = (
-                    f"{item_model.__module__}.{item_model.__qualname__}"
-                )
             if allow_truncated:
                 call_kwargs["allow_truncated"] = True
             raw = self.call_llm(**call_kwargs)

@@ -24,7 +24,6 @@
     - [单 Scene 渲染](#单-scene-渲染)
     - [查询、恢复和清理](#查询恢复和清理)
     - [环境和模型诊断](#环境和模型诊断)
-    - [缓存](#缓存)
   - [配置](#配置)
     - [主模型、视觉模型和 RAG 服务](#主模型视觉模型和-rag-服务)
   - [RAG 知识检索](#rag-知识检索)
@@ -136,7 +135,7 @@ LLM_MODEL=your-model-name
 进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env
 ```
 
-API Key 不会写入运行清单、事件日志或缓存键。不要把 `.env` 提交到 Git。
+API Key 不会写入运行清单或事件日志。不要把 `.env` 提交到 Git。
 
 ### 3. 检查环境
 
@@ -305,15 +304,6 @@ kd1-anime test-llm --no-json-mode --verbose
 
 `doctor` 默认只做本地配置检查；`--probe-*` 才会发送相应服务请求。视觉探针会发送一张最小图片消息，RAG 探针会分别请求 Embedding 和 Reranker。
 
-### 缓存
-
-```bash
-kd1-anime cache status
-kd1-anime cache clear --yes
-```
-
-缓存只保存完整的非流式业务响应和脱敏调用统计，不缓存交互式流式响应，也不保存 API Key。调试 prompt 变化或怀疑复用了旧响应时，可以先查看或清理缓存。
-
 ## 配置
 
 完整配置参考见 [`docs/configuration.md`](docs/configuration.md)，模板见 [`.env.example`](.env.example)。常用配置如下：
@@ -327,7 +317,6 @@ kd1-anime cache clear --yes
 | `LLM_REVIEW_MAX_TOKENS` | `8192` | 结构化审查输出预算 |
 | `LLM_*_MODEL` | 空 | 可选阶段模型路由；为空回退到 `LLM_MODEL` |
 | `LLM_TRUST_ENV` | `true` | 是否读取 `HTTP(S)_PROXY` 等代理环境变量 |
-| `LLM_CACHE_ENABLED` | `true` | 是否启用本地非流式响应缓存 |
 | `LLM_MAX_CONTEXT_CHARS` | `120000` | Agent 输入总预算；低优先级区块会先裁剪 |
 | `MANIM_RENDERER` | `cairo` | `cairo` 使用 CPU；`opengl` 需要 GPU/图形上下文 |
 | `MANIM_QUALITY` | `h` | Manim 质量级别：`l/m/h/p/k` |
@@ -466,7 +455,6 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 ├── .env.example                 # 配置模板
 ├── knowledge/                   # Manim 文档和示例
 ├── rag/index.sqlite3            # 本地知识索引
-├── cache/llm.sqlite3            # LLM 完整响应缓存
 ├── diagnostics/failure_cases.sqlite3 # 脱敏渲染失败案例
 └── workspace/
     ├── eval_results/            # 独立 evaluate 命令的报告

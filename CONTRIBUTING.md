@@ -69,7 +69,7 @@ ARCHITECTURE.md 描述模块之间的依赖、状态机、阶段合同和安全�
 - 生成 Python 是不可信输入；AST 校验是纵深防御，不是沙箱。
 - 不扩大导入白名单，不允许动态执行、网络、文件读写或 shell 绕过。
 - 外部源码必须先复制到私有 run；生成文件和包含需求的文件保持 0600。
-- 处理 API 错误时必须脱敏，不能把 API Key 写入日志、manifest、事件或缓存键。
+- 处理 API 错误时必须脱敏，不能把 API Key 写入日志、manifest 或事件。
 - 需要更强隔离时保留 Apptainer 的 containall、cleanenv、no-home 和可选禁网路径。
 
 ### Agent 和 Prompt

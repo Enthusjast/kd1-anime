@@ -47,40 +47,6 @@ app = typer.Typer(
 console = Console()
 rag_app = typer.Typer(help="管理本地 RAG 知识库", add_completion=False)
 app.add_typer(rag_app, name="rag")
-cache_app = typer.Typer(help="管理本地 LLM 响应缓存", add_completion=False)
-app.add_typer(cache_app, name="cache")
-
-
-@cache_app.command("status")
-def cache_status():
-    """查看缓存路径、条目数和调用统计，不显示响应内容。"""
-
-    from kd1_anime.llm_cache import LLMResponseCache
-
-    data = LLMResponseCache().summary()
-    console.print(f"路径: {data['path']}", markup=False)
-    console.print(f"响应条目: {data['entries']}")
-    console.print(f"调用事件: {data['events']}")
-    console.print(f"本进程统计: {json.dumps(data['stats'], ensure_ascii=False)}")
-
-
-@cache_app.command("clear")
-def cache_clear(
-    yes: bool = typer.Option(False, "--yes", "-y", help="不再询问确认"),
-):
-    """清除本地 LLM 响应缓存。"""
-
-    from kd1_anime.llm_cache import LLMResponseCache
-
-    cache = LLMResponseCache()
-    summary = cache.summary()
-    if (
-        not yes
-        and summary["entries"]
-        and not typer.confirm(f"清除 {summary['entries']} 个缓存响应？", default=False)
-    ):
-        raise typer.Abort()
-    console.print(f"已清除 {cache.clear()} 个缓存响应")
 
 
 @rag_app.command("index")
