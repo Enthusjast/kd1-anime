@@ -2178,11 +2178,7 @@ def test_relaxed_code_generation_can_continue_past_validation_attempt_default(mo
     from kd1_anime.agents.validator import CodeValidationResult
 
     scene_plan = plan().model_copy(
-        update={
-            "new_elements": [
-                VisualElementState(element_id="formula", variable_name="formula")
-            ]
-        }
+        update={"new_elements": [VisualElementState(element_id="formula", variable_name="formula")]}
     )
     invalid = """from manim import *
 class Demo(Scene):

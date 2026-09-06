@@ -1635,9 +1635,7 @@ class Orchestrator:
         last_continuity_error = ""
         last_lifecycle_error = ""
         last_api_errors: tuple[str, ...] = ()
-        generation_mode = (
-            self._ctx.generation_mode if self._ctx is not None else "strict"
-        )
+        generation_mode = self._ctx.generation_mode if self._ctx is not None else "strict"
         max_validation_attempts = (
             None if generation_mode == "relaxed" else settings.CODE_VALIDATION_ATTEMPTS
         )
