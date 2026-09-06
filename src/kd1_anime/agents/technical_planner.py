@@ -463,6 +463,7 @@ def _normalise_technical_lifecycle(
                 event = event.model_copy(
                     update={
                         "create_element_ids": [],
+                        "target_element_ids": sorted(target_ids - introduced_ids),
                         "api_notes": _append_api_repair_note(
                             event.api_notes,
                             "新对象已拆分为独立 introduce 事件",
@@ -470,6 +471,7 @@ def _normalise_technical_lifecycle(
                     }
                 )
                 create_ids = set()
+                target_ids -= introduced_ids
                 repairs.append(
                     f"事件 {event.event_id} 拆分新对象引入: " + ", ".join(sorted(introduced_ids))
                 )

@@ -298,6 +298,44 @@ def test_normalize_replacement_transform_preserves_exported_source_identity():
     assert any("拆分新对象引入" in repair for repair in repairs)
 
 
+def test_normalize_update_removes_new_targets_after_splitting_introduction():
+    source = VisualElementState(element_id="source", variable_name="source", required=True)
+    highlight = VisualElementState(element_id="highlight", variable_name="highlight")
+    plan = make_plan(inherited=[source], new=[highlight])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="source",
+                variable_name="source",
+                initially_active=True,
+                exported=True,
+            ),
+            TechnicalObject(element_id="highlight", variable_name="highlight"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_and_update",
+                start_seconds=0,
+                end_seconds=2,
+                semantic_action="update",
+                source_element_ids=["source"],
+                target_element_ids=["source", "highlight"],
+                create_element_ids=["highlight"],
+            )
+        ],
+        export_element_ids=["source"],
+    )
+
+    normalized, _ = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    update = next(item for item in normalized.animations if item.event_id == "show_and_update")
+    assert update.target_element_ids == ["source"]
+    assert update.create_element_ids == []
+    assert result.is_valid is True, result.errors
+
+
 def test_normalize_transform_splits_unrelated_new_objects_into_fade_in():
     grid = VisualElementState(
         element_id="grid",
