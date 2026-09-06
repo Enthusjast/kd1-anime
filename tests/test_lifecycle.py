@@ -2,6 +2,7 @@
 
 from kd1_anime.agents.lifecycle import (
     detect_unknown_animations,
+    repair_initial_active_alias_lifecycle,
     repair_missing_animation_markers,
     repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
@@ -622,6 +623,45 @@ class Demo(Scene):
 
     assert repaired == code
     assert repairs == ()
+
+
+def test_repairs_initially_active_copy_used_as_update_source():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+            )
+        ],
+        animations=[
+            {
+                "event_id": "transform_grid",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["grid"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        grid = NumberPlane()
+        self.add(grid)
+        grid_rotated = grid.copy().rotate(PI / 4)
+        # KD1_ANIMATION_EVENT: transform_grid
+        self.play(Transform(grid_rotated, grid.copy()))
+"""
+
+    repaired, repairs = repair_initial_active_alias_lifecycle(code, technical)
+
+    assert "Transform(grid, grid.copy())" in repaired
+    assert repairs == ("将继承对象的 active source 别名 grid_rotated 收敛到 grid",)
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
 
 
 def test_semantic_marker_can_precede_pure_target_preparation():

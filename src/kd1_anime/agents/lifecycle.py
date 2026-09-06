@@ -888,6 +888,144 @@ def repair_missing_animation_markers(
     return source_bytes.decode("utf-8"), tuple(repair_notes)
 
 
+def repair_initial_active_alias_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """将继承对象的临时 source 别名收敛回其合同变量。
+
+    Coder 常把 ``grid_standard`` 复制成 ``grid_initial`` 或
+    ``grid_transformed``，然后让后者成为 ``Transform``/``FadeOut`` 的
+    source。副本并没有接管 Scene 中的 active 身份，因而技术合同会报告
+    update 没有操作任何 source。只改写动画参数中的 source 位置，不改写
+    Transform target 或临时对象定义，随后仍由完整生命周期校验复核。
+    """
+
+    if not code or not technical_spec.animations:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+
+    initially_active = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.initially_active and item.variable_name
+    }
+    if not initially_active:
+        return code, ()
+
+    alias_re = re.compile(
+        r"^(?P<base>[A-Za-z_]\w*)_(?:initial|base|unit|start|target|copy|"
+        r"rotated|stretched|transformed|final|p_inverse|d|p)$"
+    )
+    aliases: dict[str, str] = {}
+    for node in _statement_nodes(construct):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        match = alias_re.fullmatch(target.id)
+        if match is None or match.group("base") not in initially_active:
+            continue
+        # 要求临时定义的表达式确实引用了合同对象，避免把任意业务变量
+        # 仅因命名相似就重写。
+        if any(
+            isinstance(child, ast.Name) and child.id == match.group("base")
+            for child in ast.walk(node.value)
+        ):
+            aliases[target.id] = match.group("base")
+    if not aliases:
+        return code, ()
+
+    def root_name_nodes(expression: ast.AST) -> list[ast.Name]:
+        if isinstance(expression, ast.Name):
+            return [expression]
+        if isinstance(expression, (ast.Attribute, ast.Subscript, ast.Starred)):
+            return root_name_nodes(expression.value)
+        return []
+
+    def source_expressions(node: ast.AST) -> list[ast.AST]:
+        if not isinstance(node, ast.Call):
+            return []
+        name = _call_name(node)
+        if name in _INTRODUCERS:
+            return list(node.args[:1])
+        if name in _REMOVERS:
+            return list(node.args)
+        if name in _TRANSFORMS:
+            return list(node.args[:1])
+        if name in _CONTAINER_ANIMATIONS:
+            return [child for argument in node.args for child in source_expressions(argument)]
+        if name in _IN_PLACE_ANIMATIONS:
+            source_index = 1 if name == "ApplyPointwiseFunction" else 0
+            return list(node.args[source_index : source_index + 1])
+        if _contains_animate(node):
+            return [
+                child.value
+                for child in ast.walk(node)
+                if isinstance(child, ast.Attribute)
+                and child.attr == "animate"
+                and not _is_self_camera_path(child.value)
+            ]
+        return []
+
+    source_bytes = code.encode("utf-8")
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+
+    def node_range(node: ast.AST) -> tuple[int, int]:
+        start = line_offsets[node.lineno - 1] + node.col_offset  # type: ignore[attr-defined]
+        end_line = getattr(node, "end_lineno", node.lineno)
+        end_col = getattr(node, "end_col_offset", node.col_offset)
+        end = line_offsets[end_line - 1] + end_col
+        return start, end
+
+    edits: dict[tuple[int, int], tuple[bytes, str]] = {}
+    for node in _statement_nodes(construct):
+        expressions: list[ast.AST] = []
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ):
+            if node.func.attr == "play":
+                expressions = [
+                    expression
+                    for argument in node.args
+                    for expression in source_expressions(argument)
+                ]
+            elif node.func.attr in {"add", "remove"}:
+                expressions = list(node.args)
+        for expression in expressions:
+            for name_node in root_name_nodes(expression):
+                base = aliases.get(name_node.id)
+                if base is None:
+                    continue
+                start, end = node_range(name_node)
+                edits[(start, end)] = (base.encode(), name_node.id)
+
+    if not edits:
+        return code, ()
+    for (start, end), (replacement, _) in sorted(edits.items(), reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    changed_aliases = {alias for _, alias in edits.values()}
+    repairs = tuple(
+        f"将继承对象的 active source 别名 {alias} 收敛到 {base}"
+        for alias, base in sorted(aliases.items())
+        if alias in changed_aliases
+    )
+    return source_bytes.decode("utf-8"), repairs
+
+
 def _construct_node(tree: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "construct":
@@ -1433,6 +1571,7 @@ def detect_unknown_animations(
 __all__ = [
     "LifecycleValidationResult",
     "detect_unknown_animations",
+    "repair_initial_active_alias_lifecycle",
     "repair_missing_animation_markers",
     "repair_removed_active_lifecycle",
     "repair_required_export_alias_lifecycle",
