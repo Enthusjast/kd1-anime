@@ -351,9 +351,12 @@ class CoderAgent(BaseAgent):
             sections.append(
                 PromptSection(
                     "TechnicalSpec 事件实现表",
-                    "下面是代码实现时必须逐一对应的精简表。每个事件只写一个同名 marker，"
-                    "并在紧随其后的一次 self.play 中使用 exact source/target/create/remove 变量；"
-                    "辅助标签只能作为同一次组合动画的额外参数。\n" + technical_event_contract,
+                    "下面是代码实现时必须逐一对应的精简表。introduce/update/camera 每个事件只写"
+                    "一个同名 marker，并在一次 self.play 中使用 exact source/target/create/remove 变量；"
+                    "remove 事件若确实无法组合，可按不重叠对象分段重复同一 marker。hold 事件优先"
+                    "使用 self.wait；若使用 self.play，只能操作已经 active 的合同 source，不得"
+                    "引入或退出对象。"
+                    "辅助标签只能作为同一次组合动画的额外对象。\n" + technical_event_contract,
                     required=True,
                     priority=115,
                     max_chars=20_000,

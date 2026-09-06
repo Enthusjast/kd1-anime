@@ -1824,8 +1824,9 @@ class Orchestrator:
                 if "hold 未操作合同对象" in lifecycle_error:
                     feedback_parts.append(
                         "\nhold 事件修复规则：纯停顿使用 self.wait()，不需要 marker；如果"
-                        "使用 self.play，必须在同一次调用中实际操作 TechnicalSpec 列出的全部"
-                        "source 变量，不能只 Indicate 其中一个公式。\n"
+                        "使用 self.play，只操作已经 active 的 TechnicalSpec source，不得"
+                        "引入或退出对象；hold 的 source 列表是可选状态上下文，不要求全部"
+                        "对象都参与同一个强调动画。\n"
                     )
                 if "重定义仍处于 active 的对象" in lifecycle_error:
                     feedback_parts.append(

@@ -651,7 +651,7 @@ def _marker_before_line(lines: list[str], line_number: int) -> str | None:
             return True
         if re.match(r"^[A-Za-z_]\w*(?:\[[^\n]*\])?(?:\.[A-Za-z_]\w*)+\s*\(", stripped):
             return True
-        return stripped[0] in ")]},"
+        return stripped[0] in ")]}," or stripped.endswith((",", "(", "[", "{"))
 
     index = line_number - 2
     while index >= 0:
@@ -1070,7 +1070,7 @@ def validate_animation_lifecycle(
             if name in ever_active and name not in active and name in optional_variables
         }
         missing_expected = expected - (actual_sources | actual_targets) - already_exited_optional
-        if missing_expected and action != "remove":
+        if missing_expected and action not in {"remove", "hold"}:
             errors.append(
                 f"第 {node.lineno} 行事件 {event.event_id} 未操作合同对象: "
                 + ", ".join(sorted(missing_expected))
