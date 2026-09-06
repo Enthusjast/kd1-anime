@@ -3916,6 +3916,10 @@ class Orchestrator:
             ) from self._checkpoint_error
         if ctx.continuity_rebuild_required or self._stop_event.is_set():
             return
+        if ctx.dry_run or all(
+            state.rendered or state.failed or state.give_up for state in ctx.scene_states.values()
+        ):
+            return
         # 代码屏障是渲染前的硬闸门。任何场景尚未完成编码/审查时，不能
         # 让场景 worker 越过它直接提交 Slurm；尤其不能让下游在缺少上游
         # 导出状态时自行生成一份“看似连续”的代码。
@@ -4014,6 +4018,14 @@ class Orchestrator:
                 # 依赖”的诊断语义，也兼容外部替换的 TechnicalPlanner。
                 return False
 
+        parallel_monitor_owned = False
+        if not ctx.dry_run and any(not state.rendered for state in active_states):
+            self._slurm_monitor = SlurmMonitorCoordinator(
+                self._render_service().backend,
+                run_timeout=(settings.LOCAL_RENDER_TIMEOUT if ctx.backend == "local" else None),
+                on_job_update=lambda job: self._checkpoint_slurm_job_update(ctx, job),
+            )
+            parallel_monitor_owned = True
         ctx.parallel_generation = True
 
         def run_scene(state: SceneState) -> None:
@@ -4037,6 +4049,10 @@ class Orchestrator:
                         state,
                         defer_continuity_commit=True,
                     )
+                if not ctx.dry_run and not state.failed and not state.give_up:
+                    # Code Review 一通过就进入本场景的渲染循环；其它 worker
+                    # 可以继续执行自己的 Code/Review，不再等待全局屏障。
+                    self._scene_worker(ctx, scene_id, state)
             except Exception as exc:
                 if self._activate_safe_fallback(ctx, scene_id, state, str(exc)):
                     return
@@ -4066,6 +4082,13 @@ class Orchestrator:
                     # 未预期的线程错误，避免静默生成不完整 manifest。
                     future.result()
         finally:
+            if parallel_monitor_owned:
+                monitor = self._slurm_monitor
+                if monitor is not None:
+                    if self._stop_event.is_set() or self._cancel_requested.is_set():
+                        monitor.cancel_pending(reason="代码/审查流水线停止")
+                    monitor.close()
+                self._slurm_monitor = None
             ctx.parallel_generation = False
 
         if self._stop_event.is_set():
@@ -6525,7 +6548,12 @@ class Orchestrator:
                 elif self._local_smoke_enabled(ctx, state) and state.local_smoke_status != "passed":
                     self._local_smoke_render(ctx, state)
                 self._phase_emit("reviewing")
-                self._scene_review(ctx, scene_id, state)
+                self._scene_review(
+                    ctx,
+                    scene_id,
+                    state,
+                    defer_continuity_commit=ctx.parallel_generation,
+                )
             # 3) dry-run: 不提交渲染
             if ctx.dry_run:
                 return
@@ -6575,7 +6603,12 @@ class Orchestrator:
                     ):
                         self._local_smoke_render(ctx, state)
                     self._phase_emit("reviewing")
-                    self._scene_review(ctx, scene_id, state)
+                    self._scene_review(
+                        ctx,
+                        scene_id,
+                        state,
+                        defer_continuity_commit=ctx.parallel_generation,
+                    )
         except Exception as exc:
             with self._state_lock:
                 # 视觉门/产物回写可能在渲染成功后抛错；失败状态不能同时

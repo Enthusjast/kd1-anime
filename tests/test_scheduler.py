@@ -547,9 +547,11 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
     )
     orchestrator = Orchestrator()
     orchestrator._llm_sem = threading.Semaphore(2)
-    entered = threading.Barrier(2)
+    scene2_code_started = threading.Event()
+    release_scene2_code = threading.Event()
     code_threads: list[int] = []
     handoff_sources: list[int | None] = []
+    order: list[str] = []
 
     def technical_spec(scene_id: int) -> TechnicalSpec:
         obj = TechnicalObject(
@@ -575,16 +577,28 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
 
     def fake_code(current_ctx, scene_id, state):
         code_threads.append(threading.get_ident())
-        entered.wait(timeout=2)
+        order.append(f"code_start_{scene_id}")
+        if scene_id == 2:
+            scene2_code_started.set()
+            assert release_scene2_code.wait(timeout=2)
         state.code = f"scene_{scene_id}"
+        order.append(f"code_done_{scene_id}")
 
     def fake_review(current_ctx, scene_id, state, *, defer_continuity_commit=False):
         assert defer_continuity_commit is True
+        if scene_id == 1:
+            assert scene2_code_started.wait(timeout=2)
         state.reviewed = True
+
+    def fake_scene_worker(current_ctx, scene_id, state):
+        order.append(f"render_start_{scene_id}")
+        if scene_id == 1:
+            release_scene2_code.set()
 
     monkeypatch.setattr(orchestrator, "_ensure_technical_spec", fake_technical)
     monkeypatch.setattr(orchestrator, "_scene_code", fake_code)
     monkeypatch.setattr(orchestrator, "_scene_review", fake_review)
+    monkeypatch.setattr(orchestrator, "_scene_worker", fake_scene_worker)
     monkeypatch.setattr(orchestrator, "_refresh_scene_export", lambda state: None)
     monkeypatch.setattr(orchestrator, "_update_element_manifest", lambda *args: None)
     monkeypatch.setattr(orchestrator, "_update_state_ledger", lambda *args: None)
@@ -596,6 +610,7 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
     assert len(set(code_threads)) == 2
     assert handoff_sources == [None, 1]
     assert all(state.reviewed for state in ctx.scene_states.values())
+    assert order.index("render_start_1") < order.index("code_done_2")
 
 
 # ---------------------------------------------------------------------------
