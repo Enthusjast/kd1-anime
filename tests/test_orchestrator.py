@@ -1558,6 +1558,7 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     import_command = next(command for command in captured_commands if "-c" in command)
     import_check = import_command[import_command.index("-c") + 1]
     assert "if not isinstance(candidate, type):" in import_check
+    compile(import_check, "<smoke-import-check>", "exec")
 
     def failed_run(command, **kwargs):
         return module.subprocess.CompletedProcess(command, 1, "", "render boom")

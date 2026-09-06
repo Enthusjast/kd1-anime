@@ -707,12 +707,13 @@ class SlurmDispatcher:
 
             lines.append('echo "[Smoke] 开始轻量运行时检查"')
             import_check = (
-                "import importlib.util, pathlib, sys; "
-                "path=pathlib.Path(sys.argv[1]); name=sys.argv[2]; "
-                "spec=importlib.util.spec_from_file_location('kd1_smoke_scene', path); "
-                "module=importlib.util.module_from_spec(spec); "
-                "spec.loader.exec_module(module); "
-                "candidate=getattr(module, name, None); "
+                "import importlib.util, pathlib, sys\n"
+                "path=pathlib.Path(sys.argv[1])\n"
+                "name=sys.argv[2]\n"
+                "spec=importlib.util.spec_from_file_location('kd1_smoke_scene', path)\n"
+                "module=importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(module)\n"
+                "candidate=getattr(module, name, None)\n"
                 "if not isinstance(candidate, type):\n"
                 "    raise SystemExit(1)"
             )
