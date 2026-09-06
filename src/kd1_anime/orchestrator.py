@@ -8151,13 +8151,9 @@ class Orchestrator:
             verification=candidate.verification,
             code_sha256=candidate.code_sha256,
         )
-        self._request_continuity_rebuild(
-            ctx,
-            scene_id,
-            reason="恢复最近可信代码候选",
-            preserve_visual_candidates=True,
-            include_failed=True,
-        )
+        # 代码回滚不改变 ScenePlan/TechnicalSpec 的结构化交接；后续场景
+        # 消费的是上一场景的 TechnicalHandoff，而不是这次 AutoFix 的源码。
+        # 因此不能仅因恢复代码候选而清空后续场景。
         return True
 
     def _stagnation_fallback_candidate(
@@ -8472,12 +8468,6 @@ class Orchestrator:
                 with self._state_lock:
                     state.slurm_job = None
                     self._checkpoint(ctx, State.FIXING)
-                self._request_continuity_rebuild(
-                    ctx,
-                    scene_id,
-                    preserve_visual_candidates=state.visual_best_candidate is not None,
-                    include_failed=True,
-                )
                 self._emit("scene_render_patch_applied", scene_id=scene_id)
                 return
         # 比较当前失败是否与上一次 AutoFix 后的结果完全相同。strict 模式
@@ -8569,7 +8559,7 @@ class Orchestrator:
                         verification="validated",
                         patch_summary="修复停滞后使用 Scene IR/安全模板",
                     )
-                    code_changed = self._install_repair_candidate(
+                    self._install_repair_candidate(
                         ctx,
                         scene_id,
                         state,
@@ -8578,13 +8568,6 @@ class Orchestrator:
                         error_fingerprint=fp,
                         reset_stagnation=True,
                     )
-                    if code_changed:
-                        self._request_continuity_rebuild(
-                            ctx,
-                            scene_id,
-                            preserve_visual_candidates=state.visual_best_candidate is not None,
-                            include_failed=True,
-                        )
                     self._emit(
                         "repair_stagnation_fallback",
                         scene_id=scene_id,
@@ -8612,7 +8595,7 @@ class Orchestrator:
             fallback = self._stagnation_fallback_candidate(ctx, state)
             if fallback is not None:
                 candidate, class_name = fallback
-                code_changed = self._install_repair_candidate(
+                self._install_repair_candidate(
                     ctx,
                     scene_id,
                     state,
@@ -8621,21 +8604,14 @@ class Orchestrator:
                     error_fingerprint=fp,
                     reset_stagnation=True,
                 )
-                if code_changed:
-                    self._request_continuity_rebuild(
-                        ctx,
-                        scene_id,
-                        preserve_visual_candidates=state.visual_best_candidate is not None,
-                        include_failed=True,
-                    )
-                    self._emit(
-                        "repair_stagnation_fallback",
-                        scene_id=scene_id,
-                        strategy="scene_ir_or_safe_template",
-                        attempts=stagnation_attempts,
-                        generation_mode="relaxed",
-                    )
-                    return
+                self._emit(
+                    "repair_stagnation_fallback",
+                    scene_id=scene_id,
+                    strategy="scene_ir_or_safe_template",
+                    attempts=stagnation_attempts,
+                    generation_mode="relaxed",
+                )
+                return
             self._emit(
                 "repair_stagnation_fallback_unavailable",
                 scene_id=scene_id,
@@ -8779,7 +8755,7 @@ class Orchestrator:
             verification="validated",
             patch_summary="AutoFix 候选通过确定性校验",
         )
-        code_changed = self._install_repair_candidate(
+        self._install_repair_candidate(
             ctx,
             scene_id,
             state,
@@ -8787,13 +8763,6 @@ class Orchestrator:
             class_name,
             error_fingerprint=fp,
         )
-        if code_changed:
-            self._request_continuity_rebuild(
-                ctx,
-                scene_id,
-                preserve_visual_candidates=state.visual_best_candidate is not None,
-                include_failed=True,
-            )
         self._emit(
             "scene_coded",
             scene_id=scene_id,

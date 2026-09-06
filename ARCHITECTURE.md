@@ -212,7 +212,7 @@ Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过�
 重新进入同一循环。代码审查中的数学/连续性 finding 只有在证据明确指向计划本身时才回到
 Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder 层修复。
 
-连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除过期交接代码并按顺序重新编码；恢复时会优先重新提取导出区，提取失败不会静默复用下游状态。
+连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。AutoFix 只改变当前场景代码，不改变 TechnicalSpec/handoff，因此不会清空后续场景；只有计划、TechnicalSpec 或结构化交接合同改变时，尚未提交渲染的下游场景才会清除过期交接代码并按顺序重新编码。恢复时会优先重新提取导出区，提取失败不会静默复用下游状态。
 
 当 `LOCAL_SMOKE_RENDER_ENABLED=true` 且不是 dry-run 时，或 CLI 显式使用 `--smoke` 时，代码在进入 Reviewer 前会以低质量、
 同 renderer 的本地命令运行一次；若配置了 Apptainer，则沿用 containall/cleanenv/no-home、当前

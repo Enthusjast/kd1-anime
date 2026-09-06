@@ -3210,6 +3210,64 @@ def test_infrastructure_error_does_not_invoke_auto_fixer(monkeypatch, tmp_path):
     assert "环境或 Slurm" in state.failure_reason
 
 
+def test_autofix_code_change_does_not_reset_downstream_scene(monkeypatch, tmp_path):
+    import time
+
+    from kd1_anime.cluster.slurm import SlurmJob
+
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    original = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    repaired = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait(2)\n"
+    first = SceneState(plan=plan(), code=original, class_name="Demo", plan_ready=True)
+    first.slurm_job = SlurmJob(
+        job_id="123",
+        scene_id=1,
+        script_path=run_paths.scenes / "render.sh",
+        log_out=run_paths.logs / "out",
+        log_err=run_paths.logs / "err",
+        media_dir=run_paths.videos / "scene_1",
+        scene_class_name="Demo",
+        submitted_at=time.time(),
+        status="FAILED",
+    )
+    downstream = SceneState(
+        plan=plan().model_copy(update={"scene_id": 2}),
+        code=original,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        rendered=True,
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={1: first, 2: downstream},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator.slurm, "get_error_log", lambda **kwargs: "render boom")
+
+    class Fixer:
+        @staticmethod
+        def is_infrastructure_error(error_log):
+            return False
+
+        def fix(self, *args, **kwargs):
+            return repaired
+
+    monkeypatch.setattr(module, "AutoFixerAgent", Fixer)
+
+    orchestrator._scene_fix(ctx, 1, first)
+
+    assert first.code == repaired
+    assert downstream.code == original
+    assert downstream.reviewed is True
+    assert downstream.rendered is True
+    assert ctx.continuity_rebuild_required is False
+
+
 def test_dispatch_respects_max_in_flight(monkeypatch, tmp_path):
     import time
 
