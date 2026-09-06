@@ -242,17 +242,17 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
 | GENERATION_MODE | relaxed | 生成策略；relaxed 放宽 LLM Review，strict 使用严格有限审查 |
-| MAX_REVIEW_ROUNDS | 8 | 单场景代码审查/重写轮数 |
-| MAX_LOW_RISK_REVIEW_ROUNDS | 2 | 低风险场景的代码审查轮数；确定性检查不跳过 |
-| MAX_PLAN_REVIEW_ROUNDS | 2 | 单场景计划审查轮数 |
-| MAX_PLAN_REPLAN_ATTEMPTS | 3 | 计划反馈后的 Planner 总重调用次数 |
+| MAX_REVIEW_ROUNDS | 8 | strict 模式单场景代码审查/重写轮数；relaxed 不使用固定上限 |
+| MAX_LOW_RISK_REVIEW_ROUNDS | 2 | strict 模式低风险场景的代码审查轮数；确定性检查不跳过 |
+| MAX_PLAN_REVIEW_ROUNDS | 2 | strict 模式单场景计划审查轮数；relaxed 不使用固定上限 |
+| MAX_PLAN_REPLAN_ATTEMPTS | 3 | strict 模式计划反馈后的 Planner 总重调用次数；relaxed 不使用固定上限 |
 | MAX_CONTINUITY_FIX_ROUNDS | 2 | 连续性局部重规划次数；耗尽后 warning 放行 |
 | CONTINUITY_CONTEXT_MODE | minimal | 跨场景代码上下文范围：minimal、full 或 stateless |
 | SKIP_REVIEW | false | 是否跳过语义代码审查；确定性校验仍保留 |
 | SAFE_FALLBACK_ENABLED | true | 高风险几何失败后是否切换保守方案 |
-| MAX_IDENTICAL_REVIEW_ATTEMPTS | 2 | 相同代码/反馈重复次数上限 |
-| MAX_STAGNANT_ATTEMPTS | 2 | 渲染修复无进展后切换确定性回退的次数 |
-| MAX_FIX_ATTEMPTS | 8 | 渲染失败后的最大代码修复次数 |
+| MAX_IDENTICAL_REVIEW_ATTEMPTS | 2 | strict 模式相同代码/反馈重复次数上限 |
+| MAX_STAGNANT_ATTEMPTS | 2 | strict 模式渲染修复无进展后切换确定性回退的次数 |
+| MAX_FIX_ATTEMPTS | 8 | strict 模式渲染失败后的最大代码修复次数；relaxed 不使用固定上限 |
 | MAX_INFRA_RETRIES | 2 | 基础设施故障重排队次数 |
 | MAX_FIX_IDENTICAL_ERRORS | 3 | 相同渲染错误指纹的放弃阈值 |
 | MAX_CLARIFY_ROUNDS | 12 | Clarifier 最大轮数 |
@@ -260,7 +260,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MAX_PROMPT_CHARS | 50000 | 用户需求字符上限 |
 | MAX_CLARIFY_CONTEXT_CHARS | 40000 | 多轮澄清上下文上限 |
 | MAX_LOG_CHARS | 30000 | AutoFixer 接收的日志上限 |
-| CODE_VALIDATION_ATTEMPTS | 3 | strict 模式代码校验失败后的重生成次数；relaxed 模式无固定上限，候选停滞时终止 |
+| CODE_VALIDATION_ATTEMPTS | 3 | strict 模式代码校验失败后的重生成次数；relaxed 模式无固定上限，并在重复候选时要求切换实现 |
 | MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH | 1/2/3 | 按场景风险允许的不同代码实现策略数 |
 | MONITOR_POLL_INTERVAL | 10 | Slurm 轮询间隔秒数 |
 | MONITOR_QUEUE_TIMEOUT | 3600 | 排队超时秒数 |

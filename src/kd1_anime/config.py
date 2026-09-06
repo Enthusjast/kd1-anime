@@ -864,21 +864,22 @@ class Settings(BaseSettings):
         default=2,
         ge=2,
         le=5,
-        description="相同代码与相同审查反馈连续出现多少次后提前终止",
+        description="strict 模式下相同代码与相同审查反馈连续出现多少次后提前终止",
     )
     MAX_STAGNANT_ATTEMPTS: int = Field(
         default=2,
         ge=1,
         le=10,
-        description="渲染修复没有改变代码或错误指纹多少次后切换确定性回退",
+        description="strict 模式下渲染修复没有改变代码或错误指纹多少次后切换确定性回退",
     )
     # 渲染失败后的最大自动修复次数。autofixer 每轮会调用 LLM 重写代码并重新提交 Slurm。
     MAX_FIX_ATTEMPTS: int = Field(default=8, ge=0, le=20)
     # Slurm 节点故障/抢占等与代码无关的终态，允许自动重新排队的次数。
     MAX_INFRA_RETRIES: int = Field(default=2, ge=0, le=10)
-    # 连续 N 次渲染错误日志指纹相同 → 提前放弃, 避免 LLM 反复"修复"同一个
-    # 环境错误浪费尝试次数。注意该检查在 _scene_fix 中还要叠加 fix_attempts>=2
-    # 门槛, 确保修复器至少有 2 次真实尝试, 不会因一次修复失败就误判放弃。
+    # strict 模式下连续 N 次渲染错误日志指纹相同 → 提前放弃, 避免 LLM 反复
+    # "修复"同一个环境错误浪费尝试次数。relaxed 模式不使用该终止条件。
+    # 注意 strict 检查在 _scene_fix 中还要叠加 fix_attempts>=2 门槛，确保
+    # 修复器至少有 2 次真实尝试，不会因一次修复失败就误判放弃。
     MAX_FIX_IDENTICAL_ERRORS: int = Field(default=3, ge=1, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
 

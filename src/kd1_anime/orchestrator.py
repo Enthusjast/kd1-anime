@@ -1635,6 +1635,7 @@ class Orchestrator:
         last_continuity_error = ""
         last_lifecycle_error = ""
         last_api_errors: tuple[str, ...] = ()
+        repeated_candidate_count = 0
         generation_mode = self._ctx.generation_mode if self._ctx is not None else "strict"
         max_validation_attempts = (
             None if generation_mode == "relaxed" else settings.CODE_VALIDATION_ATTEMPTS
@@ -1665,9 +1666,18 @@ class Orchestrator:
                 "renderer": renderer,
             }
             if self._supports_keyword(agent.generate_code, "candidate_index"):
-                code_kwargs["candidate_index"] = min(attempt, candidate_budget)
+                # strict 使用有限的候选策略预算；relaxed 不应因为候选预算或
+                # 相同候选检测而停止，递增的编号也能让模型明确知道这是一次
+                # 新的结构化修复尝试，而不是继续复读首选实现。
+                code_kwargs["candidate_index"] = (
+                    attempt if generation_mode == "relaxed" else min(attempt, candidate_budget)
+                )
             if self._supports_keyword(agent.generate_code, "candidate_budget"):
-                code_kwargs["candidate_budget"] = candidate_budget
+                code_kwargs["candidate_budget"] = (
+                    max(candidate_budget, attempt)
+                    if generation_mode == "relaxed"
+                    else candidate_budget
+                )
             if self._supports_keyword(agent.generate_code, "risk_level"):
                 code_kwargs["risk_level"] = scene_risk.level
             if continuity_bible is not None:
@@ -1837,15 +1847,7 @@ class Orchestrator:
                 failed_candidate_signatures[failure_signature] = (
                     failed_candidate_signatures.get(failure_signature, 0) + 1
                 )
-                if (
-                    failed_candidate_signatures[failure_signature]
-                    >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
-                ):
-                    raise ValidationError(
-                        "relaxed 模式下候选代码已停滞，停止重复生成："
-                        + (lifecycle_error or continuity_error or validation.feedback),
-                        hint="请调整需求或使用 --strict 进行严格有限重试",
-                    )
+                repeated_candidate_count = failed_candidate_signatures[failure_signature]
             # 提供详细的修复指导
             feedback_parts = [
                 f"上一候选是第 {attempt}/{attempt_limit_text} 次尝试，未通过确定性校验；"
@@ -1952,6 +1954,14 @@ class Orchestrator:
                             "请把 update 事件的 source 改为此前已 active 的合同对象，或先安排"
                             "一个 introduce 事件，不要用 Python 重绑定代替状态交接。\n"
                         )
+
+            if generation_mode == "relaxed" and repeated_candidate_count >= 2:
+                feedback_parts.append(
+                    "\n这是 relaxed 模式第 "
+                    f"{repeated_candidate_count} 次收到相同的无效候选。不得停止重试，"
+                    "也不得复制上一版代码；请切换到完全不同的实现结构，优先采用"
+                    "更小、更直接、生命周期清晰的方案，并逐条修复上面的确定性错误。"
+                )
 
             # 如果是 TexTemplate 相关错误，提供正确示例
             if any("TexTemplate" in err or "tex_template" in err for err in validation.errors):
@@ -5535,7 +5545,8 @@ class Orchestrator:
                     self._checkpoint(ctx, State.PLAN_REVIEWING)
 
                 exhausted = (max_rounds is not None and review_round >= max_rounds) or (
-                    identical_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
+                    not self._is_relaxed(ctx)
+                    and identical_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
                 )
                 if exhausted:
                     if self._activate_safe_fallback(ctx, scene_id, state, feedback):
@@ -7868,9 +7879,9 @@ class Orchestrator:
                 )
                 self._emit("scene_render_patch_applied", scene_id=scene_id)
                 return
-        # 比较当前失败是否与上一次 AutoFix 后的结果完全相同。这里在调用
-        # LLM 之前判断，达到停滞阈值时直接尝试确定性候选，避免重复生成
-        # 同一份代码和同一份错误。
+        # 比较当前失败是否与上一次 AutoFix 后的结果完全相同。strict 模式
+        # 在达到停滞阈值时尝试确定性候选；relaxed 模式只记录计数并继续
+        # 调用 LLM，避免把“无限修复”误截断。
         fp = error_evidence.fingerprint or self._error_fingerprint(error_log)
         with self._state_lock:
             previous_snapshot = (
@@ -7894,14 +7905,12 @@ class Orchestrator:
             else:
                 state.identical_error_count = 1
                 state.last_error_fp = fp
-            # 连续相同错误 → 提前放弃, 避免修复器在同一个环境错误上空转。
-            # 但必须叠加 fix_attempts>=2 门槛: 修复器至少要修过 2 次才允许据此放弃。
-            # 当用户显式把旧版“相同错误”阈值降到 2 时，保持旧的
-            # fail-closed 语义；默认阈值为 3 时才启用 IR/模板回退。
-            # 这样既兼容已有运行配置，也不会让一个明确要求快速放弃的
-            # 配置被新的回退策略覆盖。
+            # strict 模式下连续相同错误才触发确定性回退/放弃；relaxed 模式
+            # 不把候选停滞误判为终态，而是继续调用 AutoFixer。这样“无限
+            # review/修复”策略不会被隐藏的相同错误阈值截断。
             stagnation_terminal = (
-                settings.MAX_FIX_IDENTICAL_ERRORS >= 3
+                not self._is_relaxed(ctx)
+                and settings.MAX_FIX_IDENTICAL_ERRORS >= 3
                 and state.stagnant_repair_count >= settings.MAX_STAGNANT_ATTEMPTS
             )
             max_fix_attempts = review_mode_policy(ctx.generation_mode).limit(
@@ -7912,7 +7921,8 @@ class Orchestrator:
                 self._checkpoint(ctx, State.FIXING)
                 terminal = True
             elif (
-                state.identical_error_count >= settings.MAX_FIX_IDENTICAL_ERRORS
+                not self._is_relaxed(ctx)
+                and state.identical_error_count >= settings.MAX_FIX_IDENTICAL_ERRORS
                 and state.fix_attempts >= 2
             ):
                 state.give_up = True
@@ -8145,8 +8155,8 @@ class Orchestrator:
             scene_id=scene_id,
             file_path=str(ctx.paths.scenes / f"scene_{scene_id}.py"),
         )
-        # 注意: identical_error_count 不在这里重置 —— 只有当"错误指纹变化"时才重置
-        # (见上面的 else 分支), 从而让"修复后错误完全相同"能在第 2 次相同错误时提前放弃。
+        # 注意: identical_error_count 不在这里重置 —— 只有当错误指纹变化时才重置
+        # (见上面的 else 分支)；strict 模式据此判断相同错误是否达到终止阈值。
 
     def _activate_safe_fallback(
         self,
@@ -8478,7 +8488,10 @@ class Orchestrator:
             # Reviewer 已消耗一轮，在后续改写前先持久化计数。
             self._checkpoint(ctx, State.REVIEWING)
 
-        if identical_review_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS:
+        if (
+            not self._is_relaxed(ctx)
+            and identical_review_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
+        ):
             if self._activate_safe_fallback(ctx, scene_id, state, original_feedback):
                 return True
             with self._state_lock:

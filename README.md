@@ -410,14 +410,14 @@ kd1-anime test-llm --no-json-mode --verbose
 | `CODEGEN_MODE` | `python` | 普通 Python 生成；`hybrid/ir` 为实验性模板化路径 |
 | `MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH` | `1/2/3` | 按场景风险允许的备选实现策略数 |
 | `MAX_SCENES` | `12` | 单次规划的最大场景数 |
-| `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
-| `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 计划反馈后的 Planner 总重调用次数 |
+| `MAX_PLAN_REVIEW_ROUNDS` | `2` | strict 模式单场景计划审查/重规划轮数；relaxed 不使用固定上限 |
+| `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | strict 模式计划反馈后的 Planner 总重调用次数；relaxed 不使用固定上限 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 连续性局部重规划次数；耗尽后 warning 放行 |
 | `MAX_REVIEW_ROUNDS` | `8` | strict 模式单场景代码审查/重写轮数；relaxed 不使用固定上限 |
 | `MAX_LOW_RISK_REVIEW_ROUNDS` | `2` | strict 模式低风险场景审查轮数；确定性检查始终执行 |
 | `GENERATION_MODE` | `relaxed` | 默认生成策略：`relaxed` 或 `strict` |
-| `MAX_STAGNANT_ATTEMPTS` | `2` | 渲染修复无进展后切换 IR/安全模板的次数 |
-| `MAX_FIX_ATTEMPTS` | `8` | 渲染失败后的代码修复次数 |
+| `MAX_STAGNANT_ATTEMPTS` | `2` | strict 模式渲染修复无进展后切换 IR/安全模板的次数 |
+| `MAX_FIX_ATTEMPTS` | `8` | strict 模式渲染失败后的代码修复次数；relaxed 不使用固定上限 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
 | `AUTO_RESOURCE_ESTIMATION` | `true` | 是否按场景复杂度只向上增加 Slurm 资源 |

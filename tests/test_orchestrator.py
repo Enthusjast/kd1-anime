@@ -1925,6 +1925,35 @@ def test_identical_review_feedback_stops_repeated_rewrites(monkeypatch, tmp_path
     assert "相同代码和审查反馈" in state.failure_reason
 
 
+def test_relaxed_review_does_not_stop_on_identical_feedback(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
+    run_paths = paths(tmp_path)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        scene_states={1: state},
+        generation_mode="relaxed",
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="缺少一个明确的动画步骤",
+    )
+
+    orchestrator = Orchestrator()
+    orchestrator._apply_review_result(ctx, 1, state, result, allow_relaxed_soft_pass=False)
+    orchestrator._apply_review_result(ctx, 1, state, result, allow_relaxed_soft_pass=False)
+
+    assert state.give_up is False
+    assert state.review_round == 2
+    assert state.rewrite_feedback
+
+
 def test_safe_fallback_is_not_repeated_after_resume(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
     monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
@@ -2227,6 +2256,61 @@ class Demo(Scene):
     assert generated == valid
     assert class_name == "Demo"
     assert len(coder.calls) == 4
+
+
+def test_relaxed_code_generation_does_not_stop_on_identical_invalid_candidates(
+    monkeypatch, tmp_path
+):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={"new_elements": [VisualElementState(element_id="formula", variable_name="formula")]}
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        duplicate = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append((feedback, kwargs))
+            return valid if len(self.calls) == 4 else invalid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+    orchestrator = Orchestrator()
+    orchestrator._ctx = PipelineContext("prompt", paths=paths(tmp_path), generation_mode="relaxed")
+
+    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 4
+    assert [item[1]["candidate_index"] for item in coder.calls] == [1, 2, 3, 4]
+    assert [item[1]["candidate_budget"] for item in coder.calls] == [1, 2, 3, 4]
+    assert "不得停止重试" in coder.calls[2][0]
 
 
 def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
