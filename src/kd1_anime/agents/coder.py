@@ -237,8 +237,13 @@ class CoderAgent(BaseAgent):
         candidate_index: int = 1,
         candidate_budget: int = 1,
         risk_level: Literal["low", "medium", "high"] = "low",
+        strategy_hint: str = "",
+        temperature_override: float | None = None,
     ) -> str:
-        self._log(f"正在为 Scene {scene_plan.scene_id} [{scene_plan.title}] 生成代码...")
+        self._log(
+            f"正在为 Scene {scene_plan.scene_id} [{scene_plan.title}] 生成代码"
+            f"（候选 {max(1, candidate_index)}）..."
+        )
         structured_contract = json.dumps(
             {
                 "timeline": [item.model_dump(mode="json") for item in scene_plan.timeline[:30]],
@@ -285,6 +290,8 @@ class CoderAgent(BaseAgent):
             else "这是一个备选实现。请改变导致校验失败的局部结构，不能原样复制上一候选，"
             "但仍必须完整满足同一份数学、生命周期和连续性合同。"
         )
+        if strategy_hint:
+            candidate_note += f"\n强制结构策略：{strategy_hint}"
         sections = [
             PromptSection(
                 "场景概览",
@@ -529,7 +536,11 @@ class CoderAgent(BaseAgent):
         response = self.call_llm(
             system_prompt=build_coder_system_prompt(renderer),
             user_message=user_msg,
-            temperature=settings.LLM_CODE_TEMPERATURE,
+            temperature=(
+                settings.LLM_CODE_TEMPERATURE
+                if temperature_override is None
+                else temperature_override
+            ),
             max_tokens=settings.LLM_CODE_MAX_TOKENS,
             stream=stream,
         )

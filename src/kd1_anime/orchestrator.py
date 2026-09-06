@@ -1641,6 +1641,8 @@ class Orchestrator:
         last_lifecycle_error = ""
         last_api_errors: tuple[str, ...] = ()
         repeated_candidate_count = 0
+        strategy_hint = ""
+        temperature_override: float | None = None
         generation_mode = self._ctx.generation_mode if self._ctx is not None else "strict"
         max_validation_attempts = (
             None if generation_mode == "relaxed" else settings.CODE_VALIDATION_ATTEMPTS
@@ -1670,6 +1672,12 @@ class Orchestrator:
                 "stream": stream,
                 "renderer": renderer,
             }
+            if strategy_hint and self._supports_keyword(agent.generate_code, "strategy_hint"):
+                code_kwargs["strategy_hint"] = strategy_hint
+            if temperature_override is not None and self._supports_keyword(
+                agent.generate_code, "temperature_override"
+            ):
+                code_kwargs["temperature_override"] = temperature_override
             if self._supports_keyword(agent.generate_code, "candidate_index"):
                 # strict 使用有限的候选策略预算；relaxed 不应因为候选预算或
                 # 相同候选检测而停止，递增的编号也能让模型明确知道这是一次
@@ -1961,6 +1969,17 @@ class Orchestrator:
                         )
 
             if generation_mode == "relaxed" and repeated_candidate_count >= 2:
+                strategies = (
+                    "从 construct() 重新组织对象生命周期，先保证每个合同对象只有一个 active 身份",
+                    "采用最小可验证实现，删除非必要辅助对象和复杂 Transform，再逐步恢复画面细节",
+                    "改用与上一候选完全不同的动画编排，但严格按 TechnicalSpec 事件顺序实现",
+                )
+                strategy_hint = strategies[(repeated_candidate_count - 2) % len(strategies)]
+                temperature_override = min(
+                    0.85,
+                    max(settings.LLM_CODE_TEMPERATURE, 0.2)
+                    + 0.25 * min(repeated_candidate_count - 1, 3),
+                )
                 feedback_parts.append(
                     "\n这是 relaxed 模式第 "
                     f"{repeated_candidate_count} 次收到相同的无效候选。不得停止重试，"
@@ -1985,7 +2004,11 @@ class Orchestrator:
 """)
 
             current_feedback = "".join(feedback_parts)
-            current_previous = code
+            # 连续重复时不要继续把同一份大代码作为必需上下文发送；
+            # 让 Coder 真正从合同和确定性错误重新组织实现。
+            current_previous = (
+                "" if generation_mode == "relaxed" and repeated_candidate_count >= 2 else code
+            )
         raise ValidationError(
             "生成代码未通过确定性校验：\n"
             + (

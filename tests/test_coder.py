@@ -252,6 +252,30 @@ class TestScene(Scene):
         assert "2/3" in message
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_accepts_relaxed_stagnation_strategy(
+        self, mock_call_llm, coder_agent, sample_plan
+    ):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+
+        coder_agent.generate_code(
+            sample_plan,
+            stream=False,
+            candidate_index=3,
+            candidate_budget=3,
+            strategy_hint="从 construct() 重新组织对象生命周期",
+            temperature_override=0.7,
+        )
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "强制结构策略" in message
+        assert "重新组织对象生命周期" in message
+        assert mock_call_llm.call_args.kwargs["temperature"] == 0.7
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_with_previous_code(self, mock_call_llm, coder_agent, sample_plan):
         """测试带之前代码的代码生成。"""
         mock_call_llm.return_value = """```python

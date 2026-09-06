@@ -2345,6 +2345,9 @@ class Demo(Scene):
     assert [item[1]["candidate_index"] for item in coder.calls] == [1, 2, 3, 4]
     assert [item[1]["candidate_budget"] for item in coder.calls] == [1, 2, 3, 4]
     assert "不得停止重试" in coder.calls[2][0]
+    assert coder.calls[2][1]["previous_code"] == ""
+    assert coder.calls[2][1]["strategy_hint"]
+    assert coder.calls[2][1]["temperature_override"] > settings.LLM_CODE_TEMPERATURE
 
 
 def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
