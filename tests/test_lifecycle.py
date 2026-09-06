@@ -718,3 +718,86 @@ class Demo(Scene):
 
     assert result.is_valid is True, result.errors
     assert any("分段清理事件" in warning for warning in result.warnings)
+
+
+def test_inherited_vgroup_rebind_before_scene_add_is_allowed():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                initially_active=True,
+                exported=True,
+            )
+        ],
+        animations=[
+            {
+                "event_id": "emphasize",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            }
+        ],
+        export_element_ids=["formula"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        label = Text("label")
+        formula = VGroup(formula, label)
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: emphasize
+        self.play(formula.animate.scale(1.1))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+
+
+def test_update_event_can_animate_a_declared_subset_of_sources():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                initially_active=True,
+                exported=True,
+            ),
+            TechnicalObject(
+                element_id="vector",
+                variable_name="vector",
+                initially_active=True,
+                exported=True,
+            ),
+        ],
+        animations=[
+            {
+                "event_id": "update_vector",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["grid", "vector"],
+            }
+        ],
+        export_element_ids=["grid", "vector"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        grid = NumberPlane()
+        vector = Vector(RIGHT)
+        self.add(grid, vector)
+        # KD1_ANIMATION_EVENT: update_vector
+        self.play(vector.animate.shift(UP))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
