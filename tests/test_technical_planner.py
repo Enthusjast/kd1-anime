@@ -966,6 +966,56 @@ def test_normalize_technical_spec_introduces_inactive_animate_target():
     assert any("降级为 introduce" in repair for repair in repairs)
 
 
+def test_normalize_splits_remove_from_composite_introduction():
+    previous = VisualElementState(element_id="previous", variable_name="previous")
+    formula = VisualElementState(
+        element_id="formula",
+        variable_name="formula",
+        required=True,
+    )
+    plan = make_plan(inherited=[previous], removed=[previous], new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="previous",
+                variable_name="previous",
+                initially_active=True,
+            ),
+            TechnicalObject(element_id="formula", variable_name="formula"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="show_formula",
+                start_seconds=0,
+                end_seconds=2,
+                semantic_action="introduce",
+                target_element_ids=["formula"],
+                create_element_ids=["formula"],
+                remove_element_ids=["previous"],
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    removal = next(
+        event
+        for event in normalized.animations
+        if event.event_id.startswith("pre_remove_show_formula")
+    )
+    introduction = next(
+        event for event in normalized.animations if event.event_id == "show_formula"
+    )
+    assert removal.semantic_action == "remove"
+    assert removal.source_element_ids == ["previous"]
+    assert introduction.remove_element_ids == []
+    assert introduction.start_seconds > removal.start_seconds
+    assert result.is_valid is True, result.errors
+    assert any("拆分 introduce 前的 remove" in repair for repair in repairs)
+
+
 def test_normalize_technical_spec_adds_missing_inherited_removal_event():
     inherited = VisualElementState(element_id="old", variable_name="old")
     formula = VisualElementState(element_id="formula", variable_name="formula")

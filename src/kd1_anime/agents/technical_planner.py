@@ -409,20 +409,23 @@ def _normalise_technical_lifecycle(
             if action == "update" and create_ids:
                 introduced_ids = set(create_ids)
                 synthetic_id = unique_event_id(f"{event.event_id}_introduce")
-                synthetic_events[index] = [
-                    TechnicalAnimation(
-                        event_id=synthetic_id,
-                        start_seconds=event.start_seconds,
-                        end_seconds=event.end_seconds,
-                        semantic_action="introduce",
-                        target_element_ids=sorted(create_ids),
-                        create_element_ids=sorted(create_ids),
-                        claim_ids=list(event.claim_ids),
-                        api_notes=(
-                            "从复合 update 事件拆出的新对象引入：" + ", ".join(sorted(create_ids))
-                        ),
-                    )
-                ]
+                synthetic_events.setdefault(index, []).extend(
+                    [
+                        TechnicalAnimation(
+                            event_id=synthetic_id,
+                            start_seconds=event.start_seconds,
+                            end_seconds=event.end_seconds,
+                            semantic_action="introduce",
+                            target_element_ids=sorted(create_ids),
+                            create_element_ids=sorted(create_ids),
+                            claim_ids=list(event.claim_ids),
+                            api_notes=(
+                                "从复合 update 事件拆出的新对象引入："
+                                + ", ".join(sorted(create_ids))
+                            ),
+                        )
+                    ]
+                )
                 event = event.model_copy(
                     update={
                         "create_element_ids": [],
@@ -439,6 +442,62 @@ def _normalise_technical_lifecycle(
                 changed = True
 
         if action == "introduce":
+            # 模型有时把“移除旧对象并展示新对象”压进一个 introduce
+            # 事件。这个组合动作在语义合同中是不合法的，而且直接清空
+            # remove_element_ids 会让旧对象泄漏到场景末尾。将可确定的
+            # 退出部分拆成同一时间段前半段的 remove，既保留模型意图，
+            # 又让后续 introduce 仍然拥有单一、可验证的语义。
+            if remove_ids:
+                removable = (remove_ids & active) - required_boundary_ids
+                ignored = remove_ids - removable
+                if removable:
+                    event_duration = max(0.0001, event.end_seconds - event.start_seconds)
+                    split_duration = min(0.01, event_duration / 2)
+                    synthetic_id = unique_event_id(f"pre_remove_{event.event_id}")
+                    synthetic_events.setdefault(index, []).extend(
+                        [
+                            TechnicalAnimation(
+                                event_id=synthetic_id,
+                                start_seconds=event.start_seconds,
+                                end_seconds=event.start_seconds + split_duration,
+                                semantic_action="remove",
+                                source_element_ids=sorted(removable),
+                                remove_element_ids=sorted(removable),
+                                claim_ids=list(event.claim_ids),
+                                api_notes=(
+                                    "从复合 introduce 事件拆出的旧对象退出："
+                                    + ", ".join(sorted(removable))
+                                ),
+                            )
+                        ]
+                    )
+                    # 让原 introduce 从拆分出的 remove 之后开始。这样在
+                    # 同一时间点的排序不依赖 event_id 的字典序，且不会
+                    # 把一个被移除的身份误判为仍 active。
+                    event = event.model_copy(
+                        update={"start_seconds": event.start_seconds + split_duration}
+                    )
+                    active.difference_update(removable)
+                    repairs.append(
+                        f"事件 {event.event_id} 拆分 introduce 前的 remove: "
+                        + ", ".join(sorted(removable))
+                    )
+                if ignored:
+                    repairs.append(
+                        f"事件 {event.event_id} 忽略不可退出的 introduce remove 引用: "
+                        + ", ".join(sorted(ignored))
+                    )
+                event = event.model_copy(
+                    update={
+                        "remove_element_ids": [],
+                        "api_notes": _append_api_repair_note(
+                            event.api_notes,
+                            "introduce 中的 remove 引用已拆分为独立 remove 事件",
+                        ),
+                    }
+                )
+                remove_ids = set()
+                changed = True
             converted_to_update = False
             if source_ids:
                 source_ids = set()
@@ -461,18 +520,20 @@ def _normalise_technical_lifecycle(
                     target_ids &= fresh
                     create_ids &= fresh
                     update_id = unique_event_id(f"{event.event_id}_update")
-                    synthetic_events[index] = [
-                        TechnicalAnimation(
-                            event_id=update_id,
-                            start_seconds=event.start_seconds,
-                            end_seconds=event.end_seconds,
-                            semantic_action="update",
-                            source_element_ids=sorted(duplicate_active),
-                            claim_ids=list(event.claim_ids),
-                            api_notes="从复合 introduce 事件拆出的 active 对象更新："
-                            + ", ".join(sorted(duplicate_active)),
-                        )
-                    ]
+                    synthetic_events.setdefault(index, []).extend(
+                        [
+                            TechnicalAnimation(
+                                event_id=update_id,
+                                start_seconds=event.start_seconds,
+                                end_seconds=event.end_seconds,
+                                semantic_action="update",
+                                source_element_ids=sorted(duplicate_active),
+                                claim_ids=list(event.claim_ids),
+                                api_notes="从复合 introduce 事件拆出的 active 对象更新："
+                                + ", ".join(sorted(duplicate_active)),
+                            )
+                        ]
+                    )
                     event = event.model_copy(
                         update={
                             "target_element_ids": sorted(target_ids),
