@@ -31,7 +31,7 @@ from kd1_anime.agents.state_ledger import StateLedger
 from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.cluster.slurm import SlurmJob
-from kd1_anime.config import resolve_runtime_path
+from kd1_anime.config import GenerationMode, resolve_runtime_path
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.rendering import (
     MergeProfile,
@@ -42,8 +42,8 @@ from kd1_anime.rendering import (
 from kd1_anime.verification import ExecutionVerification, StaticVerification, VisualVerification
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 7
-READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7})
+MANIFEST_SCHEMA_VERSION = 8
+READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8})
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -431,7 +431,7 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[4, 5, 6, 7] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[4, 5, 6, 7, 8] = MANIFEST_SCHEMA_VERSION
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -442,6 +442,7 @@ class RunManifest(BaseModel):
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    generation_mode: GenerationMode = "relaxed"
     local_smoke_enabled: bool = False
     # Direct ``render`` runs contain user-supplied code and intentionally skip
     # every generation/review LLM stage, including on resume.

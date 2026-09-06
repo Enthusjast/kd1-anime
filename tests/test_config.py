@@ -96,6 +96,7 @@ def test_minimal_toml_uses_defaults_for_omitted_optional_settings(monkeypatch, t
 
     assert config.LLM_MODEL == "model"
     assert config.RENDER_BACKEND == "local"
+    assert config.GENERATION_MODE == "relaxed"
     assert config.MAX_REVIEW_ROUNDS == 8
     assert config.MAX_FIX_ATTEMPTS == 8
     assert config.MAX_PLAN_REVIEW_ROUNDS == 2
@@ -350,6 +351,7 @@ def test_llm_timeout_and_silent_stream_validation():
 
 def test_review_and_fix_attempts_defaults_and_upper_bound():
     config = Settings(_env_file=None)
+    assert config.GENERATION_MODE == "relaxed"
     assert config.MAX_REVIEW_ROUNDS == 8
     assert config.MAX_FIX_ATTEMPTS == 8
     # 超过上限 le=20 会被拒绝

@@ -522,10 +522,10 @@ def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_current_manifest_uses_v7_schema_and_merge_profile():
+def test_current_manifest_uses_v8_schema_and_merge_profile():
     assert (
         RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
-        == 7
+        == 8
     )
     assert (
         RunManifest(
@@ -555,7 +555,7 @@ def test_v4_manifest_is_readable_but_read_only(tmp_path):
     assert loaded.schema_version == 4
     with pytest.raises(ValueError, match="仅支持只读查看"):
         loaded.validate_for_resume()
-    with pytest.raises(ValueError, match="只允许写入 v7"):
+    with pytest.raises(ValueError, match="只允许写入 v8"):
         write_manifest(path, loaded)
 
 

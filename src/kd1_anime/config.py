@@ -42,6 +42,8 @@ DEFAULT_SCENES_DIR = DEFAULT_WORKSPACE_DIR / "scenes"
 DEFAULT_LOGS_DIR = DEFAULT_WORKSPACE_DIR / "logs"
 DEFAULT_VIDEOS_DIR = DEFAULT_WORKSPACE_DIR / "videos"
 
+GenerationMode = Literal["relaxed", "strict"]
+
 _LEGACY_STORAGE_DEFAULTS = {
     "RAG_INDEX_PATH": ("~/.cache/kd1-anime/rag/index.sqlite3", str(DEFAULT_RAG_INDEX_PATH)),
     "RAG_DOCS_DIR": ("", str(DEFAULT_RAG_DOCS_DIR)),
@@ -822,6 +824,10 @@ class Settings(BaseSettings):
     VIDEOS_DIR: Path = DEFAULT_VIDEOS_DIR
 
     # --- Agent 与监控 ---
+    GENERATION_MODE: GenerationMode = Field(
+        default="relaxed",
+        description="生成策略：relaxed 放宽 LLM 审查，strict 使用严格有限审查",
+    )
     MAX_REVIEW_ROUNDS: int = Field(default=8, ge=1, le=10)
     MAX_LOW_RISK_REVIEW_ROUNDS: int = Field(
         default=2,

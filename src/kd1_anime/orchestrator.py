@@ -121,7 +121,7 @@ from kd1_anime.cluster.slurm import (
     SlurmJob,
     SlurmMonitorCoordinator,
 )
-from kd1_anime.config import resolve_runtime_path, settings
+from kd1_anime.config import GenerationMode, resolve_runtime_path, settings
 from kd1_anime.exceptions import (
     LLMError,
     LLMResponseError,
@@ -391,6 +391,7 @@ class PipelineContext:
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    generation_mode: GenerationMode = field(default_factory=lambda: settings.GENERATION_MODE)
     # 本次运行固定使用的渲染后端；恢复时只能使用 manifest 中的值。
     backend: RenderBackendName = field(default_factory=lambda: settings.RENDER_BACKEND)
     # 显式 --smoke 可让 dry-run 执行一次本地低质量预检；该开关写入
@@ -1169,6 +1170,7 @@ class Orchestrator:
                 dry_run=ctx.dry_run,
                 interactive=ctx.interactive,
                 auto_fix=ctx.auto_fix,
+                generation_mode=ctx.generation_mode,
                 backend=ctx.backend,
                 local_smoke_enabled=ctx.local_smoke_enabled,
                 direct_render=ctx.direct_render,
@@ -1532,6 +1534,7 @@ class Orchestrator:
             dry_run=manifest.dry_run,
             interactive=manifest.interactive,
             auto_fix=manifest.auto_fix,
+            generation_mode=getattr(manifest, "generation_mode", "relaxed"),
             backend=getattr(manifest, "backend", "slurm"),
             local_smoke_enabled=getattr(manifest, "local_smoke_enabled", False),
             direct_render=direct_render,
@@ -2003,6 +2006,7 @@ class Orchestrator:
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
+            generation_mode=getattr(base_manifest, "generation_mode", settings.GENERATION_MODE),
             backend=selected_backend,
             dry_run=dry_run,
             interactive=interactive,

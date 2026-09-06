@@ -305,9 +305,16 @@ def main_callback(
 def chat(
     ctx: typer.Context,
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成代码不提交 Slurm"),
+    strict: bool | None = typer.Option(
+        None,
+        "--strict/--relaxed",
+        help="生成策略：strict 使用严格有限审查，relaxed 放宽 LLM 审查",
+    ),
 ):
     """启动交互式会话 (默认命令)"""
     effective_dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
+    if strict is not None:
+        settings.GENERATION_MODE = "strict" if strict else "relaxed"
     _ensure_generation_apis(dry_run=effective_dry_run)
     _start_chat(dry_run=effective_dry_run)
 
@@ -371,9 +378,16 @@ def generate(
         "--backend",
         help="渲染后端：slurm（默认）或 local（本地前台渲染）",
     ),
+    strict: bool | None = typer.Option(
+        None,
+        "--strict/--relaxed",
+        help="生成策略：strict 使用严格有限审查，relaxed 放宽 LLM 审查",
+    ),
 ):
     """直接生成模式 (无需求澄清)"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
+    if strict is not None and not resume:
+        settings.GENERATION_MODE = "strict" if strict else "relaxed"
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
     if plan_file and (prompt or file or resume or incremental):
@@ -387,6 +401,12 @@ def generate(
     if resume and backend:
         console.print(
             "[bold red]错误:[/] resume 必须使用运行清单中的渲染后端，不能覆盖 --backend",
+            markup=False,
+        )
+        raise typer.Exit(1)
+    if resume and strict is not None:
+        console.print(
+            "[bold red]错误:[/] resume 必须沿用运行清单中的生成模式，不能覆盖 --strict/--relaxed",
             markup=False,
         )
         raise typer.Exit(1)
