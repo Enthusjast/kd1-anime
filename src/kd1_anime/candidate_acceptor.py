@@ -14,7 +14,12 @@ from pathlib import Path
 
 from kd1_anime.agents.api_linter import lint_manim_api
 from kd1_anime.agents.continuity import extract_scene_continuity_elements
-from kd1_anime.agents.lifecycle import detect_unknown_animations, validate_animation_lifecycle
+from kd1_anime.agents.lifecycle import (
+    detect_unknown_animations,
+    repair_initial_active_alias_lifecycle,
+    repair_missing_animation_markers,
+    validate_animation_lifecycle,
+)
 from kd1_anime.agents.planner import ExtractedElement, ScenePlan
 from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.agents.validator import CodeValidationResult, validate_manim_code
@@ -37,6 +42,7 @@ class AcceptedCandidate:
     unknown_animations: tuple[str, ...]
     validation: CodeValidationResult
     api_warnings: tuple[str, ...] = ()
+    repairs: tuple[str, ...] = ()
 
 
 class CandidateAcceptor:
@@ -54,6 +60,12 @@ class CandidateAcceptor:
     ) -> AcceptedCandidate:
         if not isinstance(code, str) or not code.strip():
             raise CandidateRejected("候选代码为空")
+        repairs: list[str] = []
+        if technical_spec is not None:
+            code, alias_repairs = repair_initial_active_alias_lifecycle(code, technical_spec)
+            repairs.extend(alias_repairs)
+            code, marker_repairs = repair_missing_animation_markers(code, technical_spec)
+            repairs.extend(marker_repairs)
         validation = (validator or validate_manim_code)(code, renderer=renderer)
         if not validation.is_valid:
             raise CandidateRejected("AST/安全校验失败:\n" + validation.feedback)
@@ -89,6 +101,7 @@ class CandidateAcceptor:
             unknown_animations=unknown,
             validation=validation,
             api_warnings=tuple(api_result.warnings),
+            repairs=tuple(repairs),
         )
 
     def accept(
