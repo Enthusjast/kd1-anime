@@ -2047,6 +2047,38 @@ class Demo(Scene):
     assert "连续性导出区无效" in state.rewrite_feedback
 
 
+def test_parallel_scene_review_defers_shared_ledger_commit(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    class PassingReviewer:
+        def review(self, *args, **kwargs):
+            return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(module, "ReviewerAgent", PassingReviewer)
+    monkeypatch.setattr(
+        orchestrator,
+        "_update_element_manifest",
+        lambda *args: (_ for _ in ()).throw(AssertionError("并行审查不能提前写共享账本")),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_update_state_ledger",
+        lambda *args: (_ for _ in ()).throw(AssertionError("并行审查不能提前写共享账本")),
+    )
+
+    orchestrator._scene_review(ctx, 1, state, defer_continuity_commit=True)
+
+    assert state.reviewed is True
+
+
 def test_code_generation_validates_continuity_contract_before_code_review(monkeypatch):
     from kd1_anime.agents.validator import CodeValidationResult
 

@@ -7411,8 +7411,9 @@ class Orchestrator:
         if result.is_valid:
             try:
                 self._refresh_scene_export(state)
-                self._update_element_manifest(ctx, state)
-                self._update_state_ledger(ctx, state)
+                if not defer_continuity_commit:
+                    self._update_element_manifest(ctx, state)
+                    self._update_state_ledger(ctx, state)
             except ValueError as exc:
                 deterministic_review_error = True
                 result = ReviewResult(
