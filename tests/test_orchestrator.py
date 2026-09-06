@@ -22,6 +22,7 @@ from kd1_anime.agents.planner import (
     VisualElementState,
 )
 from kd1_anime.agents.reviewer import ReviewFinding, ReviewResult
+from kd1_anime.agents.state_ledger import LedgerElement, SceneBoundaryIR, StateLedger
 from kd1_anime.agents.technical_planner import TechnicalAnimation, TechnicalObject, TechnicalSpec
 from kd1_anime.config import settings
 from kd1_anime.eval.visual_eval import VisualAnalysisResult, VisualIssue
@@ -2078,6 +2079,82 @@ def test_parallel_scene_review_defers_shared_ledger_commit(monkeypatch, tmp_path
     orchestrator._scene_review(ctx, 1, state, defer_continuity_commit=True)
 
     assert state.reviewed is True
+
+
+def test_scene_review_rebuilds_stale_ledger_before_commit(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    grid = VisualElementState(element_id="grid", variable_name="grid", required=True)
+    previous_plan = plan().model_copy(update={"new_elements": [grid]})
+    current_plan = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [grid],
+            "elements_to_remove": [grid],
+            "new_elements": [],
+        }
+    )
+    previous_code = """from manim import *
+class Previous(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: grid
+        grid = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    current_code = """from manim import *
+class Current(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # KD1_CONTINUITY_EXPORT_END
+        self.wait()
+"""
+    previous = SceneState(
+        plan=previous_plan,
+        code=previous_code,
+        class_name="Previous",
+        plan_ready=True,
+        reviewed=True,
+    )
+    current = SceneState(
+        plan=current_plan,
+        code=current_code,
+        class_name="Current",
+        plan_ready=True,
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={1: previous, 2: current},
+    )
+    # 合法但陈旧的账本：上一场景的 closing 没有记录 grid。
+    ctx.state_ledger = StateLedger(
+        current_scene_id=1,
+        elements=[
+            LedgerElement(
+                element_id="old",
+                variable_name="old",
+                source_scene_id=1,
+                source_code_sha256="a" * 64,
+            )
+        ],
+        boundaries={
+            1: SceneBoundaryIR(scene_id=1, closing_element_ids=["old"]),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+
+    class PassingReviewer:
+        def review(self, *args, **kwargs):
+            return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(module, "ReviewerAgent", PassingReviewer)
+
+    orchestrator._scene_review(ctx, 2, current)
+
+    assert current.reviewed is True
+    assert any(item.element_id == "grid" for item in ctx.state_ledger.elements)
+    assert 2 in ctx.state_ledger.boundaries
 
 
 def test_code_generation_validates_continuity_contract_before_code_review(monkeypatch):

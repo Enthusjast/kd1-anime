@@ -4161,7 +4161,15 @@ class Orchestrator:
                     if not state.exported_elements_code:
                         self._refresh_scene_export(state)
                     self._update_element_manifest(ctx, state)
-                    self._update_state_ledger(ctx, state)
+                    try:
+                        self._update_state_ledger(ctx, state)
+                    except ValueError as ledger_error:
+                        if "StateLedger" not in str(ledger_error):
+                            raise
+                        self._rebuild_continuity_ledgers(ctx, state.plan.scene_id)
+                        self._refresh_scene_export(state)
+                        self._update_element_manifest(ctx, state)
+                        self._update_state_ledger(ctx, state)
                     self._apply_incremental_for_scene(ctx, state.plan.scene_id, state)
                     self._checkpoint(ctx, State.REVIEWING)
             except Exception as exc:
@@ -7081,6 +7089,32 @@ class Orchestrator:
             },
         )
 
+    def _rebuild_continuity_ledgers(self, ctx: PipelineContext, before_scene_id: int) -> None:
+        """按场景顺序重建恢复/并发中可能损坏的连续性账本。"""
+
+        candidates = [
+            state
+            for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            if state.plan.scene_id < before_scene_id and state.plan_ready and state.code
+        ]
+        expected = [
+            state.plan.scene_id
+            for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            if state.plan.scene_id < before_scene_id and state.plan_ready
+        ]
+        if [state.plan.scene_id for state in candidates] != expected:
+            missing = sorted(set(expected) - {state.plan.scene_id for state in candidates})
+            raise RuntimeError(
+                "无法重建连续性账本：前置场景缺少可验证代码 "
+                + ", ".join(str(scene_id) for scene_id in missing)
+            )
+        ctx.element_manifest = ElementManifest()
+        ctx.state_ledger = StateLedger()
+        for state in candidates:
+            self._refresh_scene_export(state)
+            self._update_element_manifest(ctx, state)
+            self._update_state_ledger(ctx, state)
+
     def _scene_code(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         rewriting = bool(state.rewrite_feedback)
         self._emit(
@@ -7413,7 +7447,23 @@ class Orchestrator:
                 self._refresh_scene_export(state)
                 if not defer_continuity_commit:
                     self._update_element_manifest(ctx, state)
-                    self._update_state_ledger(ctx, state)
+                    try:
+                        self._update_state_ledger(ctx, state)
+                    except ValueError as ledger_error:
+                        if "StateLedger" not in str(ledger_error):
+                            raise
+                        # 恢复旧运行或并发写入中断后，账本可能缺少前置
+                        # Scene 的 closing 元素。先按已有代码重建前置账本，
+                        # 再提交当前 Scene；不能把账本损坏误交给 Coder。
+                        try:
+                            self._rebuild_continuity_ledgers(ctx, scene_id)
+                            self._refresh_scene_export(state)
+                            self._update_element_manifest(ctx, state)
+                            self._update_state_ledger(ctx, state)
+                        except Exception as rebuild_error:
+                            raise RuntimeError(
+                                f"连续性账本重建失败，无法审查 Scene {scene_id}: {rebuild_error}"
+                            ) from rebuild_error
             except ValueError as exc:
                 deterministic_review_error = True
                 result = ReviewResult(
