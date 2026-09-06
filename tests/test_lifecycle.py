@@ -759,6 +759,48 @@ class Demo(Scene):
     assert validate_animation_lifecycle(repaired, technical).is_valid is True
 
 
+def test_does_not_rewrite_optional_new_object_alias_as_inherited_source():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                initially_active=True,
+            ),
+            TechnicalObject(
+                element_id="highlight_P_inv",
+                variable_name="highlight_P_inv",
+                initially_active=False,
+            ),
+        ],
+        animations=[
+            {
+                "event_id": "highlight",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "introduce",
+                "target_element_ids": ["highlight_P_inv"],
+                "create_element_ids": ["highlight_P_inv"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        highlight_P_inv = SurroundingRectangle(formula)
+        # KD1_ANIMATION_EVENT: highlight
+        self.play(Create(highlight_P_inv))
+"""
+
+    repaired, repairs = repair_initial_active_alias_lifecycle(code, technical)
+
+    assert repaired == code
+    assert repairs == ()
+
+
 def test_semantic_marker_can_precede_pure_target_preparation():
     technical = _semantic_spec("update")
     technical.objects[0].initially_active = True

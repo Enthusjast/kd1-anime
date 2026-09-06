@@ -923,6 +923,47 @@ def repair_initial_active_alias_lifecycle(
     if not contract_variables:
         return code, ()
 
+    statements = _statement_nodes(construct)
+    active_contract_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.variable_name and item.initially_active
+    }
+    for node in statements:
+        if isinstance(node, ast.Assign):
+            continue
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ):
+            continue
+        if node.func.attr in {"add", "remove"}:
+            names = {
+                name
+                for argument in node.args
+                for name in _root_names(argument)
+                if name in contract_variables
+            }
+            if node.func.attr == "add":
+                active_contract_variables.update(names)
+            else:
+                active_contract_variables.difference_update(names)
+        elif node.func.attr == "play":
+            invocations = [
+                invocation
+                for argument in node.args
+                for invocation in _animation_invocations(argument)
+            ]
+            for invocation in invocations:
+                if invocation.operation in _INTRODUCERS:
+                    active_contract_variables.update(
+                        name for name in invocation.source_names if name in contract_variables
+                    )
+                elif invocation.operation in _REMOVERS:
+                    active_contract_variables.difference_update(invocation.source_names)
+
     aliases: dict[str, str] = {}
     alias_assignments: list[tuple[str, set[str]]] = []
     for node in _statement_nodes(construct):
@@ -931,7 +972,9 @@ def repair_initial_active_alias_lifecycle(
         target = node.targets[0]
         if not isinstance(target, ast.Name):
             continue
-        base_candidates = {base for base in contract_variables if target.id.startswith(f"{base}_")}
+        base_candidates = {
+            base for base in active_contract_variables if target.id.startswith(f"{base}_")
+        }
         if not base_candidates:
             continue
         referenced_names = {
@@ -946,7 +989,7 @@ def repair_initial_active_alias_lifecycle(
         unresolved: list[tuple[str, set[str]]] = []
         progressed = False
         for alias, roots in pending:
-            resolved_roots = {root for root in roots if root in contract_variables}
+            resolved_roots = {root for root in roots if root in active_contract_variables}
             resolved_roots.update(aliases[root] for root in roots if root in aliases)
             if resolved_roots:
                 aliases[alias] = sorted(resolved_roots)[0]
