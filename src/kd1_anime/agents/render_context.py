@@ -30,4 +30,8 @@ def animation_lifecycle_guidance() -> str:
   `remove` 后不要继续使用退出对象；`camera` 不改变 Mobject 状态。
 - 每个 `self.play` 前写对应的 `# KD1_ANIMATION_EVENT: <event_id>`，未知动画调用
   可以使用，但必须遵守标记事件的对象语义并接受额外 Smoke Render。
+- `Flash`、`Indicate`、`Circumscribe`、`Wiggle` 等指示动画会立即读取目标的
+  几何点/中心，不能传入空的 `VGroup()`、空列表推导结果或可能为空的条件分组。
+  需要条件高亮时，先保证目标至少包含一个 `Line`/`Dot`/其它实际 Mobject；
+  如果目标可能为空，就跳过这次指示动画，不要让 Manim 在动画构造阶段接收空对象。
 - 不同时对同一对象施加互相冲突的动画。"""

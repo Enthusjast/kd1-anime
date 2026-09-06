@@ -528,6 +528,41 @@ class Demo(Scene):
     assert detect_unknown_animations(code, technical_spec) == result.unknown_animations
 
 
+def test_lifecycle_rejects_flash_on_explicit_empty_group():
+    technical_spec = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = VGroup()
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(Flash(formula))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is False
+    assert any("空 Mobject" in error and "Flash" in error for error in result.errors)
+
+
+def test_lifecycle_marks_conditional_group_for_smoke_render():
+    technical_spec = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = VGroup(*[MathTex(r"x") for value in []])
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(Flash(formula))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is True
+    assert any("runtime-risk" in item for item in result.unknown_animations)
+
+
 def test_semantic_marker_is_required_and_must_reference_contract_event():
     technical_spec = _semantic_spec()
     missing_marker = """

@@ -62,6 +62,14 @@ def test_failure_router_separates_plan_math_from_runtime_api_errors():
         classify_failure("AttributeError: OpenGLCamera has no frame", phase="render").handler
         == "code_patch"
     )
+    assert (
+        classify_failure(
+            "ValueError: operands could not be broadcast together with shapes (0,) (3,)\n"
+            "Flash.create_lines",
+            phase="render",
+        ).category
+        == "lifecycle"
+    )
 
 
 def test_api_linter_rejects_deprecated_manim_api():

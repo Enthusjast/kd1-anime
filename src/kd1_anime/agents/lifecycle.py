@@ -29,6 +29,28 @@ _IN_PLACE_ANIMATIONS = {
     "UpdateFromFunc",
     "Wiggle",
 }
+_POINT_SENSITIVE_ANIMATIONS = {"Flash", "Indicate", "Circumscribe", "Wiggle"}
+_EMPTY_GROUP_CONSTRUCTORS = {"VGroup", "Group", "VDict"}
+_NONEMPTY_MOBJECT_CONSTRUCTORS = {
+    "Arc",
+    "Arrow",
+    "Arrow3D",
+    "Axes",
+    "Circle",
+    "Dot",
+    "Line",
+    "MathTex",
+    "NumberPlane",
+    "ParametricFunction",
+    "Polygon",
+    "Rectangle",
+    "Square",
+    "Surface",
+    "Text",
+    "Tex",
+    "ThreeDAxes",
+    "Vector",
+}
 _CONTAINER_ANIMATIONS = {"AnimationGroup", "LaggedStart", "Succession", "Group"}
 _SCENE_SIDE_EFFECTS = {"play", "add", "remove", "clear"}
 _EVENT_MARKER_RE = re.compile(
@@ -1161,6 +1183,46 @@ def _assignment_aliases(node: ast.Assign | ast.AnnAssign) -> dict[str, set[str]]
     return {name: set(roots) for name in _assignment_names(node)}
 
 
+def _mobject_state(value: ast.AST, states: dict[str, str]) -> str:
+    """保守判断一个赋值是否可能产生空 Mobject。
+
+    这里只拦截能确定的 ``VGroup()``/``Group()`` 空构造；列表推导、条件
+    过滤和 ``copy`` 等无法在不执行用户代码的情况下证明时返回
+    ``maybe_empty``，由调用方记录风险并要求 Smoke Render，而不是误报为
+    确定性错误。
+    """
+
+    if isinstance(value, ast.Name):
+        return states.get(value.id, "unknown")
+    if isinstance(value, ast.Call):
+        name = _call_name(value)
+        if name in _EMPTY_GROUP_CONSTRUCTORS:
+            if not value.args and not value.keywords:
+                return "empty"
+            if any(isinstance(argument, ast.Starred) for argument in value.args):
+                starred = [
+                    argument.value for argument in value.args if isinstance(argument, ast.Starred)
+                ]
+                if all(
+                    isinstance(item, (ast.List, ast.Tuple, ast.Set)) and not item.elts
+                    for item in starred
+                ):
+                    return "empty"
+                return "maybe_empty"
+            return "nonempty"
+        if name in _NONEMPTY_MOBJECT_CONSTRUCTORS:
+            return "nonempty"
+        if (
+            isinstance(value.func, ast.Attribute)
+            and value.func.attr == "copy"
+            and isinstance(value.func.value, ast.Name)
+        ):
+            return states.get(value.func.value.id, "unknown")
+        if name in {"always_redraw", "become", "set_points_as_corners"}:
+            return "maybe_empty"
+    return "unknown"
+
+
 def validate_animation_lifecycle(
     code: str,
     technical_spec: TechnicalSpec,
@@ -1234,6 +1296,17 @@ def validate_animation_lifecycle(
     }
     ever_active: set[str] = set(active)
     seen_assignments: set[str] = set()
+    mobject_states: dict[str, str] = {}
+    group_add_lines: dict[str, list[int]] = {}
+    for candidate in ast.walk(construct):
+        if (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Attribute)
+            and candidate.func.attr == "add"
+            and isinstance(candidate.func.value, ast.Name)
+            and candidate.args
+        ):
+            group_add_lines.setdefault(candidate.func.value.id, []).append(candidate.lineno)
     used_event_ids: set[str] = set()
     event_actual_objects: dict[str, set[str]] = {}
     scene_added: set[str] = set()
@@ -1295,6 +1368,16 @@ def validate_animation_lifecycle(
                 )
             defined.update(names)
             seen_assignments.update(names)
+            state = (
+                _mobject_state(node.value, mobject_states)
+                if isinstance(node, ast.Assign) or node.value is not None
+                else "unknown"
+            )
+            for name in names:
+                if state != "unknown":
+                    mobject_states[name] = state
+                else:
+                    mobject_states.pop(name, None)
             for alias, roots in _assignment_aliases(node).items():
                 aliases[alias] = roots
             continue
@@ -1351,6 +1434,34 @@ def validate_animation_lifecycle(
             invocations.extend(_animation_invocations(argument))
         if not invocations and node.args:
             invocations.append(_AnimationInvocation("unknown:expression", unknown=True))
+
+        # Flash/Indicate/Circumscribe/Wiggle 会在构造动画时读取目标的几何
+        # 中心；空 VGroup 会直接触发 shapes (0,) 与 (3,) 的广播错误。
+        # 对明确的空 group 阻断候选，对条件列表/未知别名只记录风险，
+        # 让 dry-run 追加 Smoke Render，而不是把合法的新动画 API 拒之门外。
+        for animation_node in ast.walk(node):
+            if not isinstance(animation_node, ast.Call):
+                continue
+            animation_name = _call_name(animation_node)
+            if animation_name not in _POINT_SENSITIVE_ANIMATIONS or not animation_node.args:
+                continue
+            target_names = _root_names(animation_node.args[0])
+            for target_name in sorted(target_names):
+                target_state = mobject_states.get(target_name, "unknown")
+                if any(line < node.lineno for line in group_add_lines.get(target_name, [])):
+                    target_state = "nonempty"
+                if target_state == "empty":
+                    errors.append(
+                        f"第 {node.lineno} 行 {animation_name} 的目标 {target_name} 是空 Mobject；"
+                        "请构造至少一个点/线/图形，或在目标为空时跳过该动画"
+                    )
+                elif target_state in {"maybe_empty", "unknown"}:
+                    detail = (
+                        f"[runtime-risk] 第 {node.lineno} 行 {animation_name} 的目标 "
+                        f"{target_name} 可能没有几何点；请避免把空 VGroup 传给指示动画"
+                    )
+                    warnings.append(detail)
+                    unknown_animations.append(detail)
 
         if repeated_marker and event is not None and event.semantic_action == "introduce":
             # 一个“首次展示后再变换”的复合引入阶段可能合理地使用

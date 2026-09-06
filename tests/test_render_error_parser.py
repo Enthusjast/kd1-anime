@@ -66,3 +66,17 @@ AttributeError: 'OpenGLCamera' object has no attribute 'frame'
     prompt = evidence.prompt_text()
     assert "OpenGLCamera" in prompt
     assert "scene_2.py:12" in prompt
+
+
+def test_extract_render_error_classifies_empty_flash_target_as_lifecycle():
+    evidence = extract_render_error(
+        """
+Traceback (most recent call last):
+  File "scene_2.py", line 188, in construct
+    self.play(Flash(x_axis_highlight))
+  File ".../manim/animation/indication.py", line 254, in create_lines
+ValueError: operands could not be broadcast together with shapes (0,) (3,)
+"""
+    )
+
+    assert evidence.category == "lifecycle"
