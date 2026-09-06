@@ -1042,6 +1042,39 @@ def test_normalize_technical_spec_adds_missing_internal_lifecycle_removal():
     assert any("内部临时元素补齐 remove" in repair for repair in repairs)
 
 
+def test_normalize_technical_spec_downgrades_empty_fade_in_update_to_hold():
+    inherited = VisualElementState(element_id="grid", variable_name="grid")
+    plan = make_plan(inherited=[inherited])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                initially_active=True,
+            )
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="fade_in_update",
+                start_seconds=0,
+                end_seconds=1,
+                semantic_action="update",
+                source_element_ids=["grid"],
+            )
+        ],
+        latex=TechnicalLatex(required=True, preamble_packages=["ctex"]),
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    event = next(item for item in normalized.animations if item.event_id == "fade_in_update")
+    assert event.semantic_action == "hold"
+    assert result.is_valid is True, result.errors
+    assert any("update 降级为 hold" in repair for repair in repairs)
+
+
 def test_normalize_technical_spec_downgrades_create_of_active_target_to_animation():
     point = VisualElementState(element_id="point", variable_name="point")
     formula = VisualElementState(element_id="formula", variable_name="formula")

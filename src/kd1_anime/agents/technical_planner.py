@@ -224,6 +224,26 @@ def _normalise_technical_lifecycle(
         create_ids = set(event.create_element_ids)
         remove_ids = set(event.remove_element_ids)
 
+        if (
+            action == "update"
+            and "fade_in" in event.event_id.lower()
+            and not target_ids
+            and not create_ids
+            and not remove_ids
+        ):
+            action = "hold"
+            event = event.model_copy(
+                update={
+                    "semantic_action": action,
+                    "api_notes": _append_api_repair_note(
+                        event.api_notes,
+                        "fade_in 事件没有目标状态，按已 active 对象的 hold 处理",
+                    ),
+                }
+            )
+            repairs.append(f"事件 {event.event_id} 没有目标状态，update 降级为 hold")
+            changed = True
+
         if action == "update" and not source_ids:
             timeline_ids = set((timeline_element_ids or {}).get(event.event_id, ()))
             inferred = timeline_ids & active
