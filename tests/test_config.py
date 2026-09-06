@@ -84,6 +84,22 @@ def test_nested_toml_loads_and_has_higher_priority_than_dotenv(monkeypatch, tmp_
     assert Settings(_env_file=dotenv_file).LLM_MODEL == "environment-model"
 
 
+def test_empty_environment_values_do_not_hide_toml_llm_config(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text(
+        '[llm]\napi_key = "toml-key"\nmodel = "toml-model"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("LLM_MODEL", "")
+
+    config = Settings()
+
+    assert config.LLM_API_KEY == "toml-key"
+    assert config.LLM_MODEL == "toml-model"
+
+
 def test_minimal_toml_uses_defaults_for_omitted_optional_settings(monkeypatch, tmp_path):
     toml_file = tmp_path / "config.toml"
     toml_file.write_text(

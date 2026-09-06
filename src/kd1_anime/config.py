@@ -451,6 +451,9 @@ class Settings(BaseSettings):
         # source 会在存在 TOML 时关闭它们，避免历史配置填充省略字段。
         env_file=_settings_env_files(),
         env_file_encoding="utf-8",
+        # 空的 shell/.env 变量不应把已经配置好的 TOML 值覆盖为空；
+        # 非空环境变量仍保持最高优先级。
+        env_ignore_empty=True,
         extra="ignore",
         validate_assignment=True,
     )
