@@ -533,6 +533,11 @@ def plan(
         "-o",
         help="额外导出结构化计划 JSON（运行清单始终写入 ~/.kd1-anime/workspace）",
     ),
+    strict: bool | None = typer.Option(
+        None,
+        "--strict/--relaxed",
+        help="生成策略：strict 使用严格有限审查，relaxed 放宽 LLM 审查",
+    ),
 ):
     """只生成场景规划，不执行渲染；默认同时审查计划。"""
     if file:
@@ -542,6 +547,8 @@ def plan(
             "[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助"
         )
         raise typer.Exit(1)
+    if strict is not None:
+        settings.GENERATION_MODE = "strict" if strict else "relaxed"
     _ensure_generation_apis(dry_run=True)
 
     try:
