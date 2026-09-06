@@ -2,6 +2,7 @@
 
 from kd1_anime.agents.lifecycle import (
     detect_unknown_animations,
+    repair_missing_animation_markers,
     repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
     repair_required_export_replacement_lifecycle,
@@ -546,6 +547,81 @@ class Demo(Scene):
     assert any("缺少语义事件标记" in error for error in missing_result.errors)
     assert not unknown_result.is_valid
     assert any("未在 TechnicalSpec 中声明" in error for error in unknown_result.errors)
+
+
+def test_repairs_missing_marker_when_contract_event_is_unambiguous():
+    technical = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.play(FadeIn(formula))
+"""
+
+    repaired, repairs = repair_missing_animation_markers(code, technical)
+
+    assert repairs == ("为第 6 行 self.play() 补齐事件标记: show_formula",)
+    assert "# KD1_ANIMATION_EVENT: show_formula\n        self.play" in repaired
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
+
+
+def test_repairs_unplanned_play_with_diagnostic_marker_only():
+    technical = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.play(FadeIn(formula))
+        extra = Circle()
+        self.play(FadeIn(extra))
+"""
+
+    repaired, repairs = repair_missing_animation_markers(code, technical)
+
+    assert repairs == (
+        "为第 6 行 self.play() 补齐事件标记: show_formula",
+        "为无合同对象的第 8 行 self.play() 补齐诊断标记: __auto_introduce_1",
+    )
+    assert "# KD1_ANIMATION_EVENT: __auto_introduce_1" in repaired
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
+
+
+def test_does_not_guess_between_multiple_contract_update_events():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            {
+                "event_id": "update_a",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            },
+            {
+                "event_id": "update_b",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            },
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.add(formula)
+        self.play(formula.animate.scale(1.1))
+"""
+
+    repaired, repairs = repair_missing_animation_markers(code, technical)
+
+    assert repaired == code
+    assert repairs == ()
 
 
 def test_semantic_marker_can_precede_pure_target_preparation():

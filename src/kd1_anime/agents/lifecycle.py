@@ -725,6 +725,169 @@ def _animation_invocations(node: ast.AST) -> list[_AnimationInvocation]:
     return []
 
 
+def repair_missing_animation_markers(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """为可确定归属的未标记 ``self.play`` 补上语义事件标记。
+
+    代码模型在局部重写后偶尔会遗漏 marker。直接把所有缺失 marker 的
+    调用标成同一个合同事件会掩盖真正的生命周期错误，因此这里只接受
+    两种安全情况：
+
+    * 调用中出现的合同变量能唯一匹配一个尚未使用的技术事件；或
+    * 调用完全没有合同变量，此时使用 ``__auto_*`` 诊断 marker，让
+      生命周期分析器按实际动画类型做最小状态模拟。
+
+    如果已知合同变量无法唯一确定事件，原样返回，继续让 Coder 根据
+    确定性错误重写，而不是猜测事件归属。
+    """
+
+    if not code or not technical_spec.animations:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+
+    object_variables = {item.variable_name for item in technical_spec.objects if item.variable_name}
+    variable_by_element = {
+        item.element_id: item.variable_name for item in technical_spec.objects if item.variable_name
+    }
+    event_by_id = {event.event_id: event for event in technical_spec.animations}
+    source_lines = code.splitlines(keepends=True)
+    used_event_ids = {event_id for _, event_id in _event_markers(code) if event_id in event_by_id}
+    events = sorted(
+        technical_spec.animations,
+        key=lambda item: (item.start_seconds, item.event_id),
+    )
+
+    def expected_variables(event) -> set[str]:
+        if event.semantic_action == "introduce":
+            element_ids = {*event.target_element_ids, *event.create_element_ids}
+        elif event.semantic_action == "update":
+            element_ids = {*event.source_element_ids, *event.target_element_ids}
+        elif event.semantic_action == "remove":
+            element_ids = {*event.source_element_ids, *event.remove_element_ids}
+        elif event.semantic_action == "hold":
+            element_ids = set(event.source_element_ids)
+        else:
+            element_ids = set()
+        return {
+            variable_by_element[element_id]
+            for element_id in element_ids
+            if element_id in variable_by_element
+        }
+
+    def operation_kinds(invocations: list[_AnimationInvocation]) -> set[str]:
+        operations = {invocation.operation for invocation in invocations}
+        if "camera" in operations:
+            return {"camera"}
+        if operations and operations <= _REMOVERS:
+            return {"remove"}
+        if operations and operations <= _INTRODUCERS:
+            return {"introduce"}
+        if operations & (_TRANSFORMS | {"animate"}):
+            return {"update", "hold"}
+        return {"introduce", "update", "remove", "hold"}
+
+    missing: list[tuple[ast.Call, str]] = []
+    repair_notes: list[str] = []
+    auto_index = 1
+    for node in _statement_nodes(construct):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "play"
+        ):
+            continue
+        if _marker_before_line(source_lines, node.lineno) is not None:
+            continue
+
+        invocations: list[_AnimationInvocation] = []
+        for argument in node.args:
+            invocations.extend(_animation_invocations(argument))
+        actual_variables = {
+            name
+            for invocation in invocations
+            for name in (*invocation.source_names, *invocation.target_names)
+            if name in object_variables
+        }
+        kinds = operation_kinds(invocations)
+        candidates: list[tuple[int, object]] = []
+        for event in events:
+            if event.semantic_action not in kinds:
+                continue
+            if event.event_id in used_event_ids and event.semantic_action != "remove":
+                continue
+            expected = expected_variables(event)
+            overlap = len(actual_variables & expected)
+            if overlap:
+                candidates.append((overlap, event))
+            elif not actual_variables and event.semantic_action == "camera":
+                candidates.append((1, event))
+
+        selected = None
+        if candidates:
+            best_score = max(score for score, _ in candidates)
+            best = [event for score, event in candidates if score == best_score]
+            if len(best) == 1:
+                selected = best[0]
+
+        if selected is not None:
+            marker_id = selected.event_id
+            if selected.semantic_action != "remove":
+                used_event_ids.add(marker_id)
+            repair_notes.append(f"为第 {node.lineno} 行 self.play() 补齐事件标记: {marker_id}")
+        elif not actual_variables:
+            operations = {invocation.operation for invocation in invocations}
+            if operations and operations <= _REMOVERS:
+                prefix = "__auto_remove"
+            elif operations and operations <= _INTRODUCERS:
+                prefix = "__auto_introduce"
+            elif "camera" in operations:
+                prefix = "__auto_update_camera"
+            else:
+                prefix = "__auto_update"
+            marker_id = f"{prefix}_{auto_index}"
+            auto_index += 1
+            repair_notes.append(
+                f"为无合同对象的第 {node.lineno} 行 self.play() 补齐诊断标记: {marker_id}"
+            )
+        else:
+            return code, ()
+        missing.append((node, marker_id))
+
+    if not missing:
+        return code, ()
+
+    source_bytes = code.encode("utf-8")
+    line_offsets: list[int] = [0]
+    for line in source_lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+    edits: list[tuple[int, bytes]] = []
+    for node, marker_id in missing:
+        line_index = node.lineno - 1
+        if line_index < 0 or line_index >= len(source_lines):
+            return code, ()
+        line = source_lines[line_index]
+        indentation = line[: len(line) - len(line.lstrip())]
+        edits.append(
+            (
+                line_offsets[line_index],
+                f"{indentation}# KD1_ANIMATION_EVENT: {marker_id}\n".encode(),
+            )
+        )
+    for offset, replacement in sorted(edits, reverse=True):
+        source_bytes = source_bytes[:offset] + replacement + source_bytes[offset:]
+    return source_bytes.decode("utf-8"), tuple(repair_notes)
+
+
 def _construct_node(tree: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "construct":
@@ -1270,6 +1433,7 @@ def detect_unknown_animations(
 __all__ = [
     "LifecycleValidationResult",
     "detect_unknown_animations",
+    "repair_missing_animation_markers",
     "repair_removed_active_lifecycle",
     "repair_required_export_alias_lifecycle",
     "repair_required_export_replacement_lifecycle",
