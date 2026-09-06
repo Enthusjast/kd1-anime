@@ -256,6 +256,7 @@ _TOML_EVALUATION_FIELDS = frozenset(
         "VISUAL_EVAL_FRAME_COUNT",
         "VISUAL_EVAL_THRESHOLD",
         "MAX_VISUAL_FIX_ATTEMPTS",
+        "RELAXED_VISUAL_AUTO_FIX",
     }
 )
 _TOML_EMPTY_NULL_FIELDS = frozenset({"RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", "RAG_RECIPES_DIR"})
@@ -899,6 +900,10 @@ class Settings(BaseSettings):
     VISUAL_EVAL_FRAME_COUNT: int = Field(default=6, ge=1, le=8)
     VISUAL_EVAL_THRESHOLD: float = Field(default=3.5, ge=1.0, le=5.0)
     MAX_VISUAL_FIX_ATTEMPTS: int = Field(default=2, ge=0, le=5)
+    RELAXED_VISUAL_AUTO_FIX: bool = Field(
+        default=False,
+        description="relaxed 模式是否允许视觉评估触发自动修复；默认只记录诊断",
+    )
     MAX_SCENES: int = Field(default=12, ge=1, le=100)
     MAX_PROMPT_CHARS: int = Field(default=50_000, ge=100, le=1_000_000)
     # 澄清对话会携带多轮 user/assistant 消息；独立预算避免累计内容超过模型上下文。

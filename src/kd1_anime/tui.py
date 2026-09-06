@@ -748,6 +748,13 @@ class ChatSession:
                     f"  [dim]▸[/] Scene {scene_id}: [yellow]Coder 失败，已使用最小安全代码[/]{suffix}"
                 )
 
+            case "scene_code_stagnation_fallback":
+                scene_id = data.get("scene_id", "?")
+                attempts = data.get("attempts", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]代码候选无进展，已切换最小安全候选（第 {attempts} 次）[/]"
+                )
+
             case "scene_review_pass":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]审查通过 ✓[/]")
@@ -788,6 +795,12 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(
                     f"  [dim]▸[/] Scene {scene_id}: [yellow]安全候选不可用，继续尝试 AutoFix[/]"
+                )
+
+            case "scene_visual_diagnostic_only":
+                scene_id = data.get("scene_id", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]relaxed 模式仅做视觉诊断，不自动修复[/]"
                 )
 
             case "scene_smoke_rendering":

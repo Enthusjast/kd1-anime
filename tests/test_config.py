@@ -115,6 +115,7 @@ def test_minimal_toml_uses_defaults_for_omitted_optional_settings(monkeypatch, t
     assert config.GENERATION_MODE == "relaxed"
     assert config.MAX_REVIEW_ROUNDS == 8
     assert config.MAX_FIX_ATTEMPTS == 8
+    assert config.RELAXED_VISUAL_AUTO_FIX is False
     assert config.MAX_PLAN_REVIEW_ROUNDS == 2
     assert config.MONITOR_POLL_INTERVAL == 10
 

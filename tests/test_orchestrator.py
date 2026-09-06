@@ -2489,6 +2489,40 @@ class Demo(Scene):
     assert coder.calls[2][1]["temperature_override"] > settings.LLM_CODE_TEMPERATURE
 
 
+def test_relaxed_code_generation_escalates_after_different_invalid_candidates(
+    monkeypatch, tmp_path
+):
+    scene_plan = plan()
+    safe_code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls += 1
+            return (
+                "from manim import *\n"
+                f"# invalid candidate {self.calls}\n"
+                "class Demo(Scene):\n    pass\n"
+            )
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(module, "build_safe_scene_code", lambda *args, **kwargs: safe_code)
+    orchestrator = Orchestrator()
+    orchestrator._ctx = PipelineContext("prompt", paths=paths(tmp_path), generation_mode="relaxed")
+    events = []
+    orchestrator._callback = lambda event, data: events.append((event, data))
+
+    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == safe_code
+    assert class_name == "Demo"
+    assert coder.calls == 4
+    assert any(event == "scene_code_stagnation_fallback" for event, _ in events)
+
+
 def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
     run_paths = paths(tmp_path)
     run_paths.root.mkdir(parents=True)
@@ -3641,6 +3675,40 @@ def test_visual_gate_low_score_schedules_bounded_coder_rewrite(monkeypatch, tmp_
     (ctx.paths.root / stored_candidate.code_file).write_text("# tampered\n", encoding="utf-8")
     with pytest.raises(ValueError, match="最佳视觉候选代码哈希"):
         Orchestrator._context_from_manifest(manifest, ctx.paths.root)
+
+
+def test_relaxed_visual_gate_is_diagnostic_only_by_default(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    ctx, state = _make_visual_eval_context(tmp_path)
+    ctx.generation_mode = "relaxed"
+    monkeypatch.setattr(settings, "RELAXED_VISUAL_AUTO_FIX", False)
+    dimension = {"score": 2, "comprehensive_evaluation": "元素重叠"}
+    result = VisualAnalysisResult(
+        overall_analysis="布局需要修复",
+        mathematical_accuracy={"score": 4, "comprehensive_evaluation": "数学正确"},
+        visual_relevance=dimension,
+        visual_quality=dimension,
+        visual_consistency=dimension,
+        element_layout=dimension,
+        issues=[],
+    )
+
+    class LowScoreEvaluator:
+        def __init__(self, **kwargs):
+            pass
+
+        def evaluate_scene_video(self, *args, **kwargs):
+            return result, []
+
+    monkeypatch.setattr("kd1_anime.eval.Evaluator", LowScoreEvaluator)
+
+    assert Orchestrator()._visual_gate(ctx) is False
+    assert state.visual_status == "warning"
+    assert state.rendered is True
+    assert state.visual_fix_attempts == 0
+    assert state.rewrite_feedback == ""
+    assert "relaxed 模式仅做视觉诊断" in state.visual_feedback
 
 
 def test_merge_rejects_visual_receipt_for_a_different_video(tmp_path):

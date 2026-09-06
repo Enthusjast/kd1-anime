@@ -508,15 +508,32 @@ class Orchestrator:
         return self.rendering_service
 
     @staticmethod
-    def _configured_visual_profile(*, enabled: bool | None = None) -> VisualEvalProfile:
+    def _configured_visual_profile(
+        *, enabled: bool | None = None, generation_mode: GenerationMode | None = None
+    ) -> VisualEvalProfile:
         use_visual = settings.ENABLE_VISUAL_EVAL if enabled is None else enabled
         model = settings.VISUAL_LLM_MODEL or settings.EVAL_VISUAL_MODEL or ""
+        mode = generation_mode or settings.GENERATION_MODE
         return VisualEvalProfile(
             enabled=use_visual,
             model=model if use_visual else "",
             frame_count=settings.VISUAL_EVAL_FRAME_COUNT,
             threshold=settings.VISUAL_EVAL_THRESHOLD,
             max_fix_attempts=settings.MAX_VISUAL_FIX_ATTEMPTS,
+            repair_enabled=(mode != "relaxed" or settings.RELAXED_VISUAL_AUTO_FIX),
+        )
+
+    @staticmethod
+    def _visual_repair_allowed(ctx: PipelineContext) -> bool:
+        """返回当前运行是否允许视觉评估驱动代码/计划修复。
+
+        relaxed 默认只做诊断；显式配置 ``RELAXED_VISUAL_AUTO_FIX`` 后才
+        进入原有的视觉修复链路。该判断集中在 Orchestrator，避免某个
+        视觉分支绕过生成模式策略。
+        """
+
+        return ctx.visual_eval_profile.repair_enabled and (
+            ctx.generation_mode != "relaxed" or settings.RELAXED_VISUAL_AUTO_FIX
         )
 
     @staticmethod
@@ -1648,6 +1665,11 @@ class Orchestrator:
             None if generation_mode == "relaxed" else settings.CODE_VALIDATION_ATTEMPTS
         )
         failed_candidate_signatures: dict[str, int] = {}
+        validation_failure_attempts = 0
+        # relaxed 不设置总尝试上限；这个阈值只表示“连续失败没有形成
+        # 可接纳候选”，到达后升级为确定性安全候选，避免不同源码版本
+        # 把无限循环伪装成持续进展。
+        relaxed_stagnation_threshold = max(4, settings.MAX_STAGNANT_ATTEMPTS + 2)
         if technical_spec is not None:
             technical_result = compile_technical_spec(
                 plan,
@@ -1845,11 +1867,11 @@ class Orchestrator:
             last_api_errors = api_result.errors
             last_continuity_error = continuity_error
             last_lifecycle_error = lifecycle_error
+            validation_failure_attempts += 1
             if generation_mode == "relaxed":
                 failure_signature = sha256_text(
                     "\n".join(
                         (
-                            code,
                             validation.feedback,
                             continuity_error,
                             lifecycle_error,
@@ -1861,6 +1883,34 @@ class Orchestrator:
                     failed_candidate_signatures.get(failure_signature, 0) + 1
                 )
                 repeated_candidate_count = failed_candidate_signatures[failure_signature]
+                if validation_failure_attempts >= relaxed_stagnation_threshold:
+                    try:
+                        fallback_code = build_safe_scene_code(plan, technical_spec)
+                        accepted_fallback = self.candidate_acceptor.inspect(
+                            fallback_code,
+                            plan,
+                            technical_spec=technical_spec,
+                            renderer=renderer,
+                            validator=self._validate,
+                        )
+                    except Exception as exc:
+                        raise ValidationError(
+                            f"relaxed 代码候选连续无进展，且最小安全候选未通过确定性校验：{exc}",
+                            hint="检查 TechnicalSpec、连续性合同或改用 strict 模式诊断",
+                        ) from exc
+                    if accepted_fallback.code != code:
+                        if self._ctx is not None:
+                            self._emit(
+                                "scene_code_stagnation_fallback",
+                                scene_id=plan.scene_id,
+                                attempts=validation_failure_attempts,
+                                strategy="safe_code",
+                            )
+                        return accepted_fallback.code, accepted_fallback.class_name
+                    raise ValidationError(
+                        "relaxed 安全候选与当前无效候选相同，无法继续产生有效进展",
+                        hint="检查 TechnicalSpec 或连续性合同",
+                    )
             # 提供详细的修复指导
             feedback_parts = [
                 f"上一候选是第 {attempt}/{attempt_limit_text} 次尝试，未通过确定性校验；"
@@ -2094,7 +2144,8 @@ class Orchestrator:
             base_manifest=base_manifest,
             paths=RunPaths.create(output_path),
             visual_eval_profile=self._configured_visual_profile(
-                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
+                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run,
+                generation_mode=getattr(base_manifest, "generation_mode", settings.GENERATION_MODE),
             ),
             rag_profile=self._current_rag_profile(),
         )
@@ -2144,7 +2195,8 @@ class Orchestrator:
             approve_plan=approve_plan,
             local_smoke_enabled=smoke,
             visual_eval_profile=self._configured_visual_profile(
-                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
+                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run,
+                generation_mode=settings.GENERATION_MODE,
             ),
             rag_profile=self._current_rag_profile(),
         )
@@ -2225,7 +2277,9 @@ class Orchestrator:
             direct_render=True,
             scenes=[plan],
             scene_states={scene_id: scene_state},
-            visual_eval_profile=self._configured_visual_profile(enabled=False),
+            visual_eval_profile=self._configured_visual_profile(
+                enabled=False, generation_mode=settings.GENERATION_MODE
+            ),
         )
         self._ctx = ctx
         self._manifest = None
@@ -2556,7 +2610,9 @@ class Orchestrator:
             dry_run=True,
             interactive=interactive,
             approve_plan=approve_plan,
-            visual_eval_profile=self._configured_visual_profile(enabled=False),
+            visual_eval_profile=self._configured_visual_profile(
+                enabled=False, generation_mode=settings.GENERATION_MODE
+            ),
             rag_profile=self._current_rag_profile(),
         )
         self._ctx = ctx
@@ -2677,7 +2733,8 @@ class Orchestrator:
             plan_review_status="pending",
             continuity_review_status="pending",
             visual_eval_profile=self._configured_visual_profile(
-                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run
+                enabled=settings.ENABLE_VISUAL_EVAL and not dry_run,
+                generation_mode=settings.GENERATION_MODE,
             ),
             rag_profile=self._current_rag_profile(),
         )
@@ -9775,6 +9832,7 @@ class Orchestrator:
                 "model": profile.model,
                 "visual_profile_sha256": profile.digest(),
                 "attempt": visual_fix_attempt,
+                "repair_enabled": self._visual_repair_allowed(ctx),
                 "artifact_sha256": artifact.video_sha256,
                 "code_sha256": artifact.code_sha256,
                 "inherited_elements_sha256": sha256_text(inherited_code),
@@ -9881,7 +9939,11 @@ class Orchestrator:
                 continue
 
             with self._state_lock:
-                can_fix = ctx.auto_fix and state.visual_fix_attempts < profile.max_fix_attempts
+                can_fix = (
+                    ctx.auto_fix
+                    and self._visual_repair_allowed(ctx)
+                    and state.visual_fix_attempts < profile.max_fix_attempts
+                )
             if can_fix:
                 target = self._visual_repair_target(result)
                 with self._state_lock:
@@ -9929,7 +9991,13 @@ class Orchestrator:
             else:
                 with self._state_lock:
                     state.visual_status = "warning"
-                    if not state.visual_feedback:
+                    if not self._visual_repair_allowed(ctx):
+                        state.visual_feedback = (
+                            f"{state.visual_feedback}\nrelaxed 模式仅做视觉诊断"
+                            if state.visual_feedback
+                            else "relaxed 模式仅做视觉诊断"
+                        )
+                    elif not state.visual_feedback:
                         state.visual_feedback = (
                             "已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"
                         )
@@ -9943,8 +10011,20 @@ class Orchestrator:
                 "scene_visual_warning",
                 scene_id=scene_id,
                 score=score,
-                reason=("已达到视觉修复上限" if ctx.auto_fix else "已关闭自动修复"),
+                reason=(
+                    "relaxed 模式仅做视觉诊断"
+                    if not self._visual_repair_allowed(ctx)
+                    else "已达到视觉修复上限"
+                    if ctx.auto_fix
+                    else "已关闭自动修复"
+                ),
             )
+            if not self._visual_repair_allowed(ctx):
+                self._emit(
+                    "scene_visual_diagnostic_only",
+                    scene_id=scene_id,
+                    reason="relaxed 模式仅做视觉诊断",
+                )
 
         if first_plan_scene is not None:
             state = ctx.scene_states[first_plan_scene]

@@ -486,16 +486,29 @@ class SceneDashboard:
                     status.mark_done("编码")
                     status.message = "代码就绪"
 
-        elif event in ("scene_code_fallback", "repair_stagnation_fallback"):
+        elif event in (
+            "scene_code_fallback",
+            "scene_code_stagnation_fallback",
+            "repair_stagnation_fallback",
+        ):
             if status:
                 status.state = "warning"
-                status.stage = "编码" if event == "scene_code_fallback" else "修复"
-                status.started_at = 0.0
-                status.message = (
-                    "Coder 失败，已使用最小安全代码"
-                    if event == "scene_code_fallback"
-                    else "修复无进展，已切换 IR/安全候选"
+                status.stage = (
+                    "编码"
+                    if event
+                    in {
+                        "scene_code_fallback",
+                        "scene_code_stagnation_fallback",
+                    }
+                    else "修复"
                 )
+                status.started_at = 0.0
+                if event == "scene_code_fallback":
+                    status.message = "Coder 失败，已使用最小安全代码"
+                elif event == "scene_code_stagnation_fallback":
+                    status.message = "代码候选无进展，已切换最小安全候选"
+                else:
+                    status.message = "修复无进展，已切换 IR/安全候选"
 
         elif event == "repair_stagnation_fallback_unavailable":
             if status:
@@ -503,6 +516,13 @@ class SceneDashboard:
                 status.stage = "修复"
                 status.started_at = 0.0
                 status.message = "修复无进展，继续尝试新的 AutoFix 策略"
+
+        elif event == "scene_visual_diagnostic_only":
+            if status:
+                status.state = "warning"
+                status.stage = "视觉评估"
+                status.started_at = 0.0
+                status.message = "relaxed 模式仅做视觉诊断"
 
         elif event == "scene_smoke_rendered":
             if status:

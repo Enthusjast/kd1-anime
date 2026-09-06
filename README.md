@@ -430,6 +430,7 @@ kd1-anime test-llm --no-json-mode --verbose
 | `ENABLE_VISUAL_EVAL` | `false` | 是否启用独立视觉质量门 |
 | `VISUAL_EVAL_THRESHOLD` | `3.5` | 视觉评分通过阈值（1–5） |
 | `MAX_VISUAL_FIX_ATTEMPTS` | `2` | 视觉诊断触发的最大修复次数 |
+| `RELAXED_VISUAL_AUTO_FIX` | `false` | relaxed 模式是否允许视觉评估触发自动修复；默认只做诊断 |
 | `RAG_ENABLED` | `false` | 是否启用本地知识检索 |
 | `WORKSPACE_DIR` | `~/.kd1-anime/workspace` | 运行目录根路径 |
 
