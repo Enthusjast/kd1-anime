@@ -2198,6 +2198,7 @@ class Orchestrator:
                 run_id=paths.run_id,
                 run_dir=str(paths.root),
                 backend=ctx.backend,
+                generation_mode=ctx.generation_mode,
             )
             if wait:
                 try:
@@ -3174,6 +3175,7 @@ class Orchestrator:
             run_id=ctx.paths.run_id,
             run_dir=str(ctx.paths.root),
             backend=ctx.backend,
+            generation_mode=ctx.generation_mode,
         )
 
         if not ctx.dry_run:

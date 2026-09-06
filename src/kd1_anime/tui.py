@@ -612,7 +612,9 @@ class ChatSession:
         match event:
             case "run_started":
                 console.print(
-                    f"[dim]Run {esc(data.get('run_id', '?'))} · {esc(data.get('run_dir', ''))}[/]"
+                    f"[dim]Run {esc(data.get('run_id', '?'))} · "
+                    f"mode={esc(data.get('generation_mode', 'relaxed'))} · "
+                    f"{esc(data.get('run_dir', ''))}[/]"
                 )
 
             case "stage_start":
