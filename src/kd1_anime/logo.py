@@ -38,6 +38,9 @@ ASCII_LOGO_COLORS: dict[str, tuple[int, int, int]] = {
     ".": (153, 153, 153),
 }
 
+BRAND_TITLE = "kd1-anime"
+BRAND_SUBTITLE = "LLM 驱动的 Manim 动画 Agent"
+
 
 def colored_ascii_logo() -> str:
     """给硬编码 ASCII 字符附加 ANSI 真彩色控制码。"""
@@ -64,6 +67,20 @@ def colored_ascii_logo() -> str:
 COLORED_ASCII_LOGO = colored_ascii_logo()
 
 
+def colored_ascii_brand() -> str:
+    """在 Logo 右侧附加品牌名称和简介。"""
+
+    lines = COLORED_ASCII_LOGO.rstrip("\n").split("\n")
+    title_row = max(0, len(lines) // 2 - 1)
+    subtitle_row = min(len(lines) - 1, title_row + 2)
+    for index, label in ((title_row, BRAND_TITLE), (subtitle_row, BRAND_SUBTITLE)):
+        lines[index] += f"    {label}"
+    return "\n".join(lines) + "\n"
+
+
+COLORED_ASCII_BRAND = colored_ascii_brand()
+
+
 def print_logo(stream: TextIO | None = None) -> None:
     """把带颜色的 ASCII Logo 写入终端；供安装器和 Rich TUI 使用。"""
 
@@ -72,5 +89,16 @@ def print_logo(stream: TextIO | None = None) -> None:
     output.flush()
 
 
+def print_brand(stream: TextIO | None = None) -> None:
+    """把带右侧品牌文字的 Logo 写入终端。"""
+
+    output = stream or sys.stdout
+    output.write(COLORED_ASCII_BRAND)
+    output.flush()
+
+
 if __name__ == "__main__":  # pragma: no cover - exercised by install.sh
-    print_logo()
+    if "--brand" in sys.argv[1:]:
+        print_brand()
+    else:
+        print_logo()

@@ -299,7 +299,7 @@ missing_tex_packages {shlex.quote(str(tex_bin))}
     assert "scheme-full" not in packages
 
 
-def test_completion_message_renders_ansi_escape_sequences(tmp_path):
+def test_completion_message_renders_brand_fallback(tmp_path):
     config_file = tmp_path / "config" / "config.toml"
     user_bin = tmp_path / "bin"
     script = f"""
@@ -318,10 +318,11 @@ print_completion
     )
 
     assert result.returncode == 0, result.stderr
-    assert "\x1b[0;32m安装完成\x1b[0m" in result.stdout
     assert r"\033" not in result.stdout
-    assert f"3. 编辑配置: {config_file}" in result.stdout
-    assert f"命令目录: {user_bin}" in result.stdout
+    assert "安装完成" not in result.stdout
+    assert "kd1-anime    LLM 驱动的 Manim 动画 Agent" in result.stdout
+    assert f"3. 编辑配置: {config_file}" not in result.stdout
+    assert f"命令目录: {user_bin}" not in result.stdout
 
 
 def test_installer_uses_private_application_home_for_user_storage(tmp_path):
