@@ -61,7 +61,7 @@ kd1-anime render scene.py --class MyScene --backend local --wait
 ```
 
 本地后端以前台进程运行，默认最多并发一个场景；Ctrl-C 会终止整个进程组。
-本地 Job 的进程句柄不会写入 manifest，`resume` 不会凭 PID 认领旧进程，而是使用相同代码安全重新启动未完成场景。
+本地 Job 的进程句柄不会写入 manifest，`resume` 不会凭 PID 认领已有进程，而是使用相同代码安全重新启动未完成场景。
 
 ## 快速开始
 
@@ -146,7 +146,7 @@ model = "your-model-name"
 没有 `config.toml` 时：进程环境变量 > 当前目录 `.env` > `~/.kd1-anime/.env` > 程序默认值
 ```
 
-API Key 不会写入运行清单或事件日志。`config.toml` 和旧版 `.env` 都不要提交到 Git。
+API Key 不会写入运行清单或事件日志。`config.toml` 和 `.env` 都不要提交到 Git。
 
 ### 3. 检查环境
 
@@ -287,7 +287,7 @@ kd1-anime status <run-id> --json
 kd1-anime logs <run-id> --scene-id 2 --lines 120
 kd1-anime logs <run-id> --scene-id 2 --stderr
 
-# 恢复中断或失败运行；不会自动扫描历史运行
+# 恢复指定运行
 kd1-anime resume <run-id>
 
 # 只重试某个失败场景
@@ -301,7 +301,7 @@ kd1-anime stats <run-id> --json
 kd1-anime clean --older-than 30d --yes
 ```
 
-启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v8；v4–v7 可以只读查看，但不能安全继续修改。恢复时会沿用清单中的 `generation_mode`。
+使用 `status` 找到 run ID，再显式执行 `resume`。当前运行清单使用 manifest schema v8；恢复时会沿用清单中的 `generation_mode`。
 
 ### 环境和模型诊断
 
@@ -325,7 +325,7 @@ kd1-anime test-llm --no-json-mode --verbose
 ## 配置
 
 完整配置参考见 [`docs/configuration.md`](docs/configuration.md)。安装器只生成必要配置，
-未填写的审查、重试、监控等选项使用程序默认值；旧版 `.env` 仍可兼容读取，但不再是安装必需文件。常用配置如下：
+未填写的审查、重试、监控等选项使用程序默认值；可选 `.env` 配置文件仍受支持。常用配置如下：
 
 | 配置项 | 默认值 | 作用 |
 | --- | ---: | --- |
@@ -419,7 +419,7 @@ rerank_model = "your-reranker-model"
 └── recipes/manim-0.20.1/    # 带 renderer/风险标签的可信 API 配方
 ```
 
-索引只读取 `.md`、`.rst` 和 `.py`，并将源目录、源文件哈希、分块参数和 Embedding 模型写入 SQLite 索引。Recipe 会额外带有 ManimCE、版本、renderer、主题和风险标签，供 Coder 选择相关 API 配方。修改知识库文件、分块参数或 Embedding 模型后，旧索引会被标记为过期：
+索引只读取 `.md`、`.rst` 和 `.py`，并将源目录、源文件哈希、分块参数和 Embedding 模型写入 SQLite 索引。Recipe 会额外带有 ManimCE、版本、renderer、主题和风险标签，供 Coder 选择相关 API 配方。修改知识库文件、分块参数或 Embedding 模型后，索引会被标记为过期：
 
 ```bash
 # 使用配置中的默认目录建立或复用索引
@@ -476,7 +476,7 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 ```text
 ~/.kd1-anime/
 ├── config.toml                  # 主配置（0600）
-├── .env                         # 旧版兼容配置（0600，可选）
+├── .env                         # 可选兼容配置（0600）
 ├── knowledge/                   # Manim 文档和示例
 ├── rag/index.sqlite3            # 本地知识索引
 ├── diagnostics/failure_cases.sqlite3 # 脱敏渲染失败案例
@@ -497,7 +497,7 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
         └── output_final.mp4      # 默认最终视频
 ```
 
-每个 run 使用独立目录和运行锁。manifest 会原子写入，并保存阶段、渲染后端、代码 SHA-256、精确 Job、Render/Merge Profile、视频哈希和 ffprobe 元数据；每个场景还分别记录静态、执行和视觉验证结论。恢复时不会用共享目录扫描猜测视频，也不会复用不匹配的旧产物。
+每个 run 使用独立目录和运行锁。manifest 会原子写入，并保存阶段、渲染后端、代码 SHA-256、精确 Job、Render/Merge Profile、视频哈希和 ffprobe 元数据；每个场景还分别记录静态、执行和视觉验证结论。恢复时不会用共享目录扫描猜测视频，也不会复用身份不匹配的产物。
 
 运行 ID 可通过 `status` 获取；中断后显式恢复：
 
@@ -506,13 +506,13 @@ kd1-anime status
 kd1-anime resume 20260831-120000-1234abcd
 ```
 
-旧版本的 `~/.config/kd1-anime/.env` 会先非破坏地迁移并转换为 `~/.kd1-anime/config.toml`；旧文件不会删除。若 TOML 转换暂时失败，程序仍会兼容读取旧 `.env`。旧项目目录中的相对 `workspace/` 不会自动搬迁，以避免启动时复制大型视频。v7 manifest 会在读取时补齐默认 `generation_mode=relaxed` 并升级为 v8 后再恢复。
+用户配置统一放在 `~/.kd1-anime/`；相对 `workspace/` 路径按当前配置解析，程序不会自动复制大型运行目录。manifest schema v8 保存每次运行的 `generation_mode`，恢复时沿用该模式。
 
 ## 增量渲染与批量处理
 
 ### 增量渲染
 
-增量渲染仍会执行新运行的规划、代码生成和审查，只在以下身份全部一致时复用旧场景视频：代码哈希、Render Profile 哈希、旧视频哈希、场景 ID/类名以及环境验证结果。
+增量渲染会执行新运行的规划、代码生成和审查，只在以下身份全部一致时复用基准运行中的场景视频：代码哈希、Render Profile 哈希、视频哈希、场景 ID/类名以及环境验证结果。
 
 ```bash
 kd1-anime generate \

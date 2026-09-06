@@ -13,7 +13,7 @@
 - 让场景分镜可并行生成、代码按顺序交接，随后独立完成 Slurm 或本地渲染与修复。
 - 对模型输出同时执行 LLM 语义审查与确定性 AST 校验。
 - 让每次运行拥有隔离的代码、日志、媒体和输出目录。
-- 用可验证的产物身份避免旧视频、错误配置和错误 Job 被误复用。
+- 用可验证的产物身份避免过期视频、错误配置和错误 Job 被误复用。
 - 在集群故障、LLM 格式错误、渲染失败和视频编码差异下提供清晰失败边界。
 - 让没有 Slurm 的环境也能通过 dry-run 验证规划、技术合同、代码校验和审查流程；必要时
   也可以显式选择本地前台正式渲染。
@@ -164,7 +164,7 @@ Scene IR 是混合模式下的确定性后备路径：它从已经批准的 Scen
 受限对象与生命周期程序，再编译成单 Scene Python。正常情况下仍优先保留 Coder 的完整
 创作结果；IR 仅在配置为 `ir` 或 Python Coder 失败时使用。`render_error_parser` 从最后一
 段 traceback 提取异常类型、源码行、上下文和稳定指纹，并把脱敏证据写入 run artifact，
-防止 AutoFix 被同一日志中较早的旧异常带偏。
+防止 AutoFix 被同一日志中较早的异常带偏。
 
 Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
 
@@ -173,7 +173,7 @@ Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过�
 重新进入同一循环。代码审查中的数学/连续性 finding 只有在证据明确指向计划本身时才回到
 Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder 层修复。
 
-连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除旧交接代码并按顺序重新编码；恢复旧清单时会优先重新提取导出区，提取失败不会静默复用下游状态。
+连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。如果上游代码改变，尚未提交渲染的下游场景会清除过期交接代码并按顺序重新编码；恢复时会优先重新提取导出区，提取失败不会静默复用下游状态。
 
 当 `LOCAL_SMOKE_RENDER_ENABLED=true` 且不是 dry-run 时，或 CLI 显式使用 `--smoke` 时，代码在进入 Reviewer 前会以低质量、
 同 renderer 的本地命令运行一次；若配置了 Apptainer，则沿用 containall/cleanenv/no-home、当前
@@ -206,13 +206,13 @@ run bind 和 OpenGL 的 GPU/平台参数。成功结果只写入不含敏感信�
 
 `UNKNOWN` 达阈值时先取消；`scancel` 失败会进入 `CANCEL_FAILED` 并禁止自动重提。`GONE` 会依据当前 Job 的最终视频和日志分类，不会把查询故障等同于作业消失。被抢占退回排队后会重置运行计时，避免误触发 run timeout。
 
-Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算成功。每次提交都使用独立的 `attempt_<token>` 媒体目录；定位会递归适配 Manim 嵌套层级、排除 `partial_movie_files`、符号链接和早于本次提交的文件，不会把上一次修复的 MP4 当成当前产物。正式作业完成后还会记录计算节点的 Python/Manim/FFmpeg/XeLaTeX/renderer 指纹；不一致时标记 warning，增量复用会拒绝带 warning 的旧产物。
+Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算成功。每次提交都使用独立的 `attempt_<token>` 媒体目录；定位会递归适配 Manim 嵌套层级、排除 `partial_movie_files`、符号链接和早于本次提交的文件，不会把上一次修复的 MP4 当成当前产物。正式作业完成后还会记录计算节点的 Python/Manim/FFmpeg/XeLaTeX/renderer 指纹；不一致时标记 warning，增量复用会拒绝带 warning 的基准产物。
 
 ### 3.4 FIXING
 
 失败场景只读取精确 Job 的 stderr 尾部，并受 `LOG_TAIL_LINES` 和 `MAX_LOG_CHARS` 限制。环境、conda、容器、Slurm、显示服务和字体错误不会交给 LLM 重写业务代码。
 
-其余错误先经过确定性失败路由：LaTeX、renderer、生命周期和旧 API 优先尝试唯一匹配的
+其余错误先经过确定性失败路由：LaTeX、renderer、生命周期和已废弃 API 优先尝试唯一匹配的
 局部补丁；数学问题回到计划层，连续性问题回到连续性审查，Slurm/依赖/资源问题只走基础
 设施重试，合并错误只重试 FFmpeg。补丁应用后再次通过 AST、连续性和生命周期校验；无法
 唯一定位时才交给 AutoFixer，结果再次通过全部校验并强制复审。Coder 输出为空、截断或
@@ -236,7 +236,7 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v8 清单只接受当前教学合同、`generation_mode`、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置；v4–v7 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。v7 会在读取时安全补齐 relaxed 默认模式并迁移为 v8。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
+v8 清单保存当前教学合同、`generation_mode`、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
 
 `resume` 在持有 `.run.lock` 后读取清单：
 
@@ -245,7 +245,7 @@ v8 清单只接受当前教学合同、`generation_mode`、StateLedger、结构�
 - COMPLETED/GONE 只有产物验证成功才恢复为 rendered；
 - 已完成、失败、在途场景的事件快照会补发给 TUI；
 - 两个进程不能同时恢复同一 run。
-本地后端不把 PID 写入清单；恢复时不会认领旧本地进程，而是安全重启未完成场景。
+本地后端不把 PID 写入清单；恢复时不会认领已有本地进程，而是安全重启未完成场景。
 直接 `render --wait` 创建的运行会持久化 `direct_render` 标记；这类运行在等待和恢复时都
 跳过所有 Planner、Technical Planner、Coder 和 Reviewer 调用，只执行渲染监控与合并。
 
@@ -271,7 +271,7 @@ Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
 4. 写临时文件，验证成功后原子替换最终输出；
 5. 自定义输出默认拒绝覆盖。
 
-默认 `ALLOW_PARTIAL_OUTPUT=false`。增量运行仍完成新代码的生成、校验和审查；只有代码哈希、RenderProfile 哈希和旧视频哈希全部一致时才复用旧 `SceneArtifact`，不会创建伪 Job ID。
+默认 `ALLOW_PARTIAL_OUTPUT=false`。增量运行仍完成新代码的生成、校验和审查；只有代码哈希、RenderProfile 哈希和基准视频哈希全部一致时才复用基准 `SceneArtifact`，不会创建伪 Job ID。
 
 ### 3.7 VISUAL_EVALUATING / EVALUATING
 
@@ -286,7 +286,7 @@ Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
 ## 4. 运行目录
 
 默认用户数据根目录是 `~/.kd1-anime/`。配置、RAG 索引和知识库源文件分别位于
-`.env`、`rag/` 和 `knowledge/`；运行目录位于 `workspace/`。这些路径都可由
+`config.toml`、`rag/` 和 `knowledge/`；运行目录位于 `workspace/`。这些路径都可由
 用户显式配置覆盖，外部配置的输出文件不会被强制搬迁。
 
 ```text
@@ -316,10 +316,9 @@ run 根目录权限为 `0700`，prompt、manifest、锁文件和生成代码为 
 无 config.toml：进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env > 程序默认值
 ```
 
-早期版本的用户配置和默认 RAG 索引会以非破坏方式复制到新目录；旧文件保留作为
-备份。大型旧 `workspace/` 不会在导入模块时自动复制，避免启动时意外消耗大量磁盘。
+配置和知识库使用当前 `~/.kd1-anime/` 目录；大型 `workspace/` 目录不会在导入模块时自动复制，避免启动时意外消耗大量磁盘。
 
-主要分组：LLM、独立视觉 LLM、RAG、Slurm、Manim、流水线/监控、评估和路径。RAG 默认关闭；开启后使用单独的 Embedding/Reranker URL、模型和 Key，不从其它 LLM 配置回退。`MONITOR_TIMEOUT` 只用于旧配置兼容；新配置使用 queue/run/unknown 三类 timeout，并为共享文件系统产物提供完成宽限期。
+主要分组：LLM、独立视觉 LLM、RAG、Slurm、Manim、流水线/监控、评估和路径。RAG 默认关闭；开启后使用单独的 Embedding/Reranker URL、模型和 Key，不从其它 LLM 配置回退。监控使用 queue/run/unknown 三类 timeout，并为共享文件系统产物提供完成宽限期。
 
 ## 6. 安全边界
 
@@ -343,4 +342,4 @@ pytest -q
 python -m build --sdist --wheel
 ```
 
-测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v7 与旧版只读恢复、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
+测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v8、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。

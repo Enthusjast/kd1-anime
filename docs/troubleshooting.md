@@ -13,7 +13,7 @@
     kd1-anime logs <run-id> --scene-id 2 --lines 160
     kd1-anime logs <run-id> --scene-id 2 --stderr --lines 160
 
-status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢复历史运行。
+status、logs、version、clean 不会调用 LLM；使用 `status` 查询运行，使用 `resume <run-id>` 恢复指定运行。
 
 ## 2. LLM API 不可用
 
@@ -100,7 +100,7 @@ rag status 只读取本地状态，不联网；doctor --probe-rag 才会发送�
 
 ## 3.1 未识别动画 warning
 
-TechnicalSpec v2 不再要求预先列举所有动画类。每个 `self.play` 前应有对应的
+TechnicalSpec v2 不要求预先列举所有动画类。每个 `self.play` 前应有对应的
 `# KD1_ANIMATION_EVENT: <event_id>`，事件的 `semantic_action` 负责描述对象状态。
 静态分析器无法识别的新动画会记录 warning 而不是直接判错；在 `--dry-run` 中，包含这类
 调用的场景会自动执行低质量 frame 和短视频 Smoke Render，及早发现实际运行时错误。
@@ -146,7 +146,7 @@ generate --plan plan.json 时仍会重新执行确定性编译和计划审查。
     ~/.kd1-anime/workspace/runs/<run-id>/artifacts/
     ~/.kd1-anime/workspace/runs/<run-id>/events.jsonl
 
-如果上游代码已经变化，旧的下游交接代码会被清除并按顺序重建，这是为了避免继续使用陈旧的元素定义。
+如果上游代码已经变化，过期的下游交接代码会被清除并按顺序重建，这是为了避免继续使用陈旧的元素定义。
 
 Plan Review 或 Code Review 中的风格建议、一般节奏意见和缺少证据的“可能问题”现在会显示为
 warning，不会单独触发重规划或代码重写。若仍然看到场景被阻断，请查看对应审查产物中的
@@ -254,7 +254,7 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
 
 ## 11. 恢复运行显示未开始或恢复失败
 
-启动时不会自动扫描历史运行。请显式查询和恢复：
+使用以下命令查询和恢复运行：
 
     kd1-anime status
     kd1-anime status <run-id> --json
@@ -263,9 +263,7 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
 恢复使用原子 manifest 和运行级锁。它会重新核对代码 SHA-256、Renderer/Merge Profile、精确
 Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因为重启而默认为未开始。
 
-如果 manifest 不是 v8，v4–v7 旧清单可以只读查看，但不能安全写回。v7 清单读取时会补齐
-`generation_mode=relaxed` 并迁移到 v8。建议保留旧目录用于诊断，并重新生成
-新的运行，而不是手工修改 manifest。
+恢复要求 manifest schema v8。请保留运行目录用于诊断，不要手工修改 manifest；如果清单损坏，重新生成新的运行。
 
 ## 12. 运行很慢或看起来卡住
 
@@ -278,7 +276,7 @@ Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因�
 
 选择 `RENDER_BACKEND=local` 时，检查 `status <run-id>` 中的 backend、运行目录下的
 `logs/scene_*_local-*.out/.err`，以及 `LOCAL_RENDER_TIMEOUT` 和
-`LOCAL_RENDER_MEMORY_MB`。本地渲染必须前台等待；中断后不要期待旧 PID 被认领，直接
+`LOCAL_RENDER_MEMORY_MB`。本地渲染必须前台等待；中断后不要期待已有 PID 被认领，直接
 执行 `kd1-anime resume <run-id>` 即可安全重启未完成场景。
 
 如果任务在 Slurm 中仍为 PENDING，通常是队列、分区、账户、QoS 或 GPU 资源问题，不是 Coder

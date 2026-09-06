@@ -1,8 +1,8 @@
 # 配置参考
 
 本文是 kd1-anime 当前配置的完整说明。配置字段由
-src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，旧版
-.env 仍用于兼容，但不再是安装必需文件。
+src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，`.env`
+可作为可选配置来源。
 
 ## 配置文件与优先级
 
@@ -24,10 +24,8 @@ src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，旧版
     EOF
     chmod 600 ~/.kd1-anime/config.toml
 
-安装器会保留已有用户配置，不会用模板覆盖它。早期版本的
-~/.config/kd1-anime/.env 会非破坏地迁移并转换为
-~/.kd1-anime/config.toml；旧文件不会自动删除。若转换失败，程序仍会读取
-旧 .env 作为兼容回退。
+安装器会保留已有用户配置，不会用模板覆盖它。可选 `.env` 文件可作为
+`config.toml` 不存在时的兼容配置来源。
 
 交互式安装向导会依次配置主模型、视觉模型、Embedding 和 Reranker，并直接更新
 `config.toml` 对应分组；未启用的可选服务不会写入配置。非交互安装默认跳过向导，
@@ -128,7 +126,7 @@ URL。API Key 不会写入 manifest 或事件日志。
     base_url = "https://your-visual-endpoint/v1"
     model = "your-multimodal-model"
 
-EVAL_VISUAL_MODEL 是旧版模型名兼容别名，新配置请使用 VISUAL_LLM_MODEL。普通
+`EVAL_VISUAL_MODEL` 可作为 `VISUAL_LLM_MODEL` 的别名；普通
 流水线中的视觉网络故障会将结果记为 unknown 并继续；缺少视觉配置或显式
 evaluate --visual 时，程序会在视觉流程前报错。
 
@@ -271,7 +269,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MONITOR_ARTIFACT_GRACE | 60 | 作业结束后等待共享文件系统的秒数 |
 | LOG_TAIL_LINES | 80 | 读取日志尾部行数 |
 
-MONITOR_TIMEOUT 是旧配置兼容项。新配置应分别设置 queue、run 和 unknown 相关
+监控应分别设置 queue、run 和 unknown 相关
 参数。UNKNOWN 表示控制面无法确认作业状态，不等于作业已经失败；达到条件后
 程序会先尝试取消，取消失败时禁止自动重复提交。
 
@@ -288,9 +286,9 @@ MONITOR_TIMEOUT 是旧配置兼容项。新配置应分别设置 queue、run 和
 | MAX_VISUAL_FIX_ATTEMPTS | 2 | 视觉诊断触发的场景修复次数 |
 | WORKSPACE_DIR | ~/.kd1-anime/workspace | 持久化运行目录根路径 |
 | OUTPUT_FILE | output_final.mp4 | 默认最终输出；默认值放到当前 run 目录 |
-| SCENES_DIR | 派生路径 | 旧调用兼容项 |
-| LOGS_DIR | 派生路径 | 旧调用兼容项 |
-| VIDEOS_DIR | 派生路径 | 旧调用兼容项 |
+| SCENES_DIR | 派生路径 | 场景目录 |
+| LOGS_DIR | 派生路径 | 日志目录 |
+| VIDEOS_DIR | 派生路径 | 视频目录 |
 
 ## 推荐配置组合
 
@@ -301,7 +299,7 @@ MONITOR_TIMEOUT 是旧配置兼容项。新配置应分别设置 queue、run 和
     kd1-anime generate --file prompt.md --backend local
 
 本地正式渲染在当前进程的前台执行，`render` 命令必须使用 `--wait`；本地任务不会把
-PID 写入 manifest，恢复时会重新启动未完成任务，不会认领旧 PID。若只想验证计划和代码，
+PID 写入 manifest，恢复时会重新启动未完成任务，不会认领已有 PID。若只想验证计划和代码，
 使用 `--dry-run`，它不会提交正式本地任务。
 
 ### HPC：Cairo
