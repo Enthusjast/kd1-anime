@@ -19,8 +19,9 @@ from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
     renderer_guidance,
 )
+from kd1_anime.agents.review_policy import review_mode_guidance
 from kd1_anime.agents.technical_planner import TechnicalSpec
-from kd1_anime.config import settings
+from kd1_anime.config import GenerationMode, settings
 
 REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家。
 
@@ -960,6 +961,7 @@ class ReviewerAgent(BaseAgent):
         safe_fallback: bool = False,
         protocol_feedback: str = "",
         lesson_spec: LessonSpec | None = None,
+        generation_mode: GenerationMode = "strict",
     ) -> str:
         inherited_context = cls._bounded_text(inherited_elements_code, 8_000)
         fallback_context = (
@@ -986,6 +988,14 @@ class ReviewerAgent(BaseAgent):
         ]
         if fallback_context:
             sections.append(PromptSection("safe_fallback_mode", fallback_context, priority=90))
+        sections.append(
+            PromptSection(
+                "generation_mode",
+                review_mode_guidance(generation_mode),
+                required=True,
+                priority=115,
+            )
+        )
         if bible_context:
             sections.append(
                 PromptSection("continuity_bible", bible_context, priority=30, max_chars=20_000)
@@ -1058,6 +1068,7 @@ class ReviewerAgent(BaseAgent):
         technical_spec: TechnicalSpec | None = None,
         safe_fallback: bool = False,
         lesson_spec: LessonSpec | None = None,
+        generation_mode: GenerationMode = "strict",
     ) -> ReviewResult:
         self._log(f"正在审查代码 [{scene_plan.title}]...")
         bible_context = (
@@ -1070,6 +1081,7 @@ class ReviewerAgent(BaseAgent):
                 REVIEWER_SYSTEM_PROMPT,
                 renderer_guidance(renderer),
                 animation_lifecycle_guidance(),
+                review_mode_guidance(generation_mode),
             )
         )
         user_message = self._review_message(
@@ -1080,6 +1092,7 @@ class ReviewerAgent(BaseAgent):
             technical_spec=technical_spec,
             safe_fallback=safe_fallback,
             lesson_spec=lesson_spec,
+            generation_mode=generation_mode,
         )
         try:
             result = self.call_llm_json(
@@ -1104,6 +1117,7 @@ class ReviewerAgent(BaseAgent):
                 technical_spec=technical_spec,
                 safe_fallback=safe_fallback,
                 lesson_spec=lesson_spec,
+                generation_mode=generation_mode,
             )
             result = self.call_llm_json(
                 system_prompt=system_prompt,
@@ -1149,6 +1163,7 @@ class ReviewerAgent(BaseAgent):
                 safe_fallback=safe_fallback,
                 lesson_spec=lesson_spec,
                 protocol_feedback=protocol_feedback,
+                generation_mode=generation_mode,
             )
             result = self.call_llm_json(
                 system_prompt=system_prompt,

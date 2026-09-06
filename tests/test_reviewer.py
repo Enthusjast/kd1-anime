@@ -824,6 +824,40 @@ def test_reviewer_receives_safe_fallback_mode(monkeypatch):
     assert "safe_fallback_mode" in captured["user_message"]
 
 
+def test_reviewer_receives_relaxed_review_policy(monkeypatch):
+    from kd1_anime.agents.planner import ScenePlan
+    from kd1_anime.agents.reviewer import ReviewerAgent
+
+    scene_plan = ScenePlan(
+        scene_id=1,
+        title="relaxed 审查",
+        duration_seconds=10,
+        purpose="展示关系",
+        math_concept="x",
+        visual_design="简单布局",
+        camera_movement="固定",
+        visual_flow=["显示公式"],
+        key_moments=["停顿"],
+        computation="x=1",
+    )
+    captured = {}
+    reviewer = ReviewerAgent()
+
+    def fake_call(**kwargs):
+        captured.update(kwargs)
+        return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call)
+    reviewer.review(
+        "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()",
+        scene_plan,
+        generation_mode="relaxed",
+    )
+
+    assert "当前生成模式：relaxed" in captured["system_prompt"]
+    assert "布局建议" in captured["user_message"]
+
+
 def test_reviewer_retries_with_compact_context_after_truncation(monkeypatch):
     from kd1_anime.agents.planner import ScenePlan
     from kd1_anime.agents.reviewer import ReviewerAgent

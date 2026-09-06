@@ -1136,6 +1136,64 @@ def test_relaxed_continuity_skips_nonblocking_llm_review(monkeypatch, tmp_path):
     assert any("跳过非阻断 LLM" in warning for warning in ctx.continuity_warnings)
 
 
+def test_relaxed_plan_replan_stops_when_planner_returns_same_deterministic_plan(
+    monkeypatch, tmp_path
+):
+    run_paths = make_paths(tmp_path)
+    plan = make_plan(make_outline(1)).model_copy(
+        update={"visual_flow": ["切割碎片并无缝拼接到目标区域"]}
+    )
+    state = SceneState(plan=plan, plan_ready=True)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        generation_mode="relaxed",
+        outlines=[make_outline(1)],
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    class SamePlanReviewer:
+        calls = 0
+
+        def review(self, *args, **kwargs):
+            self.calls += 1
+            return PlanReviewResult(
+                is_valid=False,
+                severity="major",
+                issues=[
+                    {
+                        "category": "geometry",
+                        "severity": "major",
+                        "confidence": "high",
+                        "evidence_type": "calculation",
+                        "evidence": "切割碎片并无缝拼接到目标区域",
+                        "field": "visual_flow",
+                        "message": "几何覆盖关系无法验证",
+                        "fix_instruction": "改用可核验的基础图形或等式展示",
+                    }
+                ],
+            )
+
+    class SamePlanPlanner:
+        def plan_detail(self, outline, all_outlines, user_prompt, **kwargs):
+            return plan
+
+    reviewer = SamePlanReviewer()
+    monkeypatch.setattr(module, "PlanReviewerAgent", lambda: reviewer)
+    monkeypatch.setattr(module, "PlannerAgent", SamePlanPlanner)
+    monkeypatch.setattr(settings, "SAFE_FALLBACK_ENABLED", True)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert reviewer.calls == 1
+    assert state.safe_fallback_used is True
+    assert state.failed is False
+    assert any("未改变当前计划" in warning for warning in ctx.continuity_warnings)
+
+
 def test_continuity_review_replans_only_affected_scenes(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
     planner = ContinuityPlanner()

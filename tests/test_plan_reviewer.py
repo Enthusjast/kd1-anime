@@ -480,6 +480,21 @@ def test_plan_review_prompt_requires_math_and_geometry_validation():
     assert "warnings" in PLAN_REVIEW_PROMPT
 
 
+def test_plan_reviewer_receives_relaxed_review_policy(monkeypatch):
+    reviewer = PlanReviewerAgent()
+    captured = {}
+
+    def fake_call_llm_json(**kwargs):
+        captured.update(kwargs)
+        return PlanReviewResult(is_valid=True, severity="info")
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call_llm_json)
+    reviewer.review(make_plan(), generation_mode="relaxed")
+
+    assert "当前生成模式：relaxed" in captured["system_prompt"]
+    assert "布局建议" in captured["user_message"]
+
+
 @patch("kd1_anime.agents.base.BaseAgent.call_llm")
 def test_batch_plan_review_returns_one_result_per_scene(mock_call_llm):
     mock_call_llm.return_value = (

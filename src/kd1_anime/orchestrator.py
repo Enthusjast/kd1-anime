@@ -4160,16 +4160,7 @@ class Orchestrator:
                 with self._state_lock:
                     if not state.exported_elements_code:
                         self._refresh_scene_export(state)
-                    self._update_element_manifest(ctx, state)
-                    try:
-                        self._update_state_ledger(ctx, state)
-                    except ValueError as ledger_error:
-                        if "StateLedger" not in str(ledger_error):
-                            raise
-                        self._rebuild_continuity_ledgers(ctx, state.plan.scene_id)
-                        self._refresh_scene_export(state)
-                        self._update_element_manifest(ctx, state)
-                        self._update_state_ledger(ctx, state)
+                    self._commit_scene_review_continuity(ctx, state)
                     self._apply_incremental_for_scene(ctx, state.plan.scene_id, state)
                     self._checkpoint(ctx, State.REVIEWING)
             except Exception as exc:
@@ -5667,6 +5658,7 @@ class Orchestrator:
                     safe_fallback_scene_ids={
                         state.plan.scene_id for state in active_states if state.safe_fallback_used
                     },
+                    generation_mode=ctx.generation_mode,
                 )
         except TypeError:
             # 兼容外部替换的旧/简化批量接口，不把签名差异误报成规划失败。
@@ -5725,6 +5717,7 @@ class Orchestrator:
                     safe_fallback=state.safe_fallback_used,
                     lesson_spec=ctx.lesson_spec,
                     teaching_graph=ctx.teaching_graph,
+                    generation_mode=ctx.generation_mode,
                 )
             return state.plan.scene_id, result
 
@@ -5817,6 +5810,7 @@ class Orchestrator:
                                 safe_fallback=state.safe_fallback_used,
                                 lesson_spec=ctx.lesson_spec,
                                 teaching_graph=ctx.teaching_graph,
+                                generation_mode=ctx.generation_mode,
                             )
                     except Exception as exc:
                         if ctx.generation_mode == "relaxed" and not deterministic:
@@ -5923,11 +5917,30 @@ class Orchestrator:
                     identical_count = state.identical_plan_review_count
                     self._checkpoint(ctx, State.PLAN_REVIEWING)
 
-                exhausted = (max_rounds is not None and review_round >= max_rounds) or (
-                    not self._is_relaxed(ctx)
+                relaxed_stagnated = (
+                    self._is_relaxed(ctx)
                     and identical_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
                 )
+                exhausted = (
+                    (max_rounds is not None and review_round >= max_rounds)
+                    or relaxed_stagnated
+                    or (
+                        not self._is_relaxed(ctx)
+                        and identical_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
+                    )
+                )
                 if exhausted:
+                    if relaxed_stagnated:
+                        reason = (
+                            f"Scene {scene_id} 计划审查连续 {identical_count} 次返回相同的"
+                            "确定性问题，已停止无效重规划并尝试保守方案"
+                        )
+                        ctx.continuity_warnings.append(reason)
+                        self._emit(
+                            "scene_plan_review_stagnated",
+                            scene_id=scene_id,
+                            attempts=identical_count,
+                        )
                     if self._activate_safe_fallback(ctx, scene_id, state, feedback):
                         if self._stop_event.is_set():
                             break
@@ -5936,7 +5949,11 @@ class Orchestrator:
                         ctx,
                         scene_id,
                         state,
-                        f"Scene {scene_id} 计划审查未通过（第 {review_round} 轮）：{feedback}",
+                        (
+                            f"Scene {scene_id} 计划审查未通过：{feedback}"
+                            if relaxed_stagnated
+                            else f"Scene {scene_id} 计划审查未通过（第 {review_round} 轮）：{feedback}"
+                        ),
                     )
                     break
 
@@ -6010,6 +6027,27 @@ class Orchestrator:
                         if item.plan_ready
                     ),
                 )
+                if (
+                    self._is_relaxed(ctx)
+                    and revised_plan.model_dump_json() == state.plan.model_dump_json()
+                ):
+                    # relaxed 不限制正常的重规划次数，但对“反馈明确要求修正、
+                    # Planner 却逐字返回同一计划”的情况不能继续消耗 LLM。若
+                    # 有保守方案就切换；没有可安全降级的方案才报告真实失败。
+                    stagnation_reason = (
+                        f"Scene {scene_id} 计划重规划未改变当前计划，已停止无效循环并尝试保守方案"
+                    )
+                    ctx.continuity_warnings.append(stagnation_reason)
+                    self._emit("scene_plan_replan_stagnated", scene_id=scene_id)
+                    if self._activate_safe_fallback(ctx, scene_id, state, feedback):
+                        break
+                    self._plan_review_failure(
+                        ctx,
+                        scene_id,
+                        state,
+                        f"{stagnation_reason}：{feedback}",
+                    )
+                    break
                 code_invalidated = bool(
                     state.code or state.reviewed or state.rendered or state.slurm_job
                 )
@@ -7115,6 +7153,26 @@ class Orchestrator:
             self._update_element_manifest(ctx, state)
             self._update_state_ledger(ctx, state)
 
+    def _commit_scene_review_continuity(self, ctx: PipelineContext, state: SceneState) -> None:
+        """提交审查通过场景的交接状态，并修复旧账本的局部损坏。
+
+        relaxed 模式会把部分 LLM 审查意见降级为 warning，但这不应该让
+        恢复运行或并行写入留下的 StateLedger 缺口重新把场景送回 Coder。
+        所有“审查通过后”的共享账本写入都经过同一个入口，避免 soft-pass、
+        skip-review 和普通 pass 三条路径行为不一致。
+        """
+
+        self._update_element_manifest(ctx, state)
+        try:
+            self._update_state_ledger(ctx, state)
+        except ValueError as ledger_error:
+            if "StateLedger" not in str(ledger_error):
+                raise
+            self._rebuild_continuity_ledgers(ctx, state.plan.scene_id)
+            self._refresh_scene_export(state)
+            self._update_element_manifest(ctx, state)
+            self._update_state_ledger(ctx, state)
+
     def _scene_code(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         rewriting = bool(state.rewrite_feedback)
         self._emit(
@@ -7368,8 +7426,7 @@ class Orchestrator:
             try:
                 if not defer_continuity_commit:
                     self._refresh_scene_export(state)
-                    self._update_element_manifest(ctx, state)
-                    self._update_state_ledger(ctx, state)
+                    self._commit_scene_review_continuity(ctx, state)
                 else:
                     # 并行流水线将导出区和共享账本延迟到有序发布阶段。
                     extract_scene_continuity_elements(state.code, state.plan)
@@ -7432,6 +7489,8 @@ class Orchestrator:
                     review_kwargs["safe_fallback"] = True
                 if self._supports_keyword(reviewer.review, "lesson_spec"):
                     review_kwargs["lesson_spec"] = ctx.lesson_spec
+                if self._supports_keyword(reviewer.review, "generation_mode"):
+                    review_kwargs["generation_mode"] = ctx.generation_mode
                 try:
                     result = reviewer.review(state.code, state.plan, **review_kwargs)
                 except Exception as exc:
@@ -7446,24 +7505,7 @@ class Orchestrator:
             try:
                 self._refresh_scene_export(state)
                 if not defer_continuity_commit:
-                    self._update_element_manifest(ctx, state)
-                    try:
-                        self._update_state_ledger(ctx, state)
-                    except ValueError as ledger_error:
-                        if "StateLedger" not in str(ledger_error):
-                            raise
-                        # 恢复旧运行或并发写入中断后，账本可能缺少前置
-                        # Scene 的 closing 元素。先按已有代码重建前置账本，
-                        # 再提交当前 Scene；不能把账本损坏误交给 Coder。
-                        try:
-                            self._rebuild_continuity_ledgers(ctx, scene_id)
-                            self._refresh_scene_export(state)
-                            self._update_element_manifest(ctx, state)
-                            self._update_state_ledger(ctx, state)
-                        except Exception as rebuild_error:
-                            raise RuntimeError(
-                                f"连续性账本重建失败，无法审查 Scene {scene_id}: {rebuild_error}"
-                            ) from rebuild_error
+                    self._commit_scene_review_continuity(ctx, state)
             except ValueError as exc:
                 deterministic_review_error = True
                 result = ReviewResult(
@@ -8869,7 +8911,7 @@ class Orchestrator:
                 state.failure_category = ""
                 if not defer_continuity_commit:
                     self._apply_incremental_for_scene(ctx, scene_id, state)
-                    self._update_state_ledger(ctx, state)
+                    self._commit_scene_review_continuity(ctx, state)
                 ctx.continuity_warnings.extend(warning_messages[:20])
                 self._checkpoint(ctx, State.REVIEWING)
             self._emit("scene_review_soft_pass", scene_id=scene_id)
@@ -8889,7 +8931,7 @@ class Orchestrator:
                 state.failure_category = ""
                 if not defer_continuity_commit:
                     self._apply_incremental_for_scene(ctx, scene_id, state)
-                    self._update_state_ledger(ctx, state)
+                    self._commit_scene_review_continuity(ctx, state)
                 if warning_messages:
                     ctx.continuity_warnings.extend(warning_messages)
                 self._checkpoint(ctx, State.REVIEWING)

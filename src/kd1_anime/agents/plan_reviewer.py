@@ -20,7 +20,8 @@ from kd1_anime.agents.planner import (
 )
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
-from kd1_anime.config import settings
+from kd1_anime.agents.review_policy import review_mode_guidance
+from kd1_anime.config import GenerationMode, settings
 
 
 class PlanReviewIssue(BaseModel):
@@ -708,6 +709,7 @@ class PlanReviewerAgent(BaseAgent):
         safe_fallback: bool = False,
         lesson_spec: LessonSpec | None = None,
         teaching_graph: TeachingGraph | None = None,
+        generation_mode: GenerationMode = "strict",
     ) -> PlanReviewResult:
         neighbors = []
         for item in sorted(all_plans or [plan], key=lambda item: item.scene_id):
@@ -790,7 +792,12 @@ class PlanReviewerAgent(BaseAgent):
                 priority=115,
                 max_chars=20_000,
             ),
-            PromptSection("模式", fallback_tag, priority=100),
+            PromptSection(
+                "模式",
+                fallback_tag + "\n" + review_mode_guidance(generation_mode),
+                required=True,
+                priority=115,
+            ),
             PromptSection(
                 "输出要求", "请输出当前场景的计划审查 JSON。", required=True, priority=110
             ),
@@ -801,7 +808,10 @@ class PlanReviewerAgent(BaseAgent):
         )
         try:
             return self.call_llm_json(
-                system_prompt=f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",
+                system_prompt=(
+                    f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}\n\n"
+                    f"{review_mode_guidance(generation_mode)}"
+                ),
                 user_message=user_message,
                 response_model=PlanReviewResult,
                 temperature=settings.LLM_REVIEW_TEMPERATURE,
@@ -861,6 +871,7 @@ class PlanReviewerAgent(BaseAgent):
                 return self.call_llm_json(
                     system_prompt=(
                         f"{PLAN_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}\n\n"
+                        f"{review_mode_guidance(generation_mode)}\n\n"
                         "本次是压缩重试：不要输出分析过程或长篇解释，立即返回审查 JSON。"
                     ),
                     user_message=minimal_message,
@@ -884,6 +895,7 @@ class PlanReviewerAgent(BaseAgent):
         safe_fallback_scene_ids: set[int] | None = None,
         lesson_spec: LessonSpec | None = None,
         teaching_graph: TeachingGraph | None = None,
+        generation_mode: GenerationMode = "strict",
     ) -> dict[int, PlanReviewResult]:
         """一次请求审查一批尚未编码的计划。
 
@@ -969,7 +981,10 @@ class PlanReviewerAgent(BaseAgent):
             max_chars=settings.llm_context_char_budget(),
         )
         items = self.call_llm_json_list(
-            system_prompt=f"{PLAN_REVIEW_BATCH_PROMPT}\n\n{renderer_guidance(renderer)}",
+            system_prompt=(
+                f"{PLAN_REVIEW_BATCH_PROMPT}\n\n{renderer_guidance(renderer)}\n\n"
+                f"{review_mode_guidance(generation_mode)}"
+            ),
             user_message=user_message,
             item_model=PlanReviewBatchItem,
             temperature=settings.LLM_REVIEW_TEMPERATURE,

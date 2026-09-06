@@ -1,5 +1,9 @@
 from kd1_anime.agents.planner import ScenePlan
-from kd1_anime.agents.review_policy import review_budget, review_mode_policy
+from kd1_anime.agents.review_policy import (
+    review_budget,
+    review_mode_guidance,
+    review_mode_policy,
+)
 
 
 def make_plan(**updates):
@@ -57,3 +61,20 @@ def test_strict_review_budget_is_capped_at_eight():
 
     assert policy.limit(20) == 8
     assert policy.limit(3) == 3
+
+
+def test_relaxed_review_guidance_keeps_deterministic_checks_but_downgrades_subjective_findings():
+    guidance = review_mode_guidance("relaxed")
+
+    assert "relaxed" in guidance
+    assert "确定性检查" in guidance
+    assert "布局建议" in guidance
+    assert "warning" in guidance
+
+
+def test_strict_review_guidance_does_not_advertise_relaxed_soft_pass():
+    guidance = review_mode_guidance("strict")
+
+    assert "strict" in guidance
+    assert "确定性检查" in guidance
+    assert "relaxed" not in guidance
