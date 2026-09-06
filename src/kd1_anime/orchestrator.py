@@ -100,8 +100,10 @@ from kd1_anime.agents.state_ledger import (
     validate_boundary_handoff,
 )
 from kd1_anime.agents.technical_planner import (
+    TechnicalHandoff,
     TechnicalPlannerAgent,
     TechnicalSpec,
+    build_technical_handoff,
     compile_technical_spec,
     normalize_technical_spec_contract,
 )
@@ -394,6 +396,9 @@ class PipelineContext:
     # 直接构造 PipelineContext 的库调用/旧测试保持严格兼容；正式新运行
     # 会在入口处显式写入 settings.GENERATION_MODE。
     generation_mode: GenerationMode = "strict"
+    # 运行时标记：代码/审查 worker 是否需要把共享连续性账本延迟到
+    # 所有 worker 完成后再按 Scene ID 发布。不会写入 manifest。
+    parallel_generation: bool = False
     # 本次运行固定使用的渲染后端；恢复时只能使用 manifest 中的值。
     backend: RenderBackendName = field(default_factory=lambda: settings.RENDER_BACKEND)
     # 显式 --smoke 可让 dry-run 执行一次本地低质量预检；该开关写入
@@ -3776,8 +3781,8 @@ class Orchestrator:
             self._emitted_phases.clear()
 
         # 正式运行先完成所有场景的 Detail，再做计划正确性审查和全片连续性审查；
-        # 通过后才进入编码/代码审查/渲染。编码/审查必须顺序执行，因为 Scene N 的真实
-        # 最终 Mobject 定义要作为 Scene N+1 的输入；渲染和监控仍然并行。
+        # 通过后由 TechnicalSpec 传递结构化 handoff，随后各 Scene 的编码/审查可以并行。
+        # 旧清单没有 handoff 时仍回退到顺序代码屏障；渲染和监控始终并行。
         self._run_detail_barrier(ctx)
         if self._checkpoint_error is not None:
             raise RuntimeError(
@@ -3916,12 +3921,145 @@ class Orchestrator:
                 f"运行状态持久化失败，流水线已停止: {self._checkpoint_error}"
             ) from self._checkpoint_error
 
+    def _try_parallel_code_review_barrier(self, ctx: PipelineContext) -> bool:
+        """在所有场景拥有技术交接后并行执行 Code→Code Review。
+
+        返回 True 表示已处理本次代码屏障；缺少结构化 handoff 时返回 False，
+        由旧的顺序屏障处理 legacy manifest/测试替身。
+        """
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        if ctx.direct_render or ctx.plan_review_status not in {"passed", "skipped"}:
+            return False
+        active_states = [
+            state
+            for state in sorted(ctx.scene_states.values(), key=lambda item: item.plan.scene_id)
+            if not state.failed and not state.give_up and state.plan_ready
+        ]
+        if not active_states:
+            return True
+        # 旧版/增量运行仍可能依赖“上一场景完整导出代码”或视觉候选恢复；
+        # 这些路径必须交给原有顺序屏障处理，不能被新 worker 越过。
+        if any(state.visual_best_candidate is not None for state in active_states):
+            return False
+        if any(
+            state.plan.scene_id > 1 and not state.plan.inherited_elements and not state.plan.handoff
+            for state in active_states
+        ):
+            return False
+
+        # TechnicalSpec 按依赖顺序生成；但它只消费前一场景的技术边界，
+        # 不再等待前一场景的生成代码/Code Review。
+        for state in active_states:
+            if state.rendered and state.code and state.technical_spec is not None:
+                continue
+            try:
+                self._normalize_plan_contract_for_coding(ctx, state)
+                previous_handoff = self._technical_handoff_for_scene(ctx, state)
+                if state.plan.inherited_elements and previous_handoff is None:
+                    # 旧 TechnicalSpec 没有 handoff_out，安全回退到原有串行路径。
+                    return False
+                state.inherited_elements_code = ""
+                self._ensure_technical_spec(
+                    ctx,
+                    state,
+                    previous_technical_handoff=previous_handoff,
+                )
+                if state.technical_spec is None or state.technical_spec.handoff_out is None:
+                    return False
+            except Exception:
+                # 让既有串行屏障接管异常：它会保留“上游失败、下游等待
+                # 依赖”的诊断语义，也兼容外部替换的 TechnicalPlanner。
+                return False
+
+        ctx.parallel_generation = True
+
+        def run_scene(state: SceneState) -> None:
+            scene_id = state.plan.scene_id
+            try:
+                while not state.reviewed:
+                    if self._stop_event.is_set() or state.failed or state.give_up:
+                        return
+                    if not state.code or state.rewrite_feedback:
+                        self._phase_emit("coding")
+                        self._scene_code(ctx, scene_id, state)
+                    elif (
+                        self._local_smoke_enabled(ctx, state)
+                        and state.local_smoke_status != "passed"
+                    ):
+                        self._local_smoke_render(ctx, state)
+                    self._phase_emit("reviewing")
+                    self._scene_review(
+                        ctx,
+                        scene_id,
+                        state,
+                        defer_continuity_commit=True,
+                    )
+            except Exception as exc:
+                if self._activate_safe_fallback(ctx, scene_id, state, str(exc)):
+                    return
+                route = classify_failure(str(exc), phase="coding")
+                with self._state_lock:
+                    self._mark_failed(
+                        state,
+                        f"Scene {scene_id} 编码/审查失败: {exc}",
+                        route.category if route.category != "unknown" else "coding",
+                    )
+                    self._checkpoint(ctx, State.REVIEWING)
+                self._emit("scene_failed", scene_id=scene_id, reason=str(exc))
+
+        max_workers = max(1, min(settings.LLM_PARALLEL_WORKERS, len(active_states)))
+        try:
+            with ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="scene-code-review",
+            ) as pool:
+                futures = {
+                    pool.submit(run_scene, state): state.plan.scene_id
+                    for state in active_states
+                    if not state.rendered
+                }
+                for future in as_completed(futures):
+                    # Worker 内部负责把业务异常写入 SceneState；这里重新抛出
+                    # 未预期的线程错误，避免静默生成不完整 manifest。
+                    future.result()
+        finally:
+            ctx.parallel_generation = False
+
+        if self._stop_event.is_set():
+            return True
+
+        # 共享 ElementManifest/StateLedger 必须按 Scene ID 发布，避免 Scene 2
+        # 先完成时破坏 Scene 1→Scene 2 的边界校验。
+        for state in active_states:
+            if state.failed or state.give_up or not state.reviewed or not state.code:
+                continue
+            try:
+                with self._state_lock:
+                    if not state.exported_elements_code:
+                        self._refresh_scene_export(state)
+                    self._update_element_manifest(ctx, state)
+                    self._update_state_ledger(ctx, state)
+                    self._apply_incremental_for_scene(ctx, state.plan.scene_id, state)
+                    self._checkpoint(ctx, State.REVIEWING)
+            except Exception as exc:
+                with self._state_lock:
+                    self._mark_failed(
+                        state, f"Scene {state.plan.scene_id} 连续性发布失败: {exc}", "continuity"
+                    )
+                    self._checkpoint(ctx, State.REVIEWING)
+                self._emit("scene_failed", scene_id=state.plan.scene_id, reason=str(exc))
+        return True
+
     def _run_code_review_barrier(self, ctx: PipelineContext) -> None:
         """按 Scene ID 顺序完成编码、审查，并固定代码级连续性上下文。"""
 
         if ctx.direct_render:
             return
         if ctx.plan_review_status not in {"passed", "skipped"}:
+            return
+        if self._try_parallel_code_review_barrier(ctx):
             return
         for scene_id, state in sorted(ctx.scene_states.items()):
             if self._stop_event.is_set() or state.failed or state.give_up:
@@ -4165,33 +4303,71 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _technical_input_hash(ctx: PipelineContext, state: SceneState) -> str:
+    def _technical_input_hash(
+        ctx: PipelineContext,
+        state: SceneState,
+        previous_technical_handoff: TechnicalHandoff | None = None,
+    ) -> str:
         inherited_ids = {item.element_id for item in state.plan.inherited_elements}
+        handoff_payload = (
+            previous_technical_handoff.model_dump(mode="json")
+            if previous_technical_handoff is not None
+            else None
+        )
         payload = {
             "plan": state.plan.model_dump(mode="json"),
             "lesson_spec": ctx.lesson_spec.model_dump(mode="json"),
             "teaching_graph": ctx.teaching_graph.model_dump(mode="json"),
-            "inherited_elements_code": state.inherited_elements_code,
-            "element_manifest": [
-                entry.model_dump(mode="json")
-                for entry in sorted(
-                    ctx.element_manifest.for_elements(inherited_ids),
-                    key=lambda item: item.element_id,
-                )
-            ],
+            "previous_technical_handoff": handoff_payload,
+            "inherited_elements_code": (
+                "" if previous_technical_handoff is not None else state.inherited_elements_code
+            ),
+            "element_manifest": (
+                []
+                if previous_technical_handoff is not None
+                else [
+                    entry.model_dump(mode="json")
+                    for entry in sorted(
+                        ctx.element_manifest.for_elements(inherited_ids),
+                        key=lambda item: item.element_id,
+                    )
+                ]
+            ),
             "renderer": ctx.render_profile.renderer,
         }
         return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
-    def _ensure_technical_spec(self, ctx: PipelineContext, state: SceneState) -> None:
+    @staticmethod
+    def _attach_technical_handoffs(
+        spec: TechnicalSpec,
+        previous_technical_handoff: TechnicalHandoff | None,
+    ) -> TechnicalSpec:
+        return spec.model_copy(
+            update={
+                "handoff_in": previous_technical_handoff,
+                "handoff_out": build_technical_handoff(spec),
+            }
+        )
+
+    def _ensure_technical_spec(
+        self,
+        ctx: PipelineContext,
+        state: SceneState,
+        *,
+        previous_technical_handoff: TechnicalHandoff | None = None,
+    ) -> None:
         """确保当前场景在 Coder 前拥有与输入匹配的 TechnicalSpec。"""
 
-        input_sha256 = self._technical_input_hash(ctx, state)
+        input_sha256 = self._technical_input_hash(ctx, state, previous_technical_handoff)
         if (
             state.technical_spec is not None
             and state.technical_status == "passed"
             and state.technical_input_sha256 == input_sha256
             and state.technical_spec_sha256 == sha256_text(state.technical_spec.model_dump_json())
+            and (
+                previous_technical_handoff is None
+                or state.technical_spec.handoff_in == previous_technical_handoff
+            )
         ):
             # 恢复运行时不能只编译磁盘中的旧合同。技术合同的确定性
             # 规范化规则可能在上一次运行之后得到修复；若这里直接
@@ -4201,6 +4377,10 @@ class Orchestrator:
                 state.plan,
                 state.technical_spec,
                 renderer=ctx.render_profile.renderer,
+            )
+            normalized_spec = self._attach_technical_handoffs(
+                normalized_spec,
+                previous_technical_handoff,
             )
             if contract_repairs:
                 state.technical_spec = normalized_spec
@@ -4229,6 +4409,11 @@ class Orchestrator:
                 renderer=ctx.render_profile.renderer,
             )
             if result.is_valid:
+                if normalized_spec != state.technical_spec:
+                    state.technical_spec = normalized_spec
+                    state.technical_spec_sha256 = sha256_text(normalized_spec.model_dump_json())
+                    state.technical_input_sha256 = input_sha256
+                    self._checkpoint(ctx, State.REVIEWING)
                 return
 
         # 计划或继承上下文发生变化时，旧代码不能继续使用旧技术合同。
@@ -4296,7 +4481,7 @@ class Orchestrator:
             ctx.element_manifest.model_copy(
                 update={"entries": ctx.element_manifest.for_elements(inherited_ids)}
             )
-            if inherited_ids
+            if inherited_ids and previous_technical_handoff is None
             else None
         )
         try:
@@ -4316,6 +4501,7 @@ class Orchestrator:
                     "stream": False,
                     "lesson_spec": ctx.lesson_spec,
                     "teaching_graph": ctx.teaching_graph,
+                    "previous_technical_handoff": previous_technical_handoff,
                 }
                 planner_kwargs: dict[str, object] = {
                     key: value
@@ -4336,6 +4522,7 @@ class Orchestrator:
                         f"Scene {scene_id} TechnicalSpec 自动对齐：{repair}"
                         for repair in contract_repairs
                     )
+                spec = self._attach_technical_handoffs(spec, previous_technical_handoff)
                 result = compile_technical_spec(
                     state.plan,
                     spec,
@@ -5317,6 +5504,9 @@ class Orchestrator:
     ) -> dict[int, PlanReviewResult]:
         """优先一次审查初始整批计划；不支持/失败时由调用方逐场景回退。"""
 
+        if len(active_states) > 1:
+            return self._run_plan_review_parallel(ctx, active_states)
+
         reviewer = PlanReviewerAgent()
         review_batch = getattr(reviewer, "review_batch", None)
         if not callable(review_batch):
@@ -5366,6 +5556,66 @@ class Orchestrator:
         except Exception as exc:
             ctx.continuity_warnings.append(f"批量计划审查失败，已回退逐场景审查: {exc}")
             return {}
+
+    def _run_plan_review_parallel(
+        self,
+        ctx: PipelineContext,
+        active_states: list[SceneState],
+    ) -> dict[int, PlanReviewResult]:
+        """使用同一份全片计划快照并行审查各 Scene。"""
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        ordered_states = sorted(active_states, key=lambda item: item.plan.scene_id)
+        all_plans = [state.plan for state in ordered_states]
+        deterministic_by_scene = {
+            state.plan.scene_id: dedupe_plan_review_issues(
+                [
+                    *deterministic_plan_issues(
+                        state.plan,
+                        ctx.continuity_bible,
+                        safe_fallback=state.safe_fallback_used,
+                        lesson_spec=ctx.lesson_spec,
+                    ),
+                    *ctx.plan_compile_issues.get(state.plan.scene_id, []),
+                ]
+            )
+            for state in ordered_states
+        }
+
+        def review_one(state: SceneState) -> tuple[int, PlanReviewResult]:
+            reviewer = PlanReviewerAgent()
+            with self._llm_slot():
+                result = reviewer.review(
+                    state.plan,
+                    user_prompt=ctx.user_prompt,
+                    all_plans=all_plans,
+                    continuity_bible=ctx.continuity_bible,
+                    deterministic_issues=deterministic_by_scene[state.plan.scene_id],
+                    renderer=ctx.render_profile.renderer,
+                    safe_fallback=state.safe_fallback_used,
+                    lesson_spec=ctx.lesson_spec,
+                    teaching_graph=ctx.teaching_graph,
+                )
+            return state.plan.scene_id, result
+
+        results: dict[int, PlanReviewResult] = {}
+        max_workers = max(1, min(settings.LLM_PARALLEL_WORKERS, len(ordered_states)))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="plan-review") as pool:
+            futures = {
+                pool.submit(review_one, state): state.plan.scene_id for state in ordered_states
+            }
+            for future in as_completed(futures):
+                scene_id = futures[future]
+                try:
+                    result_scene_id, result = future.result()
+                except Exception as exc:
+                    ctx.continuity_warnings.append(
+                        f"Scene {scene_id} 并行计划审查失败，已回退逐场景审查: {exc}"
+                    )
+                    continue
+                results[result_scene_id] = result
+        return results
 
     def _run_plan_review_barrier(
         self,
@@ -6420,6 +6670,30 @@ class Orchestrator:
             )
         self._emit("scene_detailed", scene_id=scene_id, title=plan.title)
 
+    @staticmethod
+    def _technical_handoff_for_scene(
+        ctx: PipelineContext,
+        state: SceneState,
+    ) -> TechnicalHandoff | None:
+        """取得当前场景所需的前置技术边界；没有新合同时返回 None。"""
+
+        inherited_ids = {item.element_id for item in state.plan.inherited_elements}
+        if not inherited_ids:
+            return None
+        previous = ctx.scene_states.get(state.plan.scene_id - 1)
+        if previous is None or previous.technical_spec is None:
+            return None
+        handoff = previous.technical_spec.handoff_out
+        if handoff is None or not handoff.elements:
+            return None
+        selected = [item for item in handoff.elements if item.element_id in inherited_ids]
+        missing = inherited_ids - {item.element_id for item in selected}
+        if missing:
+            raise ValueError(
+                f"Scene {state.plan.scene_id} 技术交接缺少元素: {', '.join(sorted(missing))}"
+            )
+        return handoff.model_copy(update={"elements": selected})
+
     def _prepare_inherited_context(
         self, ctx: PipelineContext, scene_id: int, state: SceneState
     ) -> None:
@@ -6902,7 +7176,14 @@ class Orchestrator:
             self._emit("scene_api_warning", scene_id=scene_id, warnings=list(api_result.warnings))
         self._emit("scene_coded", scene_id=scene_id, file_path=str(path))
 
-    def _scene_review(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
+    def _scene_review(
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+        *,
+        defer_continuity_commit: bool = False,
+    ) -> None:
         if settings.SKIP_REVIEW:
             try:
                 self._refresh_scene_export(state)
@@ -6918,9 +7199,10 @@ class Orchestrator:
             with self._state_lock:
                 state.reviewed = True
                 self._mark_static_verification(state, status="passed")
-                self._apply_incremental_for_scene(ctx, scene_id, state)
-                if state.rendered:
-                    self._update_state_ledger(ctx, state)
+                if not defer_continuity_commit:
+                    self._apply_incremental_for_scene(ctx, scene_id, state)
+                    if state.rendered:
+                        self._update_state_ledger(ctx, state)
                 self._checkpoint(ctx, State.REVIEWING)
             self._emit("scene_review_skipped", scene_id=scene_id)
             if state.rendered and state.artifact and state.artifact.origin == "reused":
@@ -6994,6 +7276,7 @@ class Orchestrator:
             state,
             result,
             allow_relaxed_soft_pass=not deterministic_review_error,
+            defer_continuity_commit=defer_continuity_commit,
         )
 
     def _scene_submit(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
@@ -8355,6 +8638,7 @@ class Orchestrator:
         result: ReviewResult,
         *,
         allow_relaxed_soft_pass: bool = True,
+        defer_continuity_commit: bool = False,
     ) -> bool:
         """应用单场景审查结果。"""
         self._write_stage_artifact(
@@ -8382,8 +8666,9 @@ class Orchestrator:
                 self._mark_static_verification(state, status="passed")
                 state.failure_reason = ""
                 state.failure_category = ""
-                self._apply_incremental_for_scene(ctx, scene_id, state)
-                self._update_state_ledger(ctx, state)
+                if not defer_continuity_commit:
+                    self._apply_incremental_for_scene(ctx, scene_id, state)
+                    self._update_state_ledger(ctx, state)
                 ctx.continuity_warnings.extend(warning_messages[:20])
                 self._checkpoint(ctx, State.REVIEWING)
             self._emit("scene_review_soft_pass", scene_id=scene_id)
@@ -8401,8 +8686,9 @@ class Orchestrator:
                 self._mark_static_verification(state, status="passed")
                 state.failure_reason = ""
                 state.failure_category = ""
-                self._apply_incremental_for_scene(ctx, scene_id, state)
-                self._update_state_ledger(ctx, state)
+                if not defer_continuity_commit:
+                    self._apply_incremental_for_scene(ctx, scene_id, state)
+                    self._update_state_ledger(ctx, state)
                 if warning_messages:
                     ctx.continuity_warnings.extend(warning_messages)
                 self._checkpoint(ctx, State.REVIEWING)

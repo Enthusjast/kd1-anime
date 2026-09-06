@@ -52,6 +52,15 @@ class TechnicalObject(BaseModel):
     exported: bool = False
 
 
+class TechnicalHandoff(BaseModel):
+    """供下一个场景使用的结构化技术边界。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_scene_id: int = Field(ge=1)
+    elements: list[TechnicalObject] = Field(default_factory=list, max_length=100)
+
+
 class TechnicalAnimation(BaseModel):
     """一条与具体 Manim 动画类解耦的状态事件。
 
@@ -124,6 +133,31 @@ class TechnicalSpec(BaseModel):
     export_element_ids: list[str] = Field(default_factory=list, max_length=100)
     removed_element_ids: list[str] = Field(default_factory=list, max_length=100)
     implementation_notes: list[str] = Field(default_factory=list, max_length=100)
+    # 跨场景连续性由结构化技术边界传递；实际生成代码只作为后置验证材料。
+    handoff_in: TechnicalHandoff | None = None
+    handoff_out: TechnicalHandoff | None = None
+
+
+def build_technical_handoff(spec: TechnicalSpec) -> TechnicalHandoff:
+    """从技术合同生成只包含最终导出对象的下游输入。"""
+
+    exported_ids = set(spec.export_element_ids)
+    if not exported_ids:
+        exported_ids = {item.element_id for item in spec.objects if item.exported}
+    objects = {item.element_id: item for item in spec.objects}
+    return TechnicalHandoff(
+        source_scene_id=spec.scene_id,
+        elements=[
+            objects[element_id].model_copy(deep=True)
+            for element_id in spec.export_element_ids
+            if element_id in objects
+        ]
+        or [
+            objects[element_id].model_copy(deep=True)
+            for element_id in sorted(exported_ids)
+            if element_id in objects
+        ],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1572,6 +1606,9 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
    需要对若干对象执行同一保持/强调动画时，才列出全部实际会被 self.play 操作的 source。
 5. 已退出对象不能在后续事件继续作为 source；不得移除 export_element_ids。末尾的临时对象
    必须 remove，或明确保持 exported=false。
+   `handoff_in`/`handoff_out` 是结构化的场景边界；handoff_out 只保留
+   export_element_ids 对应的对象状态。后续场景必须依据 handoff_in 重建对象，
+   不得等待前一场景的生成代码。
 6. 仅使用当前 renderer 支持的相机 API。OpenGL 禁止 camera.frame 和 MovingCameraScene；
    在 implementation_notes 中复述禁止规则不会被当成实际调用。
 7. 使用 Tex/MathTex 时说明 xelatex、.xdv、ctex 和子对象分段策略；不要凭空假设
@@ -1650,6 +1687,7 @@ class TechnicalPlannerAgent(BaseAgent):
         stream: bool = False,
         lesson_spec: LessonSpec | None = None,
         teaching_graph: TeachingGraph | None = None,
+        previous_technical_handoff: TechnicalHandoff | None = None,
     ) -> TechnicalSpec:
         plan_json = scene_plan.model_dump_json(indent=2)
         bible_json = (
@@ -1657,6 +1695,11 @@ class TechnicalPlannerAgent(BaseAgent):
         )
         manifest_json = (
             element_manifest.model_dump_json(indent=2) if element_manifest is not None else "{}"
+        )
+        handoff_json = (
+            previous_technical_handoff.model_dump_json(indent=2)
+            if previous_technical_handoff is not None
+            else "{}"
         )
         sections = [
             PromptSection(
@@ -1689,6 +1732,15 @@ class TechnicalPlannerAgent(BaseAgent):
                 required=bool(inherited_elements_code),
                 priority=100,
                 max_chars=settings.LLM_MAX_CODE_CONTEXT_CHARS,
+            ),
+            PromptSection(
+                "previous_technical_handoff",
+                "这是前一场景已经确定的结构化技术边界。必须保持 element_id、variable_name、"
+                "对象类型和最终状态一致；不要等待或引用前一场景的生成代码。\n"
+                f"<previous_technical_handoff>\n{handoff_json}\n</previous_technical_handoff>",
+                required=previous_technical_handoff is not None,
+                priority=115,
+                max_chars=30_000,
             ),
             PromptSection(
                 "element_manifest",

@@ -457,6 +457,40 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
     assert ctx.continuity_review_round == 1
 
 
+def test_initial_plan_reviews_run_in_parallel(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    states = [
+        SceneState(
+            plan=plan().model_copy(update={"scene_id": scene_id}),
+            plan_ready=True,
+        )
+        for scene_id in (1, 2)
+    ]
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={state.plan.scene_id: state for state in states},
+        continuity_bible=ContinuityBible(),
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(2)
+    barrier = threading.Barrier(2)
+    thread_ids: list[int] = []
+
+    class ParallelReviewer:
+        def review(self, *args, **kwargs):
+            thread_ids.append(threading.get_ident())
+            barrier.wait(timeout=2)
+            return PlanReviewResult(is_valid=True, severity="info")
+
+    monkeypatch.setattr(module, "PlanReviewerAgent", ParallelReviewer)
+
+    results = orchestrator._run_plan_review_batch(ctx, states)
+
+    assert set(results) == {1, 2}
+    assert len(set(thread_ids)) == 2
+
+
 def test_plan_review_replan_budget_uses_geometry_fallback(monkeypatch, tmp_path):
     """复杂几何重规划耗尽时应降级，而不是把场景直接判死。"""
 

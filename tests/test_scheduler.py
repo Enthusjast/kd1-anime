@@ -10,9 +10,13 @@ from pathlib import Path
 import kd1_anime.orchestrator as module
 from kd1_anime.agents.continuity import ContinuityReviewResult
 from kd1_anime.agents.plan_reviewer import PlanReviewResult
-from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan, VisualElementState
 from kd1_anime.agents.reviewer import ReviewResult
-from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.agents.technical_planner import (
+    TechnicalHandoff,
+    TechnicalObject,
+    TechnicalSpec,
+)
 from kd1_anime.agents.validator import CodeValidationResult
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
@@ -519,6 +523,79 @@ def test_coder_receives_previous_scene_export_in_scene_order(monkeypatch, tmp_pa
 
     assert coder.inherited[0] == ""
     assert "formula = MathTex" in coder.inherited[1]
+
+
+def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    inherited = VisualElementState(
+        element_id="formula",
+        variable_name="formula",
+        required=True,
+    )
+    first_plan = make_plan(make_outline(1)).model_copy(update={"new_elements": [inherited]})
+    second_plan = make_plan(make_outline(2)).model_copy(
+        update={"inherited_elements": [inherited], "new_elements": []}
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        plan_review_status="passed",
+        scene_states={
+            1: SceneState(plan=first_plan, plan_ready=True, plan_reviewed=True),
+            2: SceneState(plan=second_plan, plan_ready=True, plan_reviewed=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(2)
+    entered = threading.Barrier(2)
+    code_threads: list[int] = []
+    handoff_sources: list[int | None] = []
+
+    def technical_spec(scene_id: int) -> TechnicalSpec:
+        obj = TechnicalObject(
+            element_id="formula",
+            variable_name="formula",
+            constructor="MathTex",
+            exported=True,
+        )
+        return TechnicalSpec(
+            scene_id=scene_id,
+            objects=[obj],
+            export_element_ids=["formula"],
+            handoff_out=TechnicalHandoff(source_scene_id=scene_id, elements=[obj]),
+        )
+
+    def fake_technical(current_ctx, state, *, previous_technical_handoff=None):
+        if previous_technical_handoff is not None:
+            handoff_sources.append(previous_technical_handoff.source_scene_id)
+        else:
+            handoff_sources.append(None)
+        state.technical_spec = technical_spec(state.plan.scene_id)
+        state.technical_status = "passed"
+
+    def fake_code(current_ctx, scene_id, state):
+        code_threads.append(threading.get_ident())
+        entered.wait(timeout=2)
+        state.code = f"scene_{scene_id}"
+
+    def fake_review(current_ctx, scene_id, state, *, defer_continuity_commit=False):
+        assert defer_continuity_commit is True
+        state.reviewed = True
+
+    monkeypatch.setattr(orchestrator, "_ensure_technical_spec", fake_technical)
+    monkeypatch.setattr(orchestrator, "_scene_code", fake_code)
+    monkeypatch.setattr(orchestrator, "_scene_review", fake_review)
+    monkeypatch.setattr(orchestrator, "_refresh_scene_export", lambda state: None)
+    monkeypatch.setattr(orchestrator, "_update_element_manifest", lambda *args: None)
+    monkeypatch.setattr(orchestrator, "_update_state_ledger", lambda *args: None)
+    monkeypatch.setattr(orchestrator, "_apply_incremental_for_scene", lambda *args: None)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    orchestrator._run_code_review_barrier(ctx)
+
+    assert len(set(code_threads)) == 2
+    assert handoff_sources == [None, 1]
+    assert all(state.reviewed for state in ctx.scene_states.values())
 
 
 # ---------------------------------------------------------------------------

@@ -367,6 +367,19 @@ class CoderAgent(BaseAgent):
                     max_chars=20_000,
                 )
             )
+            if technical_spec is not None and technical_spec.handoff_in is not None:
+                sections.append(
+                    PromptSection(
+                        "Technical continuity handoff",
+                        "当前场景的跨场景连续性来自下面的结构化技术边界。请在本场景中按"
+                        "相同的 element_id、variable_name、对象类型和 final_state 重建继承对象；"
+                        "不要等待或引用其它 Scene 的生成代码。\n"
+                        f"```json\n{technical_spec.handoff_in.model_dump_json(indent=2)}\n```",
+                        required=True,
+                        priority=112,
+                        max_chars=30_000,
+                    )
+                )
         sections.extend(
             [
                 PromptSection(

@@ -72,10 +72,12 @@ from kd1_anime.agents.state_ledger import (
 from kd1_anime.agents.technical_planner import (
     SemanticAnimationAction,
     TechnicalAnimation,
+    TechnicalHandoff,
     TechnicalObject,
     TechnicalPlannerAgent,
     TechnicalSpec,
     TechnicalValidationResult,
+    build_technical_handoff,
     compile_technical_spec,
     normalize_technical_spec_contract,
 )
@@ -122,6 +124,7 @@ __all__ = [
     "TeachingEdge",
     "TeachingGraph",
     "TechnicalAnimation",
+    "TechnicalHandoff",
     "TechnicalObject",
     "TechnicalPlannerAgent",
     "TechnicalSpec",
@@ -130,6 +133,7 @@ __all__ = [
     "assess_scene_risk",
     "build_bounded_prompt",
     "build_capability_contract",
+    "build_technical_handoff",
     "classify_failure",
     "classify_plan_review_issues",
     "classify_progress",

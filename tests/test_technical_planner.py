@@ -5,9 +5,11 @@ import pytest
 from kd1_anime.agents.planner import ScenePlan, TimelineEvent, VisualElementState
 from kd1_anime.agents.technical_planner import (
     TechnicalAnimation,
+    TechnicalHandoff,
     TechnicalLatex,
     TechnicalObject,
     TechnicalSpec,
+    build_technical_handoff,
     compile_technical_spec,
     normalize_technical_spec_contract,
 )
@@ -29,6 +31,42 @@ def make_plan(*, inherited=None, removed=None, new=None):
         elements_to_remove=removed or [],
         new_elements=new or [VisualElementState(element_id="formula", variable_name="formula")],
     )
+
+
+def test_technical_handoff_contains_only_exported_objects():
+    spec = TechnicalSpec(
+        scene_id=3,
+        objects=[
+            TechnicalObject(
+                element_id="kept",
+                variable_name="kept",
+                constructor="Circle",
+                final_state="center",
+                exported=True,
+            ),
+            TechnicalObject(
+                element_id="temporary",
+                variable_name="temporary",
+                constructor="Square",
+                exported=False,
+            ),
+        ],
+        export_element_ids=["kept"],
+    )
+
+    handoff = build_technical_handoff(spec)
+
+    assert isinstance(handoff, TechnicalHandoff)
+    assert handoff.source_scene_id == 3
+    assert [item.element_id for item in handoff.elements] == ["kept"]
+    assert handoff.elements[0].final_state == "center"
+
+
+def test_technical_spec_handoff_fields_are_optional_for_legacy_contracts():
+    spec = TechnicalSpec(scene_id=1)
+
+    assert spec.handoff_in is None
+    assert spec.handoff_out is None
 
 
 def test_compile_technical_spec_accepts_create_and_keep_timeline():
