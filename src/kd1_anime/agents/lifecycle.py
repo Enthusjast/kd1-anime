@@ -639,6 +639,8 @@ def _marker_before_line(lines: list[str], line_number: int) -> str | None:
     Coder 常会先在 marker 后准备 ``copy()``/目标 Mobject，再调用
     ``self.play``。这些准备语句没有 Scene 副作用，允许 marker 跨过它们，
     但遇到另一个 ``self.*`` 或控制流就停止，避免把事件错误绑定到后续动画。
+    单个 ``self.wait(...)`` 也作为无副作用的时间桥接处理，兼容模型把
+    “保持后淡出”写在同一个事件下的情况。
     """
 
     def is_safe_preparation(line: str) -> bool:
@@ -654,7 +656,14 @@ def _marker_before_line(lines: list[str], line_number: int) -> str | None:
         return stripped[0] in ")]}," or stripped.endswith((",", "(", "[", "{"))
 
     index = line_number - 2
+    wait_bridges = 0
     while index >= 0:
+        if lines[index].strip().startswith("self.wait("):
+            wait_bridges += 1
+            if wait_bridges > 1:
+                return None
+            index -= 1
+            continue
         if is_safe_preparation(lines[index]):
             match = _EVENT_MARKER_RE.match(lines[index])
             if match:

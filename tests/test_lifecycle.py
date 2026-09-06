@@ -558,6 +558,7 @@ class Demo(Scene):
         formula = Circle()
         self.add(formula)
         # KD1_ANIMATION_EVENT: show_formula
+        self.wait(0.1)
         target = formula.copy()
         target.scale(1.1)
         self.play(Transform(formula, target))

@@ -36,7 +36,8 @@ Do not run a real LLM request, submit Slurm jobs, or execute generated code duri
 Settings are defined in `src/kd1_anime/config.py` and loaded in this order:
 
 ```text
-process environment > ~/.kd1-anime/config.toml > ./.env > ~/.kd1-anime/.env
+when config.toml exists: process environment > ~/.kd1-anime/config.toml > defaults;
+otherwise: process environment > ./.env > ~/.kd1-anime/.env > defaults
 ```
 
 Never commit `config.toml`/`.env` or print API keys. The API is provider-neutral:

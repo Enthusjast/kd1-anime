@@ -141,7 +141,9 @@ model = "your-model-name"
 配置优先级为：
 
 ```text
-进程环境变量 > ~/.kd1-anime/config.toml > 当前目录 .env > ~/.kd1-anime/.env
+有 `config.toml` 时：进程环境变量 > `~/.kd1-anime/config.toml` > 程序默认值
+
+没有 `config.toml` 时：进程环境变量 > 当前目录 `.env` > `~/.kd1-anime/.env` > 程序默认值
 ```
 
 API Key 不会写入运行清单或事件日志。`config.toml` 和旧版 `.env` 都不要提交到 Git。

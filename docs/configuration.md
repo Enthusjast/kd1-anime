@@ -8,7 +8,8 @@ src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，旧版
 
 程序按以下优先级读取配置，越靠前优先级越高：
 
-    进程环境变量 > ~/.kd1-anime/config.toml > 当前目录 .env > ~/.kd1-anime/.env
+    有 config.toml：进程环境变量 > ~/.kd1-anime/config.toml > 程序默认值
+    无 config.toml：进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env > 程序默认值
 
 推荐把用户配置放在 ~/.kd1-anime/config.toml，并限制权限：
 
