@@ -598,3 +598,67 @@ class Demo(Scene):
         self.play(FadeOut(formula))
 """
     assert not validate_animation_lifecycle(code, technical).is_valid
+
+
+def test_introduce_may_crossfade_an_optional_object_and_cleanup_is_idempotent():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="old_text",
+                variable_name="old_text",
+                constructor="Text",
+            ),
+            TechnicalObject(
+                element_id="new_text",
+                variable_name="new_text",
+                constructor="Text",
+                exported=True,
+            ),
+        ],
+        animations=[
+            {
+                "event_id": "show_old",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "introduce",
+                "target_element_ids": ["old_text"],
+                "create_element_ids": ["old_text"],
+            },
+            {
+                "event_id": "show_new",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "semantic_action": "introduce",
+                "target_element_ids": ["new_text"],
+                "create_element_ids": ["new_text"],
+            },
+            {
+                "event_id": "cleanup",
+                "start_seconds": 2,
+                "end_seconds": 3,
+                "semantic_action": "remove",
+                "source_element_ids": ["old_text"],
+            },
+        ],
+        export_element_ids=["new_text"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        old_text = Text("old")
+        new_text = Text("new")
+        # KD1_ANIMATION_EVENT: show_old
+        self.play(FadeIn(old_text))
+        # KD1_ANIMATION_EVENT: show_new
+        self.play(FadeOut(old_text), FadeIn(new_text))
+        # KD1_ANIMATION_EVENT: cleanup
+        self.play(FadeOut(old_text))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+    assert any("交叉淡出" in warning for warning in result.warnings)
+    assert any("重复退出" in warning for warning in result.warnings)

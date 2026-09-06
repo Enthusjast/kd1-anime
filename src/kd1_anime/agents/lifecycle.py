@@ -830,6 +830,7 @@ def validate_animation_lifecycle(
         for item in technical_spec.objects
         if item.element_id in removed_ids and item.variable_name
     }
+    optional_variables = set(object_by_variable) - required_export_variables
 
     defined: set[str] = set()
     aliases: dict[str, set[str]] = {}
@@ -838,6 +839,7 @@ def validate_animation_lifecycle(
         for item in technical_spec.objects
         if item.initially_active and item.variable_name
     }
+    ever_active: set[str] = set(active)
     seen_assignments: set[str] = set()
     used_event_ids: set[str] = set()
     markers_required = bool(technical_spec.animations)
@@ -914,6 +916,7 @@ def validate_animation_lifecycle(
             mapped_names = mapped(names)
             if method == "add":
                 active.update(mapped_names)
+                ever_active.update(mapped_names)
             else:
                 active.difference_update(mapped_names)
             continue
@@ -968,6 +971,15 @@ def validate_animation_lifecycle(
             }:
                 source_mapped = mapped(source_names)
                 missing = source_mapped - active
+                previously_removed = {
+                    name for name in missing if name in ever_active and name in optional_variables
+                }
+                if previously_removed:
+                    warnings.append(
+                        f"第 {node.lineno} 行 {invocation.operation} 重复作用于已退出的可选对象: "
+                        + ", ".join(sorted(previously_removed))
+                    )
+                    missing -= previously_removed
                 if missing:
                     if invocation.operation == "animate":
                         message = f"第 {node.lineno} 行 animate 作用于未 active 对象: "
@@ -1028,10 +1040,16 @@ def validate_animation_lifecycle(
         actual_sources = mapped({name for call in invocations for name in call.source_names})
         actual_targets = mapped({name for call in invocations for name in call.target_names})
         expected = event_sources | event_targets | event_creates | event_removes
-        if expected - (actual_sources | actual_targets):
+        already_exited_optional = {
+            name
+            for name in expected
+            if name in ever_active and name not in active and name in optional_variables
+        }
+        missing_expected = expected - (actual_sources | actual_targets) - already_exited_optional
+        if missing_expected:
             errors.append(
                 f"第 {node.lineno} 行事件 {event.event_id} 未操作合同对象: "
-                + ", ".join(sorted(expected - (actual_sources | actual_targets)))
+                + ", ".join(sorted(missing_expected))
             )
         actual_exits = mapped(
             {
@@ -1042,7 +1060,20 @@ def validate_animation_lifecycle(
             }
         )
         if actual_exits and action != "remove":
-            errors.append(f"第 {node.lineno} 行实际退出对象与 {action} 语义不符")
+            protected_exits = actual_exits & required_export_variables
+            unexpected_exits = actual_exits - protected_exits
+            if protected_exits:
+                errors.append(
+                    f"第 {node.lineno} 行实际退出必需导出对象与 {action} 语义不符: "
+                    + ", ".join(sorted(protected_exits))
+                )
+            elif action == "introduce" and unexpected_exits <= optional_variables:
+                warnings.append(
+                    f"第 {node.lineno} 行 introduce 同时退出可选对象（视为交叉淡出）: "
+                    + ", ".join(sorted(unexpected_exits))
+                )
+            else:
+                errors.append(f"第 {node.lineno} 行实际退出对象与 {action} 语义不符")
             active.difference_update(actual_exits)
         if action == "introduce":
             missing = event_sources & active
@@ -1053,7 +1084,9 @@ def validate_animation_lifecycle(
             introduced = event_targets | event_creates
             if introduced - defined:
                 require_defined(introduced - defined, node.lineno, "introduce")
-            active.update(introduced & (actual_sources | actual_targets))
+            introduced_active = introduced & (actual_sources | actual_targets)
+            active.update(introduced_active)
+            ever_active.update(introduced_active)
         elif action == "update":
             missing = event_sources - active
             if missing:
@@ -1071,6 +1104,15 @@ def validate_animation_lifecycle(
         elif action == "remove":
             exit_names = event_sources | event_removes
             missing = exit_names - active
+            previously_removed = {
+                name for name in missing if name in ever_active and name in optional_variables
+            }
+            if previously_removed:
+                warnings.append(
+                    f"第 {node.lineno} 行 remove 重复退出可选对象: "
+                    + ", ".join(sorted(previously_removed))
+                )
+                missing -= previously_removed
             if missing:
                 errors.append(
                     f"第 {node.lineno} 行 remove 作用于未 active 对象: "
