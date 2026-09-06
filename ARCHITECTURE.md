@@ -10,7 +10,8 @@
 ## 1. 设计目标
 
 - 使用原生 Python、Pydantic 和显式有限状态机，不引入重型 Agent 框架。
-- 让场景分镜可并行生成、代码按顺序交接，随后独立完成 Slurm 或本地渲染与修复。
+- 让场景分镜和计划审查可并行；用结构化 TechnicalHandoff 传递连续性，并让无依赖 Scene
+  的 Code→Code Review 并行执行，随后独立完成 Slurm 或本地渲染与修复。
 - 对模型输出同时执行 LLM 语义审查与确定性 AST 校验。
 - 让每次运行拥有隔离的代码、日志、媒体和输出目录。
 - 用可验证的产物身份避免过期视频、错误配置和错误 Job 被误复用。
@@ -35,7 +36,7 @@
 ### 1.2 主要技术难点
 
 - **数学正确性**：需要在自然语言、等式、矩阵、几何面积和教学依赖之间建立可计算合同；
-- **跨场景状态**：Mobject 的 Python 变量身份与 Manim Scene 中的 active 状态并不等价，必须同时维护导出区、状态账本和哈希；
+- **跨场景状态**：Mobject 的 Python 变量身份与 Manim Scene 中的 active 状态并不等价，必须同时维护 TechnicalHandoff、导出区、状态账本和哈希；
 - **不可信代码执行**：生成代码来自模型，既要允许丰富的 Manim API，又要阻止文件、网络、shell、动态执行和危险导入；
 - **分布式渲染一致性**：Slurm 状态、共享文件系统、容器、GPU、XeLaTeX 和 FFmpeg 版本都可能造成“作业成功但产物无效”；
 - **并发与恢复**：分镜可并行、代码交接需串行、渲染可并行，同时所有检查点必须支持进程中断和安全 resume；
@@ -110,10 +111,11 @@ kd1_anime.orchestrator ───── callback events ────────�
 ```text
 全局：INIT → 主 LLM/RAG 可用性探测 → PLANNING
 
-分镜屏障：全片 PlanningDraft → 所有 Scene 并行 DETAILING → 计划编译/审查 → 全片连续性审查
+分镜屏障：全片 PlanningDraft → 所有 Scene 并行 DETAILING → 计划编译/审查并行 → 全片连续性审查
 
-顺序代码屏障：
-Scene 1 技术设计 → CODING → 代码 REVIEWING → Scene 2 技术设计 → CODING → 代码 REVIEWING → …
+技术与代码阶段：
+TechnicalSpec 按连续性依赖传递 TechnicalHandoff；每个就绪 Scene 独立执行
+CODING → Code REVIEWING，彼此并行；共享 ElementManifest/StateLedger 按 Scene ID 有序提交。
 
 渲染阶段：各 Scene 并行 DISPATCHING → MONITORING
                                       ▲              │
@@ -125,7 +127,7 @@ Scene 1 技术设计 → CODING → 代码 REVIEWING → Scene 2 技术设计 �
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-FSM 枚举同时用于清单检查点和 TUI 阶段提示。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜仍然并行，但编码/代码审查按场景顺序执行：Scene N 先由 Technical Planner 生成结构化 TechnicalSpec，确定性编译通过后才允许 Coder 工作；代码通过生命周期校验和 Reviewer 后，提取其连续性导出区，才允许 Scene N+1 编码。这样 Coder 收到的是上一场景真实生成的最终 Mobject 定义，并且必须遵守明确的对象生命周期，而不是仅凭 Planner 描述猜测状态。所有代码就绪后，渲染后端继续并行；默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则以前台本地进程执行（默认一个在途任务）。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。后端边界统一执行产物定位、ffprobe 和哈希验证。
+FSM 枚举同时用于清单检查点和 TUI 阶段提示。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜和初始计划审查并行；Technical Planner 按依赖链生成结构化 TechnicalSpec。每份合同的 `handoff_out` 只包含当前场景最终导出的对象状态，下一场景以 `handoff_in` 接收相同的 element ID、变量名、对象类型和最终状态，不必等待前一场景的生成代码。TechnicalSpec 就绪后，各 Scene 的 Coder 和 Code Reviewer 在独立 worker 中并行执行；每个 worker 仍然必须通过 AST、API、连续性和生命周期校验。代码审查结果先保存在各自 SceneState，随后 Orchestrator 按 Scene ID 顺序更新 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。没有结构化 handoff 的 legacy manifest 会回退到旧的顺序代码屏障。每个场景审查通过后即可提交渲染；默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则以前台本地进程执行（默认一个在途任务）。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。后端边界统一执行产物定位、ffprobe 和哈希验证。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
 CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会确认索引存在且未过期，并探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
@@ -141,7 +143,7 @@ Planner 使用分层结构化输出：
 1. `plan_draft()` 一次性生成 `PlanningDraft`：LessonSpec 固定学习目标、实体、数学断言、定义域和时长；TeachingGraph 固定断言依赖与场景分配；`SceneOutline` 按最小必要视觉单元生成。概要按返回顺序规范化 scene ID 为 `1..N`。同一画布中逐个出现、保留并对比的对象属于同一个场景；当用户明确要求同屏/整体展示而模型仍按对象拆分时，Planner 会将概要确定性合并为一个场景。只有用户明确要求多场景，或镜头/布局/叙事弧线确实独立时才拆分。
 2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
 3. 每个 worker 的 `plan_detail()` 接收原始需求、教学合同、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state、结构化 `inherited_elements` / `elements_to_remove` / `new_elements` 和转场合同。
-4. 所有 Detail 完成后先运行 Plan Compiler，检查场景 ID、断言覆盖/依赖、时间线覆盖、可解析等式、多边形鞋带面积、画布边界和元素生命周期。随后逐场景执行 Plan Review，检查数学正确性、几何可实现性和交接合同；问题只回到 Planner 重规划，单份计划的审查轮数受 `MAX_PLAN_REVIEW_ROUNDS` 限制，Planner 总重调用次数另受 `MAX_PLAN_REPLAN_ATTEMPTS` 限制，未通过的计划不会进入 Coder。计划/问题指纹重复时冻结计划并停止空转。
+4. 所有 Detail 完成后先运行 Plan Compiler，检查场景 ID、断言覆盖/依赖、时间线覆盖、可解析等式、多边形鞋带面积、画布边界和元素生命周期。初始 Plan Review 使用同一份全片计划快照并行检查数学正确性、几何可实现性和交接合同；问题只回到 Planner 重规划，单份计划的审查轮数受 `MAX_PLAN_REVIEW_ROUNDS` 限制，Planner 总重调用次数另受 `MAX_PLAN_REPLAN_ATTEMPTS` 限制，未通过的计划不会进入 Coder。计划/问题指纹重复时冻结计划并停止空转。
 5. Plan Review 通过后执行全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。高风险几何方案在计划审查或代码审查耗尽后，可切换为保守的面积/等式教学方案。
 
 Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。ScenePlan 还包含 timeline、math_claims、geometry_specs 和 handoff 四类结构化合同；无法确定的数学表达式不会被编译器擅自判定为正确。用户需求被明确标记为不可信数据，不能改变系统规则。
@@ -150,11 +152,11 @@ Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。Sc
 ### 3.2 CODING / REVIEWING
 
 TechnicalSpec 是 CODING 内部的强制前置阶段，不改变顶层 FSM 状态集合。它把
-ScenePlan 的对象声明映射为变量名、构造器、语义动作、LaTeX 分段、布局约束和导出清单；
+ScenePlan 的对象声明映射为变量名、构造器、语义动作、LaTeX 分段、布局约束、导出清单和结构化 `handoff_in`/`handoff_out`；
 合同版本 2 的动作只有 `introduce`、`update`、`remove`、`camera`、`hold`，不把某个
 Manim 动画类名当成协议。编译器会模拟 active 状态，阻断对已退出对象的继续使用。它和
 输入哈希、规范化 JSON 一起写入 `artifacts/scene_<id>_technical_spec.json` 与 `manifest.json`，
-计划或继承代码变化后自动失效，恢复时校验哈希后才会复用。
+计划或 `TechnicalHandoff` 变化后自动失效，恢复时校验哈希后才会复用。
 
 TechnicalSpec 编译前只做能够从 ScenePlan 机械证明的归一化：补齐 active source、拆出
 复合事件中的新对象引入、过滤过期边界引用和补齐必需导出对象的语义事件。无法证明安全的
@@ -177,7 +179,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Scene 类必须实现 `construct()`；
 - 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；strict 模式最多尝试 `CODE_VALIDATION_ATTEMPTS` 次，relaxed 模式允许继续生成不同候选，只有候选完全停滞时才终止。每个 `self.play` 的标记必须对应合同事件；静态分析器无法识别的具体动画调用只记录 warning，不因此拒绝候选。包含未知调用的 dry-run 场景会自动强制低质量 frame+短视频 Smoke Render。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
+若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；strict 模式最多尝试 `CODE_VALIDATION_ATTEMPTS` 次，relaxed 模式允许继续生成不同候选，只有候选完全停滞时才终止。每个 `self.play` 的标记必须对应合同事件；静态分析器无法识别的具体动画调用只记录 warning，不因此拒绝候选。包含未知调用的 dry-run 场景会自动强制低质量 frame+短视频 Smoke Render。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。下一场景优先消费前一场景 TechnicalSpec 的 `handoff_in`，只在 legacy manifest 没有结构化 handoff 时才通过 AST 提取 `[Inherited Elements Code]`；最终代码导出区仍会更新运行级 ElementManifest，作为后置验证和恢复凭据。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
 
 - valid / `info`：通过；
 - `minor`：至少一条可精确唯一匹配的查找替换；

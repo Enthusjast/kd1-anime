@@ -256,8 +256,8 @@ INIT
   → PLANNING（概要、教学合同、数学断言图）
   → DETAILING（各场景分镜并行生成）
   → PLAN_REVIEWING（确定性编译 + 计划审查 + 连续性审查）
-  → CODING（TechnicalSpec v2 → Coder，按场景顺序交接）
-  → REVIEWING（AST/生命周期 + 代码语义审查）
+  → CODING（TechnicalSpec v2 → 各 Scene 并行 Coder）
+  → REVIEWING（各 Scene 并行 AST/生命周期 + 代码语义审查）
   → DISPATCHING / MONITORING（场景级 Slurm 或本地并行）
   → FIXING → REVIEWING → …
   → VISUAL_EVALUATING（可选）
@@ -269,7 +269,7 @@ INIT
 ### 计划与代码审查的职责
 
 - **Plan Review** 检查数学断言、等式关系、定义域、几何方案、时间线和元素交接是否正确。失败只回到 Planner，不会让 Coder 反复修补错误计划。
-- **Technical Planner** 把分镜编译为对象、动画事件、布局、LaTeX 和最终导出清单。确定性编译失败时只有限重试。
+- **Technical Planner** 把分镜编译为对象、动画事件、布局、LaTeX、最终导出清单和 `TechnicalHandoff`。前一场景的结构化技术边界会传给下一场景；确定性编译失败时只有限重试。
 - **TechnicalSpec v2** 只记录 `introduce`、`update`、`remove`、`camera`、`hold` 等语义动作，不把动画类名当作协议；每个 `self.play` 前的 `KD1_ANIMATION_EVENT` 标记将代码绑定到对应事件。未识别的动画调用默认记录 warning，不会仅因名称新颖而阻断生成。
 - **Code Review** 检查已确认计划的 Manim 实现、数学展示、API、生命周期、布局、安全和场景交接。代码变化后必须重新审查。
 - **审查分级**：确定性校验或带源码/合同证据的高置信度核心错误才是 hard blocker；可唯一匹配的局部替换先自动修复；风格建议、一般节奏和不确定的“可能问题”作为 warning 放行。
@@ -282,7 +282,7 @@ INIT
 
 场景不是清单条目的机械切分单位。若用户要求在同一画布中同时展示一组对象，且这些对象需要共同变化或最终对比，Planner 应将其合并为一个场景；只有镜头、布局或叙事弧线确实独立时才拆分。
 
-分镜生成可以并行；代码生成按 Scene ID 顺序执行，以便把上一场景实际导出的 Mobject 定义交给下一场景。所有代码通过审查后，场景渲染可以并行提交到 Slurm。`SLURM_MAX_IN_FLIGHT` 可限制同时排队/运行的场景数量。
+分镜 Detail 和初始 Plan Review 可以并行。TechnicalSpec 按连续性依赖传递 `TechnicalHandoff`；拥有技术合同后，各 Scene 的 Code→Code Review 可以并行，不再等待其它无关场景的生成代码。共享 `ElementManifest`/`StateLedger` 仍按 Scene ID 顺序发布，确保边界校验确定；缺少新 handoff 的旧运行会安全回退到顺序代码屏障。每个场景代码审查通过后即可进入渲染 worker，`SLURM_MAX_IN_FLIGHT` 继续限制同时排队/运行的场景数量。
 
 ## 常用命令
 
