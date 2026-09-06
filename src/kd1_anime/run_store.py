@@ -1079,11 +1079,21 @@ def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
 
 
 def migrate_manifest_data(raw: dict, root: Path) -> dict:
-    """读取 v4-v7 清单；旧版本只允许查看，不进行猜测迁移。"""
+    """读取旧清单；仅迁移不改变语义的 v7 -> v8 字段升级。
+
+    v8 只新增了可选的 generation_mode，v7 已经使用当前的语义动画
+    合同和合并配置，因此可以安全补默认值。更早版本仍保持只读，避免
+    把旧的具体动画合同或缺失教学状态静默解释成当前格式。
+    """
 
     version = raw.get("schema_version", 1)
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
+    if version == 7 and MANIFEST_SCHEMA_VERSION == 8:
+        migrated = dict(raw)
+        migrated["schema_version"] = 8
+        migrated.setdefault("generation_mode", "relaxed")
+        return migrated
     if version in READABLE_MANIFEST_SCHEMA_VERSIONS:
         if version >= 5:
             required_fields = {"lesson_spec", "teaching_graph", "state_ledger"}

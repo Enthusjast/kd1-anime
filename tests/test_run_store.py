@@ -537,6 +537,26 @@ def test_current_manifest_uses_v8_schema_and_merge_profile():
     )
 
 
+def test_v7_manifest_migrates_safe_generation_mode_field_for_resume(tmp_path):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    raw = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="legacy v7",
+        output_path=str((root / "output.mp4").resolve()),
+    ).model_dump(mode="json")
+    raw["schema_version"] = 7
+    raw.pop("generation_mode")
+    (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    repository = RunRepository(workspace)
+    loaded = repository.load_for_resume(RUN_ID)
+
+    assert loaded.schema_version == 8
+    assert loaded.generation_mode == "relaxed"
+
+
 def test_v4_manifest_is_readable_but_read_only(tmp_path):
     workspace = tmp_path / "workspace"
     root = workspace / "runs" / RUN_ID
