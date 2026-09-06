@@ -609,6 +609,16 @@ class SlurmDispatcher:
         # OpenGL 继承树。即使是 Cairo，也把变量显式固定，方便计算节点
         # 环境指纹与正式命令保持一致。
         lines.append(f"export MANIM_RENDERER={renderer}")
+        # Smoke 阶段会受到地址空间限制；限制 BLAS 线程，避免
+        # OpenBLAS 在导入 numpy 时创建过多线程映射而误报内存不足。
+        lines.extend(
+            [
+                "export OPENBLAS_NUM_THREADS=1",
+                "export OMP_NUM_THREADS=1",
+                "export MKL_NUM_THREADS=1",
+                "export NUMEXPR_NUM_THREADS=1",
+            ]
+        )
         if use_gpu:
             # 某些集群包装器会在 CLI 解析前导入场景模块；提前设置平台
             # 可避免 OpenGL 回退到 GLX 并在无显示节点失败。
@@ -633,6 +643,14 @@ class SlurmDispatcher:
                 [
                     "--env",
                     f"MANIM_RENDERER={renderer}",
+                    "--env",
+                    "OPENBLAS_NUM_THREADS=1",
+                    "--env",
+                    "OMP_NUM_THREADS=1",
+                    "--env",
+                    "MKL_NUM_THREADS=1",
+                    "--env",
+                    "NUMEXPR_NUM_THREADS=1",
                 ]
             )
             if use_gpu:

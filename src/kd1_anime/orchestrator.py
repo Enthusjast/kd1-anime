@@ -2877,6 +2877,17 @@ class Orchestrator:
                 )
             env = os.environ.copy()
             env["MANIM_RENDERER"] = ctx.render_profile.renderer
+            # Smoke Render 通过 prlimit 限制地址空间；OpenBLAS 默认会按节点
+            # CPU 数创建大量线程映射，在小内存限制下可能在导入阶段失败。
+            # Smoke 只验证 Manim 生命周期，不需要并行线性代数，因此固定为
+            # 单线程，避免把环境资源误报成生成代码错误。
+            for variable in (
+                "OPENBLAS_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ):
+                env[variable] = "1"
             if ctx.render_profile.renderer == "opengl":
                 env["PYOPENGL_PLATFORM"] = ctx.render_profile.opengl_platform
             image = settings.SLURM_CONTAINER_IMAGE

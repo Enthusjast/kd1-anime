@@ -145,6 +145,8 @@ def test_script_runs_same_renderer_smoke_before_formal_render(monkeypatch, tmp_p
     assert "ffprobe -v error" in script
     assert "partial_movie_files" in script
     assert '"$smoke_video"' in script
+    assert "export OPENBLAS_NUM_THREADS=1" in script
+    assert "export OMP_NUM_THREADS=1" in script
 
 
 def test_script_runs_import_only_and_short_video_stages(monkeypatch, tmp_path):
