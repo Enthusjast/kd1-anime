@@ -25,7 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from kd1_anime.config import settings
-from kd1_anime.logo import ANSI_LOGO
+from kd1_anime.logo import ASCII_LOGO
 
 console = Console()
 
@@ -952,4 +952,4 @@ class ChatSession:
                     border_style="green",
                 )
             )
-        console.print(Text.from_ansi(ANSI_LOGO), end="")
+        console.print(Text(ASCII_LOGO), end="")
