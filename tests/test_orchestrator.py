@@ -2058,6 +2058,7 @@ def test_parallel_scene_review_defers_shared_ledger_commit(monkeypatch, tmp_path
     ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
     orchestrator = Orchestrator()
     orchestrator._llm_sem = threading.Semaphore(1)
+
     class PassingReviewer:
         def review(self, *args, **kwargs):
             return ReviewResult(is_valid=True)
