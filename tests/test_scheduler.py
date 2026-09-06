@@ -548,6 +548,7 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
     orchestrator = Orchestrator()
     orchestrator._llm_sem = threading.Semaphore(2)
     scene2_code_started = threading.Event()
+    scene1_code_started = threading.Event()
     release_scene2_code = threading.Event()
     code_threads: list[int] = []
     handoff_sources: list[int | None] = []
@@ -568,6 +569,9 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
         )
 
     def fake_technical(current_ctx, state, *, previous_technical_handoff=None):
+        if state.plan.scene_id == 2:
+            # Scene 2 技术设计开始时，Scene 1 的 Code 已经可以先行。
+            assert scene1_code_started.wait(timeout=2)
         if previous_technical_handoff is not None:
             handoff_sources.append(previous_technical_handoff.source_scene_id)
         else:
@@ -578,6 +582,8 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
     def fake_code(current_ctx, scene_id, state):
         code_threads.append(threading.get_ident())
         order.append(f"code_start_{scene_id}")
+        if scene_id == 1:
+            scene1_code_started.set()
         if scene_id == 2:
             scene2_code_started.set()
             assert release_scene2_code.wait(timeout=2)

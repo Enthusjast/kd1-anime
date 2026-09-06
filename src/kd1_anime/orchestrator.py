@@ -4017,30 +4017,6 @@ class Orchestrator:
             # 新运行则在此阶段还没有 Scene 代码，可以安全并行。
             return False
 
-        # TechnicalSpec 按依赖顺序生成；但它只消费前一场景的技术边界，
-        # 不再等待前一场景的生成代码/Code Review。
-        for state in active_states:
-            if state.rendered and state.code and state.technical_spec is not None:
-                continue
-            try:
-                self._normalize_plan_contract_for_coding(ctx, state)
-                previous_handoff = self._technical_handoff_for_scene(ctx, state)
-                if state.plan.inherited_elements and previous_handoff is None:
-                    # 旧 TechnicalSpec 没有 handoff_out，安全回退到原有串行路径。
-                    return False
-                state.inherited_elements_code = ""
-                self._ensure_technical_spec(
-                    ctx,
-                    state,
-                    previous_technical_handoff=previous_handoff,
-                )
-                if state.technical_spec is None or state.technical_spec.handoff_out is None:
-                    return False
-            except Exception:
-                # 让既有串行屏障接管异常：它会保留“上游失败、下游等待
-                # 依赖”的诊断语义，也兼容外部替换的 TechnicalPlanner。
-                return False
-
         parallel_monitor_owned = False
         if not ctx.dry_run and any(not state.rendered for state in active_states):
             self._slurm_monitor = SlurmMonitorCoordinator(
@@ -4051,9 +4027,64 @@ class Orchestrator:
             parallel_monitor_owned = True
         ctx.parallel_generation = True
 
+        # 每个 Scene 自己拥有一个 TechnicalSpec 就绪事件和一个 Code Review
+        # 就绪事件。结构化 handoff 只等待前者；legacy 交接才等待后者，
+        # 从而形成“技术设计先行、代码/渲染流水线随后”的流水并行。
+        technical_ready = {state.plan.scene_id: threading.Event() for state in active_states}
+        review_ready = {state.plan.scene_id: threading.Event() for state in active_states}
+        for state in active_states:
+            if state.technical_spec is not None and state.technical_status == "passed":
+                technical_ready[state.plan.scene_id].set()
+            if state.reviewed:
+                review_ready[state.plan.scene_id].set()
+
         def run_scene(state: SceneState) -> None:
             scene_id = state.plan.scene_id
             try:
+                if state.rendered:
+                    return
+                self._normalize_plan_contract_for_coding(ctx, state)
+                previous_handoff = None
+                if state.plan.inherited_elements:
+                    previous = ctx.scene_states.get(scene_id - 1)
+                    if previous is None:
+                        raise RuntimeError(f"Scene {scene_id} 缺少前置 Scene {scene_id - 1}")
+                    if not previous.rendered:
+                        technical_ready[scene_id - 1].wait()
+                        if previous.failed or previous.give_up:
+                            self._emit(
+                                "scene_waiting_for_dependency",
+                                scene_id=scene_id,
+                                dependency_scene_id=scene_id - 1,
+                                reason=f"等待 Scene {scene_id - 1} 技术设计恢复",
+                            )
+                            return
+                    previous_handoff = self._technical_handoff_for_scene(ctx, state)
+                    if previous_handoff is None:
+                        # 没有结构化 handoff 的旧运行只能消费真实导出代码。
+                        review_ready[scene_id - 1].wait()
+                        if previous.failed or previous.give_up:
+                            self._emit(
+                                "scene_waiting_for_dependency",
+                                scene_id=scene_id,
+                                dependency_scene_id=scene_id - 1,
+                                reason=f"等待 Scene {scene_id - 1} 编码/审查通过后建立继承状态",
+                            )
+                            return
+                        self._prepare_inherited_context(ctx, scene_id, state)
+                    else:
+                        state.inherited_elements_code = ""
+                else:
+                    state.inherited_elements_code = ""
+
+                self._ensure_technical_spec(
+                    ctx,
+                    state,
+                    previous_technical_handoff=previous_handoff,
+                )
+                if state.technical_spec is None:
+                    raise RuntimeError(f"Scene {scene_id} 未生成 TechnicalSpec")
+                technical_ready[scene_id].set()
                 while not state.reviewed:
                     if self._stop_event.is_set() or state.failed or state.give_up:
                         return
@@ -4072,11 +4103,14 @@ class Orchestrator:
                         state,
                         defer_continuity_commit=True,
                     )
+                review_ready[scene_id].set()
                 if not ctx.dry_run and not state.failed and not state.give_up:
                     # Code Review 一通过就进入本场景的渲染循环；其它 worker
                     # 可以继续执行自己的 Code/Review，不再等待全局屏障。
                     self._scene_worker(ctx, scene_id, state)
             except Exception as exc:
+                technical_ready[scene_id].set()
+                review_ready[scene_id].set()
                 if self._activate_safe_fallback(ctx, scene_id, state, str(exc)):
                     return
                 route = classify_failure(str(exc), phase="coding")
@@ -4089,7 +4123,7 @@ class Orchestrator:
                     self._checkpoint(ctx, State.REVIEWING)
                 self._emit("scene_failed", scene_id=scene_id, reason=str(exc))
 
-        max_workers = max(1, min(settings.LLM_PARALLEL_WORKERS, len(active_states)))
+        max_workers = max(1, len(active_states))
         try:
             with ThreadPoolExecutor(
                 max_workers=max_workers,
@@ -7298,9 +7332,13 @@ class Orchestrator:
     ) -> None:
         if settings.SKIP_REVIEW:
             try:
-                self._refresh_scene_export(state)
-                self._update_element_manifest(ctx, state)
-                self._update_state_ledger(ctx, state)
+                if not defer_continuity_commit:
+                    self._refresh_scene_export(state)
+                    self._update_element_manifest(ctx, state)
+                    self._update_state_ledger(ctx, state)
+                else:
+                    # 并行流水线将导出区和共享账本延迟到有序发布阶段。
+                    extract_scene_continuity_elements(state.code, state.plan)
             except ValueError as exc:
                 with self._state_lock:
                     state.rewrite_feedback = f"连续性导出区无效: {exc}"

@@ -283,7 +283,7 @@ INIT
 
 场景不是清单条目的机械切分单位。若用户要求在同一画布中同时展示一组对象，且这些对象需要共同变化或最终对比，Planner 应将其合并为一个场景；只有镜头、布局或叙事弧线确实独立时才拆分。
 
-分镜 Detail 和初始 Plan Review 可以并行。TechnicalSpec 按连续性依赖传递 `TechnicalHandoff`；拥有技术合同后，各 Scene 的 Code→Code Review 可以并行，不再等待其它无关场景的生成代码。共享 `ElementManifest`/`StateLedger` 仍按 Scene ID 顺序发布，确保边界校验确定；缺少新 handoff 的旧运行会安全回退到顺序代码屏障。每个 Scene 的 Code Review 通过后立即进入自己的渲染 worker，其他 Scene 可以继续编码/审查，`SLURM_MAX_IN_FLIGHT` 继续限制同时排队/运行的场景数量。
+分镜 Detail 和初始 Plan Review 可以并行。TechnicalSpec 按连续性依赖传递 `TechnicalHandoff`；前一场景的技术设计完成后，后一场景即可开始技术设计，同时前一场景继续 Code→Code Review。每个 Scene 拥有技术合同后即可独立执行 Code→Code Review，不再等待其它无关场景的生成代码。共享 `ElementManifest`/`StateLedger` 仍按 Scene ID 顺序发布，确保边界校验确定；缺少新 handoff 的旧运行会安全回退到顺序代码屏障。每个 Scene 的 Code Review 通过后立即进入自己的渲染 worker，其他 Scene 可以继续编码/审查，`SLURM_MAX_IN_FLIGHT` 继续限制同时排队/运行的场景数量。
 
 ## 常用命令
 
