@@ -65,18 +65,20 @@ URL。API Key 不会写入 manifest 或事件日志。
 | LLM_CODE_TEMPERATURE | 0.2 | Coder 温度 |
 | LLM_REVIEW_TEMPERATURE | 0.0 | Plan/Code/Continuity Review 温度 |
 | LLM_FIX_TEMPERATURE | 0.1 | AutoFix 温度 |
-| LLM_MAX_TOKENS | 32768 | 全局/兼容输出上限；阶段配置优先 |
-| LLM_PLANNING_MAX_TOKENS | 16384 | 规划、澄清和计划审查预算 |
-| LLM_TECHNICAL_MAX_TOKENS | 16384 | TechnicalSpec 输出预算 |
-| LLM_CODE_MAX_TOKENS | 24576 | Coder 和代码修复预算 |
-| LLM_REVIEW_MAX_TOKENS | 8192 | 结构化 Reviewer 输出预算 |
+| LLM_MAX_CONTEXT_TOKENS | 262000 | LLM 输入上下文 token 预算；PromptBuilder 按约 4 字符/token 换算 |
+| LLM_MAX_CONTEXT_CHARS | 空 | 可选的更保守字符上限；不填则使用 token 预算换算值 |
+| LLM_MAX_TOKENS | 32000 | 默认 LLM 输出上限 |
+| LLM_PLANNING_MAX_TOKENS | 32000 | 规划、澄清和计划审查预算 |
+| LLM_TECHNICAL_MAX_TOKENS | 32000 | TechnicalSpec 输出预算 |
+| LLM_CODE_MAX_TOKENS | 32000 | Coder 和代码修复预算 |
+| LLM_REVIEW_MAX_TOKENS | 32000 | 结构化 Reviewer 输出预算 |
 | LLM_MAX_RETRIES | 3 | 外部请求重试次数 |
 | LLM_RETRY_BASE_DELAY | 2.0 | 重试退避初始秒数 |
 | LLM_TIMEOUT_CONNECT | 30 | 连接超时秒数 |
 | LLM_TIMEOUT_READ | 600 | 读取超时秒数 |
 | LLM_HEALTHCHECK_TIMEOUT | 15 | 启动探测超时秒数 |
 | LLM_SILENT_STREAM | true | 非流式业务请求是否静默收集流式响应 |
-| LLM_EMPTY_RETRY_MAX_TOKENS | 16384 | 空响应重试时使用的预算 |
+| LLM_EMPTY_RETRY_MAX_TOKENS | 32000 | 空响应重试时使用的预算 |
 | LLM_JSON_REPAIR_ATTEMPTS | 2 | JSON/Pydantic 校验失败后的修复次数 |
 | LLM_PARALLEL_WORKERS | 4 | 进程内主模型并发上限 |
 | LLM_DEBUG | false | 是否输出调试信息 |
@@ -84,7 +86,6 @@ URL。API Key 不会写入 manifest 或事件日志。
 | LLM_USE_JSON_MODE | true | 是否请求 response_format=json_object |
 | FAILURE_CASES_PATH | ~/.kd1-anime/diagnostics/failure_cases.sqlite3 | 脱敏失败案例库路径 |
 | FAILURE_CASE_MAX_PER_CATEGORY | 100 | 每类失败案例最大保存数 |
-| LLM_MAX_CONTEXT_CHARS | 120000 | Agent 输入总字符预算 |
 | LLM_MAX_CODE_CONTEXT_CHARS | 60000 | 代码、继承定义和修复上下文预算 |
 | LLM_MAX_REVIEW_CONTEXT_CHARS | 90000 | Reviewer 输入预算 |
 | LLM_MAX_TECHNICAL_SPEC_CHARS | 30000 | TechnicalSpec 注入预算 |

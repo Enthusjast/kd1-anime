@@ -1777,7 +1777,7 @@ class PlannerAgent(BaseAgent):
             system_prompt=OUTLINE_DRAFT_PROMPT,
             user_message=build_bounded_prompt(
                 sections,
-                max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+                max_chars=settings.llm_context_char_budget(),
             ),
             response_model=PlanningDraft,
             temperature=settings.LLM_PLANNING_TEMPERATURE,
@@ -1832,7 +1832,7 @@ class PlannerAgent(BaseAgent):
             system_prompt=f"{OUTLINE_PROMPT}\n{scene_count_rule}\n\n{_scene_granularity_guidance(user_prompt)}",
             user_message=build_bounded_prompt(
                 outline_sections,
-                max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+                max_chars=settings.llm_context_char_budget(),
             ),
             item_model=SceneOutline,
             temperature=settings.LLM_PLANNING_TEMPERATURE,
@@ -1927,7 +1927,7 @@ class PlannerAgent(BaseAgent):
             system_prompt=f"{CONTINUITY_BIBLE_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=build_bounded_prompt(
                 bible_sections,
-                max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+                max_chars=settings.llm_context_char_budget(),
             ),
             response_model=ContinuityBible,
             temperature=settings.LLM_PLANNING_TEMPERATURE,
@@ -2098,7 +2098,7 @@ class PlannerAgent(BaseAgent):
             system_prompt=f"{DETAIL_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=build_bounded_prompt(
                 detail_sections,
-                max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+                max_chars=settings.llm_context_char_budget(),
             ),
             response_model=SceneDetail,
             temperature=settings.LLM_PLANNING_TEMPERATURE,

@@ -386,12 +386,14 @@ kd1-anime test-llm --no-json-mode --verbose
 | --- | ---: | --- |
 | `LLM_BASE_URL` / `LLM_MODEL` | API 地址 / 空 | 主模型端点和模型名；必须配置 |
 | `LLM_HEALTHCHECK_TIMEOUT` | `15` | 启动前主模型探测超时（秒） |
-| `LLM_PLANNING_MAX_TOKENS` | `16384` | 计划和澄清阶段输出预算 |
-| `LLM_CODE_MAX_TOKENS` | `24576` | 代码生成阶段输出预算 |
-| `LLM_REVIEW_MAX_TOKENS` | `8192` | 结构化审查输出预算 |
+| `LLM_MAX_CONTEXT_TOKENS` | `262000` | LLM 输入上下文预算；PromptBuilder 按约 4 字符/token 换算 |
+| `LLM_MAX_CONTEXT_CHARS` | 空 | 可选的更保守字符上限；不填则使用 token 预算换算值 |
+| `LLM_MAX_TOKENS` | `32000` | 默认 LLM 输出上限 |
+| `LLM_PLANNING_MAX_TOKENS` | `32000` | 计划和澄清阶段输出预算 |
+| `LLM_CODE_MAX_TOKENS` | `32000` | 代码生成阶段输出预算 |
+| `LLM_REVIEW_MAX_TOKENS` | `32000` | 结构化审查输出预算 |
 | `LLM_*_MODEL` | 空 | 可选阶段模型路由；为空回退到 `LLM_MODEL` |
 | `LLM_TRUST_ENV` | `true` | 是否读取 `HTTP(S)_PROXY` 等代理环境变量 |
-| `LLM_MAX_CONTEXT_CHARS` | `120000` | Agent 输入总预算；低优先级区块会先裁剪 |
 | `MANIM_RENDERER` | `cairo` | `cairo` 使用 CPU；`opengl` 需要 GPU/图形上下文 |
 | `MANIM_QUALITY` | `h` | Manim 质量级别：`l/m/h/p/k` |
 | `MANIM_PIXEL_WIDTH` / `HEIGHT` | `1920/1080` | 输出分辨率 |

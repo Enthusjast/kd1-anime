@@ -797,7 +797,7 @@ class PlanReviewerAgent(BaseAgent):
         ]
         user_message = build_bounded_prompt(
             review_sections,
-            max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+            max_chars=settings.llm_context_char_budget(),
         )
         try:
             return self.call_llm_json(
@@ -855,7 +855,7 @@ class PlanReviewerAgent(BaseAgent):
             ]
             minimal_message = build_bounded_prompt(
                 minimal_sections,
-                max_chars=min(settings.LLM_MAX_CONTEXT_CHARS, 60_000),
+                max_chars=min(settings.llm_context_char_budget(), 60_000),
             )
             try:
                 return self.call_llm_json(
@@ -966,7 +966,7 @@ class PlanReviewerAgent(BaseAgent):
         ]
         user_message = build_bounded_prompt(
             batch_sections,
-            max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+            max_chars=settings.llm_context_char_budget(),
         )
         items = self.call_llm_json_list(
             system_prompt=f"{PLAN_REVIEW_BATCH_PROMPT}\n\n{renderer_guidance(renderer)}",

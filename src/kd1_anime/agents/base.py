@@ -638,7 +638,7 @@ class BaseAgent:
         if display and reasoning_chunks > 0 and content_chunks == 0:
             console.print(
                 "[bold yellow]警告:[/] 推理消耗了所有 token, 未生成内容. "
-                "请大幅增大 LLM_MAX_TOKENS (建议 16384+)."
+                "请大幅增大 LLM_MAX_TOKENS (建议 32000+)."
             )
         if display:
             console.print()

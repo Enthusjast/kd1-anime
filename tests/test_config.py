@@ -297,18 +297,20 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_TIMEOUT_READ == 600.0
     assert config.LLM_SILENT_STREAM is True
     assert config.LLM_HEALTHCHECK_TIMEOUT == 15.0
-    assert config.LLM_MAX_TOKENS == 32768
+    assert config.LLM_MAX_TOKENS == 32000
     assert config.LLM_PLANNING_TEMPERATURE == 0.2
     assert config.LLM_TECHNICAL_TEMPERATURE == 0.0
     assert config.LLM_CODE_TEMPERATURE == 0.2
     assert config.LLM_REVIEW_TEMPERATURE == 0.0
     assert config.LLM_FIX_TEMPERATURE == 0.1
-    assert config.LLM_PLANNING_MAX_TOKENS == 16384
-    assert config.LLM_TECHNICAL_MAX_TOKENS == 16384
-    assert config.LLM_CODE_MAX_TOKENS == 24576
-    assert config.LLM_REVIEW_MAX_TOKENS == 8192
-    assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
-    assert config.LLM_MAX_CONTEXT_CHARS == 120_000
+    assert config.LLM_PLANNING_MAX_TOKENS == 32000
+    assert config.LLM_TECHNICAL_MAX_TOKENS == 32000
+    assert config.LLM_CODE_MAX_TOKENS == 32000
+    assert config.LLM_REVIEW_MAX_TOKENS == 32000
+    assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 32000
+    assert config.LLM_MAX_CONTEXT_TOKENS == 262_000
+    assert config.LLM_MAX_CONTEXT_CHARS is None
+    assert config.llm_context_char_budget() == 1_048_000
     assert config.LLM_MAX_CODE_CONTEXT_CHARS == 60_000
     assert config.LLM_MAX_REVIEW_CONTEXT_CHARS == 90_000
     assert config.LLM_MAX_TECHNICAL_SPEC_CHARS == 30_000
@@ -324,6 +326,26 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS == 3
     assert config.AUTO_RESOURCE_ESTIMATION is True
     assert config.ADAPTIVE_SMOKE_RENDER is True
+
+
+def test_llm_context_budget_uses_tokens_and_keeps_rag_budget_independent():
+    config = Settings(_env_file=None)
+
+    assert config.LLM_MAX_CONTEXT_TOKENS == 262_000
+    assert config.llm_context_char_budget() == 1_048_000
+    assert config.RAG_MAX_CONTEXT_CHARS == 12_000
+
+    conservative = Settings(
+        _env_file=None,
+        LLM_MAX_CONTEXT_TOKENS=200_000,
+        LLM_MAX_CONTEXT_CHARS=120_000,
+        RAG_MAX_CONTEXT_CHARS=12_000,
+    )
+    assert conservative.llm_context_char_budget() == 120_000
+    assert conservative.RAG_MAX_CONTEXT_CHARS == 12_000
+
+    blank_override = Settings(_env_file=None, LLM_MAX_CONTEXT_CHARS="")
+    assert blank_override.LLM_MAX_CONTEXT_CHARS is None
 
 
 def test_stage_model_routing_falls_back_and_overrides_per_stage():

@@ -370,7 +370,10 @@ class AutoFixerAgent(BaseAgent):
                 "输出要求", "请修复代码中的问题,输出完整的修复后代码:", required=True, priority=100
             )
         )
-        user_msg = build_bounded_prompt(sections, max_chars=settings.LLM_MAX_CONTEXT_CHARS)
+        user_msg = build_bounded_prompt(
+            sections,
+            max_chars=settings.llm_context_char_budget(),
+        )
         code = self.call_llm(
             system_prompt="\n\n".join(
                 (

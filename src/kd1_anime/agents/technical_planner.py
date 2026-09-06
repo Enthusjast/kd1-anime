@@ -1734,7 +1734,10 @@ class TechnicalPlannerAgent(BaseAgent):
                     max_chars=20_000,
                 ),
             )
-        user_message = build_bounded_prompt(sections, max_chars=settings.LLM_MAX_CONTEXT_CHARS)
+        user_message = build_bounded_prompt(
+            sections,
+            max_chars=settings.llm_context_char_budget(),
+        )
         spec = self.call_llm_json(
             system_prompt=f"{TECHNICAL_PLANNER_SYSTEM_PROMPT}\n\n{renderer_guidance(renderer)}",
             user_message=user_message,

@@ -509,7 +509,10 @@ class CoderAgent(BaseAgent):
                 priority=100,
             )
         )
-        user_msg = build_bounded_prompt(sections, max_chars=settings.LLM_MAX_CONTEXT_CHARS)
+        user_msg = build_bounded_prompt(
+            sections,
+            max_chars=settings.llm_context_char_budget(),
+        )
         response = self.call_llm(
             system_prompt=build_coder_system_prompt(renderer),
             user_message=user_msg,

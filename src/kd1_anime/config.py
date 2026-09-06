@@ -503,14 +503,13 @@ class Settings(BaseSettings):
     LLM_CODE_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
     LLM_REVIEW_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
     LLM_FIX_TEMPERATURE: float = Field(default=0.1, ge=0.0, le=2.0)
-    LLM_MAX_TOKENS: int | None = Field(default=32768, ge=1, le=1_000_000)
-    # 不同阶段的输出复杂度差异很大。默认使用较小的阶段预算，避免计划
-    # 审查/连续性审查为极短 JSON 消耗与代码生成相同的长推理预算；用户
-    # 仍可按模型能力覆盖这些值，LLM_MAX_TOKENS 保留为总配置兼容项。
-    LLM_PLANNING_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
-    LLM_TECHNICAL_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
-    LLM_CODE_MAX_TOKENS: int = Field(default=24576, ge=4096, le=1_000_000)
-    LLM_REVIEW_MAX_TOKENS: int = Field(default=8192, ge=2048, le=1_000_000)
+    LLM_MAX_TOKENS: int | None = Field(default=32000, ge=1, le=1_000_000)
+    # 各阶段默认共享 32000 token 输出预算；用户仍可按模型能力覆盖单个阶段，
+    # LLM_MAX_TOKENS 保留为默认/兼容配置项。
+    LLM_PLANNING_MAX_TOKENS: int = Field(default=32000, ge=4096, le=1_000_000)
+    LLM_TECHNICAL_MAX_TOKENS: int = Field(default=32000, ge=4096, le=1_000_000)
+    LLM_CODE_MAX_TOKENS: int = Field(default=32000, ge=4096, le=1_000_000)
+    LLM_REVIEW_MAX_TOKENS: int = Field(default=32000, ge=2048, le=1_000_000)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     # 单次 LLM 请求的连接/读取超时(秒)。读取超时对非流式是"等待完整响应"，
     # 对流式是"等待下一个 chunk"——静默流式下 600s 只是兜底，不会拖慢任何请求。
@@ -530,7 +529,7 @@ class Settings(BaseSettings):
     )
     # 空响应重试时补上的 max_tokens 兜底值：推理模型常把输出预算耗尽在思考上，
     # 导致 content 为空；补足预算后重试可避免反复拿到空响应。
-    LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=16384, ge=1024, le=65536)
+    LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=32000, ge=1024, le=65536)
     # 结构化 JSON 输出未通过 Pydantic 校验时, 带错误反馈重试的次数 (0=关闭)。
     # 模型偶尔会返回不合规的枚举值/缺字段 (如 severity="none"), 直接判死整个
     # 场景太浪费; 把校验错误喂回模型重试, 通常一次即可修正。
@@ -539,6 +538,13 @@ class Settings(BaseSettings):
     @field_validator("LLM_MAX_TOKENS", mode="before")
     @classmethod
     def validate_max_tokens(cls, value):
+        if value is None or value == "":
+            return None
+        return value
+
+    @field_validator("LLM_MAX_CONTEXT_CHARS", mode="before")
+    @classmethod
+    def validate_context_chars(cls, value):
         if value is None or value == "":
             return None
         return value
@@ -574,7 +580,10 @@ class Settings(BaseSettings):
     FAILURE_CASE_MAX_PER_CATEGORY: int = Field(default=100, ge=1, le=1_000)
     # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
     # 裁剪，低优先级的 RAG/自然语言说明会优先让出空间。
-    LLM_MAX_CONTEXT_CHARS: int = Field(default=120_000, ge=10_000, le=2_000_000)
+    LLM_MAX_CONTEXT_TOKENS: int = Field(default=262_000, ge=10_000, le=2_000_000)
+    # 可选的字符安全上限；默认由 LLM_MAX_CONTEXT_TOKENS 按约 4 字符/token 换算。
+    # RAG_MAX_CONTEXT_CHARS 是独立的检索注入上限，不受此字段影响。
+    LLM_MAX_CONTEXT_CHARS: int | None = Field(default=None, ge=10_000, le=2_000_000)
     LLM_MAX_CODE_CONTEXT_CHARS: int = Field(default=60_000, ge=5_000, le=1_000_000)
     LLM_MAX_REVIEW_CONTEXT_CHARS: int = Field(default=90_000, ge=10_000, le=2_000_000)
     LLM_MAX_TECHNICAL_SPEC_CHARS: int = Field(default=30_000, ge=5_000, le=500_000)
@@ -1036,6 +1045,17 @@ class Settings(BaseSettings):
         """验证独立多模态端点；禁止静默回退到主 LLM。"""
 
         self.visual_llm_profile().require()
+
+    def llm_context_char_budget(self) -> int:
+        """把 token 级上下文预算转换为 PromptBuilder 使用的字符预算。
+
+        项目不绑定特定 tokenizer，因此使用稳定的约 4 字符/token 估算；
+        用户可以通过 LLM_MAX_CONTEXT_CHARS 设置更保守的字符上限。
+        """
+
+        if self.LLM_MAX_CONTEXT_CHARS is not None:
+            return self.LLM_MAX_CONTEXT_CHARS
+        return min(2_000_000, self.LLM_MAX_CONTEXT_TOKENS * 4)
 
     def main_llm_profile(self, *, stage: str = "default") -> LLMRuntimeProfile:
         """构造主 Agent 配置，并按阶段选择可选模型。"""
