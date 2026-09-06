@@ -463,7 +463,7 @@ def test_multiple_scenes_complete_independently(monkeypatch, tmp_path):
         assert "scene_rendered" in scene_events
 
 
-def test_coder_receives_previous_scene_export_in_scene_order(monkeypatch, tmp_path):
+def test_coder_does_not_receive_unrelated_scene_export(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
 
     class ContextCoder(FakeCoder):
@@ -522,7 +522,7 @@ def test_coder_receives_previous_scene_export_in_scene_order(monkeypatch, tmp_pa
     orchestrator._run_scheduler(ctx)
 
     assert coder.inherited[0] == ""
-    assert "formula = MathTex" in coder.inherited[1]
+    assert coder.inherited[1] == ""
 
 
 def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, tmp_path):

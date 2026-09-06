@@ -3944,9 +3944,12 @@ class Orchestrator:
         if any(state.visual_best_candidate is not None for state in active_states):
             return False
         if any(
-            state.plan.scene_id > 1 and not state.plan.inherited_elements and not state.plan.handoff
+            state.code or state.exported_elements_code
             for state in active_states
+            if not state.rendered
         ):
+            # 增量/恢复运行可能已经拥有依赖旧代码上下文生成的候选；
+            # 新运行则在此阶段还没有 Scene 代码，可以安全并行。
             return False
 
         # TechnicalSpec 按依赖顺序生成；但它只消费前一场景的技术边界，
