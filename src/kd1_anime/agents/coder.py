@@ -65,9 +65,11 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   `semantic_action` 决定状态：`introduce` 引入新对象，`update` 修改 active source，
   `remove` 退出对象，`camera` 只处理相机，`hold` 不改变状态。具体用哪一种
   Manim Animation（例如 `Transform` 或 `.animate`）由你根据画面选择，不要修改合同或伪造 Python 别名。
-- TechnicalSpec 中每个事件只对应一次 `self.play` 和一个同名 marker；如果一个事件
-  需要同时展示多个对象，使用 `AnimationGroup`/`LaggedStart` 在这一次 `self.play`
-  中组合它们，不要重复使用同一个 marker。事件中的 element 对应的
+- TechnicalSpec 中每个 introduce/update/camera 事件只对应一次 `self.play` 和一个同名
+  marker；如果一个事件需要同时展示多个对象，使用 `AnimationGroup`/`LaggedStart` 在
+  这一次 `self.play` 中组合它们，不要重复使用同一个 marker。remove 事件若无法安全
+  组合，可按不重叠对象拆成多个 `self.play`，重复同一 remove marker，但每段只能处理
+  该事件列出的实际对象。事件中的 element 对应的
   `variable_name` 必须作为实际动画参数出现，不能只播放同名的 `_arrow`、`_label` 或
   `_target` 别名。辅助标签可以作为同一次组合动画的额外对象，但不能替代合同对象。
 - `introduce` 事件必须直接引入合同中 exact 的 target/create 变量；例如合同对象为

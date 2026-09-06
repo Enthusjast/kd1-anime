@@ -682,3 +682,39 @@ class Demo(Scene):
     assert result.is_valid is True, result.errors
     assert any("交叉淡出" in warning for warning in result.warnings)
     assert any("重复退出" in warning for warning in result.warnings)
+
+
+def test_remove_event_can_be_split_across_multiple_plays():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(element_id="old_a", variable_name="old_a", constructor="Text"),
+            TechnicalObject(element_id="old_b", variable_name="old_b", constructor="Text"),
+        ],
+        animations=[
+            {
+                "event_id": "cleanup",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "remove",
+                "source_element_ids": ["old_a", "old_b"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        old_a = Text("a")
+        old_b = Text("b")
+        self.add(old_a, old_b)
+        # KD1_ANIMATION_EVENT: cleanup
+        self.play(FadeOut(old_a))
+        # KD1_ANIMATION_EVENT: cleanup
+        self.play(FadeOut(old_b))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+    assert any("分段清理事件" in warning for warning in result.warnings)

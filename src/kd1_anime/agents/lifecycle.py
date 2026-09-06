@@ -824,7 +824,11 @@ def validate_animation_lifecycle(
     markers = _event_markers(code)
     marker_ids = [event_id for _, event_id in markers]
     for event_id in sorted({item for item in marker_ids if marker_ids.count(item) > 1}):
-        errors.append(f"动画事件标记重复: {event_id}")
+        event = event_by_id.get(event_id)
+        if event is not None and event.semantic_action == "remove":
+            warnings.append(f"动画事件标记重复: {event_id}；按分段清理事件合并校验")
+        else:
+            errors.append(f"动画事件标记重复: {event_id}")
 
     object_by_variable = {
         item.variable_name: item for item in technical_spec.objects if item.variable_name
@@ -858,6 +862,7 @@ def validate_animation_lifecycle(
     ever_active: set[str] = set(active)
     seen_assignments: set[str] = set()
     used_event_ids: set[str] = set()
+    event_actual_objects: dict[str, set[str]] = {}
     markers_required = bool(technical_spec.animations)
 
     def mapped(names: set[str]) -> set[str]:
@@ -948,7 +953,7 @@ def validate_animation_lifecycle(
                 "请在上一行写 # KD1_ANIMATION_EVENT: <event_id>"
             )
         elif marker_id is not None:
-            if marker_id in used_event_ids:
+            if marker_id in used_event_ids and (event is None or event.semantic_action != "remove"):
                 errors.append(f"第 {node.lineno} 行重复使用动画事件标记: {marker_id}")
             used_event_ids.add(marker_id)
             if event is None and not marker_id.startswith(_AUTO_EVENT_PREFIX):
@@ -1056,13 +1061,16 @@ def validate_animation_lifecycle(
         actual_sources = mapped({name for call in invocations for name in call.source_names})
         actual_targets = mapped({name for call in invocations for name in call.target_names})
         expected = event_sources | event_targets | event_creates | event_removes
+        event_actual_objects.setdefault(event.event_id, set()).update(
+            actual_sources | actual_targets
+        )
         already_exited_optional = {
             name
             for name in expected
             if name in ever_active and name not in active and name in optional_variables
         }
         missing_expected = expected - (actual_sources | actual_targets) - already_exited_optional
-        if missing_expected:
+        if missing_expected and action != "remove":
             errors.append(
                 f"第 {node.lineno} 行事件 {event.event_id} 未操作合同对象: "
                 + ", ".join(sorted(missing_expected))
@@ -1144,6 +1152,26 @@ def validate_animation_lifecycle(
         elif action == "camera":
             # 相机事件不改变 Mobject 状态。
             pass
+
+    # 清理事件可能被 Coder 拆成多个连续的 self.play；此时按同一 marker
+    # 的实际对象并集检查，而不是要求每一段重复操作整个合同集合。
+    for event_id, event in event_by_id.items():
+        if event.semantic_action != "remove":
+            continue
+        expected = {
+            variable_by_element[element_id]
+            for element_id in (*event.source_element_ids, *event.remove_element_ids)
+            if element_id in variable_by_element
+        }
+        actual = event_actual_objects.get(event_id, set())
+        already_exited_optional = {
+            name
+            for name in expected
+            if name in ever_active and name not in active and name in optional_variables
+        }
+        missing = expected - actual - already_exited_optional
+        if missing:
+            errors.append(f"事件 {event_id} 未操作合同对象: " + ", ".join(sorted(missing)))
 
     if markers_required:
         unused = set(event_by_id) - used_event_ids
