@@ -18,6 +18,29 @@
 - 让没有 Slurm 的环境也能通过 dry-run 验证规划、技术合同、代码校验和审查流程；必要时
   也可以显式选择本地前台正式渲染。
 
+### 1.1 设计思路
+
+系统把 LLM 放在“高创造性、低信任”的边界，把确定性逻辑放在“低创造性、高信任”的核心：
+
+1. Planner 先固定数学事实、教学依赖和场景边界，避免 Coder 用代码掩盖错误计划；
+2. Technical Planner 将分镜编译为可模拟的语义合同，提前暴露对象和生命周期冲突；
+3. Coder 只实现已经批准的合同，候选代码必须通过统一接纳入口；
+4. 渲染后端只消费已验证代码，并用 Job、代码哈希和视频哈希绑定产物；
+5. 任意阶段失败时，系统保留可诊断状态和最佳候选，而不是依赖进程内临时状态。
+
+默认 relaxed 模式优先保证流水线收敛：LLM-only 审查意见可以成为 warning；strict 模式
+则保留完整有限审查。无论模式如何变化，AST、安全、数学合同、生命周期和视频产物校验
+始终是硬边界。
+
+### 1.2 主要技术难点
+
+- **数学正确性**：需要在自然语言、等式、矩阵、几何面积和教学依赖之间建立可计算合同；
+- **跨场景状态**：Mobject 的 Python 变量身份与 Manim Scene 中的 active 状态并不等价，必须同时维护导出区、状态账本和哈希；
+- **不可信代码执行**：生成代码来自模型，既要允许丰富的 Manim API，又要阻止文件、网络、shell、动态执行和危险导入；
+- **分布式渲染一致性**：Slurm 状态、共享文件系统、容器、GPU、XeLaTeX 和 FFmpeg 版本都可能造成“作业成功但产物无效”；
+- **并发与恢复**：分镜可并行、代码交接需串行、渲染可并行，同时所有检查点必须支持进程中断和安全 resume；
+- **多模型边界**：主模型、视觉模型、Embedding 和 Reranker 的协议、权限、超时和失败语义不同，不能共享隐式配置。
+
 ## 2. 组件
 
 ```text
@@ -68,6 +91,19 @@ kd1_anime.orchestrator ───── callback events ────────�
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
+
+### 2.1 功能模块职责
+
+| 模块 | 职责 | 关键边界 |
+| --- | --- | --- |
+| Planning | 生成概要、教学合同、分镜和连续性圣经 | 只决定“教什么”和“场景边界” |
+| Plan Compiler/Review | 核验等式、几何、时间线和交接合同 | 确定性数学错误不能交给 Coder 修补 |
+| Technical Planner | 把 ScenePlan 编译为 TechnicalSpec v2 | 只描述语义状态，不绑定具体动画类 |
+| Coder/Reviewer | 生成和审查 Manim Scene | 所有代码变化必须重新校验和审查 |
+| Candidate Acceptor | 统一接纳 Coder、AutoFix、回滚和视觉候选 | AST、API、连续性、生命周期一次性核验 |
+| Rendering | Smoke、Slurm/local 渲染和产物验证 | Job、代码、视频和 renderer 身份必须一致 |
+| Recovery/Run Store | 原子 manifest、锁、事件和恢复 | 不凭 PID 或共享目录猜测状态 |
+| RAG/Evaluation | 文档检索、视觉评估和离线统计 | 失败记录为 degraded/unknown，不伪造结论 |
 
 ## 3. 执行模型
 
