@@ -89,12 +89,12 @@ ARCHITECTURE.md 描述模块之间的依赖、状态机、阶段合同和安全�
 1. README.md 的快速开始或命令示例；
 2. docs/configuration.md 或 docs/troubleshooting.md；
 3. CHANGELOG.md 的 Unreleased；
-4. 必要时更新 .env.example、install.sh 和 ARCHITECTURE.md。
+4. 必要时更新 install.sh、docs/configuration.md 和 ARCHITECTURE.md。
 
 新增配置时要在以下位置保持一致：
 
 - src/kd1_anime/config.py；
-- .env.example；
+- config.toml 的 TOML 映射和最小安装配置；
 - install.sh 生成的用户模板；
 - README 或 docs/configuration.md；
 - 相关配置解析和默认值测试。

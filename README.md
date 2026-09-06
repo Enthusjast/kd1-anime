@@ -179,6 +179,12 @@ kd1-anime generate "解释欧拉公式的几何意义"
 # 没有 Slurm 时验证完整的计划与代码生成流程
 kd1-anime generate "解释特征值的几何意义" --dry-run
 
+# 默认 relaxed：确定性错误仍阻断，LLM Review 失败记录 warning
+kd1-anime generate "解释特征值的几何意义" --dry-run --relaxed
+
+# strict：启用严格的有限审查
+kd1-anime generate "解释特征值的几何意义" --dry-run --strict
+
 # 需要显式执行本地低质量 Smoke/Frame Canary 时再打开；会执行生成代码
 kd1-anime generate "解释特征值的几何意义" --dry-run --smoke
 ```
@@ -295,7 +301,7 @@ kd1-anime stats <run-id> --json
 kd1-anime clean --older-than 30d --yes
 ```
 
-启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v7；v4–v6 可以只读查看，但不能安全继续修改。
+启动程序不会自动弹出历史可恢复运行。请先执行 `status` 找到 run ID，再显式执行 `resume`。恢复要求当前可写的 manifest schema 为 v8；v4–v7 可以只读查看，但不能安全继续修改。恢复时会沿用清单中的 `generation_mode`。
 
 ### 环境和模型诊断
 
@@ -319,7 +325,7 @@ kd1-anime test-llm --no-json-mode --verbose
 ## 配置
 
 完整配置参考见 [`docs/configuration.md`](docs/configuration.md)。安装器只生成必要配置，
-未填写的审查、重试、监控等选项使用程序默认值；旧版 `.env` 模板 [`.env.example`](.env.example) 仍保留用于兼容。常用配置如下：
+未填写的审查、重试、监控等选项使用程序默认值；旧版 `.env` 仍可兼容读取，但不再是安装必需文件。常用配置如下：
 
 | 配置项 | 默认值 | 作用 |
 | --- | ---: | --- |
@@ -350,8 +356,8 @@ kd1-anime test-llm --no-json-mode --verbose
 | `MAX_PLAN_REVIEW_ROUNDS` | `2` | 单场景计划审查/重规划轮数 |
 | `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 计划反馈后的 Planner 总重调用次数 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 连续性局部重规划次数；耗尽后 warning 放行 |
-| `MAX_REVIEW_ROUNDS` | `8` | 单场景代码审查/重写轮数 |
-| `MAX_LOW_RISK_REVIEW_ROUNDS` | `2` | 低风险场景的审查轮数；确定性检查始终执行 |
+| `MAX_REVIEW_ROUNDS` | `8` | strict 模式单场景代码审查/重写轮数；relaxed 不使用固定上限 |
+| `MAX_LOW_RISK_REVIEW_ROUNDS` | `2` | strict 模式低风险场景审查轮数；确定性检查始终执行 |
 | `GENERATION_MODE` | `relaxed` | 默认生成策略：`relaxed` 或 `strict` |
 | `MAX_STAGNANT_ATTEMPTS` | `2` | 渲染修复无进展后切换 IR/安全模板的次数 |
 | `MAX_FIX_ATTEMPTS` | `8` | 渲染失败后的代码修复次数 |
@@ -478,7 +484,7 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
     ├── eval_results/            # 独立 evaluate 命令的报告
     └── runs/<run-id>/
         ├── prompt.md            # 需求文件；不是 prompt.txt
-        ├── manifest.json        # 当前为 schema v7
+        ├── manifest.json        # 当前为 schema v8
         ├── events.jsonl         # 脱敏事件轨迹
         ├── scenes/              # Python Scene 与 sbatch 脚本
         ├── logs/                # stdout/stderr
@@ -500,7 +506,7 @@ kd1-anime status
 kd1-anime resume 20260831-120000-1234abcd
 ```
 
-旧版本的 `~/.config/kd1-anime/.env` 会先非破坏地迁移并转换为 `~/.kd1-anime/config.toml`；旧文件不会删除。若 TOML 转换暂时失败，程序仍会兼容读取旧 `.env`。旧项目目录中的相对 `workspace/` 不会自动搬迁，以避免启动时复制大型视频。
+旧版本的 `~/.config/kd1-anime/.env` 会先非破坏地迁移并转换为 `~/.kd1-anime/config.toml`；旧文件不会删除。若 TOML 转换暂时失败，程序仍会兼容读取旧 `.env`。旧项目目录中的相对 `workspace/` 不会自动搬迁，以避免启动时复制大型视频。v7 manifest 会在读取时补齐默认 `generation_mode=relaxed` 并升级为 v8 后再恢复。
 
 ## 增量渲染与批量处理
 

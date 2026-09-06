@@ -64,7 +64,7 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── stats.py                清单/事件日志离线统计
        ├── agents/state_ledger.py  场景边界语义账本与渲染证据
        ├── security.py             脱敏和 JSON-safe 诊断序列化
-       └── run_store.py            Manifest v7、原子检查点、运行锁
+       └── run_store.py            Manifest v8、原子检查点、运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
@@ -141,7 +141,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Scene 类必须实现 `construct()`；
 - 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；失败反馈交回 Coder，最多尝试 `CODE_VALIDATION_ATTEMPTS` 次。每个 `self.play` 的标记必须对应合同事件；静态分析器无法识别的具体动画调用只记录 warning，不因此拒绝候选。包含未知调用的 dry-run 场景会自动强制低质量 frame+短视频 Smoke Render。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
+若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；strict 模式最多尝试 `CODE_VALIDATION_ATTEMPTS` 次，relaxed 模式允许继续生成不同候选，只有候选完全停滞时才终止。每个 `self.play` 的标记必须对应合同事件；静态分析器无法识别的具体动画调用只记录 warning，不因此拒绝候选。包含未知调用的 dry-run 场景会自动强制低质量 frame+短视频 Smoke Render。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。Orchestrator 通过 AST 安全提取并保存为下一场景的 `[Inherited Elements Code]`，同时更新运行级 ElementManifest。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
 
 - valid / `info`：通过；
 - `minor`：至少一条可精确唯一匹配的查找替换；
@@ -227,7 +227,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v7 包含单调 revision、LessonSpec、TeachingGraph、StateLedger、场景 phase、能力合同、代码哈希、审查/修复次数、候选版本、精确 Job、RenderProfile、资源配置、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
+Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v8 包含单调 revision、`generation_mode`、LessonSpec、TeachingGraph、StateLedger、场景 phase、能力合同、代码哈希、审查/修复次数、候选版本、精确 Job、RenderProfile、资源配置、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -236,7 +236,7 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v7 清单只接受当前教学合同、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置；v4–v6 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
+v8 清单只接受当前教学合同、`generation_mode`、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置；v4–v7 仍可只读查看但不能安全恢复或写回，v1-v3 不再猜测迁移，恢复旧版会明确失败并要求重新生成。v7 会在读取时安全补齐 relaxed 默认模式并迁移为 v8。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
 
 `resume` 在持有 `.run.lock` 后读取清单：
 

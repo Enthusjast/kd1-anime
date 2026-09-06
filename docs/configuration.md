@@ -2,7 +2,7 @@
 
 本文是 kd1-anime 当前配置的完整说明。配置字段由
 src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，旧版
-.env 模板 ../.env.example 仍用于兼容。
+.env 仍用于兼容，但不再是安装必需文件。
 
 ## 配置文件与优先级
 
@@ -261,7 +261,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MAX_PROMPT_CHARS | 50000 | 用户需求字符上限 |
 | MAX_CLARIFY_CONTEXT_CHARS | 40000 | 多轮澄清上下文上限 |
 | MAX_LOG_CHARS | 30000 | AutoFixer 接收的日志上限 |
-| CODE_VALIDATION_ATTEMPTS | 3 | 代码校验失败后的重生成次数 |
+| CODE_VALIDATION_ATTEMPTS | 3 | strict 模式代码校验失败后的重生成次数；relaxed 模式无固定上限，候选停滞时终止 |
 | MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH | 1/2/3 | 按场景风险允许的不同代码实现策略数 |
 | MONITOR_POLL_INTERVAL | 10 | Slurm 轮询间隔秒数 |
 | MONITOR_QUEUE_TIMEOUT | 3600 | 排队超时秒数 |

@@ -43,6 +43,26 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
 
     kd1-anime test-llm --no-json-mode --verbose
 
+## 2.1 relaxed 模式仍然失败
+
+`relaxed` 只放宽 LLM Review，不会放过确定性错误。以下错误仍会阻断：
+
+- AST、危险 API、Manim API 或 XeLaTeX 校验失败；
+- TechnicalSpec 数学/生命周期合同无法编译；
+- 场景导出对象未 active、已移除对象仍 active；
+- Smoke Render、正式渲染或视频产物校验失败。
+
+查看本次运行的实际模式：
+
+    kd1-anime status <run-id> --json
+
+检查 JSON 中的 `generation_mode`。TUI 启动行也会显示 `mode=relaxed` 或
+`mode=strict`。如果只是候选代码校验失败，relaxed 会继续生成不同候选；候选完全
+重复时仍会触发停滞保护，避免无限消耗 API。
+
+`--dry-run` 只验证计划、代码和 Smoke Render，不代表正式 Slurm 视频已经成功。正式
+渲染失败时，继续查看 `logs`、`stderr` 和具体 Job 产物。
+
 程序会在进入 chat、plan 或 generate 前做短超时探测；探测失败会立即退出，不会先消耗多轮澄清或规划请求。
 
 ## 3. RAG 显示 degraded、索引过期或无法启动
@@ -243,7 +263,8 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
 恢复使用原子 manifest 和运行级锁。它会重新核对代码 SHA-256、Renderer/Merge Profile、精确
 Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因为重启而默认为未开始。
 
-如果 manifest 不是 v7，旧清单可以只读查看，但不能安全写回。建议保留旧目录用于诊断，并重新生成
+如果 manifest 不是 v8，v4–v7 旧清单可以只读查看，但不能安全写回。v7 清单读取时会补齐
+`generation_mode=relaxed` 并迁移到 v8。建议保留旧目录用于诊断，并重新生成
 新的运行，而不是手工修改 manifest。
 
 ## 12. 运行很慢或看起来卡住
