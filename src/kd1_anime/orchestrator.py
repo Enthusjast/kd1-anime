@@ -46,6 +46,7 @@ from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
     detect_unknown_animations,
+    repair_initial_active_alias_lifecycle,
     repair_missing_animation_markers,
     repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
@@ -1698,6 +1699,13 @@ class Orchestrator:
                 if replacement_repairs:
                     code = replacement_code
                     lifecycle_repairs = (*lifecycle_repairs, *replacement_repairs)
+                alias_code, alias_repairs = repair_initial_active_alias_lifecycle(
+                    code,
+                    technical_spec,
+                )
+                if alias_repairs:
+                    code = alias_code
+                    lifecycle_repairs = (*lifecycle_repairs, *alias_repairs)
                 if lifecycle_repairs:
                     log = getattr(agent, "_log", None)
                     if callable(log):
