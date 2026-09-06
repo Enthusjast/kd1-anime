@@ -487,6 +487,63 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
     assert ctx.continuity_review_round == 1
 
 
+def test_relaxed_plan_review_repairs_verified_blocking_issue(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    current_plan = plan()
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        generation_mode="relaxed",
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title=current_plan.title,
+                duration_seconds=current_plan.duration_seconds,
+                purpose=current_plan.purpose,
+                math_concept=current_plan.math_concept,
+            )
+        ],
+        scene_states={1: SceneState(plan=current_plan, plan_ready=True)},
+        plan_review_status="pending",
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+
+    class BlockingReviewer:
+        def review(self, *args, **kwargs):
+            return PlanReviewResult(
+                is_valid=False,
+                severity="major",
+                issues=[
+                    PlanReviewIssue(
+                        category="math",
+                        severity="major",
+                        confidence="high",
+                        evidence_type="calculation",
+                        evidence="a^2+b^2=d^2",
+                        field="computation",
+                        message="公式两侧确定不等价",
+                        fix_instruction="修正右侧表达式",
+                    )
+                ],
+            )
+
+    class SamePlanPlanner:
+        def plan_detail(self, *args, **kwargs):
+            return current_plan
+
+    monkeypatch.setattr(module, "PlanReviewerAgent", BlockingReviewer)
+    monkeypatch.setattr(module, "PlannerAgent", SamePlanPlanner)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert ctx.scene_states[1].failed is True
+    assert ctx.scene_states[1].failure_category == "planning"
+    assert "公式两侧确定不等价" in ctx.scene_states[1].failure_reason
+
+
 def test_initial_plan_reviews_run_in_parallel(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     states = [
@@ -1799,6 +1856,43 @@ def test_relaxed_review_soft_passes_llm_failure_after_deterministic_gate(monkeyp
     assert state.reviewed is True
     assert state.give_up is False
     assert any("relaxed Review warning" in warning for warning in ctx.continuity_warnings)
+
+
+def test_relaxed_review_repairs_verified_blocking_finding(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(plan=plan(), code=code, class_name="Demo", plan_ready=True)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        generation_mode="relaxed",
+        scene_states={1: state},
+    )
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="确定性运行时问题",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                confidence="high",
+                evidence_type="source_code",
+                evidence="self.wait()",
+                why="当前调用参数与合同不一致",
+                repair="修复当前代码",
+            )
+        ],
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert state.reviewed is False
+    assert state.give_up is False
+    assert state.rewrite_feedback
 
 
 def test_relaxed_review_does_not_bypass_deterministic_failure(monkeypatch, tmp_path):

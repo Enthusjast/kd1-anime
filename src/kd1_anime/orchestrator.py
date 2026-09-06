@@ -5894,10 +5894,8 @@ class Orchestrator:
                 )
                 if ctx.generation_mode == "relaxed" and not deterministic and issues:
                     ctx.continuity_warnings.append(
-                        f"Scene {scene_id} 计划 LLM 审查意见已降级为 warning（relaxed 模式）"
+                        f"Scene {scene_id} relaxed 计划审查发现带证据的阻断问题，进入修复"
                     )
-                    non_blocking_issues = [*non_blocking_issues, *issues]
-                    issues = []
                 self._write_stage_artifact(
                     ctx,
                     f"plan_review_scene_{scene_id}_{state.plan_review_round + 1}.json",
@@ -6435,8 +6433,9 @@ class Orchestrator:
                 ctx.teaching_graph,
             )
             if ctx.generation_mode == "relaxed" and not deterministic:
-                # relaxed 模式下连续性 LLM 意见本身不会阻断或触发重规划；
-                # 没有确定性冲突时跳过这次纯诊断调用，减少一次全片长上下文请求。
+                # 没有确定性冲突时跳过纯诊断调用；但如果前面已有一次
+                # LLM 连续性结论，major issue 仍是“必须阻断”的结论，不能
+                # 因 relaxed 而静默吞掉。minor 继续作为 warning。
                 warning = "relaxed 模式无确定性连续性冲突，跳过非阻断 LLM 连续性审查"
                 with self._state_lock:
                     ctx.continuity_review_status = "passed"
@@ -6483,13 +6482,18 @@ class Orchestrator:
                     return
                 self._emit("continuity_warning", reason=warning)
 
-            if ctx.generation_mode == "relaxed" and not deterministic:
-                llm_issues = []
-            elif ctx.generation_mode == "relaxed" and llm_issues:
-                ctx.continuity_warnings.append(
-                    f"连续性 LLM 审查意见已降级为 warning（第 {current_round} 轮）"
-                )
-                llm_issues = []
+            if ctx.generation_mode == "relaxed" and llm_issues:
+                blocking_llm_issues = [issue for issue in llm_issues if issue.severity == "major"]
+                if blocking_llm_issues:
+                    ctx.continuity_warnings.append(
+                        f"relaxed 连续性审查发现 {len(blocking_llm_issues)} 个 major 问题，进入修复"
+                    )
+                    llm_issues = blocking_llm_issues
+                else:
+                    ctx.continuity_warnings.append(
+                        f"连续性 LLM 审查意见已降级为 warning（第 {current_round} 轮）"
+                    )
+                    llm_issues = []
 
             issues = self._dedupe_continuity_issues([*deterministic, *llm_issues])
             if not issues:
@@ -9008,7 +9012,16 @@ class Orchestrator:
                 "result": result.model_dump(mode="json"),
             },
         )
-        if not result.is_valid and self._is_relaxed(ctx) and allow_relaxed_soft_pass:
+        # ReviewerAgent 已经把低置信度/无证据的意见归一化为 valid+warning。
+        # relaxed 只软放行“没有可验证修复内容”的失败；一旦结果包含
+        # high-confidence finding 或唯一可匹配 fix，仍必须进入修复循环。
+        relaxed_requires_repair = bool(result.findings or result.fixes)
+        if (
+            not result.is_valid
+            and self._is_relaxed(ctx)
+            and allow_relaxed_soft_pass
+            and not relaxed_requires_repair
+        ):
             warning_messages = [
                 f"Scene {scene_id} relaxed Review warning：{result.feedback[:2_000]}"
             ]

@@ -276,7 +276,7 @@ INIT
 - **Render Fix** 只处理渲染日志暴露的代码问题；环境、Slurm、字体和显示服务错误不会盲目交给模型重写。
 - **Continuity Review** 只处理跨场景边界。达到 `MAX_CONTINUITY_FIX_ROUNDS` 后会记录 warning 并沿用当时的可验证计划继续，不会因为连续性审查耗尽而阻断整条流水线。
 - **relaxed 快速路径**：没有确定性连续性冲突时跳过不会阻断生成的连续性 LLM 审查；LLM 审查会收到明确的宽松策略，只把主观布局/风格建议记录为 warning；若 Planner 对确定性问题原样返回同一计划，会停止无效重规划并优先切换保守方案，避免无效的长上下文调用。
-- **生成模式**：默认 `relaxed` 模式只让确定性校验阻断错误，LLM Review 的低置信度意见或调用失败会记录 warning；使用 `--strict` 或 `[pipeline] generation_mode = "strict"` 保留严格 Review，所有计划、代码、连续性和渲染修复阶段最多 8 轮。`resume` 始终沿用运行清单中的模式。
+- **生成模式**：默认 `relaxed` 模式只让确定性校验或带可核验证据的高置信度阻断结论阻断错误；低置信度意见或调用失败会记录 warning，但 verified blocker 仍会进入修复。使用 `--strict` 或 `[pipeline] generation_mode = "strict"` 保留严格 Review，所有计划、代码、连续性和渲染修复阶段最多 8 轮。`resume` 始终沿用运行清单中的模式。
 - **可靠性回退**：精确 traceback 证据和修复停滞检测默认启用；确定性 Scene IR、稳定场景模板等模板化生成路径属于实验性功能，只有设置 `CODEGEN_MODE=hybrid/ir` 才启用。
 
 ### 场景粒度与并行

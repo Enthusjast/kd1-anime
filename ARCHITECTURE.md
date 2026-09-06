@@ -207,7 +207,7 @@ Scene IR 是混合模式下的确定性后备路径：它从已经批准的 Scen
 
 Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
 
-连续性审查与代码审查同样分离。relaxed 模式的 Coder/AutoFix 无进展时会优先尝试已通过确定性校验的 IR/安全代码候选；回退不可用时仍可继续调用 LLM，不把该升级阈值当作固定修复上限。连续性修正轮数耗尽时，系统会把当时已经通过确定性
+连续性审查与代码审查同样分离。relaxed 模式的 Coder/AutoFix 无进展时会优先尝试已通过确定性校验的 IR/安全代码候选；回退不可用时仍可继续调用 LLM，不把该升级阈值当作固定修复上限。relaxed Review 仍会修复带可核验证据的 high-confidence blocker，只有低置信度或无法验证的意见降级为 warning。连续性修正轮数耗尽时，系统会把当时已经通过确定性
 检查的计划标记为 warning 并继续编码/渲染；恢复时最多自动重查一次，避免每次启动都
 重新进入同一循环。代码审查中的数学/连续性 finding 只有在证据明确指向计划本身时才回到
 Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder 层修复。
