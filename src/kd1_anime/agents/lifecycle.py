@@ -838,6 +838,12 @@ def repair_missing_animation_markers(
             best = [event for score, event in candidates if score == best_score]
             if len(best) == 1:
                 selected = best[0]
+            elif best and kinds & {"update", "hold"}:
+                # 同一 source 在连续的 update 事件中反复出现时，代码
+                # 顺序就是唯一稳定的额外信息。优先选择时间线中最早的
+                # 尚未使用事件，避免因为一次遗漏 marker 就让整轮候选
+                # 无法接纳；后续事件仍会继续消费剩余的 marker。
+                selected = best[0]
 
         if selected is not None:
             marker_id = selected.event_id
@@ -919,27 +925,39 @@ def repair_initial_active_alias_lifecycle(
     if not initially_active:
         return code, ()
 
-    alias_re = re.compile(
-        r"^(?P<base>[A-Za-z_]\w*)_(?:initial|base|unit|start|target|copy|"
-        r"rotated|stretched|transformed|final|p_inverse|d|p)$"
-    )
     aliases: dict[str, str] = {}
+    alias_assignments: list[tuple[str, set[str]]] = []
     for node in _statement_nodes(construct):
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
             continue
         target = node.targets[0]
         if not isinstance(target, ast.Name):
             continue
-        match = alias_re.fullmatch(target.id)
-        if match is None or match.group("base") not in initially_active:
+        base_candidates = {base for base in initially_active if target.id.startswith(f"{base}_")}
+        if not base_candidates:
             continue
-        # 要求临时定义的表达式确实引用了合同对象，避免把任意业务变量
-        # 仅因命名相似就重写。
-        if any(
-            isinstance(child, ast.Name) and child.id == match.group("base")
-            for child in ast.walk(node.value)
-        ):
-            aliases[target.id] = match.group("base")
+        referenced_names = {
+            child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)
+        }
+        alias_assignments.append((target.id, referenced_names))
+    # 解析 ``grid_standard -> grid_rotated -> grid_stretched`` 这样的复制
+    # 链。每一层仍必须是以 active 合同变量为前缀的赋值，且表达式引用
+    # 了已确认的上一层，避免把无关的同名业务变量当成 active source。
+    pending = list(alias_assignments)
+    while pending:
+        unresolved: list[tuple[str, set[str]]] = []
+        progressed = False
+        for alias, roots in pending:
+            resolved_roots = {root for root in roots if root in initially_active}
+            resolved_roots.update(aliases[root] for root in roots if root in aliases)
+            if resolved_roots:
+                aliases[alias] = sorted(resolved_roots)[0]
+                progressed = True
+            else:
+                unresolved.append((alias, roots))
+        if not progressed:
+            break
+        pending = unresolved
     if not aliases:
         return code, ()
 
