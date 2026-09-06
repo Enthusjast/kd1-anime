@@ -50,7 +50,8 @@ def test_coder_prompt_has_continuity_contract():
     assert "仅仅写入导出区不等于对象已经 active" in CODER_SYSTEM_PROMPT
     assert "VGroup" in CODER_SYSTEM_PROMPT
     assert "单独 FadeIn 其子对象不会使 group active" in CODER_SYSTEM_PROMPT
-    assert "TechnicalSpec 中每个 introduce/update/camera 事件只对应一次" in CODER_SYSTEM_PROMPT
+    assert "TechnicalSpec 中每个 introduce 事件只对应一次" in CODER_SYSTEM_PROMPT
+    assert "update 或 camera" in CODER_SYSTEM_PROMPT
     assert "不能只播放同名的 `_arrow`、`_label`" in CODER_SYSTEM_PROMPT
     assert "initially_active=true" in CODER_SYSTEM_PROMPT
     assert "未经验证的碎片移动" in CODER_SYSTEM_PROMPT
