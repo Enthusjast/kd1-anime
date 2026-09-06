@@ -713,7 +713,8 @@ class SlurmDispatcher:
                 "module=importlib.util.module_from_spec(spec); "
                 "spec.loader.exec_module(module); "
                 "candidate=getattr(module, name, None); "
-                "raise SystemExit(1) if not isinstance(candidate, type) else None"
+                "if not isinstance(candidate, type):\n"
+                "    raise SystemExit(1)"
             )
             lines.append(
                 smoke_run(

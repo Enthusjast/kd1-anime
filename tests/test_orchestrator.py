@@ -1540,8 +1540,10 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "video")
     monkeypatch.setattr(module.settings, "ADAPTIVE_SMOKE_RENDER", False)
+    captured_commands = []
 
     def successful_run(command, **kwargs):
+        captured_commands.append(command)
         if "--media_dir" not in command:
             return module.subprocess.CompletedProcess(command, 0, "", "")
         media_index = command.index("--media_dir") + 1
@@ -1553,6 +1555,9 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
 
     monkeypatch.setattr(module, "_run_limited_process", successful_run)
     orchestrator._local_smoke_render(ctx, state)
+    import_command = next(command for command in captured_commands if "-c" in command)
+    import_check = import_command[import_command.index("-c") + 1]
+    assert "if not isinstance(candidate, type):" in import_check
 
     def failed_run(command, **kwargs):
         return module.subprocess.CompletedProcess(command, 1, "", "render boom")

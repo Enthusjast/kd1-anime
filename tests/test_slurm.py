@@ -166,6 +166,8 @@ def test_script_runs_import_only_and_short_video_stages(monkeypatch, tmp_path):
     assert "importlib.util" in script
     assert "import-only 检查通过" in script
     assert "--from_animation_number 0,3" in script
+    assert "if not isinstance(candidate, type):" in script
+    assert "raise SystemExit(1) if" not in script
 
 
 def test_script_can_run_fast_frame_canary_without_video_probe(monkeypatch, tmp_path):
