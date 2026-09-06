@@ -1737,6 +1737,35 @@ def test_relaxed_review_soft_passes_llm_failure_after_deterministic_gate(monkeyp
     assert any("relaxed Review warning" in warning for warning in ctx.continuity_warnings)
 
 
+def test_relaxed_review_does_not_bypass_deterministic_failure(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        generation_mode="relaxed",
+        scene_states={1: state},
+    )
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    Orchestrator()._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(is_valid=False, severity="major", feedback="确定性导出合同错误"),
+        allow_relaxed_soft_pass=False,
+    )
+
+    assert state.reviewed is False
+    assert state.give_up is False
+
+
 def test_code_level_math_finding_is_sent_back_to_coder_not_planner(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     run_paths.scenes.mkdir(parents=True)

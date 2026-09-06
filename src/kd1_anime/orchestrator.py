@@ -6882,7 +6882,6 @@ class Orchestrator:
             return
         self._emit("scene_reviewing", scene_id=scene_id)
         deterministic_review_error = False
-        deterministic_review_error = False
         try:
             # 导出区是确定性的交接合同。先校验再调用 Reviewer，避免把重复
             # 导出标记、缺失元素等可直接修复的问题交给 LLM，尤其避免长上下文
