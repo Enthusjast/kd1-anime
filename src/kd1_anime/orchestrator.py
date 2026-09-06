@@ -80,7 +80,7 @@ from kd1_anime.agents.planner import (
 )
 from kd1_anime.agents.progress import ProgressSnapshot, classify_progress
 from kd1_anime.agents.render_error_parser import RenderErrorEvidence, extract_render_error
-from kd1_anime.agents.review_policy import review_budget
+from kd1_anime.agents.review_policy import review_budget, review_mode_policy
 from kd1_anime.agents.reviewer import ReviewerAgent, ReviewFinding, ReviewResult
 from kd1_anime.agents.risk import assess_scene_risk
 from kd1_anime.agents.safe_fallback import (
@@ -391,7 +391,9 @@ class PipelineContext:
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
-    generation_mode: GenerationMode = field(default_factory=lambda: settings.GENERATION_MODE)
+    # 直接构造 PipelineContext 的库调用/旧测试保持严格兼容；正式新运行
+    # 会在入口处显式写入 settings.GENERATION_MODE。
+    generation_mode: GenerationMode = "strict"
     # 本次运行固定使用的渲染后端；恢复时只能使用 manifest 中的值。
     backend: RenderBackendName = field(default_factory=lambda: settings.RENDER_BACKEND)
     # 显式 --smoke 可让 dry-run 执行一次本地低质量预检；该开关写入
@@ -612,7 +614,7 @@ class Orchestrator:
         ]
         if not stale_scenes:
             return False
-        if manifest.schema_version != 7:
+        if manifest.schema_version not in {7, 8}:
             return False
         terminal_statuses = {"COMPLETED", "CANCELLED", *FAILURE_STATES}
         for scene_id, scene in stale_scenes:
@@ -836,6 +838,10 @@ class Orchestrator:
         return name in parameters or any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
         )
+
+    @staticmethod
+    def _is_relaxed(ctx: PipelineContext) -> bool:
+        return ctx.generation_mode == "relaxed"
 
     def _current_rag_profile(self) -> RagRuntimeProfile:
         if not self.rag.enabled:
@@ -2059,6 +2065,7 @@ class Orchestrator:
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
+            generation_mode=settings.GENERATION_MODE,
             backend=selected_backend,
             dry_run=dry_run,
             interactive=interactive,
@@ -2472,6 +2479,7 @@ class Orchestrator:
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
+            generation_mode=settings.GENERATION_MODE,
             paths=RunPaths.create(output_path),
             dry_run=True,
             interactive=interactive,
@@ -2570,6 +2578,7 @@ class Orchestrator:
         ctx = PipelineContext(
             user_prompt=user_prompt,
             original_prompt=user_prompt,
+            generation_mode=settings.GENERATION_MODE,
             backend=selected_backend,
             paths=RunPaths.create(output_path),
             dry_run=dry_run,
@@ -5331,8 +5340,9 @@ class Orchestrator:
             return
 
         self._emit("plan_reviewing", scene_count=len(active_states))
-        max_rounds = max(1, settings.MAX_PLAN_REVIEW_ROUNDS)
-        max_replans = max(1, settings.MAX_PLAN_REPLAN_ATTEMPTS)
+        mode_policy = review_mode_policy(ctx.generation_mode)
+        max_rounds = mode_policy.limit(settings.MAX_PLAN_REVIEW_ROUNDS)
+        max_replans = mode_policy.limit(settings.MAX_PLAN_REPLAN_ATTEMPTS)
         # ``plan_review_round`` 描述当前这份计划的审查轮数；每次重规划
         # 后它会归零。因此必须另行累计 Planner 调用次数，否则模型在
         # 同一冲突上反复返回等价计划时，内层 while 永远不会结束。
@@ -5385,19 +5395,34 @@ class Orchestrator:
                                 teaching_graph=ctx.teaching_graph,
                             )
                     except Exception as exc:
-                        self._plan_review_failure(
-                            ctx,
-                            scene_id,
-                            state,
-                            f"Scene {scene_id} 计划审查调用失败: {exc}",
-                        )
-                        break
+                        if ctx.generation_mode == "relaxed" and not deterministic:
+                            result = PlanReviewResult(
+                                is_valid=True,
+                                summary=f"计划审查调用失败，relaxed 模式放行：{exc}",
+                            )
+                            ctx.continuity_warnings.append(
+                                f"Scene {scene_id} 计划审查调用失败，已按 relaxed 模式放行：{exc}"
+                            )
+                        else:
+                            self._plan_review_failure(
+                                ctx,
+                                scene_id,
+                                state,
+                                f"Scene {scene_id} 计划审查调用失败: {exc}",
+                            )
+                            break
 
                 all_issues, issues, non_blocking_issues = classify_plan_review_issues(
                     state.plan,
                     deterministic_issues=deterministic,
                     result=result,
                 )
+                if ctx.generation_mode == "relaxed" and not deterministic and issues:
+                    ctx.continuity_warnings.append(
+                        f"Scene {scene_id} 计划 LLM 审查意见已降级为 warning（relaxed 模式）"
+                    )
+                    non_blocking_issues = [*non_blocking_issues, *issues]
+                    issues = []
                 self._write_stage_artifact(
                     ctx,
                     f"plan_review_scene_{scene_id}_{state.plan_review_round + 1}.json",
@@ -5474,9 +5499,8 @@ class Orchestrator:
                     identical_count = state.identical_plan_review_count
                     self._checkpoint(ctx, State.PLAN_REVIEWING)
 
-                exhausted = (
-                    review_round >= max_rounds
-                    or identical_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
+                exhausted = (max_rounds is not None and review_round >= max_rounds) or (
+                    identical_count >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
                 )
                 if exhausted:
                     if self._activate_safe_fallback(ctx, scene_id, state, feedback):
@@ -5492,7 +5516,7 @@ class Orchestrator:
                     break
 
                 replan_count = replan_attempts.get(scene_id, 0)
-                if replan_count >= max_replans:
+                if max_replans is not None and replan_count >= max_replans:
                     # 每次重规划都会重置当前计划的审查轮数，因此复杂几何
                     # 方案可能永远到不了上面的 ``review_round`` 上限。重规划
                     # 预算耗尽本身也是明确的收敛信号：若反馈确认是高风险几何，
@@ -5869,7 +5893,9 @@ class Orchestrator:
             return
 
         self._emit("continuity_reviewing", scene_count=len(active_states))
-        max_rounds = max(0, settings.MAX_CONTINUITY_FIX_ROUNDS)
+        mode_policy = review_mode_policy(ctx.generation_mode)
+        max_rounds = mode_policy.limit(settings.MAX_CONTINUITY_FIX_ROUNDS)
+        seen_issue_signatures: set[str] = set()
         while True:
             with self._state_lock:
                 ctx.continuity_review_round += 1
@@ -5922,6 +5948,14 @@ class Orchestrator:
                     return
                 self._emit("continuity_warning", reason=warning)
 
+            if ctx.generation_mode == "relaxed" and not deterministic:
+                llm_issues = []
+            elif ctx.generation_mode == "relaxed" and llm_issues:
+                ctx.continuity_warnings.append(
+                    f"连续性 LLM 审查意见已降级为 warning（第 {current_round} 轮）"
+                )
+                llm_issues = []
+
             issues = self._dedupe_continuity_issues([*deterministic, *llm_issues])
             if not issues:
                 with self._state_lock:
@@ -5931,6 +5965,24 @@ class Orchestrator:
                 return
 
             affected_ids = sorted({scene_id for issue in issues for scene_id in issue.scene_ids})
+            if ctx.generation_mode == "relaxed":
+                issue_signature = sha256_text(
+                    json.dumps(
+                        [issue.model_dump(mode="json") for issue in issues],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                if issue_signature in seen_issue_signatures:
+                    warning = "连续性修正未取得进展，relaxed 模式沿用当前计划并继续生成"
+                    with self._state_lock:
+                        ctx.continuity_review_status = "warning"
+                        ctx.continuity_warnings.append(warning)
+                        self._checkpoint(ctx, State.REVIEWING)
+                    self._emit("continuity_review_accepted_with_warning", reason=warning)
+                    self._emit("continuity_warning", reason=warning)
+                    return
+                seen_issue_signatures.add(issue_signature)
             uneditable = [
                 scene_id
                 for scene_id in affected_ids
@@ -5941,7 +5993,7 @@ class Orchestrator:
                     or ctx.scene_states[scene_id].rendered
                 )
             ]
-            if current_round > max_rounds or uneditable:
+            if (max_rounds is not None and current_round > max_rounds) or uneditable:
                 reasons = [
                     f"Scene {scene_id}: "
                     + "; ".join(issue.message for issue in issues if scene_id in issue.scene_ids)
@@ -5958,16 +6010,15 @@ class Orchestrator:
                     ctx.continuity_warnings.append(warning)
                     self._checkpoint(ctx, State.REVIEWING)
                 self._emit("continuity_warning", reason=warning)
+                hit_round_limit = max_rounds is not None and current_round > max_rounds
                 event_data = {
                     "reason": warning,
-                    "reason_type": (
-                        "max_rounds" if current_round > max_rounds else "already_started"
-                    ),
+                    "reason_type": "max_rounds" if hit_round_limit else "already_started",
                     "scene_ids": affected_ids,
                     "round": current_round,
                     "max_rounds": max_rounds,
                 }
-                if current_round > max_rounds:
+                if hit_round_limit:
                     self._emit("continuity_review_exhausted", **event_data)
                 self._emit("continuity_review_accepted_with_warning", **event_data)
                 return
@@ -6867,7 +6918,16 @@ class Orchestrator:
                     review_kwargs["safe_fallback"] = True
                 if self._supports_keyword(reviewer.review, "lesson_spec"):
                     review_kwargs["lesson_spec"] = ctx.lesson_spec
-                result = reviewer.review(state.code, state.plan, **review_kwargs)
+                try:
+                    result = reviewer.review(state.code, state.plan, **review_kwargs)
+                except Exception as exc:
+                    if self._is_relaxed(ctx):
+                        result = ReviewResult(
+                            is_valid=True,
+                            warnings=[f"代码 LLM 审查调用失败，已按 relaxed 模式放行：{exc}"],
+                        )
+                    else:
+                        raise
         if result.is_valid:
             try:
                 self._refresh_scene_export(state)
@@ -8242,6 +8302,28 @@ class Orchestrator:
                 "result": result.model_dump(mode="json"),
             },
         )
+        if not result.is_valid and self._is_relaxed(ctx):
+            warning_messages = [
+                f"Scene {scene_id} relaxed Review warning：{result.feedback[:2_000]}"
+            ]
+            warning_messages.extend(
+                f"Scene {scene_id} relaxed Review warning：{warning}" for warning in result.warnings
+            )
+            with self._state_lock:
+                state.review_round = 0
+                state.review_signature = ""
+                state.identical_review_count = 0
+                state.reviewed = True
+                self._mark_static_verification(state, status="passed")
+                state.failure_reason = ""
+                state.failure_category = ""
+                self._apply_incremental_for_scene(ctx, scene_id, state)
+                self._update_state_ledger(ctx, state)
+                ctx.continuity_warnings.extend(warning_messages[:20])
+                self._checkpoint(ctx, State.REVIEWING)
+            self._emit("scene_review_soft_pass", scene_id=scene_id)
+            self._emit("scene_review_warning", scene_id=scene_id, warnings=warning_messages[:20])
+            return True
         if result.is_valid:
             warning_messages = [
                 f"Scene {scene_id} 代码审查提示：{warning}" for warning in result.warnings
@@ -8359,6 +8441,7 @@ class Orchestrator:
             state.technical_spec,
             global_max_rounds=settings.MAX_REVIEW_ROUNDS,
             low_risk_max_rounds=settings.MAX_LOW_RISK_REVIEW_ROUNDS,
+            generation_mode=ctx.generation_mode,
         )
         self._emit(
             "scene_review_budget",
@@ -8366,7 +8449,7 @@ class Orchestrator:
             risk_level=budget.risk_level,
             max_rounds=budget.max_rounds,
         )
-        if review_round >= budget.max_rounds:
+        if budget.max_rounds is not None and review_round >= budget.max_rounds:
             if self._activate_safe_fallback(ctx, scene_id, state, original_feedback):
                 return True
             with self._state_lock:
