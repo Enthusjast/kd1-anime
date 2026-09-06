@@ -7860,6 +7860,9 @@ class Orchestrator:
                 settings.MAX_FIX_IDENTICAL_ERRORS >= 3
                 and state.stagnant_repair_count >= settings.MAX_STAGNANT_ATTEMPTS
             )
+            max_fix_attempts = review_mode_policy(ctx.generation_mode).limit(
+                settings.MAX_FIX_ATTEMPTS
+            )
             if stagnation_terminal:
                 # 先保存诊断状态；回退候选的安装在锁外完成。
                 self._checkpoint(ctx, State.FIXING)
@@ -7877,10 +7880,12 @@ class Orchestrator:
                 )
                 self._checkpoint(ctx, State.FIXING)
                 terminal = True
-            elif state.fix_attempts >= settings.MAX_FIX_ATTEMPTS:
+            elif max_fix_attempts is not None and state.fix_attempts >= max_fix_attempts:
                 state.give_up = True
                 state.failure_category = "render"
-                state.failure_reason = self._give_up_reason("达到最大渲染修复次数", error_log)
+                state.failure_reason = self._give_up_reason(
+                    f"达到最大渲染修复次数（{max_fix_attempts}）", error_log
+                )
                 self._checkpoint(ctx, State.FIXING)
                 terminal = True
             else:
@@ -7966,7 +7971,7 @@ class Orchestrator:
             "scene_fixing",
             scene_id=scene_id,
             attempt=attempt,
-            max_attempts=settings.MAX_FIX_ATTEMPTS,
+            max_attempts=max_fix_attempts,
         )
         with self._llm_sem:
             fix_kwargs: dict[str, object] = {"renderer": ctx.render_profile.renderer}
