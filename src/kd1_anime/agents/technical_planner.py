@@ -1400,6 +1400,8 @@ TECHNICAL_PLANNER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 的技术�
    source 的 update；不要依赖 Python 重绑定来伪造 active 状态。
 4. 每个事件的对象引用必须已在 objects 声明，且与事件语义一致。事件对应
    ScenePlan.timeline 时，将当前 active 的元素填写到 source_element_ids；不要只写在 api_notes。
+   `hold` 如果只是时间停留，source_element_ids 应留空，让 Coder 使用 self.wait；只有
+   需要对若干对象执行同一保持/强调动画时，才列出全部实际会被 self.play 操作的 source。
 5. 已退出对象不能在后续事件继续作为 source；不得移除 export_element_ids。末尾的临时对象
    必须 remove，或明确保持 exported=false。
 6. 仅使用当前 renderer 支持的相机 API。OpenGL 禁止 camera.frame 和 MovingCameraScene；

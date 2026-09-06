@@ -548,6 +548,26 @@ class Demo(Scene):
     assert any("未在 TechnicalSpec 中声明" in error for error in unknown_result.errors)
 
 
+def test_semantic_marker_can_precede_pure_target_preparation():
+    technical = _semantic_spec("update")
+    technical.objects[0].initially_active = True
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        target = formula.copy()
+        target.scale(1.1)
+        self.play(Transform(formula, target))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+
+
 def test_camera_semantic_event_does_not_require_mobject_lifecycle():
     technical_spec = TechnicalSpec(
         scene_id=1,

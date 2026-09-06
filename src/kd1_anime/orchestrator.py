@@ -1815,6 +1815,18 @@ class Orchestrator:
                         "或改用已有事件；不要自行发明 title_fade_out 等 marker。若合同"
                         "已提供 remove 事件，使用该 exact event_id。\n"
                     )
+                if "缺少语义事件标记" in lifecycle_error:
+                    feedback_parts.append(
+                        "\n事件位置修复规则：目标对象和 copy/apply_matrix 等准备代码可以"
+                        "放在 marker 之前，但 marker 必须紧邻实际 self.play；不要在 marker"
+                        "之后继续写准备语句，否则校验器无法把事件绑定到动画。\n"
+                    )
+                if "hold 未操作合同对象" in lifecycle_error:
+                    feedback_parts.append(
+                        "\nhold 事件修复规则：纯停顿使用 self.wait()，不需要 marker；如果"
+                        "使用 self.play，必须在同一次调用中实际操作 TechnicalSpec 列出的全部"
+                        "source 变量，不能只 Indicate 其中一个公式。\n"
+                    )
                 if "重定义仍处于 active 的对象" in lifecycle_error:
                     feedback_parts.append(
                         "\n生命周期修复规则：导出区只能有一个；继承且需要继续交接的对象只能定义一次，"

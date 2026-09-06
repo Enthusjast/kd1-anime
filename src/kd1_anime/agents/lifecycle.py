@@ -634,12 +634,28 @@ def _event_markers(code: str) -> list[tuple[int, str]]:
 
 
 def _marker_before_line(lines: list[str], line_number: int) -> str | None:
-    """返回 self.play 前最近的事件标记，允许空行和普通注释。"""
+    """返回 self.play 前最近的事件标记。
+
+    Coder 常会先在 marker 后准备 ``copy()``/目标 Mobject，再调用
+    ``self.play``。这些准备语句没有 Scene 副作用，允许 marker 跨过它们，
+    但遇到另一个 ``self.*`` 或控制流就停止，避免把事件错误绑定到后续动画。
+    """
+
+    def is_safe_preparation(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            return True
+        if stripped.startswith(("self.", "if ", "for ", "while ", "with ", "return ", "raise ")):
+            return False
+        if re.match(r"^[A-Za-z_]\w*(?:\[[^\n]*\])?\s*(?:[+\-*/%]?=)", stripped):
+            return True
+        if re.match(r"^[A-Za-z_]\w*(?:\[[^\n]*\])?(?:\.[A-Za-z_]\w*)+\s*\(", stripped):
+            return True
+        return stripped[0] in ")]},"
 
     index = line_number - 2
     while index >= 0:
-        stripped = lines[index].strip()
-        if not stripped or stripped.startswith("#"):
+        if is_safe_preparation(lines[index]):
             match = _EVENT_MARKER_RE.match(lines[index])
             if match:
                 return match.group("event_id")

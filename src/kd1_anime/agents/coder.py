@@ -73,6 +73,14 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - `introduce` 事件必须直接引入合同中 exact 的 target/create 变量；例如合同对象为
   `basis_i` 时，应使用 `Create(basis_i)` 或在 `AnimationGroup` 中使用它。不要在
   同一事件下拆成多个 `self.play`，也不要额外发明 TechnicalSpec 未声明的 marker。
+- 导出区内每个合同 variable 只能赋值一次，尤其是继承对象；不要先写
+  `basis_i = Vector(...)` 再写 `basis_i = VGroup(...)`。若必须同时交接箭头和标签，
+  要么让合同变量本身就是一次性构造的 VGroup，要么保持合同变量为箭头并把标签作为
+  独立辅助对象在同一个 introduce 的 AnimationGroup 中显示，绝不能通过 Python 重绑定。
+- 目标 Mobject、`copy()`、`apply_matrix()` 等准备语句必须放在事件 marker 之前；marker
+  应紧邻实际的 `self.play(...)`（中间只能有普通注释/空行）。不要把 marker 放在目标
+  构造代码之前，也不要把 `self.wait()` 或没有合同对象的高亮动画误写成需要许多 source
+  的 `hold` 事件；纯停顿直接使用 `self.wait()`。
 - `target_element_ids` 在 update 中只是目标快照；若目标需要以新身份留在场景，
   必须另有 introduce 事件。不要把一个事件同时写成引入、更新和移除。
 - 生命周期字段的优先级高于 transition_in/transition_out、persistent_elements 等自由文本：
