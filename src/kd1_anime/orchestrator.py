@@ -148,6 +148,7 @@ from kd1_anime.rendering import (
 from kd1_anime.resources import ResourceCoordinator
 from kd1_anime.run_store import (
     MANIFEST_NAME,
+    MANIFEST_SCHEMA_VERSION,
     RunManifest,
     RunRepository,
     StoredCodeCandidate,
@@ -576,6 +577,11 @@ class Orchestrator:
         state.capability_status = "pending"
         state.candidates = []
         state.static_verification = StaticVerification(status="not_run")
+        Orchestrator._mark_execution_verification(
+            state,
+            status="not_run",
+            error="TechnicalSpec 或继承上下文已变化，需要重新执行渲染",
+        )
 
     @staticmethod
     def _mark_static_verification(
@@ -614,6 +620,29 @@ class Orchestrator:
             duration_seconds=duration_seconds,
             checked_at=datetime.now().astimezone().isoformat(),
             error=error[:10_000],
+        )
+
+    @staticmethod
+    def _invalidate_render_artifact(
+        state: SceneState,
+        *,
+        reason: str = "",
+    ) -> None:
+        """原子地使当前正式渲染结果失效。
+
+        ``artifact``、``rendered`` 和正式执行收据是同一个状态变更的三个
+        部分。过去各个修复分支只清除了前两个字段，留下
+        ``execution_verification=passed/formal_video``，下一次 checkpoint
+        就会写出“正式执行通过但没有产物”的不可恢复清单。所有会让当前
+        视频失效的路径都必须通过这个小事务完成清理。
+        """
+
+        state.artifact = None
+        state.rendered = False
+        Orchestrator._mark_execution_verification(
+            state,
+            status="not_run",
+            error=reason,
         )
 
     def _invalidate_legacy_technical_contracts(
@@ -716,6 +745,78 @@ class Orchestrator:
         manifest.revision += 1
         write_manifest(root / MANIFEST_NAME, manifest)
         return True
+
+    @staticmethod
+    def _repair_incomplete_execution_receipts(manifest: RunManifest) -> list[str]:
+        """修复 v8 清单中可安全恢复的正式执行收据。
+
+        某些旧版本的并发/修复路径可能先写入
+        ``execution_verification=passed``，随后才清除或替换视频产物。
+        这会让 resume 在真正有机会重新渲染之前被完整性检查挡住。没有
+        视频凭据时不能伪造一次成功执行：清除该收据并把场景退回渲染队列；
+        如果凭据存在但 ``rendered`` 标记丢失，则恢复这个可验证的标记，
+        后续仍会再次校验文件哈希。
+        """
+
+        repairs: list[str] = []
+        for scene_id, scene in sorted(manifest.scenes.items()):
+            execution = scene.execution_verification
+            if execution.status != "passed" or execution.scope != "formal_video":
+                continue
+            if scene.rendered and scene.artifact is not None:
+                continue
+
+            if scene.artifact is not None:
+                # 这是一个不完整的 checkpoint，但已有经过验证的产物
+                # 凭据；保留它并让正常的恢复校验确认视频文件仍然存在。
+                scene.rendered = True
+                if execution.artifact_sha256 != scene.artifact.video_sha256:
+                    scene.execution_verification = ExecutionVerification(
+                        status="not_run",
+                        code_sha256=scene.code_sha256,
+                        error="恢复时发现正式执行收据与现有产物不一致，将重新确认执行结果",
+                    )
+                repairs.append(f"Scene {scene_id}: 恢复缺失的 rendered 标记")
+                continue
+
+            scene.rendered = False
+            scene.execution_verification = ExecutionVerification(
+                status="not_run",
+                code_sha256=scene.code_sha256,
+                error="恢复时发现正式执行通过但缺少渲染产物，将重新渲染",
+            )
+            # 视觉收据绑定的是旧视频，视频凭据已经不存在时不能继续复用。
+            if (
+                scene.visual_status != "skipped"
+                or scene.visual_report_file
+                or scene.visual_verification.status != "not_run"
+            ):
+                scene.visual_status = (
+                    "pending" if manifest.visual_eval_profile.enabled else "skipped"
+                )
+                scene.visual_score = None
+                scene.visual_report_file = ""
+                scene.visual_report_sha256 = ""
+                scene.visual_artifact_sha256 = ""
+                scene.visual_feedback = ""
+                scene.visual_verification = VisualVerification(status="not_run")
+            repairs.append(f"Scene {scene_id}: 清除无产物的正式执行收据并重新排队")
+
+        if repairs:
+            # 旧的最终合成不能代表当前场景集合；恢复时必须重新合并。
+            manifest.final_video = None
+            manifest.final_video_sha256 = ""
+            if manifest.status == "completed":
+                manifest.status = "interrupted"
+            elif manifest.status == "dry_run_complete":
+                manifest.status = "running"
+            if manifest.state == "DONE":
+                manifest.state = "MONITORING"
+            for repair in repairs:
+                if repair not in manifest.fsm_warnings:
+                    manifest.fsm_warnings.append(repair)
+            manifest.fsm_warnings = manifest.fsm_warnings[-100:]
+        return repairs
 
     def _cancel_unfinished_scene_job(self, state: SceneState, *, reason: str) -> None:
         """在丢弃场景代码/计划前取消仍可能执行的旧 Job。
@@ -1186,6 +1287,33 @@ class Orchestrator:
                 )
                 + 1
             )
+            # 在持久化边界再次验证“渲染完成 ⇔ 产物凭据存在”。这既是对
+            # 并发 worker 的防护，也是对未来新增修复分支的保险：任何
+            # 中间状态都不能写入 manifest，更不能留下 passed/formal 的
+            # 孤立执行收据。
+            for scene_id, scene in sorted(ctx.scene_states.items()):
+                if scene.rendered != (scene.artifact is not None):
+                    self._invalidate_render_artifact(
+                        scene,
+                        reason="checkpoint 发现渲染标记与产物凭据不一致，已退回重新执行",
+                    )
+                    warning = (
+                        f"Scene {scene_id} checkpoint 发现渲染标记与产物凭据不一致，"
+                        "已清除旧产物并重新执行"
+                    )
+                    if warning not in ctx.fsm_warnings:
+                        ctx.fsm_warnings.append(warning)
+                elif (
+                    scene.execution_verification.status == "passed"
+                    and scene.execution_verification.scope == "formal_video"
+                    and scene.artifact is None
+                ):
+                    self._mark_execution_verification(
+                        scene,
+                        status="not_run",
+                        error="checkpoint 发现正式执行收据没有渲染产物，已退回重新执行",
+                    )
+            ctx.fsm_warnings = ctx.fsm_warnings[-100:]
             manifest = RunManifest(
                 revision=ctx.manifest_revision,
                 run_id=ctx.paths.run_id,
@@ -2345,6 +2473,12 @@ class Orchestrator:
             manifest = repository.load(run_id)
             self._set_backend(getattr(manifest, "backend", "slurm"))
             self._invalidate_legacy_technical_contracts(manifest, root)
+            repaired_receipts = self._repair_incomplete_execution_receipts(manifest)
+            if repaired_receipts:
+                if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+                    raise ValueError("旧版运行清单不能自动修复正式执行收据")
+                manifest.revision += 1
+                write_manifest(root / MANIFEST_NAME, manifest)
             manifest.validate_for_resume()
             self._callback = callback
             self._cancel_requested.clear()
@@ -2372,7 +2506,10 @@ class Orchestrator:
                         )
                     retry_state.slurm_job = None
                 retry_state.rendered = False
-                retry_state.artifact = None
+                self._invalidate_render_artifact(
+                    retry_state,
+                    reason="用户请求重新渲染当前场景",
+                )
                 retry_state.failed = False
                 retry_state.give_up = False
                 retry_state.failure_reason = ""
@@ -3692,8 +3829,10 @@ class Orchestrator:
                 self._artifact_video_path(ctx, state.artifact)
             except (OSError, RuntimeError, ValueError) as exc:
                 with self._state_lock:
-                    state.rendered = False
-                    state.artifact = None
+                    self._invalidate_render_artifact(
+                        state,
+                        reason="恢复时发现正式渲染产物不可用",
+                    )
                     state.failed = False
                     state.give_up = False
                     state.failure_reason = ""
@@ -4291,8 +4430,10 @@ class Orchestrator:
                     state.rewrite_feedback = ""
                     state.review_signature = ""
                     state.identical_review_count = 0
-                    state.artifact = None
-                    state.rendered = False
+                    self._invalidate_render_artifact(
+                        state,
+                        reason="上游连续性上下文变化，当前渲染结果失效",
+                    )
                     state.slurm_job = None
                     state.exported_elements_code = ""
                     state.exported_elements = []
@@ -4451,8 +4592,10 @@ class Orchestrator:
                 state.review_signature = ""
                 state.identical_review_count = 0
                 state.slurm_job = None
-                state.artifact = None
-                state.rendered = False
+                self._invalidate_render_artifact(
+                    state,
+                    reason="计划合同变化，当前渲染结果失效",
+                )
                 state.exported_elements_code = ""
                 state.exported_elements = []
                 self._reset_repair_progress(state)
@@ -4607,8 +4750,10 @@ class Orchestrator:
             state.rewrite_feedback = ""
             state.review_signature = ""
             state.identical_review_count = 0
-            state.artifact = None
-            state.rendered = False
+            self._invalidate_render_artifact(
+                state,
+                reason="技术合同变化，当前渲染结果失效",
+            )
             state.slurm_job = None
             state.exported_elements_code = ""
             state.exported_elements = []
@@ -6130,8 +6275,10 @@ class Orchestrator:
                         state.reviewed = False
                         state.rewrite_feedback = ""
                         state.slurm_job = None
-                        state.artifact = None
-                        state.rendered = False
+                        self._invalidate_render_artifact(
+                            state,
+                            reason="计划重规划，当前渲染结果失效",
+                        )
                         state.exported_elements_code = ""
                         state.exported_elements = []
                         self._remove_element_manifest_scene(ctx, scene_id)
@@ -6779,9 +6926,11 @@ class Orchestrator:
                 # 保留 rendered=True，否则调度器会跳过该场景，合并阶段
                 # 还可能误把不完整状态当成成功。清除派生凭据，resume
                 # 时可重新验证旧 Job 或重新提交。
-                if state.rendered:
-                    state.rendered = False
-                    state.artifact = None
+                if state.rendered or state.artifact is not None:
+                    self._invalidate_render_artifact(
+                        state,
+                        reason="场景流水线异常，正式渲染结果失效",
+                    )
                     self._reset_visual_receipt(ctx, state)
                 self._mark_failed(state, f"Scene {scene_id} 流水线异常: {exc}", "system")
             try:
@@ -7739,8 +7888,10 @@ class Orchestrator:
             job.code_sha256 = expected_code_hash
             with self._state_lock:
                 state.slurm_job = job
-                state.artifact = None
-                state.rendered = False
+                self._invalidate_render_artifact(
+                    state,
+                    reason="新的渲染作业已提交，旧正式执行结果失效",
+                )
                 state.failure_reason = ""
                 state.failure_category = ""
                 self._reset_visual_receipt(ctx, state)
@@ -7888,8 +8039,10 @@ class Orchestrator:
                 if state.infra_retries < settings.MAX_INFRA_RETRIES:
                     state.infra_retries += 1
                     state.slurm_job = None
-                    state.artifact = None
-                    state.rendered = False
+                    self._invalidate_render_artifact(
+                        state,
+                        reason="渲染基础设施重试，正式执行结果失效",
+                    )
                     state.failure_category = "infrastructure"
                     state.failure_reason = (
                         f"Slurm 基础设施状态 {job.status}，将重新排队 "
@@ -8308,8 +8461,10 @@ class Orchestrator:
                 state.review_signature = ""
                 state.identical_review_count = 0
                 state.slurm_job = None
-                state.artifact = None
-                state.rendered = False
+                self._invalidate_render_artifact(
+                    state,
+                    reason="连续性上下文重建，当前渲染结果失效",
+                )
                 state.give_up = False
                 state.failed = False
                 state.failure_reason = ""
@@ -8835,8 +8990,10 @@ class Orchestrator:
             state.rewrite_feedback = rewrite_feedback
             state.review_signature = ""
             state.identical_review_count = 0
-            state.artifact = None
-            state.rendered = False
+            self._invalidate_render_artifact(
+                state,
+                reason="切换保守教学方案，当前渲染结果失效",
+            )
             state.slurm_job = None
             state.exported_elements_code = ""
             state.exported_elements = []
@@ -9160,8 +9317,10 @@ class Orchestrator:
                 f"## 需修复的问题\n{fix_details}\n\n"
                 f"请根据以上反馈逐项修正代码，保留正确部分，只修复指出的问题。"
             )
-            state.artifact = None
-            state.rendered = False
+            self._invalidate_render_artifact(
+                state,
+                reason="代码审查要求重写，当前渲染结果失效",
+            )
             self._reset_visual_receipt(ctx, state)
             self._checkpoint(ctx, State.REVIEWING)
         self._emit("scene_review_fail", scene_id=scene_id, severity="major")
@@ -9237,16 +9396,10 @@ class Orchestrator:
                     copied_video = None
                 if copied_video is not None:
                     relative_video = copied_video.relative_to(ctx.paths.root).as_posix()
-                    state.rendered = True
-                    state.slurm_job = None
-                    self._mark_execution_verification(
-                        state,
-                        status="passed",
-                        scope="formal_video",
-                        artifact_sha256=artifact.video_sha256,
-                        duration_seconds=artifact.metadata.duration_seconds,
-                    )
-                    state.artifact = SceneArtifact(
+                    # 先完整构造新的产物凭据，再一次性发布 rendered 和
+                    # execution 收据。构造失败时，旧状态仍保持“未渲染”，
+                    # 不会留下 passed/formal 的孤立收据。
+                    reused_artifact = SceneArtifact(
                         origin="reused",
                         # 复用视频已复制到当前 run；清理 base run 后当前 run
                         # 仍必须能够恢复和重新合并，因此凭据路径也归属于当前 run。
@@ -9264,9 +9417,20 @@ class Orchestrator:
                         environment_fingerprint=dict(artifact.environment_fingerprint),
                         environment_warning=artifact.environment_warning,
                     )
-                    self._reset_visual_receipt(ctx, state)
-                    if scene_id not in ctx.scenes_to_reuse:
-                        ctx.scenes_to_reuse.append(scene_id)
+                    with self._state_lock:
+                        state.artifact = reused_artifact
+                        state.rendered = True
+                        state.slurm_job = None
+                        self._mark_execution_verification(
+                            state,
+                            status="passed",
+                            scope="formal_video",
+                            artifact_sha256=reused_artifact.video_sha256,
+                            duration_seconds=reused_artifact.metadata.duration_seconds,
+                        )
+                        self._reset_visual_receipt(ctx, state)
+                        if scene_id not in ctx.scenes_to_reuse:
+                            ctx.scenes_to_reuse.append(scene_id)
                     return
         if scene_id not in ctx.scenes_to_render:
             ctx.scenes_to_render.append(scene_id)
@@ -9517,8 +9681,10 @@ class Orchestrator:
             state.reviewed = False
             state.rewrite_feedback = ""
             state.slurm_job = None
-            state.artifact = None
-            state.rendered = False
+            self._invalidate_render_artifact(
+                state,
+                reason="计划层修复，当前渲染结果失效",
+            )
             state.exported_elements_code = ""
             state.exported_elements = []
             state.local_smoke_status = "pending"
@@ -10041,8 +10207,10 @@ class Orchestrator:
                     "跨场景元素合同。"
                 )
                 state.reviewed = False
-                state.rendered = False
-                state.artifact = None
+                self._invalidate_render_artifact(
+                    state,
+                    reason="视觉评估要求重写，当前渲染结果失效",
+                )
                 state.slurm_job = None
                 ctx.final_video = None
                 ctx.final_video_sha256 = ""
@@ -10272,8 +10440,10 @@ class Orchestrator:
                 "请只修复相邻场景边界的可见问题，不改变数学合同和继承元素身份。"
             )
             state.reviewed = False
-            state.rendered = False
-            state.artifact = None
+            self._invalidate_render_artifact(
+                state,
+                reason="边界视觉评估要求重写，当前渲染结果失效",
+            )
             state.slurm_job = None
             ctx.final_video = None
             ctx.final_video_sha256 = ""
@@ -10645,14 +10815,16 @@ class Orchestrator:
             ]
             for scene_id in invalidated_ids:
                 state = ctx.scene_states[scene_id]
-                state.rendered = False
+                self._invalidate_render_artifact(
+                    state,
+                    reason="评估改进重新生成场景，当前渲染结果失效",
+                )
                 state.reviewed = False
                 state.failed = False
                 state.give_up = False
                 state.code = ""
                 state.class_name = ""
                 state.slurm_job = None
-                state.artifact = None
                 state.fix_attempts = 0
                 state.infra_retries = 0
                 state.rewrite_feedback = ""
