@@ -589,7 +589,7 @@ class Demo(Scene):
     assert validate_animation_lifecycle(repaired, technical).is_valid is True
 
 
-def test_does_not_guess_between_multiple_contract_update_events():
+def test_uses_timeline_order_between_multiple_contract_update_events():
     technical = TechnicalSpec(
         scene_id=1,
         objects=[TechnicalObject(element_id="formula", variable_name="formula")],
@@ -621,8 +621,9 @@ class Demo(Scene):
 
     repaired, repairs = repair_missing_animation_markers(code, technical)
 
-    assert repaired == code
-    assert repairs == ()
+    assert repaired != code
+    assert "# KD1_ANIMATION_EVENT: update_a" in repaired
+    assert repairs == ("为第 7 行 self.play() 补齐事件标记: update_a",)
 
 
 def test_repairs_initially_active_copy_used_as_update_source():
