@@ -1125,6 +1125,46 @@ def test_normalize_technical_spec_downgrades_empty_fade_in_update_to_hold():
     assert any("update 降级为 hold" in repair for repair in repairs)
 
 
+def test_normalize_uncontracted_geometry_update_to_hold():
+    grid = VisualElementState(element_id="grid", variable_name="grid", required=True)
+    formula = VisualElementState(element_id="formula", variable_name="formula")
+    plan = make_plan(inherited=[grid], new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                initially_active=True,
+                constructor="NumberPlane",
+                exported=True,
+            ),
+            TechnicalObject(element_id="formula", variable_name="formula"),
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="draw_x_tangent",
+                start_seconds=0,
+                end_seconds=2,
+                semantic_action="update",
+                source_element_ids=["grid"],
+                target_element_ids=["grid"],
+                api_notes="从点 P 出发，使用 Create 或 Line 动画绘制新的辅助线",
+            )
+        ],
+        export_element_ids=["grid"],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+    result = compile_technical_spec(plan, normalized)
+
+    event = next(item for item in normalized.animations if item.event_id == "draw_x_tangent")
+    assert event.semantic_action == "hold"
+    assert event.source_element_ids == []
+    assert result.is_valid is True, result.errors
+    assert any("辅助几何 update 降级为 hold" in repair for repair in repairs)
+
+
 def test_normalize_technical_spec_downgrades_create_of_active_target_to_animation():
     point = VisualElementState(element_id="point", variable_name="point")
     formula = VisualElementState(element_id="formula", variable_name="formula")

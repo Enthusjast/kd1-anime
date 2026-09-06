@@ -244,6 +244,40 @@ def _normalise_technical_lifecycle(
             repairs.append(f"事件 {event.event_id} 没有目标状态，update 降级为 hold")
             changed = True
 
+        # 技术模型有时把“根据已有对象绘制一条新的辅助线”错误地
+        # 写成 update，并把已有对象同时列为 source/target。由于新线
+        # 没有 element_id，Coder 实际会对一个未纳入合同的 helper 使用
+        # Create/Line，随后被生命周期校验判定为“没有操作合同 source”。
+        # 这类事件没有可验证的对象状态变化，按 hold 保留时间线和断言；
+        # Coder 仍可用诊断 marker 绘制未纳入边界的辅助几何。
+        note_text = f"{event.event_id} {event.api_notes}".lower()
+        has_uncontracted_geometry_hint = (
+            "create" in note_text and "line" in note_text
+        ) or "使用 create 或 line" in note_text
+        if (
+            action == "update"
+            and source_ids
+            and target_ids == source_ids
+            and not create_ids
+            and not remove_ids
+            and has_uncontracted_geometry_hint
+        ):
+            action = "hold"
+            source_ids = target_ids = set()
+            event = event.model_copy(
+                update={
+                    "semantic_action": action,
+                    "source_element_ids": [],
+                    "target_element_ids": [],
+                    "api_notes": _append_api_repair_note(
+                        event.api_notes,
+                        "无法从合同确定新辅助几何的 element_id，按 hold 保留时间线",
+                    ),
+                }
+            )
+            repairs.append(f"事件 {event.event_id} 的未声明辅助几何 update 降级为 hold")
+            changed = True
+
         if action == "update" and not source_ids:
             timeline_ids = set((timeline_element_ids or {}).get(event.event_id, ()))
             inferred = timeline_ids & active
