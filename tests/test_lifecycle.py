@@ -665,6 +665,27 @@ class Demo(Scene):
     assert validate_animation_lifecycle(repaired, technical).is_valid is True
 
 
+def test_allows_update_event_to_have_sequential_play_segments():
+    technical = _semantic_spec("update")
+    technical.objects[0].initially_active = True
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(formula.animate.scale(1.1))
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(formula.animate.shift(RIGHT))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+    assert any("分段执行" in warning for warning in result.warnings)
+
+
 def test_semantic_marker_can_precede_pure_target_preparation():
     technical = _semantic_spec("update")
     technical.objects[0].initially_active = True

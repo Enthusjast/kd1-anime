@@ -1839,10 +1839,9 @@ class Orchestrator:
                     or "重复使用动画事件标记" in lifecycle_error
                 ):
                     feedback_parts.append(
-                        "\n事件标记修复规则：introduce/update/camera 事件只能对应一次"
-                        " self.play。需要同时展示多个对象时，把它们放进同一次"
-                        " AnimationGroup/LaggedStart；remove 事件才允许按不重叠对象分段"
-                        "重复同一 marker，其它事件不要复制 marker。\n"
+                        "\n事件标记修复规则：introduce 事件只能对应一次 self.play。需要同时展示多个对象时，"
+                        "把它们放进同一次 AnimationGroup/LaggedStart；update/camera 在同一语义阶段"
+                        "可以拆成连续 self.play 并重复同一 marker，remove 事件也允许按不重叠对象分段。\n"
                     )
                 if "未操作合同对象" in lifecycle_error:
                     feedback_parts.append(

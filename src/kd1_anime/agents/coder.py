@@ -65,11 +65,12 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
   `semantic_action` 决定状态：`introduce` 引入新对象，`update` 修改 active source，
   `remove` 退出对象，`camera` 只处理相机，`hold` 不改变状态。具体用哪一种
   Manim Animation（例如 `Transform` 或 `.animate`）由你根据画面选择，不要修改合同或伪造 Python 别名。
-- TechnicalSpec 中每个 introduce/update/camera 事件只对应一次 `self.play` 和一个同名
-  marker；如果一个事件需要同时展示多个对象，使用 `AnimationGroup`/`LaggedStart` 在
-  这一次 `self.play` 中组合它们，不要重复使用同一个 marker。remove 事件若无法安全
-  组合，可按不重叠对象拆成多个 `self.play`，重复同一 remove marker，但每段只能处理
-  该事件列出的实际对象。事件中的 element 对应的
+- TechnicalSpec 中每个 introduce 事件只对应一次 `self.play` 和一个同名 marker；如果
+  一个事件需要同时展示多个对象，使用 `AnimationGroup`/`LaggedStart` 在这一次
+  `self.play` 中组合它们。一个 update 或 camera 事件可以因为“先变换、再回正”等
+  同一语义阶段拆成多个连续的 `self.play`，这些调用重复同一个 marker 即可；remove
+  事件也可按不重叠对象分段重复同一 marker。每段只能处理该事件列出的实际对象。
+  事件中的 element 对应的
   `variable_name` 必须作为实际动画参数出现，不能只播放同名的 `_arrow`、`_label` 或
   `_target` 别名。辅助标签可以作为同一次组合动画的额外对象，但不能替代合同对象。
 - `introduce` 事件必须直接引入合同中 exact 的 target/create 变量；例如合同对象为
@@ -352,8 +353,9 @@ class CoderAgent(BaseAgent):
                 PromptSection(
                     "TechnicalSpec 事件实现表",
                     "下面是代码实现时必须逐一对应的精简表。introduce/update/camera 每个事件只写"
-                    "一个同名 marker，并在一次 self.play 中使用 exact source/target/create/remove 变量；"
-                    "remove 事件若确实无法组合，可按不重叠对象分段重复同一 marker。hold 事件优先"
+                    "一个同名 marker，并在 self.play 中使用 exact source/target/create/remove 变量；"
+                    "introduce 只允许一次 self.play；update/camera 若同一语义阶段包含连续子步骤，"
+                    "可以重复同一 marker；remove 事件若确实无法组合，也可按不重叠对象分段重复。hold 事件优先"
                     "使用 self.wait；若使用 self.play，只能操作已经 active 的合同 source，不得"
                     "引入或退出对象。"
                     "辅助标签只能作为同一次组合动画的额外对象。\n" + technical_event_contract,

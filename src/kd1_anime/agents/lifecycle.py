@@ -1153,8 +1153,9 @@ def validate_animation_lifecycle(
     marker_ids = [event_id for _, event_id in markers]
     for event_id in sorted({item for item in marker_ids if marker_ids.count(item) > 1}):
         event = event_by_id.get(event_id)
-        if event is not None and event.semantic_action == "remove":
-            warnings.append(f"动画事件标记重复: {event_id}；按分段清理事件合并校验")
+        if event is not None and event.semantic_action in {"remove", "update", "camera"}:
+            detail = "分段清理事件" if event.semantic_action == "remove" else "分段执行"
+            warnings.append(f"动画事件标记重复: {event_id}；按同一语义事件的{detail}合并校验")
         else:
             errors.append(f"动画事件标记重复: {event_id}")
 
@@ -1298,7 +1299,9 @@ def validate_animation_lifecycle(
                 "请在上一行写 # KD1_ANIMATION_EVENT: <event_id>"
             )
         elif marker_id is not None:
-            if marker_id in used_event_ids and (event is None or event.semantic_action != "remove"):
+            if marker_id in used_event_ids and (
+                event is None or event.semantic_action not in {"remove", "update", "camera"}
+            ):
                 errors.append(f"第 {node.lineno} 行重复使用动画事件标记: {marker_id}")
             used_event_ids.add(marker_id)
             if event is None and not marker_id.startswith(_AUTO_EVENT_PREFIX):
