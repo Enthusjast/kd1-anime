@@ -434,9 +434,55 @@ def reconcile_review_evidence_by_location(
     repaired_findings: list[ReviewFinding] = []
     for index, finding in enumerate(result.findings, start=1):
         evidence = finding.evidence.strip()
-        if evidence and code.find(evidence) >= 0:
-            repaired_findings.append(finding)
-            continue
+        exact_positions: list[tuple[int, int]] = []
+        if evidence:
+            offset = 0
+            while True:
+                position = code.find(evidence, offset)
+                if position < 0:
+                    break
+                end_position = position + len(evidence)
+                exact_positions.append(
+                    (
+                        code.count("\n", 0, position) + 1,
+                        code.count("\n", 0, end_position) + 1,
+                    )
+                )
+                offset = position + 1
+
+        if exact_positions:
+            declared_start = finding.line_start
+            declared_end = finding.line_end or declared_start
+            location = None
+            if declared_start is not None and declared_end is not None:
+                # 如果证据出现多次，优先使用模型给出的范围来消除
+                # 歧义；如果范围本身有偏移，唯一出现位置仍可确定地
+                # 校正。此前这里遇到“证据存在”就直接 continue，导致
+                # 只修正了文本却保留错误行号，最终协议校验仍会失败。
+                location = next(
+                    (
+                        position
+                        for position in exact_positions
+                        if position[0] >= declared_start and position[1] <= declared_end
+                    ),
+                    None,
+                )
+            if location is None and len(exact_positions) == 1:
+                location = exact_positions[0]
+            if location is not None:
+                actual_start, actual_end = location
+                if (finding.line_start, finding.line_end) != (actual_start, actual_end):
+                    repaired_findings.append(
+                        finding.model_copy(
+                            update={"line_start": actual_start, "line_end": actual_end}
+                        )
+                    )
+                    corrections.append(
+                        f"finding[{index}] 已按精确 evidence 校正行号为 {actual_start}-{actual_end}"
+                    )
+                else:
+                    repaired_findings.append(finding)
+                continue
 
         location = find_whitespace_insensitive(evidence) if evidence else None
         if location is None and finding.line_start is not None:

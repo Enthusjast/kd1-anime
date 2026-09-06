@@ -227,6 +227,34 @@ def test_reconcile_review_evidence_uses_declared_source_location():
     assert validate_review_evidence(reconciled, code) == []
 
 
+def test_reconcile_review_evidence_repairs_exact_text_with_wrong_line_numbers():
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                line_start=1,
+                line_end=1,
+                evidence="self.wait()",
+                why="该调用位置需要确认",
+                repair="按实际源码行定位",
+            )
+        ],
+    )
+    code = (
+        "from manim import *\nclass Demo(Scene):\n    def construct(self):\n        self.wait()\n"
+    )
+
+    reconciled, corrections = reconcile_review_evidence_by_location(result, code)
+
+    assert corrections
+    assert reconciled.findings[0].line_start == 4
+    assert reconciled.findings[0].line_end == 4
+    assert validate_review_evidence(reconciled, code) == []
+
+
 def test_drop_unverifiable_review_items_does_not_block_with_only_bad_evidence():
     result = ReviewResult(
         is_valid=False,
