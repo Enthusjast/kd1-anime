@@ -3724,6 +3724,23 @@ class Orchestrator:
         }
         return PlanningService.cycle_signature(payload)
 
+    @staticmethod
+    def _relaxed_planning_cycle_has_no_deterministic_blockers(ctx: PipelineContext) -> bool:
+        """判断 relaxed 模式是否可以结束重复的非阻断计划循环。"""
+
+        for state in ctx.scene_states.values():
+            if state.failed or state.give_up or not state.plan_ready:
+                continue
+            issues = deterministic_plan_issues(
+                state.plan,
+                ctx.continuity_bible,
+                safe_fallback=state.safe_fallback_used,
+                lesson_spec=ctx.lesson_spec,
+            )
+            if issues or ctx.plan_compile_issues.get(state.plan.scene_id):
+                return False
+        return True
+
     def _adapt_renderer_for_plans(self, ctx: PipelineContext) -> None:
         """在首次提交前为明确需要 Cairo 运镜的计划切换 renderer。"""
 
@@ -3814,11 +3831,22 @@ class Orchestrator:
                 "reviewing",
             }:
                 reason = "计划/连续性审查在相同输入上重复，已冻结计划并停止空转"
-                with self._state_lock:
-                    ctx.plan_review_status = "failed"
-                    ctx.continuity_warnings.append(reason)
-                    self._checkpoint(ctx, State.PLAN_REVIEWING)
-                return
+                if (
+                    ctx.generation_mode == "relaxed"
+                    and self._relaxed_planning_cycle_has_no_deterministic_blockers(ctx)
+                ):
+                    warning = reason + "；relaxed 模式沿用当前计划继续生成"
+                    with self._state_lock:
+                        ctx.plan_review_status = "passed"
+                        ctx.continuity_warnings.append(warning)
+                        self._checkpoint(ctx, State.PLAN_REVIEWING)
+                    self._emit("plan_review_accepted_with_warning", reason=warning)
+                else:
+                    with self._state_lock:
+                        ctx.plan_review_status = "failed"
+                        ctx.continuity_warnings.append(reason)
+                        self._checkpoint(ctx, State.PLAN_REVIEWING)
+                    return
             try:
                 self._checkpoint(ctx, State.PLAN_REVIEWING)
             except Exception as exc:
@@ -3858,13 +3886,23 @@ class Orchestrator:
                 continue
             break
 
-        if ctx.plan_review_status in {"pending", "reviewing"}:
+        if ctx.plan_review_status in {"pending", "reviewing"} and not (
+            ctx.generation_mode == "relaxed"
+            and self._relaxed_planning_cycle_has_no_deterministic_blockers(ctx)
+        ):
             reason = "计划审查与连续性审查未能在有限轮次内收敛"
             with self._state_lock:
                 ctx.plan_review_status = "failed"
                 ctx.continuity_warnings.append(reason)
                 self._checkpoint(ctx, State.REVIEWING)
             return
+        if ctx.plan_review_status in {"pending", "reviewing"}:
+            warning = "计划审查循环达到调度保护阈值；relaxed 模式沿用无确定性错误的当前计划"
+            with self._state_lock:
+                ctx.plan_review_status = "passed"
+                ctx.continuity_warnings.append(warning)
+                self._checkpoint(ctx, State.PLAN_REVIEWING)
+            self._emit("plan_review_accepted_with_warning", reason=warning)
 
         if planning_only:
             self._checkpoint(ctx, State.PLAN_REVIEWING)
@@ -6213,6 +6251,21 @@ class Orchestrator:
                 ctx.lesson_spec,
                 ctx.teaching_graph,
             )
+            if ctx.generation_mode == "relaxed" and not deterministic:
+                # relaxed 模式下连续性 LLM 意见本身不会阻断或触发重规划；
+                # 没有确定性冲突时跳过这次纯诊断调用，减少一次全片长上下文请求。
+                warning = "relaxed 模式无确定性连续性冲突，跳过非阻断 LLM 连续性审查"
+                with self._state_lock:
+                    ctx.continuity_review_status = "passed"
+                    ctx.continuity_warnings.append(warning)
+                    self._checkpoint(ctx, State.REVIEWING)
+                self._emit(
+                    "continuity_review_fast_pass",
+                    reason=warning,
+                    round=current_round,
+                )
+                self._emit("continuity_pass", round=current_round)
+                return
             try:
                 with self._llm_sem:
                     result = ContinuityReviewerAgent().review(

@@ -1088,6 +1088,33 @@ def test_continuity_review_is_a_barrier_before_coding(monkeypatch, tmp_path):
     )
 
 
+def test_relaxed_continuity_skips_nonblocking_llm_review(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        generation_mode="relaxed",
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="pending",
+        scene_states={1: SceneState(plan=make_plan(make_outline(1)), plan_ready=True)},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "deterministic_continuity_issues", lambda *args: [])
+
+    class UnexpectedReviewer:
+        def review(self, *args, **kwargs):
+            raise AssertionError("relaxed 无确定性冲突时不应调用连续性 LLM")
+
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", UnexpectedReviewer)
+
+    orchestrator._run_continuity_review(ctx)
+
+    assert ctx.continuity_review_status == "passed"
+    assert any("跳过非阻断 LLM" in warning for warning in ctx.continuity_warnings)
+
+
 def test_continuity_review_replans_only_affected_scenes(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
     planner = ContinuityPlanner()
