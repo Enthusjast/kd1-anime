@@ -417,7 +417,7 @@ kd1-anime test-llm --no-json-mode --verbose
 | `MAX_REVIEW_ROUNDS` | `8` | strict 模式单场景代码审查/重写轮数；relaxed 不使用固定上限 |
 | `MAX_LOW_RISK_REVIEW_ROUNDS` | `2` | strict 模式低风险场景审查轮数；确定性检查始终执行 |
 | `GENERATION_MODE` | `relaxed` | 默认生成策略：`relaxed` 或 `strict` |
-| `MAX_STAGNANT_ATTEMPTS` | `2` | strict 模式渲染修复无进展后切换 IR/安全模板的次数 |
+| `MAX_STAGNANT_ATTEMPTS` | `2` | 渲染修复无进展后尝试 IR/安全代码候选的阈值；strict 回退失败会终止，relaxed 仍可继续修复 |
 | `MAX_FIX_ATTEMPTS` | `8` | strict 模式渲染失败后的代码修复次数；relaxed 不使用固定上限 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |

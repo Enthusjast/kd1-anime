@@ -1514,6 +1514,67 @@ def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
     assert "ValueError: something deterministic" in state.failure_reason
 
 
+def test_relaxed_render_stagnation_tries_safe_candidate_before_more_llm_fixes(
+    monkeypatch, tmp_path
+):
+    run_paths = make_paths(tmp_path)
+    error_log = (
+        "Traceback (most recent call last):\n"
+        '  File "scene_1.py", line 42, in construct\n'
+        "ValueError: same render error\n"
+    )
+    polls = 0
+
+    def status_map(_job_id):
+        nonlocal polls
+        polls += 1
+        return "FAILED" if polls <= 2 else "COMPLETED"
+
+    slurm = FakeSlurm(run_paths, status_map=status_map, error_log=error_log)
+    autofixer = FakeAutoFixer()
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        slurm=slurm,
+        autofixer=autofixer,
+    )
+    monkeypatch.setattr(module.settings, "MAX_STAGNANT_ATTEMPTS", 1)
+    code = CODE
+    fallback_code = (
+        "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait(2)\n"
+    )
+
+    def fix_same_code(*args, **kwargs):
+        autofixer.fix_calls += 1
+        return code
+
+    autofixer.fix = fix_same_code
+    monkeypatch.setattr(module, "build_safe_scene_code", lambda *args, **kwargs: fallback_code)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        generation_mode="relaxed",
+        outlines=[make_outline(1)],
+    )
+    ctx.scene_states[1] = SceneState(
+        plan=make_plan(make_outline(1)),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    (run_paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
+
+    events: list[tuple[str, dict]] = []
+    orchestrator._callback = lambda event, data: events.append((event, data))
+    orchestrator._run_scheduler(ctx)
+
+    assert ctx.scene_states[1].rendered is True, ctx.scene_states[1].failure_reason
+    assert autofixer.fix_calls == 1
+    assert any(event == "repair_stagnation_fallback" for event, _ in events)
+
+
 def test_error_fingerprint_normalizes_digits(monkeypatch, tmp_path):
     from kd1_anime.orchestrator import Orchestrator
 

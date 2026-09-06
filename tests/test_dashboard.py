@@ -209,6 +209,19 @@ class TestSceneDashboard:
         assert dash.scenes[1].state == "running"
         assert "保守方案" in dash.scenes[1].render_row()[3].plain
 
+    def test_relaxed_recovery_fallback_is_visible_as_warning(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+
+        dash.on_event("scene_code_fallback", {"scene_id": 1})
+        assert dash.scenes[1].state == "warning"
+        assert "最小安全代码" in dash.scenes[1].message
+
+        dash.on_event("repair_stagnation_fallback", {"scene_id": 1, "attempts": 2})
+        assert dash.scenes[1].state == "warning"
+        assert "IR/安全候选" in dash.scenes[1].message
+
     def test_continuity_exhaustion_is_warning_and_does_not_fail_scene(self):
         dash = SceneDashboard()
         dash.live = MagicMock()

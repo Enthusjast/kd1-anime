@@ -486,6 +486,24 @@ class SceneDashboard:
                     status.mark_done("编码")
                     status.message = "代码就绪"
 
+        elif event in ("scene_code_fallback", "repair_stagnation_fallback"):
+            if status:
+                status.state = "warning"
+                status.stage = "编码" if event == "scene_code_fallback" else "修复"
+                status.started_at = 0.0
+                status.message = (
+                    "Coder 失败，已使用最小安全代码"
+                    if event == "scene_code_fallback"
+                    else "修复无进展，已切换 IR/安全候选"
+                )
+
+        elif event == "repair_stagnation_fallback_unavailable":
+            if status:
+                status.state = "warning"
+                status.stage = "修复"
+                status.started_at = 0.0
+                status.message = "修复无进展，继续尝试新的 AutoFix 策略"
+
         elif event == "scene_smoke_rendered":
             if status:
                 status.state = "running"

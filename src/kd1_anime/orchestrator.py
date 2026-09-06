@@ -7285,7 +7285,14 @@ class Orchestrator:
                             scene_id=scene_id,
                             reason="Coder 生成失败后使用结构化程序编译",
                         )
-                if not program_used and settings.CODEGEN_MODE != "python":
+                # relaxed 模式即使使用普通 Python Coder，也允许在 LLM
+                # 截断/网络失败时使用已经通过确定性校验的最小安全代码。
+                # strict + CODEGEN_MODE=python 仍保持“模板化路径必须显式启用”
+                # 的语义，避免悄悄改变严格模式的创作结果。
+                allow_safe_codegen_fallback = settings.CODEGEN_MODE != "python" or self._is_relaxed(
+                    ctx
+                )
+                if not program_used and allow_safe_codegen_fallback:
                     # Coder 的网络/截断/结构化输出故障不应直接把一个已经通过
                     # Plan/TechnicalSpec 的场景判死。使用不依赖 LLM 的最小代码
                     # 作为最后保险；它仍必须通过与正常候选完全相同的校验链。
@@ -7338,7 +7345,11 @@ class Orchestrator:
                         scene_id=scene_id,
                         reason=code_fallback_reason,
                     )
-                if not program_used and settings.CODEGEN_MODE == "python":
+                if (
+                    not program_used
+                    and settings.CODEGEN_MODE == "python"
+                    and not self._is_relaxed(ctx)
+                ):
                     raise
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         try:
@@ -8107,7 +8118,10 @@ class Orchestrator:
                     strategy="scene_ir",
                     reason=str(exc)[:2_000],
                 )
-            candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
+        # 安全代码不是模板化生成模式本身，而是渲染修复没有进展时的
+        # 最小确定性回退。因此 relaxed/strict 都可以尝试它；是否在
+        # 正常编码阶段使用，仍由上面的 CODEGEN_MODE/relaxed 条件控制。
+        candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
         for candidate in candidates:
             try:
                 accepted = self.candidate_acceptor.inspect(
@@ -8431,12 +8445,17 @@ class Orchestrator:
             else:
                 state.identical_error_count = 1
                 state.last_error_fp = fp
-            # strict 模式下连续相同错误才触发确定性回退/放弃；relaxed 模式
-            # 不把候选停滞误判为终态，而是继续调用 AutoFixer。这样“无限
-            # review/修复”策略不会被隐藏的相同错误阈值截断。
+            # strict 模式下连续相同错误会进入确定性回退/放弃；relaxed
+            # 模式不设置固定修复次数上限，但在没有进展时优先尝试 IR/安全
+            # 代码候选。回退失败后仍可继续调用 AutoFixer，不把“无限修复”
+            # 误实现成固定次数终止。
             stagnation_terminal = (
                 not self._is_relaxed(ctx)
                 and settings.MAX_FIX_IDENTICAL_ERRORS >= 3
+                and state.stagnant_repair_count >= settings.MAX_STAGNANT_ATTEMPTS
+            )
+            relaxed_stagnated = (
+                self._is_relaxed(ctx)
                 and state.stagnant_repair_count >= settings.MAX_STAGNANT_ATTEMPTS
             )
             max_fix_attempts = review_mode_policy(ctx.generation_mode).limit(
@@ -8524,6 +8543,44 @@ class Orchestrator:
                 return
             self._emit("scene_give_up", scene_id=scene_id, reason=state.failure_reason)
             return
+        if relaxed_stagnated:
+            # 这是无进展升级，不是 relaxed 的固定预算。安全候选通过同一
+            # CandidateAcceptor 后直接进入下一次 Code Review，避免再次调用
+            # 一个已经证明没有改变结果的 AutoFix Prompt。
+            stagnation_attempts = state.stagnant_repair_count
+            fallback = self._stagnation_fallback_candidate(ctx, state)
+            if fallback is not None:
+                candidate, class_name = fallback
+                code_changed = self._install_repair_candidate(
+                    ctx,
+                    scene_id,
+                    state,
+                    candidate,
+                    class_name,
+                    error_fingerprint=fp,
+                    reset_stagnation=True,
+                )
+                if code_changed:
+                    self._request_continuity_rebuild(
+                        ctx,
+                        scene_id,
+                        preserve_visual_candidates=state.visual_best_candidate is not None,
+                        include_failed=True,
+                    )
+                    self._emit(
+                        "repair_stagnation_fallback",
+                        scene_id=scene_id,
+                        strategy="scene_ir_or_safe_template",
+                        attempts=stagnation_attempts,
+                        generation_mode="relaxed",
+                    )
+                    return
+            self._emit(
+                "repair_stagnation_fallback_unavailable",
+                scene_id=scene_id,
+                attempts=stagnation_attempts,
+                generation_mode="relaxed",
+            )
         rag_context = self._retrieve_rag(
             ctx,
             "\n".join(

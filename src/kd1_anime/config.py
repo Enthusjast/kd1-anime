@@ -879,10 +879,10 @@ class Settings(BaseSettings):
     MAX_FIX_ATTEMPTS: int = Field(default=8, ge=0, le=20)
     # Slurm 节点故障/抢占等与代码无关的终态，允许自动重新排队的次数。
     MAX_INFRA_RETRIES: int = Field(default=2, ge=0, le=10)
-    # strict 模式下连续 N 次渲染错误日志指纹相同 → 提前放弃, 避免 LLM 反复
-    # "修复"同一个环境错误浪费尝试次数。relaxed 模式不使用该终止条件。
-    # 注意 strict 检查在 _scene_fix 中还要叠加 fix_attempts>=2 门槛，确保
-    # 修复器至少有 2 次真实尝试，不会因一次修复失败就误判放弃。
+    # 连续无进展时触发 IR/安全代码候选升级。strict 模式会在回退失败后
+    # 终止；relaxed 模式不把该阈值当作固定修复上限，回退不可用时仍可
+    # 继续调用 AutoFixer。
+    # strict 模式还会用该阈值识别连续相同的环境/渲染错误。
     MAX_FIX_IDENTICAL_ERRORS: int = Field(default=3, ge=1, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
 

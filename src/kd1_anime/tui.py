@@ -740,6 +740,14 @@ class ChatSession:
                 file_path = data.get("file_path", "")
                 console.print(f"  [bold green]✓[/] [dim]{esc(file_path)}[/]")
 
+            case "scene_code_fallback":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]Coder 失败，已使用最小安全代码[/]{suffix}"
+                )
+
             case "scene_review_pass":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]审查通过 ✓[/]")
@@ -768,6 +776,19 @@ class ChatSession:
             case "scene_review_fail":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]需修正[/]")
+
+            case "repair_stagnation_fallback":
+                scene_id = data.get("scene_id", "?")
+                attempts = data.get("attempts", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]修复无进展，已切换 IR/安全候选（第 {attempts} 次）[/]"
+                )
+
+            case "repair_stagnation_fallback_unavailable":
+                scene_id = data.get("scene_id", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]安全候选不可用，继续尝试 AutoFix[/]"
+                )
 
             case "scene_smoke_rendering":
                 scene_id = data.get("scene_id", "?")
