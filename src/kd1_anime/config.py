@@ -442,11 +442,11 @@ def update_toml_setting(path: Path, field_name: str, raw_value: Any) -> None:
 
 
 class Settings(BaseSettings):
-    """全局配置；环境变量 > 用户 TOML > 兼容 .env。"""
+    """全局配置；环境变量 > 用户 TOML > 默认值，旧 .env 仅作回退。"""
 
     model_config = SettingsConfigDict(
-        # dotenv_settings 内部仍按“用户文件、项目文件”的顺序合并；自定义
-        # TOML source 放在其前面，因此 TOML 会覆盖两种旧 .env 配置。
+        # dotenv_settings 保留旧版用户/项目 .env 的读取能力；自定义 TOML
+        # source 会在存在 TOML 时关闭它们，避免历史配置填充省略字段。
         env_file=_settings_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
@@ -467,6 +467,18 @@ class Settings(BaseSettings):
         toml_file = (
             USER_TOML_FILE if getattr(dotenv_settings, "env_file", None) is not None else None
         )
+        # TOML 一旦存在，就是用户配置的权威文件。旧用户 .env 只作为
+        # “尚未迁移/尚未创建 TOML”时的兼容回退，不能为 TOML 中省略的
+        # 字段注入历史数值（例如旧的 5 次重试），否则代码默认值永远
+        # 不会生效。显式传入 `_env_file=...` 仍保留给测试和调用方使用。
+        configured_env_file = getattr(dotenv_settings, "env_file", None)
+        default_env_file = settings_cls.model_config.get("env_file")
+        if USER_TOML_FILE.is_file() and configured_env_file == default_env_file:
+            dotenv_settings.env_file = None
+            # DotEnvSettingsSource 在构造时已缓存 env_vars；仅修改 env_file
+            # 不会阻止它返回旧值，必须同时清空缓存。
+            if hasattr(dotenv_settings, "env_vars"):
+                dotenv_settings.env_vars = {}
         toml_settings = _NestedTomlSettingsSource(settings_cls, toml_file=toml_file)
         return init_settings, env_settings, toml_settings, dotenv_settings, file_secret_settings
 
