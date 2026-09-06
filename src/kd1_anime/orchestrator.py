@@ -2945,7 +2945,6 @@ class Orchestrator:
                     raise RuntimeError("本地 Smoke Render 失败:\n" + detail)
 
             common_args = [
-                "manim",
                 "render",
                 f"--renderer={ctx.render_profile.renderer}",
                 f"-q{settings.LOCAL_SMOKE_RENDER_QUALITY}",

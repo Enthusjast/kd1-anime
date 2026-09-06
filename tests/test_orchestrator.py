@@ -1559,6 +1559,9 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     import_check = import_command[import_command.index("-c") + 1]
     assert "if not isinstance(candidate, type):" in import_check
     compile(import_check, "<smoke-import-check>", "exec")
+    render_commands = [command for command in captured_commands if "--media_dir" in command]
+    assert render_commands
+    assert render_commands[0][render_commands[0].index("-m") + 1 :][:2] == ["manim", "render"]
 
     def failed_run(command, **kwargs):
         return module.subprocess.CompletedProcess(command, 1, "", "render boom")
