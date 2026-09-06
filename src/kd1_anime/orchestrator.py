@@ -46,6 +46,7 @@ from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.lifecycle import (
     detect_unknown_animations,
+    repair_missing_animation_markers,
     repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
     repair_required_export_replacement_lifecycle,
@@ -1743,6 +1744,39 @@ class Orchestrator:
                             renderer=renderer,
                         )
                     lifecycle_error = "\n".join(lifecycle_result.errors)
+                    if "缺少语义事件标记" in lifecycle_error:
+                        repaired_code, marker_repairs = repair_missing_animation_markers(
+                            code,
+                            technical_spec,
+                        )
+                        if marker_repairs:
+                            code = repaired_code
+                            log = getattr(agent, "_log", None)
+                            if callable(log):
+                                log(
+                                    "已应用确定性事件标记修复: " + "；".join(marker_repairs),
+                                    style="yellow",
+                                )
+                            validation = self._validate(code, renderer=renderer)
+                            api_result = lint_manim_api(code, renderer=renderer, scene_plan=plan)
+                            continuity_error = ""
+                            try:
+                                extract_scene_continuity_elements(code, plan)
+                            except ValueError as exc:
+                                continuity_error = str(exc)
+                            if (
+                                technical_spec is not None
+                                and validation.is_valid
+                                and not continuity_error
+                            ):
+                                lifecycle_result = validate_animation_lifecycle(
+                                    code,
+                                    technical_spec,
+                                    renderer=renderer,
+                                )
+                                lifecycle_error = "\n".join(lifecycle_result.errors)
+                            else:
+                                lifecycle_error = ""
             if (
                 validation.is_valid
                 and api_result.is_valid
