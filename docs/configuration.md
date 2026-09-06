@@ -242,6 +242,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
+| GENERATION_MODE | relaxed | 生成策略；relaxed 放宽 LLM Review，strict 使用严格有限审查 |
 | MAX_REVIEW_ROUNDS | 8 | 单场景代码审查/重写轮数 |
 | MAX_LOW_RISK_REVIEW_ROUNDS | 2 | 低风险场景的代码审查轮数；确定性检查不跳过 |
 | MAX_PLAN_REVIEW_ROUNDS | 2 | 单场景计划审查轮数 |

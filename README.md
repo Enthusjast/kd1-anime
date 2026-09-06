@@ -214,6 +214,7 @@ INIT
 - **审查分级**：确定性校验或带源码/合同证据的高置信度核心错误才是 hard blocker；可唯一匹配的局部替换先自动修复；风格建议、一般节奏和不确定的“可能问题”作为 warning 放行。
 - **Render Fix** 只处理渲染日志暴露的代码问题；环境、Slurm、字体和显示服务错误不会盲目交给模型重写。
 - **Continuity Review** 只处理跨场景边界。达到 `MAX_CONTINUITY_FIX_ROUNDS` 后会记录 warning 并沿用当时的可验证计划继续，不会因为连续性审查耗尽而阻断整条流水线。
+- **生成模式**：默认 `relaxed` 模式只让确定性校验阻断错误，LLM Review 的低置信度意见或调用失败会记录 warning；使用 `--strict` 或 `[pipeline] generation_mode = "strict"` 保留严格 Review，所有计划、代码、连续性和渲染修复阶段最多 8 轮。`resume` 始终沿用运行清单中的模式。
 - **可靠性回退**：精确 traceback 证据和修复停滞检测默认启用；确定性 Scene IR、稳定场景模板等模板化生成路径属于实验性功能，只有设置 `CODEGEN_MODE=hybrid/ir` 才启用。
 
 ### 场景粒度与并行
@@ -351,6 +352,7 @@ kd1-anime test-llm --no-json-mode --verbose
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 连续性局部重规划次数；耗尽后 warning 放行 |
 | `MAX_REVIEW_ROUNDS` | `8` | 单场景代码审查/重写轮数 |
 | `MAX_LOW_RISK_REVIEW_ROUNDS` | `2` | 低风险场景的审查轮数；确定性检查始终执行 |
+| `GENERATION_MODE` | `relaxed` | 默认生成策略：`relaxed` 或 `strict` |
 | `MAX_STAGNANT_ATTEMPTS` | `2` | 渲染修复无进展后切换 IR/安全模板的次数 |
 | `MAX_FIX_ATTEMPTS` | `8` | 渲染失败后的代码修复次数 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
