@@ -1203,6 +1203,33 @@ def test_normalize_uncontracted_geometry_update_to_hold():
     assert any("辅助几何 update 降级为 hold" in repair for repair in repairs)
 
 
+def test_normalize_composite_formula_annotation_update_to_hold():
+    formula = VisualElementState(element_id="formula", variable_name="formula")
+    plan = make_plan(new=[formula])
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            TechnicalAnimation(
+                event_id="write_error_term",
+                start_seconds=0,
+                end_seconds=2,
+                semantic_action="update",
+                source_element_ids=["formula"],
+                target_element_ids=["formula"],
+                api_notes="在 formula 中添加 + o(rho) 部分，并创建 error_term_highlight 作为红色高亮",
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+
+    event = next(item for item in normalized.animations if item.event_id == "write_error_term")
+    assert event.semantic_action == "hold"
+    assert event.source_element_ids == []
+    assert any("辅助几何 update 降级为 hold" in repair for repair in repairs)
+
+
 def test_normalize_technical_spec_downgrades_create_of_active_target_to_animation():
     point = VisualElementState(element_id="point", variable_name="point")
     formula = VisualElementState(element_id="formula", variable_name="formula")

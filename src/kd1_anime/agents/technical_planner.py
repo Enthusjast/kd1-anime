@@ -252,13 +252,20 @@ def _normalise_technical_lifecycle(
         # Coder 仍可用诊断 marker 绘制未纳入边界的辅助几何。
         note_text = f"{event.event_id} {event.api_notes}".lower()
         has_uncontracted_geometry_hint = (
-            "create" in note_text
-            and (
-                "line" in note_text
-                or "绘制" in note_text
-                or event.event_id.lower().startswith("draw_")
+            (
+                "create" in note_text
+                and (
+                    "line" in note_text
+                    or "绘制" in note_text
+                    or event.event_id.lower().startswith("draw_")
+                )
             )
-        ) or "使用 create 或 line" in note_text
+            or (
+                ("创建" in note_text or "添加" in note_text)
+                and ("highlight" in note_text or "高亮" in note_text or "error" in note_text)
+            )
+            or "使用 create 或 line" in note_text
+        )
         if (
             action == "update"
             and source_ids
