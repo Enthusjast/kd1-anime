@@ -113,7 +113,7 @@ Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。Sc
 
 ### 3.2 CODING / REVIEWING
 
-TechnicalSpec 是 CODING 内部的强制前置阶段，不改变顶层 FSM 的兼容状态集合。它把
+TechnicalSpec 是 CODING 内部的强制前置阶段，不改变顶层 FSM 状态集合。它把
 ScenePlan 的对象声明映射为变量名、构造器、语义动作、LaTeX 分段、布局约束和导出清单；
 合同版本 2 的动作只有 `introduce`、`update`、`remove`、`camera`、`hold`，不把某个
 Manim 动画类名当成协议。编译器会模拟 active 状态，阻断对已退出对象的继续使用。它和
