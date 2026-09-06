@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.api_linter import lint_manim_api
+from kd1_anime.agents.api_linter import lint_manim_api, repair_manim_api_compatibility
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
@@ -83,6 +83,36 @@ def test_api_linter_warns_about_unbounded_graph_and_updater():
     assert result.is_valid is True
     assert any("x_range" in warning for warning in result.warnings)
     assert any("clear_updaters" in warning for warning in result.warnings)
+
+
+def test_api_repair_replaces_grow_arrow_for_arrow3d():
+    code = (
+        "from manim import *\n"
+        "class Demo(ThreeDScene):\n"
+        "    def construct(self):\n"
+        "        arrow = Arrow3D(ORIGIN, RIGHT)\n"
+        "        self.play(GrowArrow(arrow))\n"
+    )
+
+    repaired, repairs = repair_manim_api_compatibility(code)
+
+    assert "self.play(Create(arrow))" in repaired
+    assert repairs == ("将 Arrow3D 的 GrowArrow 替换为 Create: arrow",)
+
+
+def test_api_repair_leaves_grow_arrow_for_arrow_unchanged():
+    code = (
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        arrow = Arrow(ORIGIN, RIGHT)\n"
+        "        self.play(GrowArrow(arrow))\n"
+    )
+
+    repaired, repairs = repair_manim_api_compatibility(code)
+
+    assert repaired == code
+    assert repairs == ()
 
 
 def test_continuity_context_mode_defaults_to_only_requested_exports(monkeypatch, tmp_path):

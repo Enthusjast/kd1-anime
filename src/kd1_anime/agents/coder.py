@@ -60,6 +60,9 @@ MathTex；使用 Tex 展示中文时，中文一律使用配置了 ctex 的模�
 - updater 不形成递归引用，用完后 clear_updaters。
 - 使用当前 ManimCE 版本的现行关键字参数和类名；新的动画实现可以直接使用，
   不要因为它没有出现在提示词示例里而自行发明 API。
+- ``GrowArrow`` 只用于二维 ``Arrow``/``Vector``；三维 ``Arrow3D`` 请使用
+  ``Create``、``FadeIn`` 或其它与三维 Mobject 兼容的入场动画，避免把二维
+  箭头的 ``scale_tips`` 参数传给 ``VMobject.scale``。
 - TechnicalSpec 是只读的语义执行合同；每个 `self.play` 前必须写一行
   `# KD1_ANIMATION_EVENT: <event_id>`，并引用对应事件声明的对象。事件的
   `semantic_action` 决定状态：`introduce` 引入新对象，`update` 修改 active source，

@@ -24,7 +24,7 @@ from uuid import uuid4
 from rich.console import Console
 from rich.prompt import Confirm
 
-from kd1_anime.agents.api_linter import lint_manim_api
+from kd1_anime.agents.api_linter import lint_manim_api, repair_manim_api_compatibility
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.capability import (
     CapabilityContract,
@@ -1683,10 +1683,18 @@ class Orchestrator:
                 **code_kwargs,
             )
             if technical_spec is not None:
+                code, api_repairs = repair_manim_api_compatibility(code)
                 code, lifecycle_repairs = repair_required_export_alias_lifecycle(
                     code,
                     technical_spec,
                 )
+                if api_repairs:
+                    log = getattr(agent, "_log", None)
+                    if callable(log):
+                        log(
+                            "已应用确定性 Manim API 兼容修复: " + "；".join(api_repairs),
+                            style="yellow",
+                        )
                 transform_alias_code, transform_alias_repairs = (
                     repair_required_export_transform_alias_lifecycle(code, technical_spec)
                 )

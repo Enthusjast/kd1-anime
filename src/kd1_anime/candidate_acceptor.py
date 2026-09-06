@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from kd1_anime.agents.api_linter import lint_manim_api
+from kd1_anime.agents.api_linter import lint_manim_api, repair_manim_api_compatibility
 from kd1_anime.agents.continuity import extract_scene_continuity_elements
 from kd1_anime.agents.lifecycle import (
     detect_unknown_animations,
@@ -62,6 +62,8 @@ class CandidateAcceptor:
             raise CandidateRejected("候选代码为空")
         repairs: list[str] = []
         if technical_spec is not None:
+            code, api_repairs = repair_manim_api_compatibility(code)
+            repairs.extend(api_repairs)
             code, alias_repairs = repair_initial_active_alias_lifecycle(code, technical_spec)
             repairs.extend(alias_repairs)
             code, marker_repairs = repair_missing_animation_markers(code, technical_spec)
