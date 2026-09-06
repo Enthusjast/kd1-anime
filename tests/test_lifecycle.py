@@ -661,7 +661,7 @@ class Demo(Scene):
     repaired, repairs = repair_initial_active_alias_lifecycle(code, technical)
 
     assert "Transform(grid, grid.copy())" in repaired
-    assert repairs == ("将继承对象的 active source 别名 grid_rotated 收敛到 grid",)
+    assert repairs == ("将合同对象的 active source 别名 grid_rotated 收敛到 grid",)
     assert validate_animation_lifecycle(repaired, technical).is_valid is True
 
 
@@ -684,6 +684,79 @@ class Demo(Scene):
 
     assert result.is_valid is True, result.errors
     assert any("分段执行" in warning for warning in result.warnings)
+
+
+def test_allows_introduction_followed_by_in_place_update_with_same_marker():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 2,
+                "semantic_action": "introduce",
+                "target_element_ids": ["formula"],
+                "create_element_ids": ["formula"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        formula_target = formula.copy().scale(1.2)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeIn(formula))
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(Transform(formula, formula_target))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+
+
+def test_repairs_copy_alias_for_a_newly_introduced_contract_object():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "introduce",
+                "target_element_ids": ["formula"],
+                "create_element_ids": ["formula"],
+            },
+            {
+                "event_id": "update_formula",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            },
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeIn(formula))
+        formula_current = formula.copy().scale(1.2)
+        # KD1_ANIMATION_EVENT: update_formula
+        self.play(Transform(formula_current, formula.copy()))
+"""
+
+    repaired, repairs = repair_initial_active_alias_lifecycle(code, technical)
+
+    assert "Transform(formula, formula.copy())" in repaired
+    assert repairs == ("将合同对象的 active source 别名 formula_current 收敛到 formula",)
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
 
 
 def test_semantic_marker_can_precede_pure_target_preparation():

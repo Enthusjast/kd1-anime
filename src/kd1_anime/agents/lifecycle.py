@@ -900,11 +900,11 @@ def repair_initial_active_alias_lifecycle(
 ) -> tuple[str, tuple[str, ...]]:
     """将继承对象的临时 source 别名收敛回其合同变量。
 
-    Coder 常把 ``grid_standard`` 复制成 ``grid_initial`` 或
-    ``grid_transformed``，然后让后者成为 ``Transform``/``FadeOut`` 的
-    source。副本并没有接管 Scene 中的 active 身份，因而技术合同会报告
-    update 没有操作任何 source。只改写动画参数中的 source 位置，不改写
-    Transform target 或临时对象定义，随后仍由完整生命周期校验复核。
+    Coder 常把合同对象复制成 ``grid_initial`` 或 ``grid_transformed``，
+    然后让后者成为 ``Transform``/``FadeOut`` 的 source。副本并没有接管
+    Scene 中的 active 身份，因而技术合同会报告 update 没有操作任何 source。
+    只改写动画参数中的 source 位置，不改写 Transform target 或临时对象
+    定义，随后仍由完整生命周期校验复核。
     """
 
     if not code or not technical_spec.animations:
@@ -917,12 +917,10 @@ def repair_initial_active_alias_lifecycle(
     if construct is None:
         return code, ()
 
-    initially_active = {
-        item.variable_name
-        for item in technical_spec.objects
-        if item.initially_active and item.variable_name
+    contract_variables = {
+        item.variable_name for item in technical_spec.objects if item.variable_name
     }
-    if not initially_active:
+    if not contract_variables:
         return code, ()
 
     aliases: dict[str, str] = {}
@@ -933,7 +931,7 @@ def repair_initial_active_alias_lifecycle(
         target = node.targets[0]
         if not isinstance(target, ast.Name):
             continue
-        base_candidates = {base for base in initially_active if target.id.startswith(f"{base}_")}
+        base_candidates = {base for base in contract_variables if target.id.startswith(f"{base}_")}
         if not base_candidates:
             continue
         referenced_names = {
@@ -948,7 +946,7 @@ def repair_initial_active_alias_lifecycle(
         unresolved: list[tuple[str, set[str]]] = []
         progressed = False
         for alias, roots in pending:
-            resolved_roots = {root for root in roots if root in initially_active}
+            resolved_roots = {root for root in roots if root in contract_variables}
             resolved_roots.update(aliases[root] for root in roots if root in aliases)
             if resolved_roots:
                 aliases[alias] = sorted(resolved_roots)[0]
@@ -1037,7 +1035,7 @@ def repair_initial_active_alias_lifecycle(
         source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
     changed_aliases = {alias for _, alias in edits.values()}
     repairs = tuple(
-        f"将继承对象的 active source 别名 {alias} 收敛到 {base}"
+        f"将合同对象的 active source 别名 {alias} 收敛到 {base}"
         for alias, base in sorted(aliases.items())
         if alias in changed_aliases
     )
@@ -1156,8 +1154,6 @@ def validate_animation_lifecycle(
         if event is not None and event.semantic_action in {"remove", "update", "camera"}:
             detail = "分段清理事件" if event.semantic_action == "remove" else "分段执行"
             warnings.append(f"动画事件标记重复: {event_id}；按同一语义事件的{detail}合并校验")
-        else:
-            errors.append(f"动画事件标记重复: {event_id}")
 
     object_by_variable = {
         item.variable_name: item for item in technical_spec.objects if item.variable_name
@@ -1293,16 +1289,14 @@ def validate_animation_lifecycle(
 
         marker_id = _marker_before_line(lines, node.lineno)
         event = event_by_id.get(marker_id or "")
+        repeated_marker = False
         if marker_id is None and markers_required:
             errors.append(
                 f"第 {node.lineno} 行 self.play() 缺少语义事件标记；"
                 "请在上一行写 # KD1_ANIMATION_EVENT: <event_id>"
             )
         elif marker_id is not None:
-            if marker_id in used_event_ids and (
-                event is None or event.semantic_action not in {"remove", "update", "camera"}
-            ):
-                errors.append(f"第 {node.lineno} 行重复使用动画事件标记: {marker_id}")
+            repeated_marker = marker_id in used_event_ids
             used_event_ids.add(marker_id)
             if event is None and not marker_id.startswith(_AUTO_EVENT_PREFIX):
                 errors.append(
@@ -1314,6 +1308,15 @@ def validate_animation_lifecycle(
             invocations.extend(_animation_invocations(argument))
         if not invocations and node.args:
             invocations.append(_AnimationInvocation("unknown:expression", unknown=True))
+
+        if repeated_marker and event is not None and event.semantic_action == "introduce":
+            # 一个“首次展示后再变换”的复合引入阶段可能合理地使用
+            # 同一 marker 两次，但第二次必须是对已经 active 对象的原地
+            # 更新，不能再次 FadeIn/Create 一个新对象。这个判断放在
+            # 解析实际调用之后，避免把合法的 Transform 误判成重复引入。
+            has_introducer = any(invocation.operation in _INTRODUCERS for invocation in invocations)
+            if has_introducer:
+                errors.append(f"第 {node.lineno} 行重复使用动画事件标记: {marker_id}")
 
         for invocation in invocations:
             source_names = set(invocation.source_names)
