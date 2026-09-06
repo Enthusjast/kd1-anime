@@ -387,6 +387,45 @@ def _normalise_technical_lifecycle(
                 repairs.append(f"事件 {event.event_id} 缺少 source，按 hold 处理")
                 changed = True
 
+        if (
+            action == "update"
+            and source_ids
+            and not target_ids
+            and not create_ids
+            and not remove_ids
+            and any(
+                term in f"{event.event_id} {event.api_notes}".lower()
+                for term in (
+                    "hold",
+                    "flash",
+                    "highlight",
+                    "emphasize",
+                    "blink",
+                    "保持",
+                    "停留",
+                    "闪烁",
+                    "强调",
+                    "error_term",
+                )
+            )
+        ):
+            action = "hold"
+            event = event.model_copy(
+                update={
+                    "semantic_action": action,
+                    "target_element_ids": [],
+                    "create_element_ids": [],
+                    "remove_element_ids": [],
+                    "api_notes": _append_api_repair_note(
+                        event.api_notes,
+                        "无目标的强调/停顿事件按 hold 处理，避免伪造 source 变换",
+                    ),
+                }
+            )
+            target_ids = create_ids = remove_ids = set()
+            repairs.append(f"事件 {event.event_id} 的 source-only emphasis update 规范为 hold")
+            changed = True
+
         if action == "update":
             inactive_sources = source_ids - active
             # 模型有时会把新对象同时放进 source 和 target/create；

@@ -1163,6 +1163,40 @@ def test_normalize_technical_spec_downgrades_empty_fade_in_update_to_hold():
     assert any("update 降级为 hold" in repair for repair in repairs)
 
 
+def test_normalize_source_only_emphasis_update_to_hold():
+    formula = VisualElementState(element_id="formula", variable_name="formula")
+    plan = make_plan(
+        inherited=[formula],
+        new=[VisualElementState(element_id="other", variable_name="other", required=False)],
+    )
+    spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                initially_active=True,
+            )
+        ],
+        animations=[
+            TechnicalAnimation(
+                event_id="write_error_term",
+                start_seconds=0,
+                end_seconds=1,
+                semantic_action="update",
+                source_element_ids=["formula"],
+                api_notes="闪烁强调误差项，不改变公式状态",
+            )
+        ],
+    )
+
+    normalized, repairs = normalize_technical_spec_contract(plan, spec)
+
+    assert normalized.animations[0].semantic_action == "hold"
+    assert compile_technical_spec(plan, normalized).is_valid is True
+    assert any("source-only emphasis" in repair for repair in repairs)
+
+
 def test_normalize_uncontracted_geometry_update_to_hold():
     grid = VisualElementState(element_id="grid", variable_name="grid", required=True)
     formula = VisualElementState(element_id="formula", variable_name="formula")
