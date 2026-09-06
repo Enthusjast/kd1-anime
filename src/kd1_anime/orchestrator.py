@@ -4127,9 +4127,39 @@ class Orchestrator:
             and state.technical_input_sha256 == input_sha256
             and state.technical_spec_sha256 == sha256_text(state.technical_spec.model_dump_json())
         ):
-            result = compile_technical_spec(
+            # 恢复运行时不能只编译磁盘中的旧合同。技术合同的确定性
+            # 规范化规则可能在上一次运行之后得到修复；若这里直接
+            # return，恢复流程会继续复用旧的复合事件/生命周期字段，
+            # 使已经修复的生成逻辑对旧 run 完全不生效。
+            normalized_spec, contract_repairs = normalize_technical_spec_contract(
                 state.plan,
                 state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+            )
+            if contract_repairs:
+                state.technical_spec = normalized_spec
+                state.technical_spec_sha256 = sha256_text(normalized_spec.model_dump_json())
+                ctx.continuity_warnings.extend(
+                    f"Scene {state.plan.scene_id} 恢复时重新对齐 TechnicalSpec：{repair}"
+                    for repair in contract_repairs
+                )
+                self._write_stage_artifact(
+                    ctx,
+                    f"scene_{state.plan.scene_id}_technical_spec.json",
+                    {
+                        "schema_version": 1,
+                        "contract_version": normalized_spec.contract_version,
+                        "scene_id": state.plan.scene_id,
+                        "input_sha256": input_sha256,
+                        "spec_sha256": state.technical_spec_sha256,
+                        "spec": normalized_spec.model_dump(mode="json"),
+                        "restore_repairs": list(contract_repairs),
+                    },
+                )
+                self._checkpoint(ctx, State.REVIEWING)
+            result = compile_technical_spec(
+                state.plan,
+                normalized_spec,
                 renderer=ctx.render_profile.renderer,
             )
             if result.is_valid:
