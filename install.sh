@@ -1207,6 +1207,18 @@ fi
 EOF
 }
 
+print_logo() {
+    printf '\n'
+    # 安装完成时优先使用已安装包中的 PNG 转换结果；测试、局部调用或
+    # 安装中断时可能还没有 conda 环境，此时输出不依赖 Python 的回退标识。
+    if [ -n "${CONDA_ENV_DIR:-}" ] && [ -x "$CONDA_ENV_DIR/bin/python" ]; then
+        if env_python -m kd1_anime.logo 2>/dev/null; then
+            return 0
+        fi
+    fi
+    printf '  kd1-anime\n'
+}
+
 print_completion() {
     printf '\n%b安装完成%b\n' "$GREEN" "$NC"
     printf '%s\n' \
@@ -1214,6 +1226,7 @@ print_completion() {
         "2. 启动程序: kd1-anime" \
         "3. 编辑配置: $CONFIG_FILE" \
         "   命令目录: $USER_BIN_DIR"
+    print_logo
 }
 
 main() {

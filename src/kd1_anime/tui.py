@@ -25,6 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from kd1_anime.config import settings
+from kd1_anime.logo import ANSI_LOGO
 
 console = Console()
 
@@ -581,7 +582,7 @@ class ChatSession:
             )
             if dashboard_active:
                 dashboard.stop()
-            self._show_completion(final_video)
+            self._show_completion(final_video, dry_run=self.dry_run)
             self.exit_code = 0
             return True
         except KeyboardInterrupt:
@@ -934,17 +935,21 @@ class ChatSession:
                 )
 
     @staticmethod
-    def _show_completion(output_path) -> None:
-        """显示完成信息"""
-        if output_path is None:
+    def _show_completion(output_path, *, dry_run: bool = False) -> None:
+        """显示完成信息和 Logo。"""
+        if output_path is None and not dry_run:
             return  # 流水线失败, orchestrator 已输出错误
         console.print()
         console.print(Rule("[bold green]完成[/]", style="green"))
-        size_mb = output_path.stat().st_size / (1024 * 1024)
-        console.print(
-            Panel(
-                f"[bold]{output_path}[/]\n[dim]{size_mb:.1f} MB[/]",
-                title="[bold green]✓ 最终视频[/]",
-                border_style="green",
+        if output_path is None:
+            console.print("[bold green]✓ Dry-run 已完成[/]")
+        else:
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+            console.print(
+                Panel(
+                    f"[bold]{output_path}[/]\n[dim]{size_mb:.1f} MB[/]",
+                    title="[bold green]✓ 最终视频[/]",
+                    border_style="green",
+                )
             )
-        )
+        console.print(Text.from_ansi(ANSI_LOGO), end="")
