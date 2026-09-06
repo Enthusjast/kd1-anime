@@ -1635,6 +1635,13 @@ class Orchestrator:
         last_continuity_error = ""
         last_lifecycle_error = ""
         last_api_errors: tuple[str, ...] = ()
+        generation_mode = (
+            self._ctx.generation_mode if self._ctx is not None else "strict"
+        )
+        max_validation_attempts = (
+            None if generation_mode == "relaxed" else settings.CODE_VALIDATION_ATTEMPTS
+        )
+        failed_candidate_signatures: dict[str, int] = {}
         if technical_spec is not None:
             technical_result = compile_technical_spec(
                 plan,
@@ -1647,8 +1654,12 @@ class Orchestrator:
                     + "\n".join(f"- {error}" for error in technical_result.errors),
                     hint="请重新生成 TechnicalSpec，不要直接修改代码绕过技术合同",
                 )
-        max_validation_attempts = settings.CODE_VALIDATION_ATTEMPTS
-        for attempt in range(1, max_validation_attempts + 1):
+        attempt = 0
+        while max_validation_attempts is None or attempt < max_validation_attempts:
+            attempt += 1
+            attempt_limit_text = (
+                str(max_validation_attempts) if max_validation_attempts is not None else "∞"
+            )
             code_kwargs = {
                 "feedback": current_feedback,
                 "previous_code": current_previous,
@@ -1813,10 +1824,34 @@ class Orchestrator:
             last_api_errors = api_result.errors
             last_continuity_error = continuity_error
             last_lifecycle_error = lifecycle_error
+            if generation_mode == "relaxed":
+                failure_signature = sha256_text(
+                    "\n".join(
+                        (
+                            code,
+                            validation.feedback,
+                            continuity_error,
+                            lifecycle_error,
+                            "\n".join(api_result.errors),
+                        )
+                    )
+                )
+                failed_candidate_signatures[failure_signature] = (
+                    failed_candidate_signatures.get(failure_signature, 0) + 1
+                )
+                if (
+                    failed_candidate_signatures[failure_signature]
+                    >= settings.MAX_IDENTICAL_REVIEW_ATTEMPTS
+                ):
+                    raise ValidationError(
+                        "relaxed 模式下候选代码已停滞，停止重复生成："
+                        + (lifecycle_error or continuity_error or validation.feedback),
+                        hint="请调整需求或使用 --strict 进行严格有限重试",
+                    )
             # 提供详细的修复指导
             feedback_parts = [
-                f"上一候选是第 {attempt}/{max_validation_attempts} 次尝试，未通过确定性校验；"
-                f"现在进行第 {min(attempt + 1, max_validation_attempts)}/{max_validation_attempts} "
+                f"上一候选是第 {attempt}/{attempt_limit_text} 次尝试，未通过确定性校验；"
+                f"现在进行第 {attempt + 1}/{attempt_limit_text} "
                 "次修复。不得原样返回上一候选代码，必须针对下面的确定性错误做最小修改：\n"
                 f"{validation.feedback}"
             ]

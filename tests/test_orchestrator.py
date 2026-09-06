@@ -2174,6 +2174,65 @@ class Demo(Scene):
     assert "完全相同" in coder.calls[2]
 
 
+def test_relaxed_code_generation_can_continue_past_validation_attempt_default(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="formula", variable_name="formula")
+            ]
+        }
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        duplicate = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return (
+                valid
+                if len(self.calls) == 4
+                else invalid.replace("duplicate", f"duplicate_{len(self.calls)}")
+            )
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(settings, "GENERATION_MODE", "relaxed")
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+    orchestrator = Orchestrator()
+    orchestrator._ctx = PipelineContext("prompt", generation_mode="relaxed")
+
+    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 4
+
+
 def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
     run_paths = paths(tmp_path)
     run_paths.root.mkdir(parents=True)
