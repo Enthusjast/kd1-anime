@@ -6881,6 +6881,8 @@ class Orchestrator:
                 self._emit("scene_reused", scene_id=scene_id)
             return
         self._emit("scene_reviewing", scene_id=scene_id)
+        deterministic_review_error = False
+        deterministic_review_error = False
         try:
             # 导出区是确定性的交接合同。先校验再调用 Reviewer，避免把重复
             # 导出标记、缺失元素等可直接修复的问题交给 LLM，尤其避免长上下文
@@ -6895,6 +6897,7 @@ class Orchestrator:
                 if not lifecycle_result.is_valid:
                     raise ValueError("动画生命周期错误：" + "；".join(lifecycle_result.errors))
         except ValueError as exc:
+            deterministic_review_error = True
             result = ReviewResult(
                 is_valid=False,
                 severity="major",
@@ -6934,12 +6937,19 @@ class Orchestrator:
                 self._update_element_manifest(ctx, state)
                 self._update_state_ledger(ctx, state)
             except ValueError as exc:
+                deterministic_review_error = True
                 result = ReviewResult(
                     is_valid=False,
                     severity="major",
                     feedback=f"连续性导出区无效，无法交接给下一场景: {exc}",
                 )
-        self._apply_review_result(ctx, scene_id, state, result)
+        self._apply_review_result(
+            ctx,
+            scene_id,
+            state,
+            result,
+            allow_relaxed_soft_pass=not deterministic_review_error,
+        )
 
     def _scene_submit(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
         self._phase_emit("dispatching")
@@ -8294,7 +8304,13 @@ class Orchestrator:
         return True
 
     def _apply_review_result(
-        self, ctx: PipelineContext, scene_id: int, state: SceneState, result: ReviewResult
+        self,
+        ctx: PipelineContext,
+        scene_id: int,
+        state: SceneState,
+        result: ReviewResult,
+        *,
+        allow_relaxed_soft_pass: bool = True,
     ) -> bool:
         """应用单场景审查结果。"""
         self._write_stage_artifact(
@@ -8307,7 +8323,7 @@ class Orchestrator:
                 "result": result.model_dump(mode="json"),
             },
         )
-        if not result.is_valid and self._is_relaxed(ctx):
+        if not result.is_valid and self._is_relaxed(ctx) and allow_relaxed_soft_pass:
             warning_messages = [
                 f"Scene {scene_id} relaxed Review warning：{result.feedback[:2_000]}"
             ]
