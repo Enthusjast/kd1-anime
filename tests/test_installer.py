@@ -349,11 +349,8 @@ def test_installer_uses_private_application_home_for_user_storage(tmp_path):
     assert 'base_url = "https://api.openai.com/v1"' in content
     assert 'model = "your-model-name"' in content
     assert "[render]" in content
-    assert 'backend = "slurm"' in content
-    assert "[slurm]" in content
-    assert 'conda_env = "manim_env"' in content
-    assert 'time_limit = "01:00:00"' in content
-    assert "cpus_per_task = 4" in content
+    assert 'backend = "local"' in content
+    assert "[slurm]" not in content
     assert "[pipeline]" not in content
     assert "max_review_rounds" not in content
     assert "max_fix_attempts" not in content

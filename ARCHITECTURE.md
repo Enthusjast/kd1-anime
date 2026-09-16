@@ -367,7 +367,7 @@ AST 校验是纵深防御，不是 Python 沙箱。共享或高信任要求集�
 
 - wheel 只包含 Python 运行时模块；主机依赖由 `install.sh` 和文档管理。
 - sdist 额外包含 README、架构、配置、故障排查和贡献文档；知识库压缩包仍由安装器解压到用户目录。
-- 安装器无 sudo，优先复用完整 XeLaTeX；需要时安装最小用户级 TeX Live。
+- 安装器面向个人 Ubuntu 默认使用 local 后端；无 sudo 时在用户目录引导 Conda，优先复用完整 XeLaTeX，必要时安装最小用户级 TeX Live；Slurm 仍可显式启用。
 - 单元测试不得调用真实 LLM、提交 Slurm 或执行生成代码。
 
 质量门：

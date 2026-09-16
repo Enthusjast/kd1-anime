@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kd1-anime 一站式安装器：Ubuntu/HPC，无 sudo。
+# kd1-anime 一站式用户级安装器：个人 Ubuntu 默认本地渲染，也支持 Slurm。
 set -Eeuo pipefail
 umask 077
 
@@ -44,6 +44,15 @@ if [[ ! "$TEXLIVE_PLATFORM" =~ ^[A-Za-z0-9_-]+$ ]]; then
 fi
 CONFIG_DIR="$HOME/.kd1-anime"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
+CONDA_INSTALL_DIR="${KD1_ANIME_CONDA_DIR:-$CONFIG_DIR/miniconda3}"
+DEFAULT_RENDER_BACKEND="${KD1_ANIME_RENDER_BACKEND:-local}"
+case "$DEFAULT_RENDER_BACKEND" in
+    local|slurm) ;;
+    *)
+        err "KD1_ANIME_RENDER_BACKEND 只能是 local 或 slurm"
+        exit 1
+        ;;
+esac
 LEGACY_CONFIG_DIR="$HOME/.config/kd1-anime"
 LEGACY_CONFIG_HOME_FILE="$LEGACY_CONFIG_DIR/.env"
 LEGACY_CONFIG_EXAMPLE_FILE="$LEGACY_CONFIG_DIR/.env.example"
@@ -72,6 +81,111 @@ cleanup() {
 }
 trap cleanup EXIT
 
+check_host() {
+    local command_name missing=()
+
+    if [ "$(uname -s)" != "Linux" ]; then
+        err "此安装器面向 Linux/Ubuntu，当前系统不是 Linux。"
+        return 1
+    fi
+    if [ -r /etc/os-release ]; then
+        # Ubuntu 及其兼容发行版可以直接使用本安装器；其它 Linux 仍允许
+        # 继续，但错误提示会明确说明脚本未针对其系统包布局测试。
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        case "${ID:-}" in
+            ubuntu|linuxmint|pop|elementary|debian) ;;
+            *) warn "当前发行版 ${PRETTY_NAME:-未知} 未经过专门测试，将继续使用用户级安装" ;;
+        esac
+    fi
+
+    for command_name in awk bash chmod cmp dirname find grep head ln mktemp mv rm sed sort tar; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        missing+=("curl 或 wget")
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        missing+=("sha256sum")
+    fi
+    if [ "${#missing[@]}" -gt 0 ]; then
+        err "缺少基础命令: ${missing[*]}"
+        err "请在 Ubuntu 上安装对应工具后重试（例如 sudo apt install curl ca-certificates tar coreutils），"
+        err "安装器本身不会自动调用 sudo。"
+        return 1
+    fi
+}
+
+conda_installer_platform() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf '%s\n' x86_64 ;;
+        aarch64|arm64) printf '%s\n' aarch64 ;;
+        *)
+            err "不支持的 Conda CPU 架构: $(uname -m)"
+            return 1
+            ;;
+    esac
+}
+
+install_user_conda() {
+    local platform installer url expected actual
+
+    if [[ "$CONDA_INSTALL_DIR" != /* ]] || [[ "$CONDA_INSTALL_DIR" == *$'\n'* ]] || [[ "$CONDA_INSTALL_DIR" == *$'\r'* ]]; then
+        err "KD1_ANIME_CONDA_DIR 必须是不含换行的绝对路径: $CONDA_INSTALL_DIR"
+        return 1
+    fi
+    if [ -e "$CONDA_INSTALL_DIR" ]; then
+        if [ -x "$CONDA_INSTALL_DIR/bin/conda" ]; then
+            return 0
+        fi
+        err "Conda 安装目录已存在但不是可用 Conda 环境: $CONDA_INSTALL_DIR"
+        err "如需更换目录，请备份后移除该目录，或设置 KD1_ANIME_CONDA_DIR。"
+        return 1
+    fi
+
+    platform="$(conda_installer_platform)" || return 1
+    url="${KD1_ANIME_CONDA_INSTALLER_URL:-https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-${platform}.sh}"
+    if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
+        err "KD1_ANIME_CONDA_INSTALLER_URL 必须是有效的 HTTP(S) URL"
+        return 1
+    fi
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    installer="$(mktemp "$CONFIG_DIR/.miniconda-installer.XXXXXX")"
+    cleanup_dirs+=("$installer")
+    info "未找到 Conda，下载用户级 Miniconda 到 $CONDA_INSTALL_DIR"
+    download "$url" "$installer"
+
+    expected="${KD1_ANIME_CONDA_INSTALLER_SHA256:-}"
+    if [ -n "$expected" ]; then
+        expected="${expected,,}"
+        if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            err "KD1_ANIME_CONDA_INSTALLER_SHA256 必须是 64 位十六进制 SHA-256"
+            return 1
+        fi
+        actual="$(sha256sum "$installer" | awk '{print $1}')"
+        if [ "$actual" != "$expected" ]; then
+            err "Miniconda 安装器 SHA-256 不匹配"
+            err "expected: $expected"
+            err "actual:   $actual"
+            return 1
+        fi
+        log "Miniconda 安装器 SHA-256 验证通过"
+    elif [ "$REQUIRE_CHECKSUM" = 1 ]; then
+        err "安全模式要求设置 KD1_ANIME_CONDA_INSTALLER_SHA256"
+        return 1
+    else
+        warn "未设置 KD1_ANIME_CONDA_INSTALLER_SHA256；生产环境建议固定安装器摘要"
+    fi
+
+    bash "$installer" -b -p "$CONDA_INSTALL_DIR"
+    [ -x "$CONDA_INSTALL_DIR/bin/conda" ] || {
+        err "Miniconda 安装完成后未找到 conda: $CONDA_INSTALL_DIR/bin/conda"
+        return 1
+    }
+    log "用户级 Miniconda 安装完成: $CONDA_INSTALL_DIR"
+}
+
 find_conda() {
     unset PYTHONHOME
     if command -v module >/dev/null 2>&1; then
@@ -87,9 +201,24 @@ find_conda() {
         export PATH="$KNOWN_CONDA_BASE/bin:$PATH"
         CONDA_BASE="$KNOWN_CONDA_BASE"
     fi
+    if [ -z "$CONDA_BASE" ]; then
+        local candidate
+        for candidate in "$HOME/miniconda3" "$HOME/miniforge3" "$HOME/mambaforge"; do
+            if [ -x "$candidate/bin/conda" ]; then
+                export PATH="$candidate/bin:$PATH"
+                CONDA_BASE="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -z "$CONDA_BASE" ] && [ -x "$CONDA_INSTALL_DIR/bin/conda" ]; then
+        export PATH="$CONDA_INSTALL_DIR/bin:$PATH"
+        CONDA_BASE="$CONDA_INSTALL_DIR"
+    fi
     if [ -z "$CONDA_BASE" ] || [ ! -x "$CONDA_BASE/bin/conda" ]; then
-        err "无法定位 conda；请设置 KD1_ANIME_CONDA_BASE 或联系管理员。"
-        exit 1
+        install_user_conda
+        export PATH="$CONDA_INSTALL_DIR/bin:$PATH"
+        CONDA_BASE="$CONDA_INSTALL_DIR"
     fi
     export PATH="$CONDA_BASE/bin:$PATH"
     unset PYTHONHOME
@@ -436,6 +565,8 @@ EOF
 }
 
 write_minimal_toml_config() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
     cat > "$CONFIG_FILE" <<'EOF'
 # kd1-anime 最小运行配置；文件可能包含 API Key，权限应为 0600。
 # 未列出的配置使用程序默认值；环境变量优先级最高。
@@ -446,25 +577,12 @@ base_url = "https://api.openai.com/v1"
 model = "your-model-name"
 
 [render]
-backend = "slurm"
+backend = "__KD1_ANIME_DEFAULT_BACKEND__"
 manim_renderer = "cairo"
 manim_quality = "h"
-
-[slurm]
-partition = ""
-account = ""
-qos = ""
-conda_env = "manim_env"
-conda_base = ""
-time_limit = "01:00:00"
-cpus_per_task = 4
-mem_gb = ""
-gpu_type = ""
-gpu_count = 1
-container_image = ""
-require_container = false
-container_disable_network = false
 EOF
+    # 只替换固定占位符，不把用户输入直接拼入 TOML 内容。
+    sed -i "s/__KD1_ANIME_DEFAULT_BACKEND__/$DEFAULT_RENDER_BACKEND/" "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
 }
 
@@ -520,10 +638,18 @@ write_user_config() {
     fi
 
     write_minimal_toml_config
-    write_config_value SLURM_CONDA_ENV "$ENV_NAME"
-    write_config_value SLURM_CONDA_BASE "$CONDA_BASE"
+    if [ "$DEFAULT_RENDER_BACKEND" = "slurm" ]; then
+        # 只有用户显式选择 Slurm 时才写入远程环境信息；个人本地安装不
+        # 应在最小配置中携带无关的集群字段。
+        write_config_value SLURM_CONDA_ENV "$ENV_NAME"
+        write_config_value SLURM_CONDA_BASE "$CONDA_BASE"
+    fi
     log "已创建用户配置: $CONFIG_FILE"
-    warn "首次运行前请编辑该文件并填写 [llm] 的 api_key、base_url 和 model"
+    if [ "$DEFAULT_RENDER_BACKEND" = "local" ]; then
+        warn "首次运行前请编辑该文件并填写 [llm] 的 api_key、base_url 和 model；当前默认使用 local 后端"
+    else
+        warn "首次运行前请编辑该文件并填写 [llm] 的 api_key、base_url 和 model；当前默认使用 Slurm 后端"
+    fi
 }
 
 install_manim_knowledge() {
@@ -1224,7 +1350,9 @@ print_completion() {
 }
 
 main() {
-echo -e "${CYAN}=== kd1-anime 环境安装 ===${NC}"
+echo -e "${CYAN}=== kd1-anime 个人 Ubuntu 安装 ===${NC}"
+check_host || exit 1
+info "默认正式渲染后端: $DEFAULT_RENDER_BACKEND"
 find_conda
 
 info "创建/检查 conda 环境 $ENV_NAME"

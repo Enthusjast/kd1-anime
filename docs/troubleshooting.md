@@ -148,6 +148,21 @@ generate --plan plan.json 时仍会重新执行确定性编译和计划审查。
 
 如果上游代码已经变化，过期的下游交接代码会被清除并按顺序重建，这是为了避免继续使用陈旧的元素定义。
 
+## 个人 Ubuntu 安装
+
+安装脚本使用用户目录，不要求 sudo。若系统中没有 Conda，会自动下载并安装
+Miniconda 到 `~/.kd1-anime/miniconda3`；若已有可用 Conda，则优先复用。
+脚本还会使用用户目录版 TeX Live 补齐 XeLaTeX 和 Manim 所需依赖。
+
+安装器生成的配置默认使用本地渲染：
+
+    [render]
+    backend = "local"
+
+如果需要使用远程集群，将其改为 `"slurm"`，并配置 `[slurm]` 中的远程环境信息。
+缺少 `curl`/`wget`、`tar` 或 `sha256sum` 时，请先安装 Ubuntu 基础工具后再次运行；
+安装器不会自动调用 sudo。
+
 Plan Review 或 Code Review 中的风格建议、一般节奏意见和缺少证据的“可能问题”现在会显示为
 warning，不会单独触发重规划或代码重写。若仍然看到场景被阻断，请查看对应审查产物中的
 blocking_issues/findings；真正的 hard blocker 应当能定位到确定性检查或具体源码/合同证据。

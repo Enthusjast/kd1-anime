@@ -122,7 +122,8 @@ kd1-anime render scene.py --class MyScene --backend local --wait
 
 ### 1. 安装
 
-在 Ubuntu/HPC 上可以只下载并运行安装脚本。脚本默认不使用 sudo，也不会把完整源码 clone 到当前目录或主目录：
+在个人 Ubuntu 电脑上可以直接下载并运行安装脚本。脚本使用用户目录安装，不要求 sudo，
+也不会把完整源码 clone 到当前目录或主目录：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.sh \
@@ -130,7 +131,16 @@ curl -fsSL https://raw.githubusercontent.com/Enthusjast/kd1-anime/main/install.s
   && bash /tmp/kd1-anime-install.sh
 ```
 
-安装器会创建或复用 `manim_env`，安装 Manim CE `0.20.1`、FFmpeg、CJK 字体和 Manim 所需的最小 XeLaTeX 依赖，并将 Manim 文档和示例放入 `~/.kd1-anime/knowledge/`。
+安装器会优先复用已有 Conda；未找到时，会把 Miniconda 安装到
+`~/.kd1-anime/miniconda3`，然后创建或复用 `manim_env`。随后安装 Manim CE
+`0.20.1`、FFmpeg、CJK 字体和 Manim 所需的最小 XeLaTeX 依赖，并将 Manim 文档和示例放入
+`~/.kd1-anime/knowledge/`。
+
+新安装默认将正式渲染后端设为 `local`，不需要 Slurm。需要使用集群时，将配置文件中的
+`[render] backend` 改为 `"slurm"`，再补充集群账户、分区和远程 Conda 配置。
+也可以在安装前设置 `KD1_ANIME_RENDER_BACKEND=slurm`，让新配置直接使用 Slurm。
+没有 Conda 时，安装器默认使用 `~/.kd1-anime/miniconda3`；可通过
+`KD1_ANIME_CONDA_DIR` 指定其它用户目录，或通过 `KD1_ANIME_CONDA_BASE` 复用已有安装。
 
 交互式终端中，安装器最后会启动模型配置向导，依次配置主模型、视觉模型、Embedding 和 Reranker，
 并将回答写入 `~/.kd1-anime/config.toml` 的对应 TOML 分组。未启用的可选服务不会写入配置分组。
@@ -149,6 +159,8 @@ KD1_ANIME_CONFIGURE_MODE=never bash /tmp/kd1-anime-install.sh
 ```bash
 export KD1_ANIME_REF=v0.4.0
 export KD1_ANIME_ARCHIVE_SHA256=<github-zip-sha256>
+# 如果需要从零引导 Conda，可选校验 Miniconda 安装器
+export KD1_ANIME_CONDA_INSTALLER_SHA256=<miniconda-installer-sha256>
 # 可选：校验 TeX Live 安装器
 export KD1_ANIME_TEXLIVE_INSTALLER_SHA256=<install-tl-sha256>
 # 设置后，上面两个摘要都必须提供
@@ -161,10 +173,13 @@ bash /tmp/kd1-anime-install.sh
 ```bash
 git clone https://github.com/Enthusjast/kd1-anime.git
 cd kd1-anime
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
+source "$HOME/.kd1-anime/miniconda3/etc/profile.d/conda.sh"
 conda activate manim_env
 python -m pip install -e '.[dev]'
 ```
+
+如果系统已有其它 Conda 安装，将上面的路径替换为该 Conda 的
+`etc/profile.d/conda.sh` 路径即可。
 
 仅安装 Python 包不会自动安装 Manim、XeLaTeX、FFmpeg 或 Slurm；这些原生依赖由 `install.sh` 或系统环境负责。
 
@@ -400,7 +415,7 @@ kd1-anime test-llm --no-json-mode --verbose
 | `MANIM_PIXEL_WIDTH` / `HEIGHT` | `1920/1080` | 输出分辨率 |
 | `MANIM_FRAME_RATE` | `60` | 输出帧率 |
 | `MANIM_OPENGL_PLATFORM` | `egl` | OpenGL 上下文后端；无显示的 HPC 通常使用 `egl` |
-| `RENDER_BACKEND` | `slurm` | 正式渲染后端：`slurm` 或 `local` |
+| `RENDER_BACKEND` | `slurm`（程序默认；安装器生成的新配置为 `local`） | 正式渲染后端：`slurm` 或 `local` |
 | `LOCAL_RENDER_MAX_IN_FLIGHT` | `1` | 本地正式渲染最大并发数 |
 | `LOCAL_RENDER_TIMEOUT` | `3600` | 单个本地正式渲染超时秒数 |
 | `LOCAL_RENDER_MEMORY_MB` | `16384` | 本地正式渲染地址空间上限 |

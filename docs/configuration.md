@@ -2,7 +2,7 @@
 
 本文是 kd1-anime 当前配置的完整说明。配置字段由
 src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，`.env`
-可作为可选配置来源。
+可作为可选配置来源。安装器生成的个人电脑配置默认使用 `local` 渲染后端。
 
 ## 配置文件与优先级
 
@@ -26,6 +26,13 @@ src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，`.env`
 
 安装器会保留已有用户配置，不会用模板覆盖它。可选 `.env` 文件可作为
 `config.toml` 不存在时的兼容配置来源。
+
+个人 Ubuntu 上如果没有 Conda，安装器会将 Miniconda 安装到
+`~/.kd1-anime/miniconda3`。生产环境可设置
+`KD1_ANIME_CONDA_INSTALLER_SHA256` 固定并校验安装器摘要；设置
+`KD1_ANIME_REQUIRE_CHECKSUM=1` 后，源码、Miniconda 和 TeX Live 安装器都必须提供摘要。
+安装前也可用 `KD1_ANIME_CONDA_DIR` 指定 Miniconda 目录，或用
+`KD1_ANIME_RENDER_BACKEND=slurm` 让新配置默认使用 Slurm。
 
 交互式安装向导会依次配置主模型、视觉模型、Embedding 和 Reranker，并直接更新
 `config.toml` 对应分组；未启用的可选服务不会写入配置。非交互安装默认跳过向导，
@@ -208,7 +215,7 @@ Cairo 不申请 GPU；只有 MANIM_RENDERER=opengl 时才使用 GPU 配置。所
 | MANIM_PIXEL_HEIGHT | 1080 | 输出高度，必须为偶数 |
 | MANIM_FRAME_RATE | 60 | 输出帧率 |
 | MANIM_OPENGL_PLATFORM | egl | OpenGL 后端：egl 或 glx |
-| RENDER_BACKEND | slurm | 正式渲染后端：slurm 或 local |
+| RENDER_BACKEND | slurm（程序默认；安装器生成的新配置为 local） | 正式渲染后端：slurm 或 local |
 | LOCAL_RENDER_MAX_IN_FLIGHT | 1 | 本地正式渲染最大并发数 |
 | LOCAL_RENDER_TIMEOUT | 3600 | 单个本地正式渲染超时秒数 |
 | LOCAL_RENDER_MEMORY_MB | 16384 | 本地正式渲染地址空间上限 |
@@ -293,18 +300,23 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 
 ## 推荐配置组合
 
-### 本地/无 Slurm
+### 本地 Ubuntu/无 Slurm
 
     RENDER_BACKEND=local
     MANIM_RENDERER=cairo
     kd1-anime generate --file prompt.md --backend local
 
+个人 Ubuntu 安装会自动在 `~/.kd1-anime/miniconda3` 中安装或复用用户级 Conda，
+并使用用户目录版 TeX Live；安装过程不要求 sudo。已有 Conda 或完整 XeLaTeX
+环境会优先复用。
+
 本地正式渲染在当前进程的前台执行，`render` 命令必须使用 `--wait`；本地任务不会把
 PID 写入 manifest，恢复时会重新启动未完成任务，不会认领已有 PID。若只想验证计划和代码，
 使用 `--dry-run`，它不会提交正式本地任务。
 
-### HPC：Cairo
+### HPC/Slurm：Cairo
 
+    RENDER_BACKEND=slurm
     MANIM_RENDERER=cairo
     SLURM_PARTITION=your-partition
     SLURM_ACCOUNT=your-account
