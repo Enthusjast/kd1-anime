@@ -34,7 +34,7 @@ def test_reviewer_prompt_contains_real_checklist():
     assert "ThreeDScene" in REVIEWER_SYSTEM_PROMPT
     assert "结构化" in REVIEWER_SYSTEM_PROMPT
     assert "initially_active=true" in REVIEWER_SYSTEM_PROMPT
-    assert "VGroup 本身只有在被加入或引入后才是 active" in REVIEWER_SYSTEM_PROMPT
+    assert "VGroup" in REVIEWER_SYSTEM_PROMPT
     assert "证据优先于行号" in REVIEWER_SYSTEM_PROMPT
     assert "只报告确定的问题" in REVIEWER_SYSTEM_PROMPT
     assert "confidence" in REVIEWER_SYSTEM_PROMPT
@@ -224,6 +224,34 @@ def test_reconcile_review_evidence_uses_declared_source_location():
 
     assert corrections
     assert reconciled.findings[0].evidence == "self.wait()"
+    assert validate_review_evidence(reconciled, code) == []
+
+
+def test_reconcile_review_evidence_repairs_exact_text_with_wrong_line_numbers():
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                line_start=1,
+                line_end=1,
+                evidence="self.wait()",
+                why="该调用位置需要确认",
+                repair="按实际源码行定位",
+            )
+        ],
+    )
+    code = (
+        "from manim import *\nclass Demo(Scene):\n    def construct(self):\n        self.wait()\n"
+    )
+
+    reconciled, corrections = reconcile_review_evidence_by_location(result, code)
+
+    assert corrections
+    assert reconciled.findings[0].line_start == 4
+    assert reconciled.findings[0].line_end == 4
     assert validate_review_evidence(reconciled, code) == []
 
 
@@ -794,6 +822,40 @@ def test_reviewer_receives_safe_fallback_mode(monkeypatch):
     reviewer.review("from manim import *", scene_plan, safe_fallback=True)
 
     assert "safe_fallback_mode" in captured["user_message"]
+
+
+def test_reviewer_receives_relaxed_review_policy(monkeypatch):
+    from kd1_anime.agents.planner import ScenePlan
+    from kd1_anime.agents.reviewer import ReviewerAgent
+
+    scene_plan = ScenePlan(
+        scene_id=1,
+        title="relaxed 审查",
+        duration_seconds=10,
+        purpose="展示关系",
+        math_concept="x",
+        visual_design="简单布局",
+        camera_movement="固定",
+        visual_flow=["显示公式"],
+        key_moments=["停顿"],
+        computation="x=1",
+    )
+    captured = {}
+    reviewer = ReviewerAgent()
+
+    def fake_call(**kwargs):
+        captured.update(kwargs)
+        return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(reviewer, "call_llm_json", fake_call)
+    reviewer.review(
+        "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()",
+        scene_plan,
+        generation_mode="relaxed",
+    )
+
+    assert "当前生成模式：relaxed" in captured["system_prompt"]
+    assert "布局建议" in captured["user_message"]
 
 
 def test_reviewer_retries_with_compact_context_after_truncation(monkeypatch):

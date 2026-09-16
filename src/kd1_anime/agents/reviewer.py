@@ -19,8 +19,9 @@ from kd1_anime.agents.render_context import (
     animation_lifecycle_guidance,
     renderer_guidance,
 )
+from kd1_anime.agents.review_policy import review_mode_guidance
 from kd1_anime.agents.technical_planner import TechnicalSpec
-from kd1_anime.config import settings
+from kd1_anime.config import GenerationMode, settings
 
 REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家。
 
@@ -58,12 +59,14 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
 14. 每个 Tex/MathTex 调用都必须显式传入同一个 `tex_template`。
 
 ## D. Manim 动画逻辑（严重）
-15. Create/Write/FadeIn 会负责引入对象；不得对尚未引入且不是 introducer 目标的对象，
-    或已被 ReplacementTransform/FadeOut 移除的对象继续动画。
-16. Transform 后的变量引用、VGroup 成员关系和 z-index 应保持一致。
-    VGroup 本身只有在被加入或引入后才是 active；但不要把“对子对象分别淡入”与“对未引入的
-    group 做 Transform”混为一谈，必须以当前代码中实际的 active 状态为依据。
-17. ValueTracker、Axes.c2p、plot、Surface 等 API 参数应符合 ManimCE。
+15. TechnicalSpec 的 `contract_version=2` 使用语义动作而非动画类名。每个 `self.play`
+    前都应有 `# KD1_ANIMATION_EVENT: <event_id>`，事件的 source/target/create/remove
+    与代码引用的对象应一致。`introduce` 引入对象，`update` 只修改 active source，
+    `remove` 退出对象，`camera` 不改变 Mobject 状态，`hold` 不改变状态。
+16. 不要对尚未引入或已退出的对象继续动画；复合 Mobject 只有整体加入场景后才是 active。
+    不要仅凭具体动画类名是否出现在提示词中做判断，未知动画类可作为 warning，重点检查
+    它是否遵守对应事件的语义合同。
+17. ValueTracker、Axes.c2p、plot、Surface 等 API 参数应符合当前 ManimCE。
 18. 动画顺序应可执行，不能同时对同一对象施加冲突动画。
 
 ## E. 视觉与布局（建议，非阻塞）
@@ -88,6 +91,9 @@ REVIEWER_SYSTEM_PROMPT = r"""你是 Manim Community Edition 代码审查专家�
     variable_name、颜色和布局锚点不能无故改变。
 31. 只有 elements_to_remove 中明确列出的元素才能 FadeOut；持续元素不能通过 clear()、整体淡出
     或无替换重画而丢失。
+    当 `removed_element_ids` 明确列出元素时，代码必须在场景结束前让其不再 active；当
+    `export_element_ids` 明确要求保留时，代码不得将其 FadeOut。两者同时出现在自由文本中时，
+    只按结构化合同审查代码，并指出计划文本冲突，不要求代码猜测优先级。
 32. 需要跨场景交接对象时，必须存在 KD1_CONTINUITY_EXPORT_BEGIN/END 导出区；导出区只能包含可独立重建的 Mobject
     定义，以及作用于导出区内已定义对象的安全样式/布局调用。导出集合以结构化
     ScenePlan/TechnicalSpec 中 `required=true` 且未移除的元素为唯一权威，不要从
@@ -429,9 +435,55 @@ def reconcile_review_evidence_by_location(
     repaired_findings: list[ReviewFinding] = []
     for index, finding in enumerate(result.findings, start=1):
         evidence = finding.evidence.strip()
-        if evidence and code.find(evidence) >= 0:
-            repaired_findings.append(finding)
-            continue
+        exact_positions: list[tuple[int, int]] = []
+        if evidence:
+            offset = 0
+            while True:
+                position = code.find(evidence, offset)
+                if position < 0:
+                    break
+                end_position = position + len(evidence)
+                exact_positions.append(
+                    (
+                        code.count("\n", 0, position) + 1,
+                        code.count("\n", 0, end_position) + 1,
+                    )
+                )
+                offset = position + 1
+
+        if exact_positions:
+            declared_start = finding.line_start
+            declared_end = finding.line_end or declared_start
+            location = None
+            if declared_start is not None and declared_end is not None:
+                # 如果证据出现多次，优先使用模型给出的范围来消除
+                # 歧义；如果范围本身有偏移，唯一出现位置仍可确定地
+                # 校正。此前这里遇到“证据存在”就直接 continue，导致
+                # 只修正了文本却保留错误行号，最终协议校验仍会失败。
+                location = next(
+                    (
+                        position
+                        for position in exact_positions
+                        if position[0] >= declared_start and position[1] <= declared_end
+                    ),
+                    None,
+                )
+            if location is None and len(exact_positions) == 1:
+                location = exact_positions[0]
+            if location is not None:
+                actual_start, actual_end = location
+                if (finding.line_start, finding.line_end) != (actual_start, actual_end):
+                    repaired_findings.append(
+                        finding.model_copy(
+                            update={"line_start": actual_start, "line_end": actual_end}
+                        )
+                    )
+                    corrections.append(
+                        f"finding[{index}] 已按精确 evidence 校正行号为 {actual_start}-{actual_end}"
+                    )
+                else:
+                    repaired_findings.append(finding)
+                continue
 
         location = find_whitespace_insensitive(evidence) if evidence else None
         if location is None and finding.line_start is not None:
@@ -617,16 +669,6 @@ def filter_contradictory_review_findings(
             contradiction = "当前代码已经配置并使用 TexTemplate"
         elif "未将其赋给 config.tex_template" in text and "config.tex_template" in lowered:
             contradiction = "当前代码已经将模板赋给 config.tex_template"
-        elif (
-            finding.category == "lifecycle"
-            and "replacementtransform(" in finding.evidence.lower()
-            and any(marker in text for marker in ("未引入", "未在场景", "目标对象"))
-            and "source 未 active" not in text
-        ):
-            # ReplacementTransform 的 target 不需要预先 self.add；它会
-            # 在动画完成时替换 source 并成为 Scene 中的 active 对象。
-            # source 的 active 状态仍由确定性生命周期检查负责。
-            contradiction = "ReplacementTransform 会使 target 成为 active 对象"
         elif technical_spec is not None and finding.category == "continuity":
             removed_variables = {
                 item.variable_name
@@ -649,6 +691,17 @@ def filter_contradictory_review_findings(
                 )
             ):
                 contradiction = "TechnicalSpec 明确要求该对象在本场景退出"
+        elif (
+            technical_spec is None
+            and finding.category == "lifecycle"
+            and "replacementtransform(" in finding.evidence.lower()
+            and any(marker in text for marker in ("未引入", "未在场景", "目标对象"))
+            and "source 未 active" not in text
+        ):
+            # 没有语义 TechnicalSpec 时，保留旧版的一个确定性事实过滤：
+            # ReplacementTransform 会让 target 接管场景身份。正式技术
+            # 合同存在时不再使用此规则，避免覆盖 semantic_action=update。
+            contradiction = "ReplacementTransform 会使 target 成为 active 对象"
         elif "create 后未" in text and "create(" in lowered:
             # Manim 的 Create/FadeIn/Write introducer 会把目标加入 Scene；
             # 不应要求在其后再用 self.add，否则会制造重复引入。
@@ -908,6 +961,7 @@ class ReviewerAgent(BaseAgent):
         safe_fallback: bool = False,
         protocol_feedback: str = "",
         lesson_spec: LessonSpec | None = None,
+        generation_mode: GenerationMode = "strict",
     ) -> str:
         inherited_context = cls._bounded_text(inherited_elements_code, 8_000)
         fallback_context = (
@@ -934,6 +988,14 @@ class ReviewerAgent(BaseAgent):
         ]
         if fallback_context:
             sections.append(PromptSection("safe_fallback_mode", fallback_context, priority=90))
+        sections.append(
+            PromptSection(
+                "generation_mode",
+                review_mode_guidance(generation_mode),
+                required=True,
+                priority=115,
+            )
+        )
         if bible_context:
             sections.append(
                 PromptSection("continuity_bible", bible_context, priority=30, max_chars=20_000)
@@ -1006,6 +1068,7 @@ class ReviewerAgent(BaseAgent):
         technical_spec: TechnicalSpec | None = None,
         safe_fallback: bool = False,
         lesson_spec: LessonSpec | None = None,
+        generation_mode: GenerationMode = "strict",
     ) -> ReviewResult:
         self._log(f"正在审查代码 [{scene_plan.title}]...")
         bible_context = (
@@ -1018,6 +1081,7 @@ class ReviewerAgent(BaseAgent):
                 REVIEWER_SYSTEM_PROMPT,
                 renderer_guidance(renderer),
                 animation_lifecycle_guidance(),
+                review_mode_guidance(generation_mode),
             )
         )
         user_message = self._review_message(
@@ -1028,6 +1092,7 @@ class ReviewerAgent(BaseAgent):
             technical_spec=technical_spec,
             safe_fallback=safe_fallback,
             lesson_spec=lesson_spec,
+            generation_mode=generation_mode,
         )
         try:
             result = self.call_llm_json(
@@ -1052,6 +1117,7 @@ class ReviewerAgent(BaseAgent):
                 technical_spec=technical_spec,
                 safe_fallback=safe_fallback,
                 lesson_spec=lesson_spec,
+                generation_mode=generation_mode,
             )
             result = self.call_llm_json(
                 system_prompt=system_prompt,
@@ -1097,6 +1163,7 @@ class ReviewerAgent(BaseAgent):
                 safe_fallback=safe_fallback,
                 lesson_spec=lesson_spec,
                 protocol_feedback=protocol_feedback,
+                generation_mode=generation_mode,
             )
             result = self.call_llm_json(
                 system_prompt=system_prompt,

@@ -15,6 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from rich.console import Console
@@ -63,6 +64,7 @@ MONITOR_ABORT_STATES = {
 
 @dataclass
 class SlurmJob:
+    # 名字沿用旧 API；现在它也承载 LocalRenderBackend 创建的本地作业。
     job_id: str
     scene_id: int
     script_path: Path
@@ -85,6 +87,7 @@ class SlurmJob:
     cancelled: bool = False
     environment_fingerprint: dict[str, str] = field(default_factory=dict)
     environment_warning: str = ""
+    backend: Literal["slurm", "local"] = "slurm"
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,6 +609,16 @@ class SlurmDispatcher:
         # OpenGL 继承树。即使是 Cairo，也把变量显式固定，方便计算节点
         # 环境指纹与正式命令保持一致。
         lines.append(f"export MANIM_RENDERER={renderer}")
+        # Smoke 阶段会受到地址空间限制；限制 BLAS 线程，避免
+        # OpenBLAS 在导入 numpy 时创建过多线程映射而误报内存不足。
+        lines.extend(
+            [
+                "export OPENBLAS_NUM_THREADS=1",
+                "export OMP_NUM_THREADS=1",
+                "export MKL_NUM_THREADS=1",
+                "export NUMEXPR_NUM_THREADS=1",
+            ]
+        )
         if use_gpu:
             # 某些集群包装器会在 CLI 解析前导入场景模块；提前设置平台
             # 可避免 OpenGL 回退到 GLX 并在无显示节点失败。
@@ -616,7 +629,7 @@ class SlurmDispatcher:
             if not Path(image).is_file():
                 raise RuntimeError(
                     f"Apptainer 镜像不存在: {image}\n"
-                    f"请检查 .env 中的 SLURM_CONTAINER_IMAGE 配置。\n"
+                    f"请检查 config.toml（或兼容 .env）中的 SLURM_CONTAINER_IMAGE 配置。\n"
                     f"如果不需要容器，请设置 SLURM_CONTAINER_IMAGE 为空或注释掉该行。"
                 )
             container_cmd = [
@@ -630,6 +643,14 @@ class SlurmDispatcher:
                 [
                     "--env",
                     f"MANIM_RENDERER={renderer}",
+                    "--env",
+                    "OPENBLAS_NUM_THREADS=1",
+                    "--env",
+                    "OMP_NUM_THREADS=1",
+                    "--env",
+                    "MKL_NUM_THREADS=1",
+                    "--env",
+                    "NUMEXPR_NUM_THREADS=1",
                 ]
             )
             if use_gpu:
@@ -704,13 +725,15 @@ class SlurmDispatcher:
 
             lines.append('echo "[Smoke] 开始轻量运行时检查"')
             import_check = (
-                "import importlib.util, pathlib, sys; "
-                "path=pathlib.Path(sys.argv[1]); name=sys.argv[2]; "
-                "spec=importlib.util.spec_from_file_location('kd1_smoke_scene', path); "
-                "module=importlib.util.module_from_spec(spec); "
-                "spec.loader.exec_module(module); "
-                "candidate=getattr(module, name, None); "
-                "raise SystemExit(1) if not isinstance(candidate, type) else None"
+                "import importlib.util, pathlib, sys\n"
+                "path=pathlib.Path(sys.argv[1])\n"
+                "name=sys.argv[2]\n"
+                "spec=importlib.util.spec_from_file_location('kd1_smoke_scene', path)\n"
+                "module=importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(module)\n"
+                "candidate=getattr(module, name, None)\n"
+                "if not isinstance(candidate, type):\n"
+                "    raise SystemExit(1)"
             )
             lines.append(
                 smoke_run(

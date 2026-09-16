@@ -1,23 +1,30 @@
-"""全局配置：从用户级配置、当前目录 .env 和系统环境变量加载。"""
+"""全局配置：从 TOML、兼容 .env 和系统环境变量加载。"""
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-# 应用产生的配置、知识库、缓存和运行产物统一放在一个私有目录中。
+logger = logging.getLogger(__name__)
+
+# 应用产生的配置、知识库和运行产物统一放在一个私有目录中。
 # 不跟随 XDG_CONFIG_HOME：集群上不同 shell/module 配置的 XDG 值经常不一致，
 # 而单一固定根目录更容易备份、迁移和排查。
 APP_HOME = Path.home() / ".kd1-anime"
 USER_CONFIG_DIR = APP_HOME
+USER_TOML_FILE = APP_HOME / "config.toml"
 USER_ENV_FILE = APP_HOME / ".env"
 
 # 仅用于从早期版本平滑迁移；新文件永远只写入 APP_HOME。
@@ -34,6 +41,8 @@ DEFAULT_WORKSPACE_DIR = APP_HOME / "workspace"
 DEFAULT_SCENES_DIR = DEFAULT_WORKSPACE_DIR / "scenes"
 DEFAULT_LOGS_DIR = DEFAULT_WORKSPACE_DIR / "logs"
 DEFAULT_VIDEOS_DIR = DEFAULT_WORKSPACE_DIR / "videos"
+
+GenerationMode = Literal["relaxed", "strict"]
 
 _LEGACY_STORAGE_DEFAULTS = {
     "RAG_INDEX_PATH": ("~/.cache/kd1-anime/rag/index.sqlite3", str(DEFAULT_RAG_INDEX_PATH)),
@@ -96,6 +105,35 @@ def _write_private_text(path: Path, content: str) -> None:
         # 使用同目录硬链接实现“仅当目标不存在时创建”。相比 os.replace，
         # 并发启动时不会把用户刚创建的新配置覆盖掉。
         os.link(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _replace_private_text(path: Path, content: str) -> None:
+    """以 0600 原子替换私有文本文件。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -205,17 +243,250 @@ def resolve_runtime_path(path: Path) -> Path:
     return (base / expanded).resolve()
 
 
+_TOML_PATH_FIELDS = frozenset(
+    {"WORKSPACE_DIR", "OUTPUT_FILE", "SCENES_DIR", "LOGS_DIR", "VIDEOS_DIR"}
+)
+_TOML_EVALUATION_FIELDS = frozenset(
+    {
+        "ENABLE_AUTO_EVAL",
+        "ENABLE_VISUAL_EVAL",
+        "EVAL_THRESHOLD",
+        "MAX_EVAL_ROUNDS",
+        "EVAL_VISUAL_MODEL",
+        "VISUAL_EVAL_FRAME_COUNT",
+        "VISUAL_EVAL_THRESHOLD",
+        "MAX_VISUAL_FIX_ATTEMPTS",
+        "RELAXED_VISUAL_AUTO_FIX",
+    }
+)
+_TOML_EMPTY_NULL_FIELDS = frozenset({"RAG_DOCS_DIR", "RAG_EXAMPLES_DIR", "RAG_RECIPES_DIR"})
+
+
+def _toml_field_location(field_name: str) -> tuple[str, str]:
+    """Return the public TOML section/key for an existing Settings field.
+
+    Settings intentionally keeps its historical flat environment-variable names.
+    This mapping is the single boundary between that API and the more readable
+    nested TOML representation.
+    """
+
+    if field_name.startswith("VISUAL_LLM_"):
+        return "visual_llm", field_name[11:].lower()
+    if field_name.startswith("LLM_"):
+        return "llm", field_name[4:].lower()
+    if field_name.startswith("RAG_"):
+        return "rag", field_name[4:].lower()
+    if field_name.startswith("SLURM_"):
+        return "slurm", field_name[6:].lower()
+    if field_name == "RENDER_BACKEND":
+        return "render", "backend"
+    if (
+        field_name.startswith("LOCAL_RENDER_")
+        or field_name.startswith("LOCAL_SMOKE_RENDER_")
+        or field_name.startswith("SMOKE_RENDER_")
+        or field_name.startswith("MANIM_")
+        or field_name in {"ALLOW_PARTIAL_OUTPUT", "OVERWRITE_OUTPUT"}
+    ):
+        return "render", field_name.lower()
+    if field_name.startswith("MERGE_") or field_name.startswith("TRANSITION_"):
+        return "merge", field_name.lower()
+    if field_name in _TOML_PATH_FIELDS:
+        return "paths", field_name.lower()
+    if field_name.startswith("MONITOR_") or field_name == "LOG_TAIL_LINES":
+        return "monitor", field_name.lower()
+    if field_name in _TOML_EVALUATION_FIELDS:
+        return "evaluation", field_name.lower()
+    return "pipeline", field_name.lower()
+
+
+def _toml_field_locations(settings_cls: type[BaseSettings]) -> dict[tuple[str, str], str]:
+    locations: dict[tuple[str, str], str] = {}
+    for field_name in settings_cls.model_fields:
+        location = _toml_field_location(field_name)
+        if location in locations:
+            raise RuntimeError(
+                "TOML 配置映射冲突: "
+                f"{location[0]}.{location[1]} ({locations[location]} / {field_name})"
+            )
+        locations[location] = field_name
+    return locations
+
+
+def _flatten_toml_settings(
+    data: Mapping[str, Any], settings_cls: type[BaseSettings]
+) -> dict[str, Any]:
+    """Flatten and validate the shape of nested TOML before Pydantic validation."""
+
+    locations = _toml_field_locations(settings_cls)
+    flattened: dict[str, Any] = {}
+    for raw_section, raw_values in data.items():
+        section = str(raw_section).lower()
+        if not isinstance(raw_values, Mapping):
+            raise ValueError(f"TOML 配置节 [{section}] 必须是表格")
+        for raw_key, value in raw_values.items():
+            key = str(raw_key).lower()
+            field_name = locations.get((section, key))
+            if field_name is None:
+                raise ValueError(f"TOML 配置包含未知字段: [{section}] {key}")
+            if field_name in flattened:
+                raise ValueError(f"TOML 配置字段重复: {field_name}")
+            flattened[field_name] = value
+    return flattened
+
+
+class _NestedTomlSettingsSource(PydanticBaseSettingsSource):
+    """Pydantic source adapter for the project's nested TOML schema."""
+
+    def __init__(self, settings_cls: type[BaseSettings], toml_file: Path | None):
+        super().__init__(settings_cls)
+        self.toml_file = toml_file
+        self.values: dict[str, Any] = {}
+        if toml_file is not None and toml_file.is_file():
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # pragma: no cover - only used on Python 3.10
+                import tomli as tomllib
+
+            try:
+                with toml_file.open("rb") as handle:
+                    data = tomllib.load(handle)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"无法读取 TOML 配置 {toml_file}: {type(exc).__name__}") from exc
+            self.values = _flatten_toml_settings(data, settings_cls)
+
+    def get_field_value(self, field, field_name: str) -> tuple[Any, str, bool]:
+        return self.values.get(field_name), field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return dict(self.values)
+
+
+def _toml_literal(value: Any) -> str | None:
+    """Serialize the scalar values emitted by Settings into valid TOML."""
+
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        value = str(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("TOML 配置不能写入非有限浮点数")
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        items = [_toml_literal(item) for item in value]
+        if any(item is None for item in items):
+            raise ValueError("TOML 数组不能包含 null")
+        return "[" + ", ".join(item for item in items if item is not None) + "]"
+    raise TypeError(f"不支持写入 TOML 的配置值类型: {type(value).__name__}")
+
+
+def settings_to_toml(
+    config: BaseSettings,
+    *,
+    preserve_empty_fields: set[str] | frozenset[str] = frozenset(),
+    include_fields: set[str] | frozenset[str] | None = None,
+) -> str:
+    """Render a Settings object using the canonical nested TOML layout."""
+
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for field_name in type(config).model_fields:
+        if include_fields is not None and field_name not in include_fields:
+            continue
+        section, key = _toml_field_location(field_name)
+        literal = _toml_literal(getattr(config, field_name))
+        if literal is None and field_name in preserve_empty_fields:
+            literal = '""'
+        if literal is None:
+            continue
+        groups.setdefault(section, []).append((key, literal))
+
+    lines = [
+        "# kd1-anime runtime configuration. This file may contain API keys; keep mode 0600.",
+        "# Environment variables take precedence over this file.",
+        "",
+    ]
+    for section, values in groups.items():
+        lines.append(f"[{section}]")
+        lines.extend(f"{key} = {literal}" for key, literal in values)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def update_toml_setting(path: Path, field_name: str, raw_value: Any) -> None:
+    """Validate and atomically update one TOML setting.
+
+    The installer uses this helper for its interactive wizard so it does not
+    need to duplicate TOML quoting or type conversion in shell code.
+    """
+
+    if field_name not in Settings.model_fields:
+        raise ValueError(f"未知配置字段: {field_name}")
+    values: dict[str, Any] = {}
+    if path.is_file():
+        source = _NestedTomlSettingsSource(Settings, toml_file=path)
+        values.update(source())
+    values[field_name] = raw_value
+    validated = Settings(_env_file=None, **values)
+    preserve_empty = set(values) & _TOML_EMPTY_NULL_FIELDS
+    _replace_private_text(
+        path,
+        settings_to_toml(
+            validated,
+            preserve_empty_fields=preserve_empty,
+            include_fields=set(values),
+        ),
+    )
+
+
 class Settings(BaseSettings):
-    """全局配置；系统环境变量优先于当前目录和用户级 .env。"""
+    """全局配置；环境变量 > 用户 TOML > 默认值，旧 .env 仅作回退。"""
 
     model_config = SettingsConfigDict(
-        # 后面的文件优先级更高，因此项目目录 .env 可覆盖用户级默认配置。
-        # 旧文件只作为迁移失败时的只读回退；新配置优先级高于旧配置。
+        # dotenv_settings 保留旧版用户/项目 .env 的读取能力；自定义 TOML
+        # source 会在存在 TOML 时关闭它们，避免历史配置填充省略字段。
         env_file=_settings_env_files(),
         env_file_encoding="utf-8",
+        # 空的 shell/.env 变量不应把已经配置好的 TOML 值覆盖为空；
+        # 非空环境变量仍保持最高优先级。
+        env_ignore_empty=True,
         extra="ignore",
         validate_assignment=True,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        # `_env_file=None` 是项目测试和调用方禁用所有文件配置的既有约定；
+        # 同时关闭 TOML，避免测试意外读取开发者机器上的用户配置。
+        toml_file = (
+            USER_TOML_FILE if getattr(dotenv_settings, "env_file", None) is not None else None
+        )
+        # TOML 一旦存在，就是用户配置的权威文件。旧用户 .env 只作为
+        # “尚未迁移/尚未创建 TOML”时的兼容回退，不能为 TOML 中省略的
+        # 字段注入历史数值（例如旧的 5 次重试），否则代码默认值永远
+        # 不会生效。显式传入 `_env_file=...` 仍保留给测试和调用方使用。
+        configured_env_file = getattr(dotenv_settings, "env_file", None)
+        default_env_file = settings_cls.model_config.get("env_file")
+        if USER_TOML_FILE.is_file() and configured_env_file == default_env_file:
+            dotenv_settings.env_file = None
+            # DotEnvSettingsSource 在构造时已缓存 env_vars；仅修改 env_file
+            # 不会阻止它返回旧值，必须同时清空缓存。
+            if hasattr(dotenv_settings, "env_vars"):
+                dotenv_settings.env_vars = {}
+        toml_settings = _NestedTomlSettingsSource(settings_cls, toml_file=toml_file)
+        return init_settings, env_settings, toml_settings, dotenv_settings, file_secret_settings
 
     # --- LLM API ---
     LLM_API_KEY: str = ""
@@ -236,14 +507,13 @@ class Settings(BaseSettings):
     LLM_CODE_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
     LLM_REVIEW_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0)
     LLM_FIX_TEMPERATURE: float = Field(default=0.1, ge=0.0, le=2.0)
-    LLM_MAX_TOKENS: int | None = Field(default=32768, ge=1, le=1_000_000)
-    # 不同阶段的输出复杂度差异很大。默认使用较小的阶段预算，避免计划
-    # 审查/连续性审查为极短 JSON 消耗与代码生成相同的长推理预算；用户
-    # 仍可按模型能力覆盖这些值，LLM_MAX_TOKENS 保留为总配置兼容项。
-    LLM_PLANNING_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
-    LLM_TECHNICAL_MAX_TOKENS: int = Field(default=16384, ge=4096, le=1_000_000)
-    LLM_CODE_MAX_TOKENS: int = Field(default=24576, ge=4096, le=1_000_000)
-    LLM_REVIEW_MAX_TOKENS: int = Field(default=8192, ge=2048, le=1_000_000)
+    LLM_MAX_TOKENS: int | None = Field(default=32000, ge=1, le=1_000_000)
+    # 各阶段默认共享 32000 token 输出预算；用户仍可按模型能力覆盖单个阶段，
+    # LLM_MAX_TOKENS 保留为默认/兼容配置项。
+    LLM_PLANNING_MAX_TOKENS: int = Field(default=32000, ge=4096, le=1_000_000)
+    LLM_TECHNICAL_MAX_TOKENS: int = Field(default=32000, ge=4096, le=1_000_000)
+    LLM_CODE_MAX_TOKENS: int = Field(default=32000, ge=4096, le=1_000_000)
+    LLM_REVIEW_MAX_TOKENS: int = Field(default=32000, ge=2048, le=1_000_000)
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     # 单次 LLM 请求的连接/读取超时(秒)。读取超时对非流式是"等待完整响应"，
     # 对流式是"等待下一个 chunk"——静默流式下 600s 只是兜底，不会拖慢任何请求。
@@ -263,7 +533,7 @@ class Settings(BaseSettings):
     )
     # 空响应重试时补上的 max_tokens 兜底值：推理模型常把输出预算耗尽在思考上，
     # 导致 content 为空；补足预算后重试可避免反复拿到空响应。
-    LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=16384, ge=1024, le=65536)
+    LLM_EMPTY_RETRY_MAX_TOKENS: int = Field(default=32000, ge=1024, le=65536)
     # 结构化 JSON 输出未通过 Pydantic 校验时, 带错误反馈重试的次数 (0=关闭)。
     # 模型偶尔会返回不合规的枚举值/缺字段 (如 severity="none"), 直接判死整个
     # 场景太浪费; 把校验错误喂回模型重试, 通常一次即可修正。
@@ -272,6 +542,13 @@ class Settings(BaseSettings):
     @field_validator("LLM_MAX_TOKENS", mode="before")
     @classmethod
     def validate_max_tokens(cls, value):
+        if value is None or value == "":
+            return None
+        return value
+
+    @field_validator("LLM_MAX_CONTEXT_CHARS", mode="before")
+    @classmethod
+    def validate_context_chars(cls, value):
         if value is None or value == "":
             return None
         return value
@@ -303,19 +580,14 @@ class Settings(BaseSettings):
         default=True,
         description="是否使用 response_format=json_object。某些端点不支持此参数时会自动降级",
     )
-    # 非流式业务请求的本地响应缓存。缓存只保存去除 API Key 后的请求指纹和
-    # 完整文本响应，默认位于用户私有目录；流式交互请求永不写入缓存。
-    LLM_CACHE_ENABLED: bool = Field(
-        default=True,
-        description="是否启用本地 LLM 响应缓存（不缓存流式交互请求）",
-    )
-    LLM_CACHE_PATH: Path = APP_HOME / "cache" / "llm.sqlite3"
-    LLM_CACHE_MAX_ENTRIES: int = Field(default=512, ge=0, le=100_000)
     FAILURE_CASES_PATH: Path = APP_HOME / "diagnostics" / "failure_cases.sqlite3"
     FAILURE_CASE_MAX_PER_CATEGORY: int = Field(default=100, ge=1, le=1_000)
     # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
     # 裁剪，低优先级的 RAG/自然语言说明会优先让出空间。
-    LLM_MAX_CONTEXT_CHARS: int = Field(default=120_000, ge=10_000, le=2_000_000)
+    LLM_MAX_CONTEXT_TOKENS: int = Field(default=262_000, ge=10_000, le=2_000_000)
+    # 可选的字符安全上限；默认由 LLM_MAX_CONTEXT_TOKENS 按约 4 字符/token 换算。
+    # RAG_MAX_CONTEXT_CHARS 是独立的检索注入上限，不受此字段影响。
+    LLM_MAX_CONTEXT_CHARS: int | None = Field(default=None, ge=10_000, le=2_000_000)
     LLM_MAX_CODE_CONTEXT_CHARS: int = Field(default=60_000, ge=5_000, le=1_000_000)
     LLM_MAX_REVIEW_CONTEXT_CHARS: int = Field(default=90_000, ge=10_000, le=2_000_000)
     LLM_MAX_TECHNICAL_SPEC_CHARS: int = Field(default=30_000, ge=5_000, le=500_000)
@@ -453,6 +725,28 @@ class Settings(BaseSettings):
             raise ValueError("RAG_CHUNK_OVERLAP 必须小于 RAG_CHUNK_SIZE")
         return self
 
+    # --- 渲染后端 ---
+    # Slurm 仍是默认后端；local 只在用户明确选择时运行生成代码。
+    RENDER_BACKEND: Literal["slurm", "local"] = "slurm"
+    LOCAL_RENDER_MAX_IN_FLIGHT: int = Field(
+        default=1,
+        ge=1,
+        le=64,
+        description="本地正式渲染的最大并发数；默认串行，避免登录节点过载",
+    )
+    LOCAL_RENDER_TIMEOUT: int = Field(
+        default=3_600,
+        ge=10,
+        le=86_400,
+        description="单个本地正式渲染的最长运行时间（秒）",
+    )
+    LOCAL_RENDER_MEMORY_MB: int = Field(
+        default=16_384,
+        ge=256,
+        le=131_072,
+        description="本地正式渲染的地址空间上限（MB）",
+    )
+
     # --- Slurm 集群 ---
     SLURM_PARTITION: str = ""
     SLURM_ACCOUNT: str = ""
@@ -543,7 +837,11 @@ class Settings(BaseSettings):
     VIDEOS_DIR: Path = DEFAULT_VIDEOS_DIR
 
     # --- Agent 与监控 ---
-    MAX_REVIEW_ROUNDS: int = Field(default=5, ge=1, le=10)
+    GENERATION_MODE: GenerationMode = Field(
+        default="relaxed",
+        description="生成策略：relaxed 放宽 LLM 审查，strict 使用严格有限审查",
+    )
+    MAX_REVIEW_ROUNDS: int = Field(default=8, ge=1, le=10)
     MAX_LOW_RISK_REVIEW_ROUNDS: int = Field(
         default=2,
         ge=1,
@@ -570,21 +868,22 @@ class Settings(BaseSettings):
         default=2,
         ge=2,
         le=5,
-        description="相同代码与相同审查反馈连续出现多少次后提前终止",
+        description="strict 模式下相同代码与相同审查反馈连续出现多少次后提前终止",
     )
     MAX_STAGNANT_ATTEMPTS: int = Field(
         default=2,
         ge=1,
         le=10,
-        description="渲染修复没有改变代码或错误指纹多少次后切换确定性回退",
+        description="strict 模式下渲染修复没有改变代码或错误指纹多少次后切换确定性回退",
     )
     # 渲染失败后的最大自动修复次数。autofixer 每轮会调用 LLM 重写代码并重新提交 Slurm。
-    MAX_FIX_ATTEMPTS: int = Field(default=5, ge=0, le=20)
+    MAX_FIX_ATTEMPTS: int = Field(default=8, ge=0, le=20)
     # Slurm 节点故障/抢占等与代码无关的终态，允许自动重新排队的次数。
     MAX_INFRA_RETRIES: int = Field(default=2, ge=0, le=10)
-    # 连续 N 次渲染错误日志指纹相同 → 提前放弃, 避免 LLM 反复"修复"同一个
-    # 环境错误浪费尝试次数。注意该检查在 _scene_fix 中还要叠加 fix_attempts>=2
-    # 门槛, 确保修复器至少有 2 次真实尝试, 不会因一次修复失败就误判放弃。
+    # 连续无进展时触发 IR/安全代码候选升级。strict 模式会在回退失败后
+    # 终止；relaxed 模式不把该阈值当作固定修复上限，回退不可用时仍可
+    # 继续调用 AutoFixer。
+    # strict 模式还会用该阈值识别连续相同的环境/渲染错误。
     MAX_FIX_IDENTICAL_ERRORS: int = Field(default=3, ge=1, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
 
@@ -601,6 +900,10 @@ class Settings(BaseSettings):
     VISUAL_EVAL_FRAME_COUNT: int = Field(default=6, ge=1, le=8)
     VISUAL_EVAL_THRESHOLD: float = Field(default=3.5, ge=1.0, le=5.0)
     MAX_VISUAL_FIX_ATTEMPTS: int = Field(default=2, ge=0, le=5)
+    RELAXED_VISUAL_AUTO_FIX: bool = Field(
+        default=False,
+        description="relaxed 模式是否允许视觉评估触发自动修复；默认只记录诊断",
+    )
     MAX_SCENES: int = Field(default=12, ge=1, le=100)
     MAX_PROMPT_CHARS: int = Field(default=50_000, ge=100, le=1_000_000)
     # 澄清对话会携带多轮 user/assistant 消息；独立预算避免累计内容超过模型上下文。
@@ -671,13 +974,6 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("LLM_CACHE_PATH", mode="before")
-    @classmethod
-    def normalize_llm_cache_path(cls, value):
-        if value is None or (isinstance(value, str) and not value.strip()):
-            return APP_HOME / "cache" / "llm.sqlite3"
-        return value
-
     @field_validator("SLURM_CONDA_BASE", mode="before")
     @classmethod
     def normalize_conda_base(cls, value):
@@ -715,6 +1011,10 @@ class Settings(BaseSettings):
         return USER_CONFIG_DIR
 
     @property
+    def user_config_file(self) -> Path:
+        return USER_TOML_FILE
+
+    @property
     def user_env_file(self) -> Path:
         return USER_ENV_FILE
 
@@ -731,9 +1031,7 @@ class Settings(BaseSettings):
             missing.append("LLM_MODEL")
 
         if missing:
-            config_path = self.user_env_file
-            example_path = Path.cwd() / ".env.example"
-
+            config_path = self.user_config_file
             error_msg = f"""LLM 配置不完整（缺少或仍为占位值：{", ".join(missing)}）
 
 配置方法（按优先级）：
@@ -745,10 +1043,10 @@ class Settings(BaseSettings):
 2. 编辑配置文件：
    {config_path}
 
-3. 在项目目录创建 .env：
+3. 旧版也支持在项目目录创建 .env：
    {Path.cwd() / ".env"}
 
-配置示例见：{example_path}
+配置字段和 TOML 分组示例见 docs/configuration.md
             """
             raise ValueError(error_msg)
 
@@ -756,6 +1054,17 @@ class Settings(BaseSettings):
         """验证独立多模态端点；禁止静默回退到主 LLM。"""
 
         self.visual_llm_profile().require()
+
+    def llm_context_char_budget(self) -> int:
+        """把 token 级上下文预算转换为 PromptBuilder 使用的字符预算。
+
+        项目不绑定特定 tokenizer，因此使用稳定的约 4 字符/token 估算；
+        用户可以通过 LLM_MAX_CONTEXT_CHARS 设置更保守的字符上限。
+        """
+
+        if self.LLM_MAX_CONTEXT_CHARS is not None:
+            return self.LLM_MAX_CONTEXT_CHARS
+        return min(2_000_000, self.LLM_MAX_CONTEXT_TOKENS * 4)
 
     def main_llm_profile(self, *, stage: str = "default") -> LLMRuntimeProfile:
         """构造主 Agent 配置，并按阶段选择可选模型。"""
@@ -845,4 +1154,75 @@ class Settings(BaseSettings):
         )
 
 
+def _parse_legacy_env(content: str) -> dict[str, str]:
+    """Parse the simple KEY=VALUE syntax used by the project's old .env files."""
+
+    values: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            if value[0] == '"':
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    value = value[1:-1]
+            else:
+                value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def migrate_user_env_to_toml(
+    source_file: Path | None = None,
+    target_file: Path | None = None,
+) -> Path | None:
+    """Non-destructively migrate the user .env into the canonical TOML file.
+
+    Only the application-owned user file is migrated automatically. A project
+    directory `.env` remains a compatibility override and is never copied into
+    the user's private config directory.
+    """
+
+    source = source_file or USER_ENV_FILE
+    target = target_file or USER_TOML_FILE
+    if target.exists() or not source.is_file():
+        return None
+    try:
+        values = _parse_legacy_env(source.read_text(encoding="utf-8"))
+        if not values:
+            return None
+        validated = Settings(_env_file=None, **values)
+        preserve_empty = set(values) & _TOML_EMPTY_NULL_FIELDS
+        _write_private_text(
+            target,
+            settings_to_toml(
+                validated,
+                preserve_empty_fields=preserve_empty,
+                include_fields=set(values),
+            ),
+        )
+    except FileExistsError:
+        # Another process won the create-only race; its TOML is authoritative.
+        return None
+    except (OSError, TypeError, UnicodeError, ValueError) as exc:
+        logger.warning(
+            "无法将用户 .env 迁移为 TOML，将继续使用兼容配置（错误类型：%s）",
+            type(exc).__name__,
+        )
+        return None
+    return target
+
+
+migrate_user_env_to_toml()
 settings = Settings()

@@ -92,6 +92,9 @@ class SceneStatus:
     started_at: float = 0.0  # 当前阶段开始时间 (用于显示耗时)
     done: list[str] = field(default_factory=list)  # 已完成的流水线阶段
     safe_fallback_used: bool = False  # 是否采用了保守教学方案
+    static_verification: str = "not_run"
+    execution_verification: str = "not_run"
+    visual_verification: str = "not_run"
 
     def mark_done(self, stage_name: str) -> None:
         """记录一个阶段完成 (去重)。"""
@@ -180,7 +183,7 @@ class SceneDashboard:
         self.total: int = 0
         self.visual_enabled: bool = False
         self.rag_status: str = "disabled"
-        self.rag_models: str = ""
+        self.backend: str = "slurm"
         # Rich 的自动刷新线程会和 Orchestrator 的事件线程同时读取/修改
         # 场景状态。使用可重入锁：_render() 需要持锁读取状态，而事件
         # 线程在更新后还要主动触发一次刷新。
@@ -278,17 +281,12 @@ class SceneDashboard:
 
         elif event in ("run_started", "run_resumed"):
             self.run_id = data.get("run_id", "") or self.run_id
+            self.backend = data.get("backend", self.backend) or self.backend
             if not self.started_at:
                 self.started_at = time.time()
 
         elif event == "rag_status":
             self.rag_status = data.get("status", "disabled") or "disabled"
-            warning = (data.get("warning", "") or "").strip()
-            embedding = data.get("embedding_model", "") or "未配置"
-            reranker = data.get("reranker_model", "") or "未配置"
-            self.rag_models = f"E:{embedding} R:{reranker}"
-            if warning and self.rag_status == "degraded":
-                self.rag_models += " · degraded"
 
         elif event == "scene_safe_fallback":
             if status:
@@ -488,12 +486,75 @@ class SceneDashboard:
                     status.mark_done("编码")
                     status.message = "代码就绪"
 
+        elif event in (
+            "scene_code_fallback",
+            "scene_code_stagnation_fallback",
+            "repair_stagnation_fallback",
+        ):
+            if status:
+                status.state = "warning"
+                status.stage = (
+                    "编码"
+                    if event
+                    in {
+                        "scene_code_fallback",
+                        "scene_code_stagnation_fallback",
+                    }
+                    else "修复"
+                )
+                status.started_at = 0.0
+                if event == "scene_code_fallback":
+                    status.message = "Coder 失败，已使用最小安全代码"
+                elif event == "scene_code_stagnation_fallback":
+                    status.message = "代码候选无进展，已切换最小安全候选"
+                else:
+                    status.message = "修复无进展，已切换 IR/安全候选"
+
+        elif event == "repair_stagnation_fallback_unavailable":
+            if status:
+                status.state = "warning"
+                status.stage = "修复"
+                status.started_at = 0.0
+                status.message = "修复无进展，继续尝试新的 AutoFix 策略"
+
+        elif event == "scene_visual_diagnostic_only":
+            if status:
+                status.state = "warning"
+                status.stage = "视觉评估"
+                status.started_at = 0.0
+                status.message = "relaxed 模式仅做视觉诊断"
+
         elif event == "scene_smoke_rendered":
             if status:
                 status.state = "running"
                 status.stage = ""
                 status.started_at = 0.0
                 status.message = "Smoke Render 通过"
+
+        elif event == "scene_static_verified":
+            if status:
+                status.static_verification = "passed"
+
+        elif event == "scene_execution_verified":
+            if status:
+                status.execution_verification = data.get("status", "passed")
+
+        elif event == "scene_unknown_animation_detected":
+            if status:
+                status.state = "warning"
+                status.stage = ""
+                status.started_at = 0.0
+                count = len(data.get("details", []))
+                status.message = f"发现 {count or 1} 个未识别动画，已强制 Smoke Render"
+
+        elif event == "recipe_saved":
+            if status:
+                status.message = "已保存匿名动画配方"
+
+        elif event == "recipe_index_warning":
+            if status:
+                status.state = "warning"
+                status.message = "配方已保存，RAG 索引待刷新"
 
         elif event in ("scene_review_pass", "scene_review_skipped"):
             if status:
@@ -539,11 +600,13 @@ class SceneDashboard:
 
         elif event == "scene_visual_evaluating":
             if status:
+                status.visual_verification = "evaluating"
                 status.invalidate_from(VISUAL_STAGE, self.stages)
                 self._mark_running(status, VISUAL_STAGE, "关键帧视觉评估中")
 
         elif event == "scene_visual_pass":
             if status:
+                status.visual_verification = "passed"
                 status.mark_done(VISUAL_STAGE)
                 status.state = "completed"
                 status.stage = VISUAL_STAGE
@@ -557,6 +620,9 @@ class SceneDashboard:
 
         elif event in ("scene_visual_warning", "scene_visual_unknown"):
             if status:
+                status.visual_verification = (
+                    "warning" if event == "scene_visual_warning" else "unknown"
+                )
                 status.mark_done(VISUAL_STAGE)
                 status.state = "warning"
                 status.stage = VISUAL_STAGE
@@ -687,6 +753,11 @@ class SceneDashboard:
         completed = sum(1 for s in self.scenes.values() if s.state in {"completed", "warning"})
         failed = sum(1 for s in self.scenes.values() if s.state == "failed")
         warnings = sum(1 for s in self.scenes.values() if s.state == "warning")
+        static_verified = sum(s.static_verification == "passed" for s in self.scenes.values())
+        execution_verified = sum(s.execution_verification == "passed" for s in self.scenes.values())
+        visual_verified = sum(
+            s.visual_verification in {"passed", "warning", "unknown"} for s in self.scenes.values()
+        )
 
         header = Text()
         header.append(f"  {self.stage_label or '流水线'}  ", style="bold white")
@@ -701,6 +772,11 @@ class SceneDashboard:
                 f"完成 {completed}/{total}",
                 style="green" if completed == total and not warnings else "yellow",
             )
+            header.append(
+                f"  校验 S:{static_verified}/{total} E:{execution_verified}/{total} "
+                f"V:{visual_verified}/{total}",
+                style="dim",
+            )
         elif completed:
             header.append(f"完成 {completed}", style="yellow")
         if failed:
@@ -712,8 +788,7 @@ class SceneDashboard:
                 f"  RAG:{self.rag_status}",
                 style="yellow" if self.rag_status == "degraded" else "cyan",
             )
-            if self.rag_models:
-                header.append(f" ({self.rag_models})", style="dim")
+        header.append(f"  后端:{self.backend}", style="dim")
         if self.started_at:
             header.append(f"  用时 {int(time.time() - self.started_at)}s", style="dim")
 

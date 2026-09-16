@@ -25,6 +25,7 @@ from rich.table import Table
 from rich.text import Text
 
 from kd1_anime.config import settings
+from kd1_anime.logo import COLORED_ASCII_LOGO
 
 console = Console()
 
@@ -581,7 +582,7 @@ class ChatSession:
             )
             if dashboard_active:
                 dashboard.stop()
-            self._show_completion(final_video)
+            self._show_completion(final_video, dry_run=self.dry_run)
             self.exit_code = 0
             return True
         except KeyboardInterrupt:
@@ -612,7 +613,9 @@ class ChatSession:
         match event:
             case "run_started":
                 console.print(
-                    f"[dim]Run {esc(data.get('run_id', '?'))} · {esc(data.get('run_dir', ''))}[/]"
+                    f"[dim]Run {esc(data.get('run_id', '?'))} · "
+                    f"mode={esc(data.get('generation_mode', 'relaxed'))} · "
+                    f"{esc(data.get('run_dir', ''))}[/]"
                 )
 
             case "stage_start":
@@ -737,6 +740,21 @@ class ChatSession:
                 file_path = data.get("file_path", "")
                 console.print(f"  [bold green]✓[/] [dim]{esc(file_path)}[/]")
 
+            case "scene_code_fallback":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]Coder 失败，已使用最小安全代码[/]{suffix}"
+                )
+
+            case "scene_code_stagnation_fallback":
+                scene_id = data.get("scene_id", "?")
+                attempts = data.get("attempts", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]代码候选无进展，已切换最小安全候选（第 {attempts} 次）[/]"
+                )
+
             case "scene_review_pass":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]审查通过 ✓[/]")
@@ -766,6 +784,25 @@ class ChatSession:
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [yellow]需修正[/]")
 
+            case "repair_stagnation_fallback":
+                scene_id = data.get("scene_id", "?")
+                attempts = data.get("attempts", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]修复无进展，已切换 IR/安全候选（第 {attempts} 次）[/]"
+                )
+
+            case "repair_stagnation_fallback_unavailable":
+                scene_id = data.get("scene_id", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]安全候选不可用，继续尝试 AutoFix[/]"
+                )
+
+            case "scene_visual_diagnostic_only":
+                scene_id = data.get("scene_id", "?")
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]relaxed 模式仅做视觉诊断，不自动修复[/]"
+                )
+
             case "scene_smoke_rendering":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [cyan]Smoke Render 检查中[/]")
@@ -773,6 +810,26 @@ class ChatSession:
             case "scene_smoke_rendered":
                 scene_id = data.get("scene_id", "?")
                 console.print(f"  [dim]▸[/] Scene {scene_id}: [bold green]Smoke Render 通过 ✓[/]")
+
+            case "scene_unknown_animation_detected":
+                scene_id = data.get("scene_id", "?")
+                count = len(data.get("details", [])) or 1
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]发现 {count} 个未识别动画，"
+                    "已强制 Smoke Render[/]"
+                )
+
+            case "recipe_saved":
+                scene_id = data.get("scene_id", "?")
+                console.print(f"  [dim]▸[/] Scene {scene_id}: [dim]已保存匿名动画配方[/]")
+
+            case "recipe_index_warning":
+                scene_id = data.get("scene_id", "?")
+                reason = esc(data.get("reason", ""))
+                suffix = f"：{reason}" if reason else ""
+                console.print(
+                    f"  [dim]▸[/] Scene {scene_id}: [yellow]配方已保存，RAG 索引待刷新[/]{suffix}"
+                )
 
             case "scene_submitted":
                 scene_id = data.get("scene_id", "?")
@@ -912,17 +969,21 @@ class ChatSession:
                 )
 
     @staticmethod
-    def _show_completion(output_path) -> None:
-        """显示完成信息"""
-        if output_path is None:
+    def _show_completion(output_path, *, dry_run: bool = False) -> None:
+        """显示完成信息和 Logo。"""
+        if output_path is None and not dry_run:
             return  # 流水线失败, orchestrator 已输出错误
         console.print()
         console.print(Rule("[bold green]完成[/]", style="green"))
-        size_mb = output_path.stat().st_size / (1024 * 1024)
-        console.print(
-            Panel(
-                f"[bold]{output_path}[/]\n[dim]{size_mb:.1f} MB[/]",
-                title="[bold green]✓ 最终视频[/]",
-                border_style="green",
+        if output_path is None:
+            console.print("[bold green]✓ Dry-run 已完成[/]")
+        else:
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+            console.print(
+                Panel(
+                    f"[bold]{output_path}[/]\n[dim]{size_mb:.1f} MB[/]",
+                    title="[bold green]✓ 最终视频[/]",
+                    border_style="green",
+                )
             )
-        )
+        console.print(Text.from_ansi(COLORED_ASCII_LOGO), end="")

@@ -47,40 +47,6 @@ app = typer.Typer(
 console = Console()
 rag_app = typer.Typer(help="管理本地 RAG 知识库", add_completion=False)
 app.add_typer(rag_app, name="rag")
-cache_app = typer.Typer(help="管理本地 LLM 响应缓存", add_completion=False)
-app.add_typer(cache_app, name="cache")
-
-
-@cache_app.command("status")
-def cache_status():
-    """查看缓存路径、条目数和调用统计，不显示响应内容。"""
-
-    from kd1_anime.llm_cache import LLMResponseCache
-
-    data = LLMResponseCache().summary()
-    console.print(f"路径: {data['path']}", markup=False)
-    console.print(f"响应条目: {data['entries']}")
-    console.print(f"调用事件: {data['events']}")
-    console.print(f"本进程统计: {json.dumps(data['stats'], ensure_ascii=False)}")
-
-
-@cache_app.command("clear")
-def cache_clear(
-    yes: bool = typer.Option(False, "--yes", "-y", help="不再询问确认"),
-):
-    """清除本地 LLM 响应缓存。"""
-
-    from kd1_anime.llm_cache import LLMResponseCache
-
-    cache = LLMResponseCache()
-    summary = cache.summary()
-    if (
-        not yes
-        and summary["entries"]
-        and not typer.confirm(f"清除 {summary['entries']} 个缓存响应？", default=False)
-    ):
-        raise typer.Abort()
-    console.print(f"已清除 {cache.clear()} 个缓存响应")
 
 
 @rag_app.command("index")
@@ -269,6 +235,10 @@ def _cancel_jobs_before_clean(manifest: RunManifest) -> None:
     ]
     if not jobs:
         return
+    if getattr(manifest, "backend", "slurm") == "local":
+        # 本地进程句柄不持久化；不能在新进程中凭 Job ID/PID 猜测并删除其
+        # 正在写入的 run 目录。正常完成/取消的本地 Job 不会进入 jobs。
+        raise RuntimeError("运行包含未完成的本地渲染任务，无法安全确认并删除；请先恢复或停止它")
     dispatcher = SlurmDispatcher()
     try:
         statuses = dispatcher.poll_all_statuses([job.job_id for job in jobs])
@@ -310,7 +280,7 @@ def _ensure_generation_apis(*, dry_run: bool) -> None:
 def main_callback(
     ctx: typer.Context,
     api_key: str = typer.Option(
-        None, "--api-key", "-k", help="LLM API Key (也可通过 .env 文件设置)"
+        None, "--api-key", "-k", help="LLM API Key (也可通过 config.toml 或 .env 设置)"
     ),
     model: str = typer.Option(None, "--model", "-m", help="LLM 模型名称"),
     dry_run: bool = typer.Option(
@@ -335,9 +305,16 @@ def main_callback(
 def chat(
     ctx: typer.Context,
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成代码不提交 Slurm"),
+    strict: bool | None = typer.Option(
+        None,
+        "--strict/--relaxed",
+        help="生成策略：strict 使用严格有限审查，relaxed 放宽 LLM 审查",
+    ),
 ):
     """启动交互式会话 (默认命令)"""
     effective_dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
+    if strict is not None:
+        settings.GENERATION_MODE = "strict" if strict else "relaxed"
     _ensure_generation_apis(dry_run=effective_dry_run)
     _start_chat(dry_run=effective_dry_run)
 
@@ -352,7 +329,7 @@ def generate(
     force: bool = typer.Option(False, "--force", help="允许覆盖已存在的输出文件"),
     partition: str = typer.Option(None, "--partition", "-p", help="Slurm 分区"),
     max_fix: int = typer.Option(
-        None, "--max-fix", min=0, help="最大自动修复尝试次数 (默认: 5, 上限 20)"
+        None, "--max-fix", min=0, help="最大自动修复尝试次数 (默认: 8, 上限 20)"
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="只生成场景规划和代码,不提交 Slurm 任务"),
     smoke: bool = typer.Option(
@@ -396,14 +373,41 @@ def generate(
         dir_okay=False,
         readable=True,
     ),
+    backend: str = typer.Option(
+        None,
+        "--backend",
+        help="渲染后端：slurm（默认）或 local（本地前台渲染）",
+    ),
+    strict: bool | None = typer.Option(
+        None,
+        "--strict/--relaxed",
+        help="生成策略：strict 使用严格有限审查，relaxed 放宽 LLM 审查",
+    ),
 ):
     """直接生成模式 (无需求澄清)"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
+    if strict is not None and not resume:
+        settings.GENERATION_MODE = "strict" if strict else "relaxed"
     if file:
         prompt = file.read_text(encoding="utf-8").strip()
     if plan_file and (prompt or file or resume or incremental):
         console.print(
             "[bold red]错误:[/] --plan 不能与 prompt、--file、--resume 或 --incremental 混用"
+        )
+        raise typer.Exit(1)
+    if backend and backend not in {"slurm", "local"}:
+        console.print("[bold red]错误:[/] --backend 只能是 slurm 或 local", markup=False)
+        raise typer.Exit(1)
+    if resume and backend:
+        console.print(
+            "[bold red]错误:[/] resume 必须使用运行清单中的渲染后端，不能覆盖 --backend",
+            markup=False,
+        )
+        raise typer.Exit(1)
+    if resume and strict is not None:
+        console.print(
+            "[bold red]错误:[/] resume 必须沿用运行清单中的生成模式，不能覆盖 --strict/--relaxed",
+            markup=False,
         )
         raise typer.Exit(1)
     if not prompt and not resume and not plan_file:
@@ -418,10 +422,12 @@ def generate(
             settings.MAX_FIX_ATTEMPTS = max_fix
         if output:
             settings.OUTPUT_FILE = output
-        # 不要让 Typer 的默认 False 覆盖 .env 中显式配置的 true；只有用户
+        # 不要让 Typer 的默认 False 覆盖配置文件中显式配置的 true；只有用户
         # 明确传入 --force 时才开启覆盖。
         if force:
             settings.OVERWRITE_OUTPUT = True
+        if backend:
+            settings.RENDER_BACKEND = backend
     except ValueError as e:
         console.print(f"[bold red]配置错误:[/] {e}", markup=False)
         raise typer.Exit(1) from e
@@ -470,6 +476,7 @@ def generate(
                 output_path=output,
                 approve_plan=approve_plan,
                 smoke=smoke,
+                backend=backend,
             )
         elif incremental:
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
@@ -478,6 +485,7 @@ def generate(
                 incremental,
                 dry_run=dry_run,
                 smoke=smoke,
+                backend=backend,
             )
         else:
             run_kwargs = {"dry_run": dry_run}
@@ -485,6 +493,8 @@ def generate(
                 run_kwargs["approve_plan"] = True
             if smoke:
                 run_kwargs["smoke"] = True
+            if backend:
+                run_kwargs["backend"] = backend
             final_video = orchestrator.run(prompt, **run_kwargs)
 
         if dry_run:
@@ -523,6 +533,11 @@ def plan(
         "-o",
         help="额外导出结构化计划 JSON（运行清单始终写入 ~/.kd1-anime/workspace）",
     ),
+    strict: bool | None = typer.Option(
+        None,
+        "--strict/--relaxed",
+        help="生成策略：strict 使用严格有限审查，relaxed 放宽 LLM 审查",
+    ),
 ):
     """只生成场景规划，不执行渲染；默认同时审查计划。"""
     if file:
@@ -532,6 +547,8 @@ def plan(
             "[bold red]错误:[/] 请提供 prompt 或通过 --file 指定文件\n使用 kd1-anime plan --help 查看帮助"
         )
         raise typer.Exit(1)
+    if strict is not None:
+        settings.GENERATION_MODE = "strict" if strict else "relaxed"
     _ensure_generation_apis(dry_run=True)
 
     try:
@@ -596,12 +613,23 @@ def render(
     class_name: str = typer.Option(None, "--class", "-c", help="Manim Scene 类名 (默认自动识别)"),
     scene_id: int = typer.Option(1, "--scene-id", "-s", min=1, help="场景 ID, 用于命名"),
     wait: bool = typer.Option(False, "--wait", "-w", help="等待任务完成并显示进度"),
+    backend: str = typer.Option(
+        None,
+        "--backend",
+        help="渲染后端：slurm（默认）或 local（本地前台渲染）",
+    ),
 ):
     """直接提交单个 .py 文件到 Slurm 渲染 (跳过 pipeline)"""
     from kd1_anime.agents.validator import validate_manim_code
     from kd1_anime.orchestrator import Orchestrator
 
     sid = scene_id
+    if backend and backend not in {"slurm", "local"}:
+        console.print("[bold red]错误:[/] --backend 只能是 slurm 或 local", markup=False)
+        raise typer.Exit(1)
+    if backend == "local" and not wait and not bool((ctx.obj or {}).get("dry_run")):
+        console.print("[bold red]错误:[/] 本地渲染后端必须使用 --wait 前台运行", markup=False)
+        raise typer.Exit(1)
     source_code = file.read_text(encoding="utf-8")
     validation = validate_manim_code(source_code, renderer=settings.MANIM_RENDERER)
     if not validation.is_valid:
@@ -628,6 +656,7 @@ def render(
             selected_class,
             scene_id=sid,
             wait=wait,
+            backend=backend,
         )
     except Exception as e:
         console.print(f"[bold red]渲染任务失败:[/] {e}", markup=False)
@@ -666,6 +695,7 @@ def _print_run_details(manifest: RunManifest) -> None:
     console.print(f"Created:      {manifest.created_at.astimezone().isoformat(timespec='seconds')}")
     console.print(f"Updated:      {manifest.updated_at.astimezone().isoformat(timespec='seconds')}")
     console.print(f"Output:       {manifest.final_video or manifest.output_path}", markup=False)
+    console.print(f"Backend:      {getattr(manifest, 'backend', 'slurm')}", markup=False)
     integrity_errors = manifest.integrity_errors()
     if integrity_errors:
         console.print(
@@ -689,6 +719,19 @@ def _print_run_details(manifest: RunManifest) -> None:
             f"{scene.review_round}/{scene.fix_attempts}",
         )
     console.print(table)
+    verification = Table(title="Verification")
+    verification.add_column("Scene")
+    verification.add_column("Static")
+    verification.add_column("Execution")
+    verification.add_column("Visual")
+    for scene_id, scene in sorted(manifest.scenes.items()):
+        verification.add_row(
+            str(scene_id),
+            scene.static_verification.status,
+            scene.execution_verification.status,
+            scene.visual_verification.status,
+        )
+    console.print(verification)
     if manifest.error:
         console.print("Last error:", style="bold red")
         console.print(manifest.error, markup=False)
@@ -775,6 +818,7 @@ def stats(
     table = Table(title="Pipeline statistics")
     for column in (
         "Run ID",
+        "Backend",
         "Status",
         "Scenes",
         "Plan reviews",
@@ -787,6 +831,7 @@ def stats(
         scenes = item["scenes"]
         table.add_row(
             item["run_id"],
+            item.get("backend", "slurm"),
             item["status"],
             f"{scenes['rendered']}/{item['scene_count']}",
             str(item["plan_review_attempts"]),
@@ -1057,9 +1102,17 @@ def batch(
         "-o",
         help="输出目录",
     ),
+    backend: str = typer.Option(
+        None,
+        "--backend",
+        help="渲染后端：slurm（默认）或 local（本地前台渲染）",
+    ),
 ):
     """批量并行处理多个动画项目。"""
     dry_run = dry_run or bool((ctx.obj or {}).get("dry_run"))
+    if backend and backend not in {"slurm", "local"}:
+        console.print("[bold red]错误:[/] --backend 只能是 slurm 或 local", markup=False)
+        raise typer.Exit(1)
     _ensure_generation_apis(dry_run=dry_run)
 
     from kd1_anime.batch import BatchConfig, BatchProcessor
@@ -1070,6 +1123,7 @@ def batch(
             max_parallel=max_parallel,
             dry_run=dry_run,
             output_dir=output_dir,
+            backend=backend,
         )
         processor = BatchProcessor(config)
         processor.load_tasks_from_file(prompts_file)
@@ -1880,7 +1934,7 @@ def test_llm(
             console.print(f"    解析结果: status={result.status}, message={result.message}")
         except Exception as e:
             console.print(f"  [yellow]⚠ JSON 模式异常: {e}[/]")
-            console.print("    建议: 在 .env 中设置 LLM_USE_JSON_MODE=false")
+            console.print("    建议: 在 config.toml 的 [llm] 中设置 use_json_mode=false")
             failed = True
 
     console.print()

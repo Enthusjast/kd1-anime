@@ -134,6 +134,16 @@ IndexError: list index out of range
         error_type = fixer._classify_error(error_log)
         assert "IndexError" in error_type or "下标越界" in error_type
 
+    def test_classify_empty_flash_target_error(self, fixer):
+        error_log = """
+Traceback (most recent call last):
+  File "scene_2.py", line 188, in construct
+    self.play(Flash(x_axis_highlight))
+ValueError: operands could not be broadcast together with shapes (0,) (3,)
+"""
+        error_type = fixer._classify_error(error_log)
+        assert "空 Mobject" in error_type or "Flash" in error_type
+
     def test_classify_unknown_error(self, fixer):
         """测试未知错误分类。"""
         error_log = """

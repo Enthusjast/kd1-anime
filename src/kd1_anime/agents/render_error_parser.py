@@ -126,6 +126,10 @@ def _category(error_type: str, message: str, *, renderer: str | None) -> ErrorCa
         for token in ("should_render", "openglcamera", "camera.frame", "egl", "glx", "renderer")
     ) or (renderer == "opengl" and "camera" in text):
         return "renderer"
+    if "operands could not be broadcast" in text and (
+        "shapes (0,)" in text or "flash" in text or "create_lines" in text
+    ):
+        return "lifecycle"
     if any(token in text for token in ("active", "transform", "fadeout", "vgroup", "lifecycle")):
         return "lifecycle"
     if error_type:

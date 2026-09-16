@@ -105,6 +105,19 @@ def test_incremental_reuses_verified_matching_artifact(monkeypatch, tmp_path):
         render_profile=profile,
     )
 
+    original_mark_execution = Orchestrator._mark_execution_verification
+
+    def assert_artifact_is_published_first(state, **kwargs):
+        if kwargs.get("status") == "passed":
+            assert state.artifact is not None
+        original_mark_execution(state, **kwargs)
+
+    monkeypatch.setattr(
+        Orchestrator,
+        "_mark_execution_verification",
+        staticmethod(assert_artifact_is_published_first),
+    )
+
     Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
 
     assert state.rendered is True

@@ -77,6 +77,33 @@ def test_capability_contract_rejects_opengl_camera_frame():
     assert any("OpenGL" in error for error in result.errors)
 
 
+def test_3d_camera_motion_uses_threedscene_api_not_moving_camera():
+    spec = TechnicalSpec(
+        scene_id=1,
+        renderer="opengl",
+        objects=[TechnicalObject(element_id="surface", constructor="Surface")],
+        implementation_notes=["使用 ThreeDScene.set_camera_orientation 平滑旋转镜头"],
+    )
+
+    contract = build_capability_contract(
+        make_plan(camera_movement="镜头缓慢旋转并平移，展示曲面形状"),
+        spec,
+        renderer="opengl",
+        render_profile=profile("opengl"),
+        gpu_type="A100",
+    )
+
+    assert contract.requires_3d is True
+    assert contract.requires_moving_camera is False
+    assert contract.scene_parent == "ThreeDScene"
+    result = validate_capability_contract(
+        contract,
+        render_profile=profile("opengl"),
+        gpu_type="A100",
+    )
+    assert result.is_valid is True
+
+
 def test_capability_contract_allows_cairo_moving_camera_and_warns_unknown_tex():
     contract = build_capability_contract(
         make_plan(camera_movement="使用 self.camera.frame 推近"),

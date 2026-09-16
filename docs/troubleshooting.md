@@ -13,7 +13,7 @@
     kd1-anime logs <run-id> --scene-id 2 --lines 160
     kd1-anime logs <run-id> --scene-id 2 --stderr --lines 160
 
-status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢复历史运行。
+status、logs、version、clean 不会调用 LLM；使用 `status` 查询运行，使用 `resume <run-id>` 恢复指定运行。
 
 ## 2. LLM API 不可用
 
@@ -32,7 +32,7 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
 1. LLM_API_KEY、LLM_BASE_URL、LLM_MODEL 是否都已填写；
 2. Base URL 是否为 OpenAI-compatible 地址，通常包含 /v1；
 3. 模型名是否是服务端实际支持的名称；
-4. 当前 shell 是否读取了正确的配置文件。优先级是进程环境变量、当前目录 .env、用户配置；
+4. 当前 shell 是否读取了正确的配置文件。优先级是进程环境变量、用户 config.toml、当前目录 .env、用户 .env；
 5. 集群或登录节点是否需要代理。
 
 不使用 HTTP 代理时：
@@ -42,6 +42,26 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
 如果只是某些结构化请求失败，可以先测试不使用 JSON response format：
 
     kd1-anime test-llm --no-json-mode --verbose
+
+## 2.1 relaxed 模式仍然失败
+
+`relaxed` 只放宽 LLM Review，不会放过确定性错误。以下错误仍会阻断：
+
+- AST、危险 API、Manim API 或 XeLaTeX 校验失败；
+- TechnicalSpec 数学/生命周期合同无法编译；
+- 场景导出对象未 active、已移除对象仍 active；
+- Smoke Render、正式渲染或视频产物校验失败。
+
+查看本次运行的实际模式：
+
+    kd1-anime status <run-id> --json
+
+检查 JSON 中的 `generation_mode`。TUI 启动行也会显示 `mode=relaxed` 或
+`mode=strict`。如果只是候选代码校验失败，relaxed 会继续生成不同候选；候选完全
+重复时仍会触发停滞保护，避免无限消耗 API。
+
+`--dry-run` 只验证计划、代码和 Smoke Render，不代表正式 Slurm 视频已经成功。正式
+渲染失败时，继续查看 `logs`、`stderr` 和具体 Job 产物。
 
 程序会在进入 chat、plan 或 generate 前做短超时探测；探测失败会立即退出，不会先消耗多轮澄清或规划请求。
 
@@ -64,7 +84,7 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
 1. RAG_ENABLED 是否真的为 true；
 2. RAG_EMBEDDING_BASE_URL/MODEL/KEY 是否属于独立 Embedding 服务；
 3. RAG_RERANK_BASE_URL/MODEL/KEY 是否属于独立 Reranker 服务；
-4. RAG_DOCS_DIR 和 RAG_EXAMPLES_DIR 是否存在且包含 md、rst 或 py 文件；
+4. RAG_DOCS_DIR、RAG_EXAMPLES_DIR 或 RAG_RECIPES_DIR 是否存在且包含 md、rst 或 py 文件；
 5. 知识库文件、Embedding 模型或分块参数变化后是否重新建立索引；
 6. 当前网络是否被代理变量影响。
 
@@ -73,6 +93,17 @@ status、logs、version、clean 不会调用 LLM，也不会自动扫描或恢�
     RAG_TRUST_ENV=false kd1-anime doctor --probe-rag
 
 rag status 只读取本地状态，不联网；doctor --probe-rag 才会发送最小 Embedding 和 Reranker 请求。
+
+正式渲染成功后，系统可能在 `RAG_RECIPES_DIR` 生成按代码哈希去重的匿名配方；它不包含
+原始提示词或服务凭据。配方索引采用增量 Embedding，刷新失败只显示 warning，可稍后手动
+执行 `kd1-anime rag index` 重试。
+
+## 3.1 未识别动画 warning
+
+TechnicalSpec v2 不要求预先列举所有动画类。每个 `self.play` 前应有对应的
+`# KD1_ANIMATION_EVENT: <event_id>`，事件的 `semantic_action` 负责描述对象状态。
+静态分析器无法识别的新动画会记录 warning 而不是直接判错；在 `--dry-run` 中，包含这类
+调用的场景会自动执行低质量 frame 和短视频 Smoke Render，及早发现实际运行时错误。
 
 ## 4. Clarifier 或 READY 解析异常
 
@@ -115,7 +146,22 @@ generate --plan plan.json 时仍会重新执行确定性编译和计划审查。
     ~/.kd1-anime/workspace/runs/<run-id>/artifacts/
     ~/.kd1-anime/workspace/runs/<run-id>/events.jsonl
 
-如果上游代码已经变化，旧的下游交接代码会被清除并按顺序重建，这是为了避免继续使用陈旧的元素定义。
+如果上游代码已经变化，过期的下游交接代码会被清除并按顺序重建，这是为了避免继续使用陈旧的元素定义。
+
+## 个人 Ubuntu 安装
+
+安装脚本使用用户目录，不要求 sudo。若系统中没有 Conda，会自动下载并安装
+Miniconda 到 `~/.kd1-anime/miniconda3`；若已有可用 Conda，则优先复用。
+脚本还会使用用户目录版 TeX Live 补齐 XeLaTeX 和 Manim 所需依赖。
+
+安装器生成的配置默认使用本地渲染：
+
+    [render]
+    backend = "local"
+
+如果需要使用远程集群，将其改为 `"slurm"`，并配置 `[slurm]` 中的远程环境信息。
+缺少 `curl`/`wget`、`tar` 或 `sha256sum` 时，请先安装 Ubuntu 基础工具后再次运行；
+安装器不会自动调用 sudo。
 
 Plan Review 或 Code Review 中的风格建议、一般节奏意见和缺少证据的“可能问题”现在会显示为
 warning，不会单独触发重规划或代码重写。若仍然看到场景被阻断，请查看对应审查产物中的
@@ -223,7 +269,7 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
 
 ## 11. 恢复运行显示未开始或恢复失败
 
-启动时不会自动扫描历史运行。请显式查询和恢复：
+使用以下命令查询和恢复运行：
 
     kd1-anime status
     kd1-anime status <run-id> --json
@@ -232,8 +278,7 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
 恢复使用原子 manifest 和运行级锁。它会重新核对代码 SHA-256、Renderer/Merge Profile、精确
 Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因为重启而默认为未开始。
 
-如果 manifest 不是 v7，旧清单可以只读查看，但不能安全写回。建议保留旧目录用于诊断，并重新生成
-新的运行，而不是手工修改 manifest。
+恢复要求 manifest schema v8。请保留运行目录用于诊断，不要手工修改 manifest；如果清单损坏，重新生成新的运行。
 
 ## 12. 运行很慢或看起来卡住
 
@@ -241,9 +286,13 @@ Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因�
 2. 用 logs 查看远端 stdout/stderr；
 3. 降低 MANIM_QUALITY 或 Smoke Render 质量进行排查；
 4. 设置合理的 SLURM_MAX_IN_FLIGHT，避免共享队列拥堵；
-5. 对重复调试请求使用 cache status，确认是否命中了旧响应；
-6. 适当调整阶段级 LLM_*_MAX_TOKENS，不要盲目提高所有阶段的预算；
-7. 设置 MONITOR_QUEUE_TIMEOUT、MONITOR_RUN_TIMEOUT 和 MONITOR_UNKNOWN_TIMEOUT，避免无限等待。
+5. 适当调整阶段级 LLM_*_MAX_TOKENS，不要盲目提高所有阶段的预算；
+6. 设置 MONITOR_QUEUE_TIMEOUT、MONITOR_RUN_TIMEOUT 和 MONITOR_UNKNOWN_TIMEOUT，避免无限等待。
+
+选择 `RENDER_BACKEND=local` 时，检查 `status <run-id>` 中的 backend、运行目录下的
+`logs/scene_*_local-*.out/.err`，以及 `LOCAL_RENDER_TIMEOUT` 和
+`LOCAL_RENDER_MEMORY_MB`。本地渲染必须前台等待；中断后不要期待已有 PID 被认领，直接
+执行 `kd1-anime resume <run-id>` 即可安全重启未完成场景。
 
 如果任务在 Slurm 中仍为 PENDING，通常是队列、分区、账户、QoS 或 GPU 资源问题，不是 Coder
 问题。先检查 sbatch 提交输出和集群队列，不要反复触发代码修复。

@@ -42,6 +42,7 @@ def test_default_storage_is_under_private_application_home():
 
     assert config_module.Path.home() / ".kd1-anime" == config_module.APP_HOME
     assert config_module.USER_CONFIG_DIR == config_module.APP_HOME
+    assert config_module.USER_TOML_FILE == config_module.APP_HOME / "config.toml"
     assert config_module.USER_ENV_FILE == config_module.APP_HOME / ".env"
     assert config.RAG_INDEX_PATH == config_module.DEFAULT_RAG_INDEX_PATH
     assert config.RAG_DOCS_DIR == config_module.DEFAULT_RAG_DOCS_DIR
@@ -51,6 +52,142 @@ def test_default_storage_is_under_private_application_home():
     assert config.SCENES_DIR == config_module.DEFAULT_SCENES_DIR
     assert config.LOGS_DIR == config_module.DEFAULT_LOGS_DIR
     assert config.VIDEOS_DIR == config_module.DEFAULT_VIDEOS_DIR
+
+
+def test_nested_toml_loads_and_has_higher_priority_than_dotenv(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text(
+        "[llm]\n"
+        "model = 'toml-model'\n"
+        "base_url = 'https://toml.example/v1'\n"
+        "\n"
+        "[rag]\n"
+        "enabled = true\n"
+        "top_k = 11\n",
+        encoding="utf-8",
+    )
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text(
+        "LLM_MODEL=dotenv-model\nLLM_BASE_URL=https://dotenv.example/v1\nRAG_TOP_K=3\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+
+    config = Settings(_env_file=dotenv_file)
+
+    assert config.LLM_MODEL == "toml-model"
+    assert config.LLM_BASE_URL == "https://toml.example/v1"
+    assert config.RAG_ENABLED is True
+    assert config.RAG_TOP_K == 11
+
+    monkeypatch.setenv("LLM_MODEL", "environment-model")
+    assert Settings(_env_file=dotenv_file).LLM_MODEL == "environment-model"
+
+
+def test_empty_environment_values_do_not_hide_toml_llm_config(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text(
+        '[llm]\napi_key = "toml-key"\nmodel = "toml-model"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("LLM_MODEL", "")
+
+    config = Settings()
+
+    assert config.LLM_API_KEY == "toml-key"
+    assert config.LLM_MODEL == "toml-model"
+
+
+def test_minimal_toml_uses_defaults_for_omitted_optional_settings(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text(
+        "[llm]\nmodel = 'model'\n[render]\nbackend = 'local'\n[slurm]\nconda_env = 'manim_env'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+
+    config = Settings()
+
+    assert config.LLM_MODEL == "model"
+    assert config.RENDER_BACKEND == "local"
+    assert config.GENERATION_MODE == "relaxed"
+    assert config.MAX_REVIEW_ROUNDS == 8
+    assert config.MAX_FIX_ATTEMPTS == 8
+    assert config.RELAXED_VISUAL_AUTO_FIX is False
+    assert config.MAX_PLAN_REVIEW_ROUNDS == 2
+    assert config.MONITOR_POLL_INTERVAL == 10
+
+
+def test_toml_is_authoritative_over_legacy_dotenv_defaults(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text("[llm]\nmodel = 'toml-model'\n", encoding="utf-8")
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text("MAX_REVIEW_ROUNDS=5\nMAX_FIX_ATTEMPTS=5\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+    monkeypatch.setitem(Settings.model_config, "env_file", (str(dotenv_file),))
+
+    config = Settings()
+
+    assert config.LLM_MODEL == "toml-model"
+    assert config.MAX_REVIEW_ROUNDS == 8
+    assert config.MAX_FIX_ATTEMPTS == 8
+
+
+def test_toml_update_preserves_omitted_defaults(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    toml_file.write_text("[llm]\nmodel = 'model'\n", encoding="utf-8")
+
+    config_module.update_toml_setting(toml_file, "MAX_REVIEW_ROUNDS", "8")
+
+    content = toml_file.read_text(encoding="utf-8")
+    assert "max_review_rounds = 8" in content
+    assert "max_fix_attempts" not in content
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+    assert Settings().MAX_FIX_ATTEMPTS == 8
+
+
+def test_toml_rejects_unknown_fields_and_malformed_syntax(monkeypatch, tmp_path):
+    toml_file = tmp_path / "config.toml"
+    monkeypatch.setattr(config_module, "USER_TOML_FILE", toml_file)
+
+    toml_file.write_text("[pipeline]\nnot_a_setting = true\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="未知字段"):
+        Settings()
+
+    toml_file.write_text("[llm\nmodel = 'broken'\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+def test_user_env_is_migrated_to_nested_toml_without_overwriting(tmp_path):
+    source = tmp_path / ".env"
+    target = tmp_path / "config.toml"
+    source.write_text(
+        'LLM_API_KEY="secret-value"\n'
+        "LLM_BASE_URL=https://example.invalid/v1\n"
+        "LLM_MODEL=demo-model\n"
+        "RAG_ENABLED=true\n"
+        "RAG_DOCS_DIR=\n"
+        "RAG_TOP_K=9\n",
+        encoding="utf-8",
+    )
+
+    assert config_module.migrate_user_env_to_toml(source, target) == target
+    assert target.stat().st_mode & 0o777 == 0o600
+    content = target.read_text(encoding="utf-8")
+    assert "[llm]" in content
+    assert 'api_key = "secret-value"' in content
+    assert "[rag]" in content
+    assert "top_k = 9" in content
+    assert 'docs_dir = ""' in content
+    assert "max_review_rounds" not in content
+    assert "max_fix_attempts" not in content
+
+    target.write_text("[llm]\nmodel = 'edited'\n", encoding="utf-8")
+    assert config_module.migrate_user_env_to_toml(source, target) is None
+    assert "edited" in target.read_text(encoding="utf-8")
 
 
 def test_legacy_user_config_is_migrated_without_overwriting_custom_paths(tmp_path):
@@ -177,20 +314,20 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LLM_TIMEOUT_READ == 600.0
     assert config.LLM_SILENT_STREAM is True
     assert config.LLM_HEALTHCHECK_TIMEOUT == 15.0
-    assert config.LLM_MAX_TOKENS == 32768
+    assert config.LLM_MAX_TOKENS == 32000
     assert config.LLM_PLANNING_TEMPERATURE == 0.2
     assert config.LLM_TECHNICAL_TEMPERATURE == 0.0
     assert config.LLM_CODE_TEMPERATURE == 0.2
     assert config.LLM_REVIEW_TEMPERATURE == 0.0
     assert config.LLM_FIX_TEMPERATURE == 0.1
-    assert config.LLM_PLANNING_MAX_TOKENS == 16384
-    assert config.LLM_TECHNICAL_MAX_TOKENS == 16384
-    assert config.LLM_CODE_MAX_TOKENS == 24576
-    assert config.LLM_REVIEW_MAX_TOKENS == 8192
-    assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 16384
-    assert config.LLM_CACHE_ENABLED is True
-    assert config.LLM_CACHE_MAX_ENTRIES == 512
-    assert config.LLM_MAX_CONTEXT_CHARS == 120_000
+    assert config.LLM_PLANNING_MAX_TOKENS == 32000
+    assert config.LLM_TECHNICAL_MAX_TOKENS == 32000
+    assert config.LLM_CODE_MAX_TOKENS == 32000
+    assert config.LLM_REVIEW_MAX_TOKENS == 32000
+    assert config.LLM_EMPTY_RETRY_MAX_TOKENS == 32000
+    assert config.LLM_MAX_CONTEXT_TOKENS == 262_000
+    assert config.LLM_MAX_CONTEXT_CHARS is None
+    assert config.llm_context_char_budget() == 1_048_000
     assert config.LLM_MAX_CODE_CONTEXT_CHARS == 60_000
     assert config.LLM_MAX_REVIEW_CONTEXT_CHARS == 90_000
     assert config.LLM_MAX_TECHNICAL_SPEC_CHARS == 30_000
@@ -206,6 +343,26 @@ def test_llm_timeout_and_silent_stream_defaults():
     assert config.LOCAL_SMOKE_RENDER_SHORT_ANIMATIONS == 3
     assert config.AUTO_RESOURCE_ESTIMATION is True
     assert config.ADAPTIVE_SMOKE_RENDER is True
+
+
+def test_llm_context_budget_uses_tokens_and_keeps_rag_budget_independent():
+    config = Settings(_env_file=None)
+
+    assert config.LLM_MAX_CONTEXT_TOKENS == 262_000
+    assert config.llm_context_char_budget() == 1_048_000
+    assert config.RAG_MAX_CONTEXT_CHARS == 12_000
+
+    conservative = Settings(
+        _env_file=None,
+        LLM_MAX_CONTEXT_TOKENS=200_000,
+        LLM_MAX_CONTEXT_CHARS=120_000,
+        RAG_MAX_CONTEXT_CHARS=12_000,
+    )
+    assert conservative.llm_context_char_budget() == 120_000
+    assert conservative.RAG_MAX_CONTEXT_CHARS == 12_000
+
+    blank_override = Settings(_env_file=None, LLM_MAX_CONTEXT_CHARS="")
+    assert blank_override.LLM_MAX_CONTEXT_CHARS is None
 
 
 def test_stage_model_routing_falls_back_and_overrides_per_stage():
@@ -231,9 +388,11 @@ def test_llm_timeout_and_silent_stream_validation():
         Settings(_env_file=None, LLM_EMPTY_RETRY_MAX_TOKENS=100)  # 低于下限
 
 
-def test_max_fix_attempts_default_and_upper_bound():
+def test_review_and_fix_attempts_defaults_and_upper_bound():
     config = Settings(_env_file=None)
-    assert config.MAX_FIX_ATTEMPTS == 5
+    assert config.GENERATION_MODE == "relaxed"
+    assert config.MAX_REVIEW_ROUNDS == 8
+    assert config.MAX_FIX_ATTEMPTS == 8
     # 超过上限 le=20 会被拒绝
     with pytest.raises(ValueError):
         Settings(_env_file=None, MAX_FIX_ATTEMPTS=21)

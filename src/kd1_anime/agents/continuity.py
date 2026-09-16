@@ -2172,7 +2172,7 @@ class ContinuityReviewerAgent(BaseAgent):
         ]
         user_message = build_bounded_prompt(
             sections,
-            max_chars=settings.LLM_MAX_CONTEXT_CHARS,
+            max_chars=settings.llm_context_char_budget(),
         )
         return self.call_llm_json(
             system_prompt=f"{CONTINUITY_REVIEW_PROMPT}\n\n{renderer_guidance(renderer)}",

@@ -1160,6 +1160,26 @@ def test_safe_fallback_detects_geometry_feedback_for_square_plan():
     )
 
 
+def test_safe_fallback_detects_geometry_specs_without_geometry_words_in_plan():
+    plan = make_plan(2).model_copy(
+        update={
+            "computation": "P D P^{-1} 的矩阵变换结果需要保持在画面内",
+            "geometry_specs": [
+                GeometrySpec(
+                    geometry_id="transformed_grid",
+                    shape="polygon",
+                    vertices=[[0, 0], [1, 0], [1, 1]],
+                )
+            ],
+        }
+    )
+
+    assert is_high_confidence_geometry_conflict(
+        plan,
+        "[geometry] 变换后的顶点超出安全范围，几何关系不一致",
+    )
+
+
 def test_safe_fallback_removes_invalid_geometry_and_rebuilds_timeline():
     plan = make_plan(2).model_copy(
         update={

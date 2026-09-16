@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 import kd1_anime.orchestrator as module
-from kd1_anime.agents.api_linter import lint_manim_api
+from kd1_anime.agents.api_linter import lint_manim_api, repair_manim_api_compatibility
 from kd1_anime.agents.failure_router import classify_failure
 from kd1_anime.agents.plan_reviewer import PlanReviewIssue, PlanReviewResult
 from kd1_anime.agents.planner import (
@@ -22,6 +22,7 @@ from kd1_anime.agents.planner import (
     VisualElementState,
 )
 from kd1_anime.agents.reviewer import ReviewFinding, ReviewResult
+from kd1_anime.agents.state_ledger import LedgerElement, SceneBoundaryIR, StateLedger
 from kd1_anime.agents.technical_planner import TechnicalAnimation, TechnicalObject, TechnicalSpec
 from kd1_anime.config import settings
 from kd1_anime.eval.visual_eval import VisualAnalysisResult, VisualIssue
@@ -61,6 +62,14 @@ def test_failure_router_separates_plan_math_from_runtime_api_errors():
         classify_failure("AttributeError: OpenGLCamera has no frame", phase="render").handler
         == "code_patch"
     )
+    assert (
+        classify_failure(
+            "ValueError: operands could not be broadcast together with shapes (0,) (3,)\n"
+            "Flash.create_lines",
+            phase="render",
+        ).category
+        == "lifecycle"
+    )
 
 
 def test_api_linter_rejects_deprecated_manim_api():
@@ -83,6 +92,36 @@ def test_api_linter_warns_about_unbounded_graph_and_updater():
     assert result.is_valid is True
     assert any("x_range" in warning for warning in result.warnings)
     assert any("clear_updaters" in warning for warning in result.warnings)
+
+
+def test_api_repair_replaces_grow_arrow_for_arrow3d():
+    code = (
+        "from manim import *\n"
+        "class Demo(ThreeDScene):\n"
+        "    def construct(self):\n"
+        "        arrow = Arrow3D(ORIGIN, RIGHT)\n"
+        "        self.play(GrowArrow(arrow))\n"
+    )
+
+    repaired, repairs = repair_manim_api_compatibility(code)
+
+    assert "self.play(Create(arrow))" in repaired
+    assert repairs == ("将 Arrow3D 的 GrowArrow 替换为 Create: arrow",)
+
+
+def test_api_repair_leaves_grow_arrow_for_arrow_unchanged():
+    code = (
+        "from manim import *\n"
+        "class Demo(Scene):\n"
+        "    def construct(self):\n"
+        "        arrow = Arrow(ORIGIN, RIGHT)\n"
+        "        self.play(GrowArrow(arrow))\n"
+    )
+
+    repaired, repairs = repair_manim_api_compatibility(code)
+
+    assert repaired == code
+    assert repairs == ()
 
 
 def test_continuity_context_mode_defaults_to_only_requested_exports(monkeypatch, tmp_path):
@@ -248,6 +287,35 @@ def test_default_python_codegen_does_not_use_template_fallback(monkeypatch, tmp_
 
     with pytest.raises(RuntimeError, match="coder unavailable"):
         orchestrator._scene_code(ctx, 1, state)
+
+
+def test_relaxed_python_codegen_uses_validated_safe_fallback(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.root.mkdir(parents=True)
+    state = SceneState(plan=plan(), plan_ready=True)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        generation_mode="relaxed",
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_retrieve_rag", lambda *args, **kwargs: "")
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "python")
+    monkeypatch.setattr(
+        orchestrator,
+        "_generate_validated_code",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("coder unavailable")),
+    )
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_local_smoke_render", lambda *args, **kwargs: None)
+
+    orchestrator._scene_code(ctx, 1, state)
+
+    assert state.code.startswith("from manim import *")
+    assert state.safe_fallback_used is True
+    assert "最小安全代码降级" in state.safe_fallback_reason
 
 
 def test_direct_render_skips_generation_barrier(monkeypatch, tmp_path):
@@ -425,6 +493,97 @@ def test_plan_review_replan_budget_stops_an_identical_plan_loop(monkeypatch, tmp
     assert ctx.plan_review_status == "failed"
     assert "达到最大次数" in ctx.scene_states[1].failure_reason
     assert ctx.continuity_review_round == 1
+
+
+def test_relaxed_plan_review_repairs_verified_blocking_issue(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    current_plan = plan()
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        generation_mode="relaxed",
+        outlines=[
+            SceneOutline(
+                scene_id=1,
+                title=current_plan.title,
+                duration_seconds=current_plan.duration_seconds,
+                purpose=current_plan.purpose,
+                math_concept=current_plan.math_concept,
+            )
+        ],
+        scene_states={1: SceneState(plan=current_plan, plan_ready=True)},
+        plan_review_status="pending",
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_run_plan_review_batch", lambda *args, **kwargs: {})
+
+    class BlockingReviewer:
+        def review(self, *args, **kwargs):
+            return PlanReviewResult(
+                is_valid=False,
+                severity="major",
+                issues=[
+                    PlanReviewIssue(
+                        category="math",
+                        severity="major",
+                        confidence="high",
+                        evidence_type="calculation",
+                        evidence="a^2+b^2=d^2",
+                        field="computation",
+                        message="公式两侧确定不等价",
+                        fix_instruction="修正右侧表达式",
+                    )
+                ],
+            )
+
+    class SamePlanPlanner:
+        def plan_detail(self, *args, **kwargs):
+            return current_plan
+
+    monkeypatch.setattr(module, "PlanReviewerAgent", BlockingReviewer)
+    monkeypatch.setattr(module, "PlannerAgent", SamePlanPlanner)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert ctx.scene_states[1].failed is True
+    assert ctx.scene_states[1].failure_category == "planning"
+    assert "公式两侧确定不等价" in ctx.scene_states[1].failure_reason
+
+
+def test_initial_plan_reviews_run_in_parallel(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    states = [
+        SceneState(
+            plan=plan().model_copy(update={"scene_id": scene_id}),
+            plan_ready=True,
+        )
+        for scene_id in (1, 2)
+    ]
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={state.plan.scene_id: state for state in states},
+        continuity_bible=ContinuityBible(),
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(2)
+    barrier = threading.Barrier(2)
+    thread_ids: list[int] = []
+
+    class ParallelReviewer:
+        def review(self, *args, **kwargs):
+            thread_ids.append(threading.get_ident())
+            barrier.wait(timeout=2)
+            return PlanReviewResult(is_valid=True, severity="info")
+
+    monkeypatch.setattr(module, "PlanReviewerAgent", ParallelReviewer)
+
+    results = orchestrator._run_plan_review_batch(ctx, states)
+
+    assert set(results) == {1, 2}
+    assert len(set(thread_ids)) == 2
 
 
 def test_plan_review_replan_budget_uses_geometry_fallback(monkeypatch, tmp_path):
@@ -1441,11 +1600,49 @@ def test_explicit_smoke_override_enables_dry_run_canary(tmp_path):
     assert Orchestrator._local_smoke_enabled(ctx) is True
 
 
+def test_unknown_animation_forces_dry_run_smoke_canary(tmp_path):
+    ctx = PipelineContext("x", paths=paths(tmp_path), dry_run=True)
+    state = SceneState(plan=plan(), unknown_animation_detected=True)
+
+    assert Orchestrator._local_smoke_enabled(ctx, state) is True
+
+
+def test_resume_invalidation_discards_legacy_technical_contract(tmp_path):
+    run_root = paths(tmp_path).root
+    run_root.mkdir(parents=True)
+    legacy = StoredSceneState.model_validate(
+        {
+            "plan": plan(),
+            "technical_spec": {
+                "scene_id": 1,
+                "renderer": "cairo",
+                "objects": [],
+                "animations": [],
+                "export_element_ids": [],
+                "removed_element_ids": [],
+            },
+        }
+    )
+    manifest = RunManifest(
+        run_id="20260728-120000-1234abcd",
+        user_prompt="prompt",
+        output_path=str(run_root / "out.mp4"),
+        scenes={1: legacy},
+    )
+    orchestrator = Orchestrator()
+
+    assert orchestrator._invalidate_legacy_technical_contracts(manifest, run_root) is True
+    assert manifest.scenes[1].technical_contract_stale is False
+    assert manifest.scenes[1].technical_spec is None
+    assert manifest.scenes[1].reviewed is False
+    assert manifest.state == "CODING"
+
+
 def test_stagnation_fallback_produces_a_different_valid_candidate(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     state = SceneState(plan=plan(), code="old code", plan_ready=True)
     ctx = PipelineContext("prompt", paths=run_paths, scene_states={1: state})
-    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "hybrid")
+    monkeypatch.setattr(module.settings, "CODEGEN_MODE", "python")
 
     candidate = Orchestrator()._stagnation_fallback_candidate(ctx, state)
 
@@ -1502,8 +1699,12 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_ENABLED", True)
     monkeypatch.setattr(module.settings, "LOCAL_SMOKE_RENDER_MODE", "video")
     monkeypatch.setattr(module.settings, "ADAPTIVE_SMOKE_RENDER", False)
+    captured_commands = []
+    captured_envs = []
 
     def successful_run(command, **kwargs):
+        captured_commands.append(command)
+        captured_envs.append(kwargs.get("env", {}))
         if "--media_dir" not in command:
             return module.subprocess.CompletedProcess(command, 0, "", "")
         media_index = command.index("--media_dir") + 1
@@ -1515,6 +1716,23 @@ def test_local_smoke_render_checks_output_and_failure(monkeypatch, tmp_path):
 
     monkeypatch.setattr(module, "_run_limited_process", successful_run)
     orchestrator._local_smoke_render(ctx, state)
+    import_command = next(command for command in captured_commands if "-c" in command)
+    import_check = import_command[import_command.index("-c") + 1]
+    assert "if not isinstance(candidate, type):" in import_check
+    compile(import_check, "<smoke-import-check>", "exec")
+    render_commands = [command for command in captured_commands if "--media_dir" in command]
+    assert render_commands
+    assert render_commands[0][render_commands[0].index("-m") + 1 :][:2] == ["manim", "render"]
+    assert captured_envs
+    assert all(
+        captured_envs[0][name] == "1"
+        for name in (
+            "OPENBLAS_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        )
+    )
 
     def failed_run(command, **kwargs):
         return module.subprocess.CompletedProcess(command, 1, "", "render boom")
@@ -1615,6 +1833,105 @@ def test_major_review_with_verified_local_fix_stays_in_code_review(monkeypatch, 
     assert state.give_up is False
 
 
+def test_relaxed_review_soft_passes_llm_failure_after_deterministic_gate(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        generation_mode="relaxed",
+        scene_states={1: state},
+    )
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    Orchestrator()._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(
+            is_valid=False,
+            severity="major",
+            feedback="模型认为存在非确定性的布局问题",
+        ),
+    )
+
+    assert state.reviewed is True
+    assert state.give_up is False
+    assert any("relaxed Review warning" in warning for warning in ctx.continuity_warnings)
+
+
+def test_relaxed_review_repairs_verified_blocking_finding(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    state = SceneState(plan=plan(), code=code, class_name="Demo", plan_ready=True)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        generation_mode="relaxed",
+        scene_states={1: state},
+    )
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="确定性运行时问题",
+        findings=[
+            ReviewFinding(
+                category="runtime",
+                severity="major",
+                confidence="high",
+                evidence_type="source_code",
+                evidence="self.wait()",
+                why="当前调用参数与合同不一致",
+                repair="修复当前代码",
+            )
+        ],
+    )
+
+    Orchestrator()._apply_review_result(ctx, 1, state, result)
+
+    assert state.reviewed is False
+    assert state.give_up is False
+    assert state.rewrite_feedback
+
+
+def test_relaxed_review_does_not_bypass_deterministic_failure(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        generation_mode="relaxed",
+        scene_states={1: state},
+    )
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    Orchestrator()._apply_review_result(
+        ctx,
+        1,
+        state,
+        ReviewResult(is_valid=False, severity="major", feedback="确定性导出合同错误"),
+        allow_relaxed_soft_pass=False,
+    )
+
+    assert state.reviewed is False
+    assert state.give_up is False
+
+
 def test_code_level_math_finding_is_sent_back_to_coder_not_planner(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
     run_paths.scenes.mkdir(parents=True)
@@ -1650,6 +1967,48 @@ def test_code_level_math_finding_is_sent_back_to_coder_not_planner(monkeypatch, 
     assert state.rewrite_feedback
     assert not ctx.plan_compile_issues
     assert state.give_up is False
+
+
+def test_plan_repair_receives_only_plan_finding_not_code_review_noise(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    monkeypatch.setattr(Orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    captured: dict[str, str] = {}
+
+    def capture_plan_repair(ctx, scene_id, state, feedback, target, source="视觉评估"):
+        captured["feedback"] = feedback
+        captured["target"] = target
+
+    monkeypatch.setattr(orchestrator, "_schedule_visual_plan_repair", capture_plan_repair)
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="代码级噪声：这一行的布局可能重叠，应该交给 Coder",
+        findings=[
+            ReviewFinding(
+                category="continuity",
+                severity="major",
+                evidence_type="contract",
+                why="ScenePlan 的 opening_state 与 handoff 不一致",
+                repair="修正 ScenePlan 的跨场景交接合同",
+            )
+        ],
+    )
+
+    orchestrator._apply_review_result(ctx, 1, state, result)
+
+    assert captured == {
+        "feedback": "修正 ScenePlan 的跨场景交接合同",
+        "target": "continuity",
+    }
 
 
 def test_review_exhaustion_switches_high_risk_geometry_to_safe_fallback(monkeypatch, tmp_path):
@@ -1732,6 +2091,35 @@ def test_identical_review_feedback_stops_repeated_rewrites(monkeypatch, tmp_path
     assert "相同代码和审查反馈" in state.failure_reason
 
 
+def test_relaxed_review_does_not_stop_on_identical_feedback(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
+    run_paths = paths(tmp_path)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n",
+        class_name="Demo",
+    )
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        scene_states={1: state},
+        generation_mode="relaxed",
+    )
+    result = ReviewResult(
+        is_valid=False,
+        severity="major",
+        feedback="缺少一个明确的动画步骤",
+    )
+
+    orchestrator = Orchestrator()
+    orchestrator._apply_review_result(ctx, 1, state, result, allow_relaxed_soft_pass=False)
+    orchestrator._apply_review_result(ctx, 1, state, result, allow_relaxed_soft_pass=False)
+
+    assert state.give_up is False
+    assert state.review_round == 2
+    assert state.rewrite_feedback
+
+
 def test_safe_fallback_is_not_repeated_after_resume(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "MAX_REVIEW_ROUNDS", 1)
     monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
@@ -1789,6 +2177,115 @@ class Demo(Scene):
     assert called is False
     assert state.reviewed is False
     assert "连续性导出区无效" in state.rewrite_feedback
+
+
+def test_parallel_scene_review_defers_shared_ledger_commit(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    state = SceneState(
+        plan=plan(),
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+        class_name="Demo",
+        plan_ready=True,
+    )
+    ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+
+    class PassingReviewer:
+        def review(self, *args, **kwargs):
+            return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(module, "ReviewerAgent", PassingReviewer)
+    monkeypatch.setattr(
+        orchestrator,
+        "_update_element_manifest",
+        lambda *args: (_ for _ in ()).throw(AssertionError("并行审查不能提前写共享账本")),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_update_state_ledger",
+        lambda *args: (_ for _ in ()).throw(AssertionError("并行审查不能提前写共享账本")),
+    )
+
+    orchestrator._scene_review(ctx, 1, state, defer_continuity_commit=True)
+
+    assert state.reviewed is True
+
+
+def test_scene_review_rebuilds_stale_ledger_before_commit(monkeypatch, tmp_path):
+    run_paths = paths(tmp_path)
+    grid = VisualElementState(element_id="grid", variable_name="grid", required=True)
+    previous_plan = plan().model_copy(update={"new_elements": [grid]})
+    current_plan = plan().model_copy(
+        update={
+            "scene_id": 2,
+            "inherited_elements": [grid],
+            "elements_to_remove": [grid],
+            "new_elements": [],
+        }
+    )
+    previous_code = """from manim import *
+class Previous(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: grid
+        grid = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    current_code = """from manim import *
+class Current(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # KD1_CONTINUITY_EXPORT_END
+        self.wait()
+"""
+    previous = SceneState(
+        plan=previous_plan,
+        code=previous_code,
+        class_name="Previous",
+        plan_ready=True,
+        reviewed=True,
+    )
+    current = SceneState(
+        plan=current_plan,
+        code=current_code,
+        class_name="Current",
+        plan_ready=True,
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={1: previous, 2: current},
+    )
+    # 合法但陈旧的账本：上一场景的 closing 没有记录 grid。
+    ctx.state_ledger = StateLedger(
+        current_scene_id=1,
+        elements=[
+            LedgerElement(
+                element_id="old",
+                variable_name="old",
+                source_scene_id=1,
+                source_code_sha256="a" * 64,
+            )
+        ],
+        boundaries={
+            1: SceneBoundaryIR(scene_id=1, closing_element_ids=["old"]),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+
+    class PassingReviewer:
+        def review(self, *args, **kwargs):
+            return ReviewResult(is_valid=True)
+
+    monkeypatch.setattr(module, "ReviewerAgent", PassingReviewer)
+
+    orchestrator._scene_review(ctx, 2, current)
+
+    assert current.reviewed is True
+    assert any(item.element_id == "grid" for item in ctx.state_ledger.elements)
+    assert 2 in ctx.state_ledger.boundaries
 
 
 def test_code_generation_validates_continuity_contract_before_code_review(monkeypatch):
@@ -1865,7 +2362,7 @@ def test_code_generation_explains_single_export_definition_on_lifecycle_failure(
                 element_id="formula",
                 variable_name="formula",
                 constructor="Circle",
-                lifecycle=["define", "create", "keep"],
+                lifecycle=["define", "introduce", "keep"],
                 exported=True,
             )
         ],
@@ -1874,7 +2371,7 @@ def test_code_generation_explains_single_export_definition_on_lifecycle_failure(
                 event_id="show_formula",
                 start_seconds=0,
                 end_seconds=1,
-                operation="create",
+                semantic_action="introduce",
                 target_element_ids=["formula"],
                 create_element_ids=["formula"],
             )
@@ -1885,6 +2382,7 @@ def test_code_generation_explains_single_export_definition_on_lifecycle_failure(
 class Demo(Scene):
     def construct(self):
         formula = Circle()
+        # KD1_ANIMATION_EVENT: show_formula
         self.play(Create(formula))
         # KD1_CONTINUITY_EXPORT_BEGIN
         # element_id: formula
@@ -1898,6 +2396,7 @@ class Demo(Scene):
         # element_id: formula
         formula = Circle()
         # KD1_CONTINUITY_EXPORT_END
+        # KD1_ANIMATION_EVENT: show_formula
         self.play(Create(formula))
 """
 
@@ -1977,6 +2476,153 @@ class Demo(Scene):
 
     assert len(coder.calls) == 3
     assert "完全相同" in coder.calls[2]
+
+
+def test_relaxed_code_generation_can_continue_past_validation_attempt_default(monkeypatch):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={"new_elements": [VisualElementState(element_id="formula", variable_name="formula")]}
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        duplicate = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append(feedback)
+            return (
+                valid
+                if len(self.calls) == 4
+                else invalid.replace("duplicate", f"duplicate_{len(self.calls)}")
+            )
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(settings, "GENERATION_MODE", "relaxed")
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+    orchestrator = Orchestrator()
+    orchestrator._ctx = PipelineContext("prompt", generation_mode="relaxed")
+
+    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 4
+
+
+def test_relaxed_code_generation_does_not_stop_on_identical_invalid_candidates(
+    monkeypatch, tmp_path
+):
+    from kd1_anime.agents.validator import CodeValidationResult
+
+    scene_plan = plan().model_copy(
+        update={"new_elements": [VisualElementState(element_id="formula", variable_name="formula")]}
+    )
+    invalid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # element_id: formula
+        duplicate = Square()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+    valid = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula
+        formula = Circle()
+        # KD1_CONTINUITY_EXPORT_END
+"""
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = []
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls.append((feedback, kwargs))
+            return valid if len(self.calls) == 4 else invalid
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(
+        Orchestrator,
+        "_validate",
+        staticmethod(lambda code, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
+    )
+    orchestrator = Orchestrator()
+    orchestrator._ctx = PipelineContext("prompt", paths=paths(tmp_path), generation_mode="relaxed")
+
+    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == valid
+    assert class_name == "Demo"
+    assert len(coder.calls) == 4
+    assert [item[1]["candidate_index"] for item in coder.calls] == [1, 2, 3, 4]
+    assert [item[1]["candidate_budget"] for item in coder.calls] == [1, 2, 3, 4]
+    assert "不得停止重试" in coder.calls[2][0]
+    assert coder.calls[2][1]["previous_code"] == ""
+    assert coder.calls[2][1]["strategy_hint"]
+    assert coder.calls[2][1]["temperature_override"] > settings.LLM_CODE_TEMPERATURE
+
+
+def test_relaxed_code_generation_escalates_after_different_invalid_candidates(
+    monkeypatch, tmp_path
+):
+    scene_plan = plan()
+    safe_code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+
+    class FakeCoder:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_code(self, scene_plan, feedback="", **kwargs):
+            self.calls += 1
+            return (
+                "from manim import *\n"
+                f"# invalid candidate {self.calls}\n"
+                "class Demo(Scene):\n    pass\n"
+            )
+
+    coder = FakeCoder()
+    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
+    monkeypatch.setattr(module, "build_safe_scene_code", lambda *args, **kwargs: safe_code)
+    orchestrator = Orchestrator()
+    orchestrator._ctx = PipelineContext("prompt", paths=paths(tmp_path), generation_mode="relaxed")
+    events = []
+    orchestrator._callback = lambda event, data: events.append((event, data))
+
+    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+
+    assert generated == safe_code
+    assert class_name == "Demo"
+    assert coder.calls == 4
+    assert any(event == "scene_code_stagnation_fallback" for event, _ in events)
 
 
 def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
@@ -2572,6 +3218,64 @@ def test_infrastructure_error_does_not_invoke_auto_fixer(monkeypatch, tmp_path):
     assert "环境或 Slurm" in state.failure_reason
 
 
+def test_autofix_code_change_does_not_reset_downstream_scene(monkeypatch, tmp_path):
+    import time
+
+    from kd1_anime.cluster.slurm import SlurmJob
+
+    run_paths = paths(tmp_path)
+    run_paths.scenes.mkdir(parents=True)
+    original = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    repaired = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait(2)\n"
+    first = SceneState(plan=plan(), code=original, class_name="Demo", plan_ready=True)
+    first.slurm_job = SlurmJob(
+        job_id="123",
+        scene_id=1,
+        script_path=run_paths.scenes / "render.sh",
+        log_out=run_paths.logs / "out",
+        log_err=run_paths.logs / "err",
+        media_dir=run_paths.videos / "scene_1",
+        scene_class_name="Demo",
+        submitted_at=time.time(),
+        status="FAILED",
+    )
+    downstream = SceneState(
+        plan=plan().model_copy(update={"scene_id": 2}),
+        code=original,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+        rendered=True,
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        scene_states={1: first, 2: downstream},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator.slurm, "get_error_log", lambda **kwargs: "render boom")
+
+    class Fixer:
+        @staticmethod
+        def is_infrastructure_error(error_log):
+            return False
+
+        def fix(self, *args, **kwargs):
+            return repaired
+
+    monkeypatch.setattr(module, "AutoFixerAgent", Fixer)
+
+    orchestrator._scene_fix(ctx, 1, first)
+
+    assert first.code == repaired
+    assert downstream.code == original
+    assert downstream.reviewed is True
+    assert downstream.rendered is True
+    assert ctx.continuity_rebuild_required is False
+
+
 def test_dispatch_respects_max_in_flight(monkeypatch, tmp_path):
     import time
 
@@ -3131,6 +3835,40 @@ def test_visual_gate_low_score_schedules_bounded_coder_rewrite(monkeypatch, tmp_
     (ctx.paths.root / stored_candidate.code_file).write_text("# tampered\n", encoding="utf-8")
     with pytest.raises(ValueError, match="最佳视觉候选代码哈希"):
         Orchestrator._context_from_manifest(manifest, ctx.paths.root)
+
+
+def test_relaxed_visual_gate_is_diagnostic_only_by_default(monkeypatch, tmp_path):
+    from kd1_anime.config import settings
+
+    ctx, state = _make_visual_eval_context(tmp_path)
+    ctx.generation_mode = "relaxed"
+    monkeypatch.setattr(settings, "RELAXED_VISUAL_AUTO_FIX", False)
+    dimension = {"score": 2, "comprehensive_evaluation": "元素重叠"}
+    result = VisualAnalysisResult(
+        overall_analysis="布局需要修复",
+        mathematical_accuracy={"score": 4, "comprehensive_evaluation": "数学正确"},
+        visual_relevance=dimension,
+        visual_quality=dimension,
+        visual_consistency=dimension,
+        element_layout=dimension,
+        issues=[],
+    )
+
+    class LowScoreEvaluator:
+        def __init__(self, **kwargs):
+            pass
+
+        def evaluate_scene_video(self, *args, **kwargs):
+            return result, []
+
+    monkeypatch.setattr("kd1_anime.eval.Evaluator", LowScoreEvaluator)
+
+    assert Orchestrator()._visual_gate(ctx) is False
+    assert state.visual_status == "warning"
+    assert state.rendered is True
+    assert state.visual_fix_attempts == 0
+    assert state.rewrite_feedback == ""
+    assert "relaxed 模式仅做视觉诊断" in state.visual_feedback
 
 
 def test_merge_rejects_visual_receipt_for_a_different_video(tmp_path):

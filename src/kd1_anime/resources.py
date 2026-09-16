@@ -11,6 +11,7 @@ class ResourceCoordinator:
         *,
         llm_limit: int,
         slurm_limit: int,
+        local_limit: int | None = None,
         visual_llm_limit: int | None = None,
         rag_limit: int | None = None,
     ) -> None:
@@ -26,6 +27,9 @@ class ResourceCoordinator:
         self._slurm_limit = max(0, slurm_limit)
         self._slurm_active = 0
         self._slurm_lock = threading.Lock()
+        self._local_limit = max(1, local_limit if local_limit is not None else 1)
+        self._local_active = 0
+        self._local_lock = threading.Lock()
 
     def try_acquire_slurm(self) -> bool:
         with self._slurm_lock:
@@ -45,3 +49,24 @@ class ResourceCoordinator:
             if self._slurm_active <= 0:
                 raise RuntimeError("Slurm 资源名额被重复释放")
             self._slurm_active -= 1
+
+    def try_acquire_local(self) -> bool:
+        """获取本地正式渲染名额；默认跨批次也保持串行。"""
+
+        with self._local_lock:
+            if self._local_active >= self._local_limit:
+                return False
+            self._local_active += 1
+            return True
+
+    def register_existing_local(self) -> None:
+        """兼容接口：本地旧进程不会在恢复时被认领。"""
+
+        with self._local_lock:
+            self._local_active += 1
+
+    def release_local(self) -> None:
+        with self._local_lock:
+            if self._local_active <= 0:
+                raise RuntimeError("本地渲染资源名额被重复释放")
+            self._local_active -= 1

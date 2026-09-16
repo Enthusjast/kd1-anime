@@ -18,7 +18,7 @@ from kd1_anime.agents.scene_templates import (
     build_scene_template,
     select_scene_template,
 )
-from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
+from kd1_anime.agents.technical_planner import TechnicalAnimation, TechnicalObject, TechnicalSpec
 from kd1_anime.agents.validator import validate_manim_code
 from kd1_anime.config import settings
 
@@ -252,6 +252,30 @@ class TestScene(Scene):
         assert "2/3" in message
 
     @patch("kd1_anime.agents.base.BaseAgent.call_llm")
+    def test_generate_code_accepts_relaxed_stagnation_strategy(
+        self, mock_call_llm, coder_agent, sample_plan
+    ):
+        mock_call_llm.return_value = """```python
+from manim import *
+class TestScene(Scene):
+    def construct(self): pass
+```"""
+
+        coder_agent.generate_code(
+            sample_plan,
+            stream=False,
+            candidate_index=3,
+            candidate_budget=3,
+            strategy_hint="从 construct() 重新组织对象生命周期",
+            temperature_override=0.7,
+        )
+
+        message = mock_call_llm.call_args.kwargs["user_message"]
+        assert "强制结构策略" in message
+        assert "重新组织对象生命周期" in message
+        assert mock_call_llm.call_args.kwargs["temperature"] == 0.7
+
+    @patch("kd1_anime.agents.base.BaseAgent.call_llm")
     def test_generate_code_with_previous_code(self, mock_call_llm, coder_agent, sample_plan):
         """测试带之前代码的代码生成。"""
         mock_call_llm.return_value = """```python
@@ -385,6 +409,16 @@ class TestScene(Scene):
         technical_spec = TechnicalSpec(
             scene_id=1,
             objects=[TechnicalObject(element_id="circle", variable_name="circle")],
+            animations=[
+                TechnicalAnimation(
+                    event_id="show_circle",
+                    start_seconds=0,
+                    end_seconds=1,
+                    semantic_action="introduce",
+                    target_element_ids=["circle"],
+                    create_element_ids=["circle"],
+                )
+            ],
             export_element_ids=["circle"],
         )
 
@@ -393,6 +427,9 @@ class TestScene(Scene):
         message = mock_call_llm.call_args.kwargs["user_message"]
         assert "TechnicalSpec" in message
         assert '"export_element_ids"' in message
+        assert "TechnicalSpec 事件实现表" in message
+        assert "show_circle" in message
+        assert "exactly one self.play" in message
 
 
 class TestCodeExtraction:

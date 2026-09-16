@@ -179,4 +179,75 @@ def lint_manim_api(
     )
 
 
-__all__ = ["ApiLintResult", "lint_manim_api"]
+def repair_manim_api_compatibility(code: str) -> tuple[str, tuple[str, ...]]:
+    """修复可从 AST 直接确定的 Manim 动画类型不匹配。
+
+    ``GrowArrow`` 的实现会调用二维 ``Arrow`` 的 ``scale(...,
+    scale_tips=True)``；将它用于 ``Arrow3D`` 会在渲染开始时抛出
+    ``VMobject.scale()`` 参数错误。三维箭头仍可使用 ``Create`` 平滑
+    显现，因此这里只替换确定声明为 ``Arrow3D`` 的变量，不触碰普通
+    ``Arrow`` 或无法确认类型的表达式。
+    """
+
+    if not code:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+
+    arrow3d_variables: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if not (isinstance(node.value, ast.Call) and _call_name(node.value) == "Arrow3D"):
+            continue
+        arrow3d_variables.update(target.id for target in targets if isinstance(target, ast.Name))
+    if not arrow3d_variables:
+        return code, ()
+
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+
+    def node_range(node: ast.AST) -> tuple[int, int]:
+        start = line_offsets[node.lineno - 1] + node.col_offset  # type: ignore[attr-defined]
+        end_line = getattr(node, "end_lineno", node.lineno)
+        end_col = getattr(node, "end_col_offset", node.col_offset)
+        end = line_offsets[end_line - 1] + end_col
+        return start, end
+
+    edits: list[tuple[int, int, bytes]] = []
+    repaired_variables: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and _call_name(node) == "GrowArrow"
+            and len(node.args) == 1
+            and not node.keywords
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in arrow3d_variables
+        ):
+            continue
+        start, end = node_range(node)
+        variable = node.args[0].id
+        edits.append((start, end, f"Create({variable})".encode()))
+        repaired_variables.add(variable)
+
+    if not edits:
+        return code, ()
+    source_bytes = code.encode("utf-8")
+    for start, end, replacement in sorted(edits, reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    return (
+        source_bytes.decode("utf-8"),
+        ("将 Arrow3D 的 GrowArrow 替换为 Create: " + ", ".join(sorted(repaired_variables)),),
+    )
+
+
+__all__ = ["ApiLintResult", "lint_manim_api", "repair_manim_api_compatibility"]

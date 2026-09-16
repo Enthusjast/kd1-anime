@@ -76,6 +76,31 @@ def test_compiler_checks_numeric_matrix_product_in_computation():
     assert any("矩阵乘法" in issue.message for issue in result)
 
 
+def test_compiler_ignores_matrix_factors_before_product_equalities():
+    plan = make_plan(
+        computation=(
+            "验证 P D P^{-1} = [[1,1],[1,-1]] * [[4,0],[0,2]] * 0.5 * "
+            "[[1,1],[1,-1]] = [[4,2],[4,-2]] * 0.5 * [[1,1],[1,-1]] = "
+            "[[3,1],[1,3]]"
+        )
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any("矩阵等式" in issue.message for issue in result)
+
+
+def test_compiler_handles_latex_matrix_product_operators():
+    plan = make_plan(
+        computation=r"矩阵乘法 [[1,2]] \cdot [[3],[4]] = [[11]]；"
+        r"另一个乘积 [[1,2]] \times [[3],[4]] = [[11]]"
+    )
+
+    result = PlanCompiler().compile_scene(plan)
+
+    assert not any("矩阵乘法" in issue.message for issue in result)
+
+
 def test_compiler_checks_simple_equations_in_free_form_computation():
     plan = make_plan(computation="展开得到 (a+b)^2 = a^2+b^2")
 

@@ -147,7 +147,19 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
 - 不要凭空假设一定有第二个元素; 用循环、显式长度检查或备选路径
 - 保持分镜的数学内容与视觉设计不变, 只修复取值方式
 
-### 12. OpenGL 渲染下 mobject 缺少 should_render (高频)
+### 12. 空 Mobject 传给指示动画
+**症状**: `ValueError: operands could not be broadcast together with shapes (0,) (3,)`，
+        traceback 位于 `Flash.create_lines`、`Indicate`、`Circumscribe`、`Wiggle`，
+        或错误行是 `Flash(some_group, ...)`
+**原因**: 目标通常是 `VGroup()`、空的列表推导/条件过滤结果，因而没有任何几何点；
+        `Flash` 在构造动画时会立即调用目标中心，尚未进入 `self.play` 就会失败。
+**修复**:
+- 只把确定包含实际 `Line`/`Dot`/其它 Mobject 的对象传给这些指示动画；
+- 对条件分组先确保非空，或在为空时跳过高亮动画；不要用 `VGroup()` 作为占位目标；
+- 不要把空 group 强行送入 `Flash`/`Indicate`，也不要删除正确的数学对象；
+- 保留原有事件 marker，并让 fallback 分支仍只处理当前事件声明的对象。
+
+### 13. OpenGL 渲染下 mobject 缺少 should_render (高频)
 **症状**: `AttributeError: Xxx object has no attribute 'should_render'`
          (Xxx 是 Polygon/VGroup/Line 等), 位置在 opengl_renderer.py 的
          update_frame 遍历 scene.mobjects 时
@@ -180,6 +192,8 @@ AUTO_FIXER_SYSTEM_PROMPT = r"""你是一个 Manim 代码调试专家.你的任�
    继承元素定义和全局颜色/字体配置；除非错误日志直接涉及导出区，否则不要删除或重命名它们。
 10. TechnicalSpec 是只读的技术合同。修复后必须继续满足对象生命周期、动画源/目标、
     renderer 和最终导出清单，不能用删除动画或重建整场景掩盖错误。
+    contract_version=2 的每个 `self.play` 前都必须保留或补齐对应的
+    `# KD1_ANIMATION_EVENT: <event_id>`，不得把具体动画类名当成状态合同。
 11. LessonSpec/TeachingGraph 是只读数学合同。只修复运行时错误；不得因为渲染日志
     自行改写公式、推导结论或定义域。若错误来自计划，应交回计划阶段。
 
@@ -368,7 +382,10 @@ class AutoFixerAgent(BaseAgent):
                 "输出要求", "请修复代码中的问题,输出完整的修复后代码:", required=True, priority=100
             )
         )
-        user_msg = build_bounded_prompt(sections, max_chars=settings.LLM_MAX_CONTEXT_CHARS)
+        user_msg = build_bounded_prompt(
+            sections,
+            max_chars=settings.llm_context_char_budget(),
+        )
         code = self.call_llm(
             system_prompt="\n\n".join(
                 (
@@ -411,6 +428,14 @@ class AutoFixerAgent(BaseAgent):
                 "OpenGL mobject 不兼容 — 场景里出现了自定义 mobject 子类或非 "
                 "OpenGLMobject 对象 (缺 should_render 属性)。删除自定义子类, "
                 "只用 manim 标准类 (Polygon/VGroup/Line/MathTex) 在 construct() 内构造"
+            )
+        elif "operands could not be broadcast" in log_lower and (
+            "shapes (0,)" in log_lower or "flash" in log_lower or "create_lines" in log_lower
+        ):
+            return (
+                "空 Mobject 指示动画错误 — Flash/Indicate/Circumscribe/Wiggle 的目标没有几何点，"
+                "通常是空 VGroup 或空条件列表。保证目标非空，或在目标为空时跳过该指示动画；"
+                "保留事件 marker 和数学对象，不要重写整场景"
             )
         elif "latex" in log_lower or "emergency stop" in log_lower or "missing $" in log_lower:
             return "LaTeX 编译错误 — 检查 MathTex 中的 LaTeX 语法、括号匹配、转义字符"

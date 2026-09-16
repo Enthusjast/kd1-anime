@@ -168,34 +168,41 @@ def build_scene_template(
     examples = {
         "formula": (
             '        formula = MathTex(r"a^2+b^2=c^2", tex_template=tex_template)\n'
+            "        # KD1_ANIMATION_EVENT: show_formula\n"
             "        self.play(Write(formula), run_time=1)"
         ),
         "graph": (
             "        axes = Axes(x_range=[-4, 4, 1], y_range=[-2, 8, 2])\n"
             '        graph = axes.plot(lambda x: x**2, x_range=[-2.5, 2.5], color=COLORS["primary"])\n'
+            "        # KD1_ANIMATION_EVENT: draw_graph\n"
             "        self.play(Create(axes), Create(graph), run_time=2)"
         ),
         "geometry": (
             '        shape = Polygon(LEFT * 2, RIGHT * 2, UP * 2, color=COLORS["primary"])\n'
+            "        # KD1_ANIMATION_EVENT: show_geometry\n"
             "        self.play(Create(shape), run_time=1)"
         ),
         "surface": (
             "        self.set_camera_orientation(phi=70 * DEGREES, theta=-45 * DEGREES)\n"
             "        axes = ThreeDAxes()\n"
             "        surface = Surface(lambda u, v: axes.c2p(u, v, u**2 + v**2), u_range=[-2, 2], v_range=[-2, 2], resolution=(12, 12))\n"
+            "        # KD1_ANIMATION_EVENT: show_surface\n"
             "        self.play(Create(axes), Create(surface), run_time=2)"
         ),
         "moving_camera": (
             '        focus = Circle(color=COLORS["primary"])\n'
             "        self.add(focus)\n"
             "        self.camera.frame.save_state()\n"
+            "        # KD1_ANIMATION_EVENT: move_camera\n"
             "        self.play(self.camera.frame.animate.scale(0.6).move_to(focus), run_time=1.5)\n"
+            "        # KD1_ANIMATION_EVENT: restore_camera\n"
             "        self.play(Restore(self.camera.frame), run_time=1)"
         ),
         "updater": (
             "        tracker = ValueTracker(0)\n"
             '        dot = always_redraw(lambda: Dot(RIGHT * tracker.get_value(), color=COLORS["highlight"]))\n'
             "        self.add(dot)\n"
+            "        # KD1_ANIMATION_EVENT: update_tracker\n"
             "        self.play(tracker.animate.set_value(3), run_time=2, rate_func=smooth)\n"
             "        dot.clear_updaters()"
         ),
@@ -277,7 +284,9 @@ def build_safe_scene_code(
             f"        title = Text({quote(scene_plan.title[:120])}, font_size=32)",
             f"        summary = Text({quote((scene_plan.math_concept + '：' + scene_plan.computation)[:240])}, font_size=24)",
             "        summary.next_to(title, DOWN, buff=0.5)",
+            "        # KD1_ANIMATION_EVENT: __auto_aux_title",
             "        self.play(FadeIn(title), run_time=0.5)",
+            "        # KD1_ANIMATION_EVENT: __auto_aux_summary",
             "        self.play(FadeIn(summary), run_time=0.5)",
         ]
     )
@@ -287,6 +296,7 @@ def build_safe_scene_code(
             [
                 f"        {variable}.move_to(DOWN * {index + 1})",
                 f"        self.add({variable})",
+                f"        # KD1_ANIMATION_EVENT: __auto_remove_{variable}",
                 f"        self.play(FadeOut({variable}), run_time=0.3)",
             ]
         )
@@ -297,6 +307,7 @@ def build_safe_scene_code(
         if bool(getattr(technical, "initially_active", False)):
             lines.append(f"        self.add({variable})")
         else:
+            lines.append(f"        # KD1_ANIMATION_EVENT: __auto_introduce_{variable}")
             lines.append(f"        self.play(FadeIn({variable}), run_time=0.3)")
     lines.append("        self.wait(1)")
     return "\n".join(lines) + "\n"

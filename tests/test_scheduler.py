@@ -10,9 +10,13 @@ from pathlib import Path
 import kd1_anime.orchestrator as module
 from kd1_anime.agents.continuity import ContinuityReviewResult
 from kd1_anime.agents.plan_reviewer import PlanReviewResult
-from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan
+from kd1_anime.agents.planner import ContinuityBible, SceneOutline, ScenePlan, VisualElementState
 from kd1_anime.agents.reviewer import ReviewResult
-from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.agents.technical_planner import (
+    TechnicalHandoff,
+    TechnicalObject,
+    TechnicalSpec,
+)
 from kd1_anime.agents.validator import CodeValidationResult
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
@@ -459,7 +463,7 @@ def test_multiple_scenes_complete_independently(monkeypatch, tmp_path):
         assert "scene_rendered" in scene_events
 
 
-def test_coder_receives_previous_scene_export_in_scene_order(monkeypatch, tmp_path):
+def test_coder_does_not_receive_unrelated_scene_export(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
 
     class ContextCoder(FakeCoder):
@@ -518,7 +522,101 @@ def test_coder_receives_previous_scene_export_in_scene_order(monkeypatch, tmp_pa
     orchestrator._run_scheduler(ctx)
 
     assert coder.inherited[0] == ""
-    assert "formula = MathTex" in coder.inherited[1]
+    assert coder.inherited[1] == ""
+
+
+def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    inherited = VisualElementState(
+        element_id="formula",
+        variable_name="formula",
+        required=True,
+    )
+    first_plan = make_plan(make_outline(1)).model_copy(update={"new_elements": [inherited]})
+    second_plan = make_plan(make_outline(2)).model_copy(
+        update={"inherited_elements": [inherited], "new_elements": []}
+    )
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        plan_review_status="passed",
+        scene_states={
+            1: SceneState(plan=first_plan, plan_ready=True, plan_reviewed=True),
+            2: SceneState(plan=second_plan, plan_ready=True, plan_reviewed=True),
+        },
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(2)
+    scene2_code_started = threading.Event()
+    scene1_code_started = threading.Event()
+    release_scene2_code = threading.Event()
+    code_threads: list[int] = []
+    handoff_sources: list[int | None] = []
+    order: list[str] = []
+
+    def technical_spec(scene_id: int) -> TechnicalSpec:
+        obj = TechnicalObject(
+            element_id="formula",
+            variable_name="formula",
+            constructor="MathTex",
+            exported=True,
+        )
+        return TechnicalSpec(
+            scene_id=scene_id,
+            objects=[obj],
+            export_element_ids=["formula"],
+            handoff_out=TechnicalHandoff(source_scene_id=scene_id, elements=[obj]),
+        )
+
+    def fake_technical(current_ctx, state, *, previous_technical_handoff=None):
+        if state.plan.scene_id == 2:
+            # Scene 2 技术设计开始时，Scene 1 的 Code 已经可以先行。
+            assert scene1_code_started.wait(timeout=2)
+        if previous_technical_handoff is not None:
+            handoff_sources.append(previous_technical_handoff.source_scene_id)
+        else:
+            handoff_sources.append(None)
+        state.technical_spec = technical_spec(state.plan.scene_id)
+        state.technical_status = "passed"
+
+    def fake_code(current_ctx, scene_id, state):
+        code_threads.append(threading.get_ident())
+        order.append(f"code_start_{scene_id}")
+        if scene_id == 1:
+            scene1_code_started.set()
+        if scene_id == 2:
+            scene2_code_started.set()
+            assert release_scene2_code.wait(timeout=2)
+        state.code = f"scene_{scene_id}"
+        order.append(f"code_done_{scene_id}")
+
+    def fake_review(current_ctx, scene_id, state, *, defer_continuity_commit=False):
+        assert defer_continuity_commit is True
+        if scene_id == 1:
+            assert scene2_code_started.wait(timeout=2)
+        state.reviewed = True
+
+    def fake_scene_worker(current_ctx, scene_id, state):
+        order.append(f"render_start_{scene_id}")
+        if scene_id == 1:
+            release_scene2_code.set()
+
+    monkeypatch.setattr(orchestrator, "_ensure_technical_spec", fake_technical)
+    monkeypatch.setattr(orchestrator, "_scene_code", fake_code)
+    monkeypatch.setattr(orchestrator, "_scene_review", fake_review)
+    monkeypatch.setattr(orchestrator, "_scene_worker", fake_scene_worker)
+    monkeypatch.setattr(orchestrator, "_refresh_scene_export", lambda state: None)
+    monkeypatch.setattr(orchestrator, "_update_element_manifest", lambda *args: None)
+    monkeypatch.setattr(orchestrator, "_update_state_ledger", lambda *args: None)
+    monkeypatch.setattr(orchestrator, "_apply_incremental_for_scene", lambda *args: None)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    orchestrator._run_code_review_barrier(ctx)
+
+    assert len(set(code_threads)) == 2
+    assert handoff_sources == [None, 1]
+    assert all(state.reviewed for state in ctx.scene_states.values())
+    assert order.index("render_start_1") < order.index("code_done_2")
 
 
 # ---------------------------------------------------------------------------
@@ -1011,6 +1109,91 @@ def test_continuity_review_is_a_barrier_before_coding(monkeypatch, tmp_path):
     )
 
 
+def test_relaxed_continuity_skips_nonblocking_llm_review(monkeypatch, tmp_path):
+    run_paths = make_paths(tmp_path)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        generation_mode="relaxed",
+        continuity_bible=ContinuityBible(),
+        continuity_review_status="pending",
+        scene_states={1: SceneState(plan=make_plan(make_outline(1)), plan_ready=True)},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "deterministic_continuity_issues", lambda *args: [])
+
+    class UnexpectedReviewer:
+        def review(self, *args, **kwargs):
+            raise AssertionError("relaxed 无确定性冲突时不应调用连续性 LLM")
+
+    monkeypatch.setattr(module, "ContinuityReviewerAgent", UnexpectedReviewer)
+
+    orchestrator._run_continuity_review(ctx)
+
+    assert ctx.continuity_review_status == "passed"
+    assert any("跳过非阻断 LLM" in warning for warning in ctx.continuity_warnings)
+
+
+def test_relaxed_plan_replan_stops_when_planner_returns_same_deterministic_plan(
+    monkeypatch, tmp_path
+):
+    run_paths = make_paths(tmp_path)
+    plan = make_plan(make_outline(1)).model_copy(
+        update={"visual_flow": ["切割碎片并无缝拼接到目标区域"]}
+    )
+    state = SceneState(plan=plan, plan_ready=True)
+    ctx = PipelineContext(
+        "prompt",
+        paths=run_paths,
+        generation_mode="relaxed",
+        outlines=[make_outline(1)],
+        scene_states={1: state},
+    )
+    orchestrator = Orchestrator()
+    orchestrator._llm_sem = threading.Semaphore(1)
+    monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
+
+    class SamePlanReviewer:
+        calls = 0
+
+        def review(self, *args, **kwargs):
+            self.calls += 1
+            return PlanReviewResult(
+                is_valid=False,
+                severity="major",
+                issues=[
+                    {
+                        "category": "geometry",
+                        "severity": "major",
+                        "confidence": "high",
+                        "evidence_type": "calculation",
+                        "evidence": "切割碎片并无缝拼接到目标区域",
+                        "field": "visual_flow",
+                        "message": "几何覆盖关系无法验证",
+                        "fix_instruction": "改用可核验的基础图形或等式展示",
+                    }
+                ],
+            )
+
+    class SamePlanPlanner:
+        def plan_detail(self, outline, all_outlines, user_prompt, **kwargs):
+            return plan
+
+    reviewer = SamePlanReviewer()
+    monkeypatch.setattr(module, "PlanReviewerAgent", lambda: reviewer)
+    monkeypatch.setattr(module, "PlannerAgent", SamePlanPlanner)
+    monkeypatch.setattr(settings, "SAFE_FALLBACK_ENABLED", True)
+
+    orchestrator._run_plan_review_barrier(ctx)
+
+    assert reviewer.calls == 1
+    assert state.safe_fallback_used is True
+    assert state.failed is False
+    assert any("未改变当前计划" in warning for warning in ctx.continuity_warnings)
+
+
 def test_continuity_review_replans_only_affected_scenes(monkeypatch, tmp_path):
     run_paths = make_paths(tmp_path)
     planner = ContinuityPlanner()
@@ -1329,6 +1512,67 @@ def test_identical_render_error_gives_up_early(monkeypatch, tmp_path):
     assert "连续 3 次渲染错误完全相同" in state.failure_reason
     # 放弃原因里带错误日志尾部, 方便直接定位根因
     assert "ValueError: something deterministic" in state.failure_reason
+
+
+def test_relaxed_render_stagnation_tries_safe_candidate_before_more_llm_fixes(
+    monkeypatch, tmp_path
+):
+    run_paths = make_paths(tmp_path)
+    error_log = (
+        "Traceback (most recent call last):\n"
+        '  File "scene_1.py", line 42, in construct\n'
+        "ValueError: same render error\n"
+    )
+    polls = 0
+
+    def status_map(_job_id):
+        nonlocal polls
+        polls += 1
+        return "FAILED" if polls <= 2 else "COMPLETED"
+
+    slurm = FakeSlurm(run_paths, status_map=status_map, error_log=error_log)
+    autofixer = FakeAutoFixer()
+    orchestrator = make_orchestrator(
+        monkeypatch,
+        tmp_path,
+        run_paths,
+        slurm=slurm,
+        autofixer=autofixer,
+    )
+    monkeypatch.setattr(module.settings, "MAX_STAGNANT_ATTEMPTS", 1)
+    code = CODE
+    fallback_code = (
+        "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait(2)\n"
+    )
+
+    def fix_same_code(*args, **kwargs):
+        autofixer.fix_calls += 1
+        return code
+
+    autofixer.fix = fix_same_code
+    monkeypatch.setattr(module, "build_safe_scene_code", lambda *args, **kwargs: fallback_code)
+    ctx = PipelineContext(
+        "x",
+        paths=run_paths,
+        generation_mode="relaxed",
+        outlines=[make_outline(1)],
+    )
+    ctx.scene_states[1] = SceneState(
+        plan=make_plan(make_outline(1)),
+        code=code,
+        class_name="Demo",
+        plan_ready=True,
+        reviewed=True,
+    )
+    (run_paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
+
+    events: list[tuple[str, dict]] = []
+    orchestrator._callback = lambda event, data: events.append((event, data))
+    orchestrator._run_scheduler(ctx)
+
+    assert ctx.scene_states[1].rendered is True, ctx.scene_states[1].failure_reason
+    assert autofixer.fix_calls == 1
+    assert any(event == "repair_stagnation_fallback" for event, _ in events)
 
 
 def test_error_fingerprint_normalizes_digits(monkeypatch, tmp_path):

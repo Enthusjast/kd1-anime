@@ -69,7 +69,7 @@ ARCHITECTURE.md 描述模块之间的依赖、状态机、阶段合同和安全�
 - 生成 Python 是不可信输入；AST 校验是纵深防御，不是沙箱。
 - 不扩大导入白名单，不允许动态执行、网络、文件读写或 shell 绕过。
 - 外部源码必须先复制到私有 run；生成文件和包含需求的文件保持 0600。
-- 处理 API 错误时必须脱敏，不能把 API Key 写入日志、manifest、事件或缓存键。
+- 处理 API 错误时必须脱敏，不能把 API Key 写入日志、manifest 或事件。
 - 需要更强隔离时保留 Apptainer 的 containall、cleanenv、no-home 和可选禁网路径。
 
 ### Agent 和 Prompt
@@ -89,12 +89,12 @@ ARCHITECTURE.md 描述模块之间的依赖、状态机、阶段合同和安全�
 1. README.md 的快速开始或命令示例；
 2. docs/configuration.md 或 docs/troubleshooting.md；
 3. CHANGELOG.md 的 Unreleased；
-4. 必要时更新 .env.example、install.sh 和 ARCHITECTURE.md。
+4. 必要时更新 install.sh、docs/configuration.md 和 ARCHITECTURE.md。
 
 新增配置时要在以下位置保持一致：
 
 - src/kd1_anime/config.py；
-- .env.example；
+- config.toml 的 TOML 映射和最小安装配置；
 - install.sh 生成的用户模板；
 - README 或 docs/configuration.md；
 - 相关配置解析和默认值测试。

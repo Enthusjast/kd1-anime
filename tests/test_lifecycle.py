@@ -1,7 +1,13 @@
 """生成代码对象生命周期校验测试。"""
 
 from kd1_anime.agents.lifecycle import (
+    detect_unknown_animations,
+    repair_initial_active_alias_lifecycle,
+    repair_missing_animation_markers,
+    repair_removed_active_lifecycle,
     repair_required_export_alias_lifecycle,
+    repair_required_export_replacement_lifecycle,
+    repair_required_export_transform_alias_lifecycle,
     validate_animation_lifecycle,
 )
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
@@ -120,6 +126,163 @@ class Demo(Scene):
     assert repairs == ()
 
 
+def test_repairs_replacement_target_rebound_to_required_export():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+                exported=True,
+            )
+        ],
+        export_element_ids=["grid"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: grid
+        grid = NumberPlane()
+        # KD1_CONTINUITY_EXPORT_END
+        self.add(grid)
+        target_grid = NumberPlane()
+        self.play(ReplacementTransform(grid, target_grid))
+        grid = target_grid
+        self.play(grid.animate.scale(0.9))
+"""
+
+    repaired, repairs = repair_required_export_transform_alias_lifecycle(code, technical_spec)
+
+    assert repairs
+    assert "ReplacementTransform(grid, target_grid)" not in repaired
+    assert "Transform(grid, target_grid)" in repaired
+    assert "grid = target_grid" not in repaired
+    assert "self.play(grid.animate.scale(0.9))" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
+def test_repairs_reported_active_removed_objects_at_construct_end():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+            ),
+            TechnicalObject(
+                element_id="vector",
+                variable_name="vector",
+                constructor="Vector",
+                initially_active=True,
+            ),
+        ],
+        removed_element_ids=["grid", "vector"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        grid = NumberPlane()
+        vector = Vector(RIGHT)
+        self.add(grid, vector)
+        self.wait(1)
+"""
+
+    repaired, repairs = repair_removed_active_lifecycle(
+        code,
+        technical_spec,
+        ["场景结束时已移除对象仍 active: grid, vector"],
+    )
+
+    assert repairs == ("为仍 active 的移除对象补齐 FadeOut: grid, vector",)
+    assert "self.play(FadeOut(grid, vector), run_time=0.5)" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
+def test_repairs_replacement_of_required_export_without_rebinding():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+                exported=True,
+            )
+        ],
+        export_element_ids=["grid"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: grid
+        grid = NumberPlane()
+        # KD1_CONTINUITY_EXPORT_END
+        self.add(grid)
+        target_grid = NumberPlane()
+        self.play(ReplacementTransform(grid, target_grid))
+        self.wait(1)
+"""
+
+    repaired, repairs = repair_required_export_replacement_lifecycle(code, technical_spec)
+
+    assert repairs
+    assert "Transform(grid, target_grid)" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
+def test_repairs_replacement_of_required_export_to_declared_target():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula_before",
+                variable_name="formula_before",
+                constructor="MathTex",
+                initially_active=True,
+                exported=True,
+            ),
+            TechnicalObject(
+                element_id="formula_after",
+                variable_name="formula_after",
+                constructor="MathTex",
+            ),
+        ],
+        export_element_ids=["formula_before"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        # KD1_CONTINUITY_EXPORT_BEGIN
+        # element_id: formula_before
+        formula_before = MathTex(r"x")
+        # KD1_CONTINUITY_EXPORT_END
+        formula_after = MathTex(r"x^2")
+        self.add(formula_before)
+        self.play(ReplacementTransform(formula_before, formula_after))
+"""
+
+    repaired, repairs = repair_required_export_replacement_lifecycle(code, technical_spec)
+
+    assert repairs
+    assert "Transform(formula_before, formula_after)" in repaired
+    result = validate_animation_lifecycle(repaired, technical_spec)
+    assert result.is_valid is True, result.errors
+
+
 def test_lifecycle_accepts_animation_of_loop_variable():
     code = """
 from manim import *
@@ -133,6 +296,21 @@ class Demo(Scene):
     result = validate_animation_lifecycle(code, spec(exported=()))
 
     assert result.is_valid is True
+
+
+def test_lifecycle_ignores_threedscene_camera_animation():
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        formula = MathTex(r"z=f(x,y)")
+        self.play(FadeIn(formula))
+        self.play(self.camera.animate.set_euler_angles(theta=1.2, phi=0.8))
+"""
+
+    result = validate_animation_lifecycle(code, spec())
+
+    assert result.is_valid is True, result.errors
 
 
 def test_lifecycle_tracks_vgroup_aliases_for_member_objects():
@@ -303,3 +481,612 @@ class Demo(Scene):
 
     assert result.is_valid is False
     assert any("辅助函数" in error and "self.play" in error for error in result.errors)
+
+
+def _semantic_spec(action="introduce"):
+    return TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                constructor="MathTex",
+                exported=True,
+            )
+        ],
+        animations=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": action,
+                "target_element_ids": ["formula"] if action == "introduce" else [],
+                "create_element_ids": ["formula"] if action == "introduce" else [],
+                "source_element_ids": ["formula"] if action != "introduce" else [],
+            }
+        ],
+        export_element_ids=["formula"],
+    )
+
+
+def test_semantic_marker_allows_an_animation_not_in_static_name_list():
+    technical_spec = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(CustomReveal(formula))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is True, result.errors
+    assert result.unknown_animations
+    assert any("unknown-animation" in warning for warning in result.warnings)
+    assert detect_unknown_animations(code, technical_spec) == result.unknown_animations
+
+
+def test_lifecycle_rejects_flash_on_explicit_empty_group():
+    technical_spec = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = VGroup()
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(Flash(formula))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is False
+    assert any("空 Mobject" in error and "Flash" in error for error in result.errors)
+
+
+def test_lifecycle_marks_conditional_group_for_smoke_render():
+    technical_spec = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = VGroup(*[MathTex(r"x") for value in []])
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(Flash(formula))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is True
+    assert any("runtime-risk" in item for item in result.unknown_animations)
+
+
+def test_semantic_marker_is_required_and_must_reference_contract_event():
+    technical_spec = _semantic_spec()
+    missing_marker = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.play(FadeIn(formula))
+"""
+    unknown_marker = missing_marker.replace(
+        "self.play", "# KD1_ANIMATION_EVENT: wrong\n        self.play"
+    )
+
+    missing_result = validate_animation_lifecycle(missing_marker, technical_spec)
+    unknown_result = validate_animation_lifecycle(unknown_marker, technical_spec)
+
+    assert not missing_result.is_valid
+    assert any("缺少语义事件标记" in error for error in missing_result.errors)
+    assert not unknown_result.is_valid
+    assert any("未在 TechnicalSpec 中声明" in error for error in unknown_result.errors)
+
+
+def test_repairs_missing_marker_when_contract_event_is_unambiguous():
+    technical = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.play(FadeIn(formula))
+"""
+
+    repaired, repairs = repair_missing_animation_markers(code, technical)
+
+    assert repairs == ("为第 6 行 self.play() 补齐事件标记: show_formula",)
+    assert "# KD1_ANIMATION_EVENT: show_formula\n        self.play" in repaired
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
+
+
+def test_repairs_unplanned_play_with_diagnostic_marker_only():
+    technical = _semantic_spec()
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.play(FadeIn(formula))
+        extra = Circle()
+        self.play(FadeIn(extra))
+"""
+
+    repaired, repairs = repair_missing_animation_markers(code, technical)
+
+    assert repairs == (
+        "为第 6 行 self.play() 补齐事件标记: show_formula",
+        "为无合同对象的第 8 行 self.play() 补齐诊断标记: __auto_introduce_1",
+    )
+    assert "# KD1_ANIMATION_EVENT: __auto_introduce_1" in repaired
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
+
+
+def test_uses_timeline_order_between_multiple_contract_update_events():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            {
+                "event_id": "update_a",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            },
+            {
+                "event_id": "update_b",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            },
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        self.add(formula)
+        self.play(formula.animate.scale(1.1))
+"""
+
+    repaired, repairs = repair_missing_animation_markers(code, technical)
+
+    assert repaired != code
+    assert "# KD1_ANIMATION_EVENT: update_a" in repaired
+    assert repairs == ("为第 7 行 self.play() 补齐事件标记: update_a",)
+
+
+def test_repairs_initially_active_copy_used_as_update_source():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                constructor="NumberPlane",
+                initially_active=True,
+            )
+        ],
+        animations=[
+            {
+                "event_id": "transform_grid",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["grid"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        grid = NumberPlane()
+        self.add(grid)
+        grid_rotated = grid.copy().rotate(PI / 4)
+        # KD1_ANIMATION_EVENT: transform_grid
+        self.play(Transform(grid_rotated, grid.copy()))
+"""
+
+    repaired, repairs = repair_initial_active_alias_lifecycle(code, technical)
+
+    assert "Transform(grid, grid.copy())" in repaired
+    assert repairs == ("将合同对象的 active source 别名 grid_rotated 收敛到 grid",)
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
+
+
+def test_allows_update_event_to_have_sequential_play_segments():
+    technical = _semantic_spec("update")
+    technical.objects[0].initially_active = True
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(formula.animate.scale(1.1))
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(formula.animate.shift(RIGHT))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+    assert any("分段执行" in warning for warning in result.warnings)
+
+
+def test_allows_introduction_followed_by_in_place_update_with_same_marker():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 2,
+                "semantic_action": "introduce",
+                "target_element_ids": ["formula"],
+                "create_element_ids": ["formula"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        formula_target = formula.copy().scale(1.2)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeIn(formula))
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(Transform(formula, formula_target))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+
+
+def test_repairs_copy_alias_for_a_newly_introduced_contract_object():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[TechnicalObject(element_id="formula", variable_name="formula")],
+        animations=[
+            {
+                "event_id": "show_formula",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "introduce",
+                "target_element_ids": ["formula"],
+                "create_element_ids": ["formula"],
+            },
+            {
+                "event_id": "update_formula",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            },
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeIn(formula))
+        formula_current = formula.copy().scale(1.2)
+        # KD1_ANIMATION_EVENT: update_formula
+        self.play(Transform(formula_current, formula.copy()))
+"""
+
+    repaired, repairs = repair_initial_active_alias_lifecycle(code, technical)
+
+    assert "Transform(formula, formula.copy())" in repaired
+    assert repairs == ("将合同对象的 active source 别名 formula_current 收敛到 formula",)
+    assert validate_animation_lifecycle(repaired, technical).is_valid is True
+
+
+def test_does_not_rewrite_optional_new_object_alias_as_inherited_source():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                initially_active=True,
+            ),
+            TechnicalObject(
+                element_id="highlight_P_inv",
+                variable_name="highlight_P_inv",
+                initially_active=False,
+            ),
+        ],
+        animations=[
+            {
+                "event_id": "highlight",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "introduce",
+                "target_element_ids": ["highlight_P_inv"],
+                "create_element_ids": ["highlight_P_inv"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        highlight_P_inv = SurroundingRectangle(formula)
+        # KD1_ANIMATION_EVENT: highlight
+        self.play(Create(highlight_P_inv))
+"""
+
+    repaired, repairs = repair_initial_active_alias_lifecycle(code, technical)
+
+    assert repaired == code
+    assert repairs == ()
+
+
+def test_semantic_marker_can_precede_pure_target_preparation():
+    technical = _semantic_spec("update")
+    technical.objects[0].initially_active = True
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.wait(0.1)
+        target = formula.copy()
+        target.scale(1.1)
+        self.play(Transform(formula, target))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+
+
+def test_camera_semantic_event_does_not_require_mobject_lifecycle():
+    technical_spec = TechnicalSpec(
+        scene_id=1,
+        animations=[
+            {
+                "event_id": "camera_move",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "camera",
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(ThreeDScene):
+    def construct(self):
+        # KD1_ANIMATION_EVENT: camera_move
+        self.play(self.camera.animate.set_euler_angles(theta=1.0, phi=0.8))
+"""
+
+    result = validate_animation_lifecycle(code, technical_spec)
+
+    assert result.is_valid is True, result.errors
+
+
+def test_marker_cannot_introduce_an_object_not_used_by_animation():
+    code = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        other = Square()
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeIn(other))
+"""
+    result = validate_animation_lifecycle(code, _semantic_spec())
+    assert not result.is_valid
+
+
+def test_update_marker_cannot_hide_actual_removal():
+    technical = _semantic_spec("update")
+    technical.objects[0].initially_active = True
+    code = """from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = Circle()
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: show_formula
+        self.play(FadeOut(formula))
+"""
+    assert not validate_animation_lifecycle(code, technical).is_valid
+
+
+def test_introduce_may_crossfade_an_optional_object_and_cleanup_is_idempotent():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="old_text",
+                variable_name="old_text",
+                constructor="Text",
+            ),
+            TechnicalObject(
+                element_id="new_text",
+                variable_name="new_text",
+                constructor="Text",
+                exported=True,
+            ),
+        ],
+        animations=[
+            {
+                "event_id": "show_old",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "introduce",
+                "target_element_ids": ["old_text"],
+                "create_element_ids": ["old_text"],
+            },
+            {
+                "event_id": "show_new",
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "semantic_action": "introduce",
+                "target_element_ids": ["new_text"],
+                "create_element_ids": ["new_text"],
+            },
+            {
+                "event_id": "cleanup",
+                "start_seconds": 2,
+                "end_seconds": 3,
+                "semantic_action": "remove",
+                "source_element_ids": ["old_text"],
+            },
+        ],
+        export_element_ids=["new_text"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        old_text = Text("old")
+        new_text = Text("new")
+        # KD1_ANIMATION_EVENT: show_old
+        self.play(FadeIn(old_text))
+        # KD1_ANIMATION_EVENT: show_new
+        self.play(FadeOut(old_text), FadeIn(new_text))
+        # KD1_ANIMATION_EVENT: cleanup
+        self.play(FadeOut(old_text))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+    assert any("交叉淡出" in warning for warning in result.warnings)
+    assert any("重复退出" in warning for warning in result.warnings)
+
+
+def test_remove_event_can_be_split_across_multiple_plays():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(element_id="old_a", variable_name="old_a", constructor="Text"),
+            TechnicalObject(element_id="old_b", variable_name="old_b", constructor="Text"),
+        ],
+        animations=[
+            {
+                "event_id": "cleanup",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "remove",
+                "source_element_ids": ["old_a", "old_b"],
+            }
+        ],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        old_a = Text("a")
+        old_b = Text("b")
+        self.add(old_a, old_b)
+        # KD1_ANIMATION_EVENT: cleanup
+        self.play(FadeOut(old_a))
+        # KD1_ANIMATION_EVENT: cleanup
+        self.play(FadeOut(old_b))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+    assert any("分段清理事件" in warning for warning in result.warnings)
+
+
+def test_inherited_vgroup_rebind_before_scene_add_is_allowed():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="formula",
+                variable_name="formula",
+                initially_active=True,
+                exported=True,
+            )
+        ],
+        animations=[
+            {
+                "event_id": "emphasize",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["formula"],
+            }
+        ],
+        export_element_ids=["formula"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        formula = MathTex(r"x")
+        label = Text("label")
+        formula = VGroup(formula, label)
+        self.add(formula)
+        # KD1_ANIMATION_EVENT: emphasize
+        self.play(formula.animate.scale(1.1))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors
+
+
+def test_update_event_can_animate_a_declared_subset_of_sources():
+    technical = TechnicalSpec(
+        scene_id=1,
+        objects=[
+            TechnicalObject(
+                element_id="grid",
+                variable_name="grid",
+                initially_active=True,
+                exported=True,
+            ),
+            TechnicalObject(
+                element_id="vector",
+                variable_name="vector",
+                initially_active=True,
+                exported=True,
+            ),
+        ],
+        animations=[
+            {
+                "event_id": "update_vector",
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "semantic_action": "update",
+                "source_element_ids": ["grid", "vector"],
+            }
+        ],
+        export_element_ids=["grid", "vector"],
+    )
+    code = """
+from manim import *
+class Demo(Scene):
+    def construct(self):
+        grid = NumberPlane()
+        vector = Vector(RIGHT)
+        self.add(grid, vector)
+        # KD1_ANIMATION_EVENT: update_vector
+        self.play(vector.animate.shift(UP))
+"""
+
+    result = validate_animation_lifecycle(code, technical)
+
+    assert result.is_valid is True, result.errors

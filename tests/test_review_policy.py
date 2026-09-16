@@ -1,5 +1,9 @@
 from kd1_anime.agents.planner import ScenePlan
-from kd1_anime.agents.review_policy import review_budget
+from kd1_anime.agents.review_policy import (
+    review_budget,
+    review_mode_guidance,
+    review_mode_policy,
+)
 
 
 def make_plan(**updates):
@@ -37,3 +41,40 @@ def test_high_risk_review_uses_global_budget():
 
     assert budget.risk_level == "high"
     assert budget.max_rounds == 5
+
+
+def test_relaxed_review_has_no_fixed_round_budget():
+    budget = review_budget(
+        make_plan(visual_design="三维 Surface 曲面"),
+        None,
+        global_max_rounds=8,
+        generation_mode="relaxed",
+    )
+
+    assert budget.max_rounds is None
+    assert budget.deterministic_checks_required is True
+    assert review_mode_policy("relaxed").limit(8) is None
+
+
+def test_strict_review_budget_is_capped_at_eight():
+    policy = review_mode_policy("strict")
+
+    assert policy.limit(20) == 8
+    assert policy.limit(3) == 3
+
+
+def test_relaxed_review_guidance_keeps_deterministic_checks_but_downgrades_subjective_findings():
+    guidance = review_mode_guidance("relaxed")
+
+    assert "relaxed" in guidance
+    assert "确定性检查" in guidance
+    assert "布局建议" in guidance
+    assert "warning" in guidance
+
+
+def test_strict_review_guidance_does_not_advertise_relaxed_soft_pass():
+    guidance = review_mode_guidance("strict")
+
+    assert "strict" in guidance
+    assert "确定性检查" in guidance
+    assert "relaxed" not in guidance

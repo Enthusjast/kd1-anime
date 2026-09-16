@@ -101,6 +101,39 @@ def test_default_client_disables_sdk_retries(monkeypatch):
     assert captured["max_retries"] == 0
 
 
+def test_identical_non_stream_requests_are_not_reused(monkeypatch):
+    """每次非流式请求都必须重新访问模型，不复用旧响应。"""
+
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://test.local/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "test-model")
+    monkeypatch.setattr(settings, "LLM_SILENT_STREAM", False)
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=f"response-{len(calls)}"),
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    class RequestAgent(BaseAgent):
+        @property
+        def client(self):
+            return SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    agent = RequestAgent()
+
+    assert agent.call_llm(user_message="same") == "response-1"
+    assert agent.call_llm(user_message="same") == "response-2"
+    assert len(calls) == 2
+
+
 class PositiveResult(BaseModel):
     value: int
 

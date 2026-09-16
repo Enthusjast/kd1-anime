@@ -178,6 +178,19 @@ class TestSceneDashboard:
         assert dash.scenes[1].icon == "⚠"
         assert "未知" in dash.scenes[1].message
 
+    def test_unknown_animation_warning_is_visible_without_failing_scene(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+        dash.on_event(
+            "scene_unknown_animation_detected",
+            {"scene_id": 1, "details": ["第 10 行 unknown:Reveal"]},
+        )
+
+        assert dash.scenes[1].state == "warning"
+        assert dash.scenes[1].icon == "⚠"
+        assert "Smoke Render" in dash.scenes[1].message
+
     def test_safe_fallback_is_visible_without_marking_scene_complete(self):
         dash = SceneDashboard()
         dash.live = MagicMock()
@@ -195,6 +208,19 @@ class TestSceneDashboard:
         dash.on_event("scene_coding", {"scene_id": 1})
         assert dash.scenes[1].state == "running"
         assert "保守方案" in dash.scenes[1].render_row()[3].plain
+
+    def test_relaxed_recovery_fallback_is_visible_as_warning(self):
+        dash = SceneDashboard()
+        dash.live = MagicMock()
+        dash.on_event("plan_complete", {"scenes": [MagicMock(scene_id=1, title="S1")]})
+
+        dash.on_event("scene_code_fallback", {"scene_id": 1})
+        assert dash.scenes[1].state == "warning"
+        assert "最小安全代码" in dash.scenes[1].message
+
+        dash.on_event("repair_stagnation_fallback", {"scene_id": 1, "attempts": 2})
+        assert dash.scenes[1].state == "warning"
+        assert "IR/安全候选" in dash.scenes[1].message
 
     def test_continuity_exhaustion_is_warning_and_does_not_fail_scene(self):
         dash = SceneDashboard()
@@ -452,8 +478,16 @@ class TestSceneDashboardEvents:
         )
 
         assert dash.rag_status == "active"
-        assert dash.rag_models == "E:embedding R:reranker"
-        assert "degraded" not in str(dash._render())
+        import io
+
+        from rich.console import Console as RichConsole
+
+        buffer = io.StringIO()
+        RichConsole(file=buffer, width=120, force_terminal=False).print(dash._render())
+        rendered = buffer.getvalue()
+        assert "embedding" not in rendered
+        assert "reranker" not in rendered
+        assert "RAG:active" in rendered
 
         dash.on_event(
             "rag_status",
@@ -464,7 +498,12 @@ class TestSceneDashboardEvents:
                 "reranker_model": "reranker",
             },
         )
-        assert "degraded" in dash.rag_models
+        buffer = io.StringIO()
+        RichConsole(file=buffer, width=120, force_terminal=False).print(dash._render())
+        rendered = buffer.getvalue()
+        assert "embedding" not in rendered
+        assert "reranker" not in rendered
+        assert "RAG:degraded" in rendered
 
     def test_rendering_scene_shows_elapsed(self):
         import time

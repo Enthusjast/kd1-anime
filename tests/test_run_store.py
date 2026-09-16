@@ -166,6 +166,33 @@ def test_checkpoint_round_trip_persists_technical_spec_identity(tmp_path):
     assert manifest.integrity_errors() == []
 
 
+def test_legacy_technical_spec_is_readable_but_cannot_resume():
+    legacy = StoredSceneState.model_validate(
+        {
+            "plan": make_plan(),
+            "technical_spec": {
+                "scene_id": 1,
+                "renderer": "cairo",
+                "objects": [],
+                "animations": [],
+                "export_element_ids": [],
+                "removed_element_ids": [],
+            },
+        }
+    )
+
+    assert legacy.technical_spec is None
+    assert legacy.technical_contract_stale is True
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path="/tmp/output.mp4",
+        scenes={1: legacy},
+    )
+    with pytest.raises(ValueError, match="旧版 TechnicalSpec"):
+        manifest.validate_for_resume()
+
+
 def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():
     manifest = RunManifest(
         run_id=RUN_ID,
@@ -495,10 +522,10 @@ def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_current_manifest_uses_v7_schema_and_merge_profile():
+def test_current_manifest_uses_v8_schema_and_merge_profile():
     assert (
         RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
-        == 7
+        == 8
     )
     assert (
         RunManifest(
@@ -508,6 +535,26 @@ def test_current_manifest_uses_v7_schema_and_merge_profile():
         ).merge_profile.video_codec
         == "libx264"
     )
+
+
+def test_v7_manifest_migrates_safe_generation_mode_field_for_resume(tmp_path):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    raw = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="legacy v7",
+        output_path=str((root / "output.mp4").resolve()),
+    ).model_dump(mode="json")
+    raw["schema_version"] = 7
+    raw.pop("generation_mode")
+    (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    repository = RunRepository(workspace)
+    loaded = repository.load_for_resume(RUN_ID)
+
+    assert loaded.schema_version == 8
+    assert loaded.generation_mode == "relaxed"
 
 
 def test_v4_manifest_is_readable_but_read_only(tmp_path):
@@ -528,7 +575,7 @@ def test_v4_manifest_is_readable_but_read_only(tmp_path):
     assert loaded.schema_version == 4
     with pytest.raises(ValueError, match="仅支持只读查看"):
         loaded.validate_for_resume()
-    with pytest.raises(ValueError, match="只允许写入 v7"):
+    with pytest.raises(ValueError, match="只允许写入 v8"):
         write_manifest(path, loaded)
 
 

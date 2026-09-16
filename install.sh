@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kd1-anime 一站式安装器：Ubuntu/HPC，无 sudo。
+# kd1-anime 一站式用户级安装器：个人 Ubuntu 默认本地渲染，也支持 Slurm。
 set -Eeuo pipefail
 umask 077
 
@@ -43,9 +43,18 @@ if [[ ! "$TEXLIVE_PLATFORM" =~ ^[A-Za-z0-9_-]+$ ]]; then
     exit 1
 fi
 CONFIG_DIR="$HOME/.kd1-anime"
-CONFIG_FILE="$CONFIG_DIR/.env"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
+CONDA_INSTALL_DIR="${KD1_ANIME_CONDA_DIR:-$CONFIG_DIR/miniconda3}"
+DEFAULT_RENDER_BACKEND="${KD1_ANIME_RENDER_BACKEND:-local}"
+case "$DEFAULT_RENDER_BACKEND" in
+    local|slurm) ;;
+    *)
+        err "KD1_ANIME_RENDER_BACKEND 只能是 local 或 slurm"
+        exit 1
+        ;;
+esac
 LEGACY_CONFIG_DIR="$HOME/.config/kd1-anime"
-LEGACY_CONFIG_FILE="$LEGACY_CONFIG_DIR/.env"
+LEGACY_CONFIG_HOME_FILE="$LEGACY_CONFIG_DIR/.env"
 LEGACY_CONFIG_EXAMPLE_FILE="$LEGACY_CONFIG_DIR/.env.example"
 USER_BIN_DIR="${KD1_ANIME_USER_BIN_DIR:-$HOME/.local/bin}"
 REQUIRE_CHECKSUM="${KD1_ANIME_REQUIRE_CHECKSUM:-0}"
@@ -72,6 +81,111 @@ cleanup() {
 }
 trap cleanup EXIT
 
+check_host() {
+    local command_name missing=()
+
+    if [ "$(uname -s)" != "Linux" ]; then
+        err "此安装器面向 Linux/Ubuntu，当前系统不是 Linux。"
+        return 1
+    fi
+    if [ -r /etc/os-release ]; then
+        # Ubuntu 及其兼容发行版可以直接使用本安装器；其它 Linux 仍允许
+        # 继续，但错误提示会明确说明脚本未针对其系统包布局测试。
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        case "${ID:-}" in
+            ubuntu|linuxmint|pop|elementary|debian) ;;
+            *) warn "当前发行版 ${PRETTY_NAME:-未知} 未经过专门测试，将继续使用用户级安装" ;;
+        esac
+    fi
+
+    for command_name in awk bash chmod cmp dirname find grep head ln mktemp mv rm sed sort tar; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        missing+=("curl 或 wget")
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        missing+=("sha256sum")
+    fi
+    if [ "${#missing[@]}" -gt 0 ]; then
+        err "缺少基础命令: ${missing[*]}"
+        err "请在 Ubuntu 上安装对应工具后重试（例如 sudo apt install curl ca-certificates tar coreutils），"
+        err "安装器本身不会自动调用 sudo。"
+        return 1
+    fi
+}
+
+conda_installer_platform() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf '%s\n' x86_64 ;;
+        aarch64|arm64) printf '%s\n' aarch64 ;;
+        *)
+            err "不支持的 Conda CPU 架构: $(uname -m)"
+            return 1
+            ;;
+    esac
+}
+
+install_user_conda() {
+    local platform installer url expected actual
+
+    if [[ "$CONDA_INSTALL_DIR" != /* ]] || [[ "$CONDA_INSTALL_DIR" == *$'\n'* ]] || [[ "$CONDA_INSTALL_DIR" == *$'\r'* ]]; then
+        err "KD1_ANIME_CONDA_DIR 必须是不含换行的绝对路径: $CONDA_INSTALL_DIR"
+        return 1
+    fi
+    if [ -e "$CONDA_INSTALL_DIR" ]; then
+        if [ -x "$CONDA_INSTALL_DIR/bin/conda" ]; then
+            return 0
+        fi
+        err "Conda 安装目录已存在但不是可用 Conda 环境: $CONDA_INSTALL_DIR"
+        err "如需更换目录，请备份后移除该目录，或设置 KD1_ANIME_CONDA_DIR。"
+        return 1
+    fi
+
+    platform="$(conda_installer_platform)" || return 1
+    url="${KD1_ANIME_CONDA_INSTALLER_URL:-https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-${platform}.sh}"
+    if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
+        err "KD1_ANIME_CONDA_INSTALLER_URL 必须是有效的 HTTP(S) URL"
+        return 1
+    fi
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    installer="$(mktemp "$CONFIG_DIR/.miniconda-installer.XXXXXX")"
+    cleanup_dirs+=("$installer")
+    info "未找到 Conda，下载用户级 Miniconda 到 $CONDA_INSTALL_DIR"
+    download "$url" "$installer"
+
+    expected="${KD1_ANIME_CONDA_INSTALLER_SHA256:-}"
+    if [ -n "$expected" ]; then
+        expected="${expected,,}"
+        if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            err "KD1_ANIME_CONDA_INSTALLER_SHA256 必须是 64 位十六进制 SHA-256"
+            return 1
+        fi
+        actual="$(sha256sum "$installer" | awk '{print $1}')"
+        if [ "$actual" != "$expected" ]; then
+            err "Miniconda 安装器 SHA-256 不匹配"
+            err "expected: $expected"
+            err "actual:   $actual"
+            return 1
+        fi
+        log "Miniconda 安装器 SHA-256 验证通过"
+    elif [ "$REQUIRE_CHECKSUM" = 1 ]; then
+        err "安全模式要求设置 KD1_ANIME_CONDA_INSTALLER_SHA256"
+        return 1
+    else
+        warn "未设置 KD1_ANIME_CONDA_INSTALLER_SHA256；生产环境建议固定安装器摘要"
+    fi
+
+    bash "$installer" -b -p "$CONDA_INSTALL_DIR"
+    [ -x "$CONDA_INSTALL_DIR/bin/conda" ] || {
+        err "Miniconda 安装完成后未找到 conda: $CONDA_INSTALL_DIR/bin/conda"
+        return 1
+    }
+    log "用户级 Miniconda 安装完成: $CONDA_INSTALL_DIR"
+}
+
 find_conda() {
     unset PYTHONHOME
     if command -v module >/dev/null 2>&1; then
@@ -87,9 +201,24 @@ find_conda() {
         export PATH="$KNOWN_CONDA_BASE/bin:$PATH"
         CONDA_BASE="$KNOWN_CONDA_BASE"
     fi
+    if [ -z "$CONDA_BASE" ]; then
+        local candidate
+        for candidate in "$HOME/miniconda3" "$HOME/miniforge3" "$HOME/mambaforge"; do
+            if [ -x "$candidate/bin/conda" ]; then
+                export PATH="$candidate/bin:$PATH"
+                CONDA_BASE="$candidate"
+                break
+            fi
+        done
+    fi
+    if [ -z "$CONDA_BASE" ] && [ -x "$CONDA_INSTALL_DIR/bin/conda" ]; then
+        export PATH="$CONDA_INSTALL_DIR/bin:$PATH"
+        CONDA_BASE="$CONDA_INSTALL_DIR"
+    fi
     if [ -z "$CONDA_BASE" ] || [ ! -x "$CONDA_BASE/bin/conda" ]; then
-        err "无法定位 conda；请设置 KD1_ANIME_CONDA_BASE 或联系管理员。"
-        exit 1
+        install_user_conda
+        export PATH="$CONDA_INSTALL_DIR/bin:$PATH"
+        CONDA_BASE="$CONDA_INSTALL_DIR"
     fi
     export PATH="$CONDA_BASE/bin:$PATH"
     unset PYTHONHOME
@@ -427,7 +556,61 @@ rewrite_legacy_storage_defaults() {
         "$file"
 }
 
+write_empty_toml_config() {
+    cat > "$CONFIG_FILE" <<'EOF'
+# kd1-anime runtime configuration.
+# Environment variables take precedence over this file.
+EOF
+    chmod 600 "$CONFIG_FILE"
+}
+
+write_minimal_toml_config() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<'EOF'
+# kd1-anime 最小运行配置；文件可能包含 API Key，权限应为 0600。
+# 未列出的配置使用程序默认值；环境变量优先级最高。
+
+[llm]
+api_key = "sk-your-key-here"
+base_url = "https://api.openai.com/v1"
+model = "your-model-name"
+
+[render]
+backend = "__KD1_ANIME_DEFAULT_BACKEND__"
+manim_renderer = "cairo"
+manim_quality = "h"
+EOF
+    # 只替换固定占位符，不把用户输入直接拼入 TOML 内容。
+    sed -i "s/__KD1_ANIME_DEFAULT_BACKEND__/$DEFAULT_RENDER_BACKEND/" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
+migrate_installed_config() {
+    local python_bin="${CONDA_ENV_DIR:-}/bin/python" local_legacy_file="$CONFIG_DIR/.env"
+    [ -n "${CONDA_ENV_DIR:-}" ] && [ -x "$python_bin" ] || return 1
+    CONFIG_MIGRATION_TARGET="$CONFIG_FILE" \
+        CONFIG_MIGRATION_LOCAL="$local_legacy_file" \
+        CONFIG_MIGRATION_LEGACY="$LEGACY_CONFIG_HOME_FILE" \
+        "$python_bin" - <<'PY'
+import os
+from pathlib import Path
+
+from kd1_anime.config import migrate_legacy_user_config, migrate_user_env_to_toml
+
+target = Path(os.environ["CONFIG_MIGRATION_TARGET"])
+local = Path(os.environ["CONFIG_MIGRATION_LOCAL"])
+legacy = Path(os.environ["CONFIG_MIGRATION_LEGACY"])
+if local.is_file():
+    migrate_user_env_to_toml(local, target)
+elif legacy.is_file():
+    migrate_legacy_user_config(legacy.parent, target.parent)
+    migrate_user_env_to_toml(target.parent / ".env", target)
+PY
+}
+
 write_user_config() {
+    local local_legacy_file="$CONFIG_DIR/.env"
     mkdir -p \
         "$CONFIG_DIR" \
         "$CONFIG_DIR/knowledge/docs" \
@@ -441,166 +624,32 @@ write_user_config() {
         warn "用户配置已存在，未覆盖: $CONFIG_FILE"
         return
     fi
-    if [ -f "$LEGACY_CONFIG_FILE" ]; then
-        cp "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
-        rewrite_legacy_storage_defaults "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE"
-        if [ -f "$LEGACY_CONFIG_EXAMPLE_FILE" ] && [ ! -f "$CONFIG_DIR/.env.example" ]; then
-            cp "$LEGACY_CONFIG_EXAMPLE_FILE" "$CONFIG_DIR/.env.example"
-            rewrite_legacy_storage_defaults "$CONFIG_DIR/.env.example"
-            chmod 600 "$CONFIG_DIR/.env.example"
+
+    if [ -f "$local_legacy_file" ] || [ -f "$LEGACY_CONFIG_HOME_FILE" ]; then
+        if migrate_installed_config && [ -f "$CONFIG_FILE" ]; then
+            chmod 600 "$CONFIG_FILE"
+            warn "已将旧用户 .env 迁移到: $CONFIG_FILE（旧文件未删除）"
+        else
+            # 没有可用的应用 Python 时不写默认值，确保旧 .env 仍能完整回退。
+            write_empty_toml_config
+            warn "暂时无法迁移旧 .env；保留兼容读取，首次启动时会再次尝试迁移"
         fi
-        warn "已将旧用户配置迁移到: $CONFIG_FILE（旧文件未删除）"
         return
     fi
-    cat > "$CONFIG_DIR/.env.example" <<EOF
-LLM_API_KEY=sk-your-key-here
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=your-model-name
-LLM_SEND_MAX_TOKENS=true
-LLM_TEMPERATURE=0.3
-LLM_MAX_TOKENS=32768
-# 阶段级 token 预算：计划/审查通常不需要代码生成的长输出预算。
-LLM_PLANNING_MAX_TOKENS=16384
-LLM_TECHNICAL_MAX_TOKENS=16384
-LLM_CODE_MAX_TOKENS=24576
-LLM_REVIEW_MAX_TOKENS=8192
-LLM_MAX_RETRIES=3
-LLM_RETRY_BASE_DELAY=2.0
-LLM_TIMEOUT_CONNECT=30.0
-LLM_TIMEOUT_READ=600.0
-LLM_HEALTHCHECK_TIMEOUT=15.0
-LLM_SILENT_STREAM=true
-LLM_EMPTY_RETRY_MAX_TOKENS=16384
-LLM_JSON_REPAIR_ATTEMPTS=2
-LLM_USE_JSON_MODE=true
-LLM_DEBUG=false
-LLM_TRUST_ENV=true
-LLM_CACHE_ENABLED=true
-LLM_CACHE_PATH=~/.kd1-anime/cache/llm.sqlite3
-LLM_CACHE_MAX_ENTRIES=512
-LLM_MAX_CONTEXT_CHARS=120000
-LLM_MAX_CODE_CONTEXT_CHARS=60000
-LLM_MAX_REVIEW_CONTEXT_CHARS=90000
-LLM_MAX_TECHNICAL_SPEC_CHARS=30000
-MAX_TECHNICAL_SPEC_ATTEMPTS=3
-VISUAL_LLM_API_KEY=
-VISUAL_LLM_BASE_URL=
-VISUAL_LLM_MODEL=
-VISUAL_LLM_SEND_MAX_TOKENS=true
-VISUAL_LLM_TEMPERATURE=0.0
-VISUAL_LLM_MAX_TOKENS=3000
-VISUAL_LLM_MAX_RETRIES=3
-VISUAL_LLM_RETRY_BASE_DELAY=2.0
-VISUAL_LLM_TIMEOUT_CONNECT=30.0
-VISUAL_LLM_TIMEOUT_READ=300.0
-VISUAL_LLM_HEALTHCHECK_TIMEOUT=20.0
-VISUAL_LLM_JSON_REPAIR_ATTEMPTS=1
-VISUAL_LLM_USE_JSON_MODE=true
-VISUAL_LLM_PARALLEL_WORKERS=2
-VISUAL_LLM_DEBUG=false
-VISUAL_LLM_TRUST_ENV=true
-RAG_ENABLED=false
-RAG_INDEX_PATH=~/.kd1-anime/rag/index.sqlite3
-RAG_DOCS_DIR=~/.kd1-anime/knowledge/docs
-RAG_EXAMPLES_DIR=~/.kd1-anime/knowledge/examples
-RAG_RECIPES_DIR=~/.kd1-anime/knowledge/recipes
-RAG_EMBEDDING_API_KEY=
-RAG_EMBEDDING_BASE_URL=
-RAG_EMBEDDING_MODEL=
-RAG_EMBEDDING_TIMEOUT=60.0
-RAG_EMBEDDING_BATCH_SIZE=32
-RAG_RERANK_API_KEY=
-RAG_RERANK_BASE_URL=
-RAG_RERANK_MODEL=
-RAG_RERANK_TIMEOUT=60.0
-RAG_TRUST_ENV=true
-RAG_TOP_K=8
-RAG_RERANK_TOP_N=4
-RAG_MAX_CONTEXT_CHARS=12000
-RAG_CHUNK_SIZE=1800
-RAG_CHUNK_OVERLAP=200
-RAG_PARALLEL_WORKERS=2
-SLURM_PARTITION=
-SLURM_QOS=
-SLURM_ACCOUNT=
-SLURM_CONDA_ENV=$ENV_NAME
-SLURM_CONDA_BASE=$CONDA_BASE
-SLURM_TIME_LIMIT=01:00:00
-SLURM_CPUS_PER_TASK=4
-SLURM_MEM_GB=
-SLURM_GPU_TYPE=
-SLURM_GPU_COUNT=1
-SLURM_MAX_IN_FLIGHT=0
-SLURM_SUBMIT_RETRIES=3
-SLURM_SUBMIT_RETRY_DELAY=2.0
-SLURM_CONTAINER_IMAGE=
-SLURM_REQUIRE_CONTAINER=false
-SLURM_CONTAINER_DISABLE_NETWORK=false
-MAX_INFRA_RETRIES=2
-MANIM_RENDERER=cairo
-MANIM_QUALITY=h
-MANIM_PIXEL_WIDTH=1920
-MANIM_PIXEL_HEIGHT=1080
-MANIM_FRAME_RATE=60
-MANIM_OPENGL_PLATFORM=egl
-SMOKE_RENDER_ENABLED=true
-SMOKE_RENDER_MODE=frame
-SMOKE_RENDER_QUALITY=l
-SMOKE_RENDER_TIMEOUT=180
-LOCAL_SMOKE_RENDER_ENABLED=false
-LOCAL_SMOKE_RENDER_MODE=frame
-LOCAL_SMOKE_RENDER_QUALITY=l
-LOCAL_SMOKE_RENDER_TIMEOUT=180
-LOCAL_SMOKE_RENDER_MEMORY_MB=4096
-ALLOW_PARTIAL_OUTPUT=false
-OVERWRITE_OUTPUT=false
-TRANSITION_TYPE=fade
-TRANSITION_DURATION=0.5
-MERGE_VIDEO_CODEC=libx264
-MERGE_VIDEO_PRESET=medium
-MERGE_VIDEO_CRF=18
-MERGE_AUDIO_SAMPLE_RATE=48000
-MERGE_AUDIO_CHANNEL_LAYOUT=stereo
-LLM_PARALLEL_WORKERS=4
-MAX_REVIEW_ROUNDS=5
-MAX_PLAN_REVIEW_ROUNDS=2
-# 同一场景计划审查反馈后的 Planner 重调用总次数，防止重规划死循环。
-MAX_PLAN_REPLAN_ATTEMPTS=3
-MAX_CONTINUITY_FIX_ROUNDS=2
-SKIP_REVIEW=false
-SAFE_FALLBACK_ENABLED=true
-# 相同代码和相同审查反馈连续出现达到此次数后停止重复重写。
-MAX_IDENTICAL_REVIEW_ATTEMPTS=2
-MAX_FIX_ATTEMPTS=5
-MAX_FIX_IDENTICAL_ERRORS=3
-MAX_CLARIFY_ROUNDS=12
-MAX_SCENES=12
-MAX_PROMPT_CHARS=50000
-MAX_CLARIFY_CONTEXT_CHARS=40000
-MAX_LOG_CHARS=30000
-CODE_VALIDATION_ATTEMPTS=3
-MONITOR_POLL_INTERVAL=10
-MONITOR_QUEUE_TIMEOUT=3600
-MONITOR_RUN_TIMEOUT=3600
-MONITOR_UNKNOWN_TIMEOUT=300
-MONITOR_ARTIFACT_GRACE=60
-MONITOR_MAX_UNKNOWN=5
-LOG_TAIL_LINES=80
-ENABLE_AUTO_EVAL=false
-ENABLE_VISUAL_EVAL=false
-EVAL_THRESHOLD=3.5
-MAX_EVAL_ROUNDS=2
-VISUAL_EVAL_FRAME_COUNT=6
-VISUAL_EVAL_THRESHOLD=3.5
-MAX_VISUAL_FIX_ATTEMPTS=2
-WORKSPACE_DIR=~/.kd1-anime/workspace
-OUTPUT_FILE=output_final.mp4
-EOF
-    cp "$CONFIG_DIR/.env.example" "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
+
+    write_minimal_toml_config
+    if [ "$DEFAULT_RENDER_BACKEND" = "slurm" ]; then
+        # 只有用户显式选择 Slurm 时才写入远程环境信息；个人本地安装不
+        # 应在最小配置中携带无关的集群字段。
+        write_config_value SLURM_CONDA_ENV "$ENV_NAME"
+        write_config_value SLURM_CONDA_BASE "$CONDA_BASE"
+    fi
     log "已创建用户配置: $CONFIG_FILE"
-    warn "首次运行前请编辑该文件并填写 LLM_API_KEY、LLM_BASE_URL 和 LLM_MODEL"
+    if [ "$DEFAULT_RENDER_BACKEND" = "local" ]; then
+        warn "首次运行前请编辑该文件并填写 [llm] 的 api_key、base_url 和 model；当前默认使用 local 后端"
+    else
+        warn "首次运行前请编辑该文件并填写 [llm] 的 api_key、base_url 和 model；当前默认使用 Slurm 后端"
+    fi
 }
 
 install_manim_knowledge() {
@@ -820,41 +869,194 @@ install_manim_recipes() {
     log "Manim ${MANIM_KNOWLEDGE_VERSION} Recipe 已安装到 $CONFIG_DIR/knowledge/recipes"
 }
 
+toml_config_tool() {
+    local operation="$1" field="${2:-}" value="${3:-}" python_bin
+    if [ -n "${CONDA_ENV_DIR:-}" ] && [ -x "$CONDA_ENV_DIR/bin/python" ]; then
+        python_bin="$CONDA_ENV_DIR/bin/python"
+    else
+        python_bin="$(command -v python3 || true)"
+    fi
+    if [ -z "$python_bin" ]; then
+        err "找不到用于读写 TOML 配置的 Python"
+        return 1
+    fi
+    CONFIG_PATH="$CONFIG_FILE" CONFIG_FIELD="$field" CONFIG_VALUE="$value" \
+        "$python_bin" - "$operation" <<'PY'
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+
+def location(field):
+    if field == "ENABLE_VISUAL_EVAL":
+        return "evaluation", "enable_visual_eval"
+    if field == "RAG_ENABLED":
+        return "rag", "enabled"
+    if field.startswith("VISUAL_LLM_"):
+        return "visual_llm", field[11:].lower()
+    if field.startswith("LLM_"):
+        return "llm", field[4:].lower()
+    if field.startswith("RAG_"):
+        return "rag", field[4:].lower()
+    if field.startswith("SLURM_"):
+        return "slurm", field[6:].lower()
+    if field == "RENDER_BACKEND":
+        return "render", "backend"
+    if (
+        field.startswith("LOCAL_RENDER_")
+        or field.startswith("LOCAL_SMOKE_RENDER_")
+        or field.startswith("SMOKE_RENDER_")
+        or field.startswith("MANIM_")
+        or field in {"ALLOW_PARTIAL_OUTPUT", "OVERWRITE_OUTPUT"}
+    ):
+        return "render", field.lower()
+    if field.startswith("MERGE_") or field.startswith("TRANSITION_"):
+        return "merge", field.lower()
+    if field in {"WORKSPACE_DIR", "OUTPUT_FILE", "SCENES_DIR", "LOGS_DIR", "VIDEOS_DIR"}:
+        return "paths", field.lower()
+    if field.startswith("MONITOR_") or field == "LOG_TAIL_LINES":
+        return "monitor", field.lower()
+    if field in {
+        "ENABLE_AUTO_EVAL",
+        "EVAL_THRESHOLD",
+        "MAX_EVAL_ROUNDS",
+        "EVAL_VISUAL_MODEL",
+        "VISUAL_EVAL_FRAME_COUNT",
+        "VISUAL_EVAL_THRESHOLD",
+        "MAX_VISUAL_FIX_ATTEMPTS",
+    }:
+        return "evaluation", field.lower()
+    return "pipeline", field.lower()
+
+
+path = Path(os.environ["CONFIG_PATH"])
+field = os.environ["CONFIG_FIELD"]
+operation = sys.argv[1]
+section, key = location(field)
+
+if path.is_file():
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+else:
+    lines = []
+
+current_section = ""
+found = None
+section_start = None
+section_end = None
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if current_section == section and section_end is None:
+            section_end = index
+        current_section = stripped[1:-1].strip().lower()
+        if current_section == section and section_start is None:
+            section_start = index
+        continue
+    if current_section != section:
+        continue
+    match = re.match(r"^(\s*)" + re.escape(key) + r"\s*=\s*(.*?)(?:\r?\n)?$", line)
+    if match:
+        found = index
+
+if operation == "get":
+    if found is None:
+        raise SystemExit(0)
+    raw = lines[found].split("=", 1)[1].strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] == "'" else raw
+    print(parsed)
+    raise SystemExit(0)
+
+if operation != "set":
+    raise SystemExit(f"unsupported TOML operation: {operation}")
+
+boolean_fields = {"ENABLE_VISUAL_EVAL", "RAG_ENABLED"}
+if field in boolean_fields:
+    literal = os.environ["CONFIG_VALUE"].lower()
+    if literal not in {"true", "false"}:
+        raise SystemExit(f"布尔配置值无效: {field}")
+else:
+    literal = json.dumps(os.environ["CONFIG_VALUE"], ensure_ascii=False)
+
+replacement = f"{key} = {literal}\n"
+if found is not None:
+    lines[found] = replacement
+elif section_start is not None:
+    insert_at = section_end if section_end is not None else len(lines)
+    lines.insert(insert_at, replacement)
+else:
+    if lines and lines[-1].strip():
+        lines.append("\n")
+    lines.extend([f"[{section}]\n", replacement])
+
+path.parent.mkdir(parents=True, exist_ok=True)
+path.parent.chmod(0o700)
+fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+temporary = Path(temporary_name)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        fd = -1
+        handle.writelines(lines)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    if temporary.exists():
+        temporary.unlink()
+PY
+}
+
 config_value() {
     local key="$1" line value
-    line="$(grep -E "^${key}=" "$CONFIG_FILE" | tail -n 1 || true)"
-    value="${line#*=}"
-    value="${value%$'\r'}"
-    if [ "${#value}" -ge 2 ] && [ "${value:0:1}" = '"' ] && [ "${value: -1}" = '"' ]; then
-        value="${value:1:${#value}-2}"
-    elif [ "${#value}" -ge 2 ] && [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ]; then
-        value="${value:1:${#value}-2}"
+    if [[ "$CONFIG_FILE" == *.env ]]; then
+        line="$(grep -E "^${key}=" "$CONFIG_FILE" | tail -n 1 || true)"
+        value="${line#*=}"
+        value="${value%$'\r'}"
+        if [ "${#value}" -ge 2 ] && [ "${value:0:1}" = '"' ] && [ "${value: -1}" = '"' ]; then
+            value="${value:1:${#value}-2}"
+        elif [ "${#value}" -ge 2 ] && [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ]; then
+            value="${value:1:${#value}-2}"
+        fi
+        CONFIG_VALUE="$value"
+        return
     fi
-    CONFIG_VALUE="$value"
+    CONFIG_VALUE="$(toml_config_tool get "$key" "")"
 }
 
 write_config_value() {
-    local key="$1" value="$2" temporary
+    local key="$1" value="$2" temporary line
     if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || [[ "$value" == *$'\n'* ]] || [[ "$value" == *$'\r'* ]]; then
         err "配置项或配置值包含不安全字符: $key"
         return 1
     fi
-    temporary="$(mktemp "$CONFIG_DIR/.env.configure.XXXXXX")"
-    cleanup_dirs+=("$temporary")
-    if grep -qE "^${key}=" "$CONFIG_FILE"; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            if [[ "$line" == "$key="* ]]; then
-                printf '%s=%s\n' "$key" "$value"
-            else
-                printf '%s\n' "$line"
-            fi
-        done < "$CONFIG_FILE" > "$temporary"
-    else
-        cat "$CONFIG_FILE" > "$temporary"
-        printf '%s=%s\n' "$key" "$value" >> "$temporary"
+    if [[ "$CONFIG_FILE" == *.env ]]; then
+        temporary="$(mktemp "$CONFIG_DIR/.env.configure.XXXXXX")"
+        cleanup_dirs+=("$temporary")
+        if grep -qE "^${key}=" "$CONFIG_FILE"; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                if [[ "$line" == "$key="* ]]; then
+                    printf '%s=%s\n' "$key" "$value"
+                else
+                    printf '%s\n' "$line"
+                fi
+            done < "$CONFIG_FILE" > "$temporary"
+        else
+            cat "$CONFIG_FILE" > "$temporary"
+            printf '%s=%s\n' "$key" "$value" >> "$temporary"
+        fi
+        chmod 600 "$temporary"
+        mv -f "$temporary" "$CONFIG_FILE"
+        return
     fi
-    chmod 600 "$temporary"
-    mv -f "$temporary" "$CONFIG_FILE"
+    toml_config_tool set "$key" "$value"
 }
 
 prompt_yes_no() {
@@ -1131,17 +1333,26 @@ fi
 EOF
 }
 
+print_logo() {
+    printf '\n'
+    # 安装完成时优先使用已安装包中的彩色 ASCII Logo；测试、局部调用或
+    # 安装中断时可能还没有 conda 环境，此时输出不依赖 Python 的回退标识。
+    if [ -n "${CONDA_ENV_DIR:-}" ] && [ -x "$CONDA_ENV_DIR/bin/python" ]; then
+        if env_python -m kd1_anime.logo --brand 2>/dev/null; then
+            return 0
+        fi
+    fi
+    printf '  kd1-anime    LLM 驱动的 Manim 动画 Agent\n'
+}
+
 print_completion() {
-    printf '\n%b安装完成%b\n' "$GREEN" "$NC"
-    printf '%s\n' \
-        "1. 进入 Manim 环境: manim-env" \
-        "2. 启动程序: kd1-anime" \
-        "3. 编辑配置: $CONFIG_FILE" \
-        "   命令目录: $USER_BIN_DIR"
+    print_logo
 }
 
 main() {
-echo -e "${CYAN}=== kd1-anime 环境安装 ===${NC}"
+echo -e "${CYAN}=== kd1-anime 个人 Ubuntu 安装 ===${NC}"
+check_host || exit 1
+info "默认正式渲染后端: $DEFAULT_RENDER_BACKEND"
 find_conda
 
 info "创建/检查 conda 环境 $ENV_NAME"

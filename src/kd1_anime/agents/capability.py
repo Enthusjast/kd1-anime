@@ -15,6 +15,36 @@ SceneParent = Literal["Scene", "ThreeDScene", "MovingCameraScene"]
 Renderer = Literal["cairo", "opengl"]
 
 
+_CAMERA_API_TERMS = ("camera.frame", "movingcamerascene")
+_CAMERA_NEGATION_RE = re.compile(
+    r"(?:禁止|严禁|不得|不能|不要|不应|无需|避免|勿|免于|do\s+not|don't|never|without|not)"
+    r"(?:\s|使用|调用|要求|访问|通过|依赖|use|call|require|access|with)?",
+    re.IGNORECASE,
+)
+
+
+def _contains_positive_camera_api_reference(text: str) -> bool:
+    """只把实际要求 frame API 的文字视为 MovingCameraScene 需求。
+
+    OpenGL 的安全指导会明确写出“禁止 camera.frame”。如果仅使用
+    ``"camera.frame" in text``，这类否定说明会被误判为实际需求。这里
+    保留少量上下文检查否定词，并将其与普通“镜头平移/旋转”区分开。
+    """
+
+    normalized = str(text or "")
+    for term in _CAMERA_API_TERMS:
+        offset = 0
+        while True:
+            index = normalized.lower().find(term, offset)
+            if index < 0:
+                break
+            prefix = re.split(r"[\n。；，,、;!?]", normalized[:index])[-1]
+            if not _CAMERA_NEGATION_RE.search(prefix):
+                return True
+            offset = index + len(term)
+    return False
+
+
 class CapabilityContract(BaseModel):
     """一个场景在代码生成/提交前必须满足的运行能力集合。"""
 
@@ -90,13 +120,15 @@ def build_capability_contract(
     requires_3d = bool(
         constructors & {"Surface", "ThreeDAxes", "Sphere", "Cube", "ParametricSurface"}
     ) or any(token in text for token in ("三维", "3d", "曲面", "切平面", "threedscene"))
-    requires_moving_camera = bool(
-        re.search(
-            r"self\.camera\.frame|movingcamerascene|camera\.frame|"
-            r"镜头(?:推近|拉远|平移|缩放)|camera\s+(?:zoom|pan)",
-            text,
-        )
+    explicit_moving_camera = _contains_positive_camera_api_reference(text)
+    generic_camera_motion = bool(
+        re.search(r"镜头(?:推近|拉远|平移|缩放)|camera\s+(?:zoom|pan)", text)
     )
+    # 三维镜头运动属于 ThreeDScene 的专用相机能力，不能因为计划写了
+    # “旋转/平移/推近”就推断出 MovingCameraScene。只有明确要求
+    # self.camera.frame/MovingCameraScene 时，才将其标记为不兼容的能力。
+    # 非三维 Cairo 场景仍可从泛化的镜头运动描述推断 MovingCameraScene。
+    requires_moving_camera = explicit_moving_camera or (generic_camera_motion and not requires_3d)
     requires_tex = bool(constructors & {"Tex", "MathTex", "MarkupText"}) or bool(
         re.search(r"mathtex|textemplate|\\(?:frac|sum|int|alpha|beta)", text)
     )

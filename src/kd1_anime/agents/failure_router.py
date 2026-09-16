@@ -117,6 +117,15 @@ def classify_failure(
         )
     ):
         return FailureRoute("renderer", "code_patch", True, "Manim renderer 或相机 API 不兼容")
+    if "operands could not be broadcast" in text and (
+        "shapes (0,)" in text or "flash" in text or "create_lines" in text
+    ):
+        return FailureRoute(
+            "lifecycle",
+            "code_patch",
+            True,
+            "指示动画收到没有几何点的空 Mobject",
+        )
     if any(
         marker in text
         for marker in ("active", "transform", "fadeout", "vgroup", "lifecycle", "生命周期")

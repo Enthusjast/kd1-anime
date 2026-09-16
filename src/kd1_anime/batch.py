@@ -47,6 +47,7 @@ class BatchConfig:
     dry_run: bool = False
     output_dir: Path | None = None
     incremental: bool = False
+    backend: Literal["slurm", "local"] | None = None
     base_run_ids: dict[int, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -62,6 +63,8 @@ class BatchConfig:
                 raise ValueError(f"base_run_ids 包含无效 run-id: {run_id!r}")
             normalized[task_id] = run_id
         self.base_run_ids = normalized
+        if self.backend not in {None, "slurm", "local"}:
+            raise ValueError("backend 必须是 slurm、local 或 null")
 
 
 def load_prompts_from_file(file_path: Path) -> list[str]:
@@ -111,6 +114,7 @@ def load_batch_config(file_path: Path) -> BatchConfig:
         dry_run=data.get("dry_run", False),
         output_dir=Path(data["output_dir"]) if "output_dir" in data else None,
         incremental=data.get("incremental", False),
+        backend=data.get("backend"),
         base_run_ids=data.get("base_run_ids", {}),
     )
 
@@ -126,6 +130,7 @@ class BatchProcessor:
             visual_llm_limit=settings.VISUAL_LLM_PARALLEL_WORKERS,
             rag_limit=settings.RAG_PARALLEL_WORKERS,
             slurm_limit=settings.SLURM_MAX_IN_FLIGHT,
+            local_limit=settings.LOCAL_RENDER_MAX_IN_FLIGHT,
         )
         self._active_lock = threading.RLock()
         self._active_orchestrators: dict[int, object] = {}
@@ -178,19 +183,22 @@ class BatchProcessor:
             if self.config.incremental and task.task_id in self.config.base_run_ids:
                 # 增量渲染模式
                 base_run_id = self.config.base_run_ids[task.task_id]
-                final_video = orchestrator.run_incremental(
-                    task.prompt,
-                    base_run_id,
-                    dry_run=self.config.dry_run,
-                    output_path=output_path,
-                )
+                run_kwargs = {
+                    "dry_run": self.config.dry_run,
+                    "output_path": output_path,
+                }
+                if self.config.backend is not None:
+                    run_kwargs["backend"] = self.config.backend
+                final_video = orchestrator.run_incremental(task.prompt, base_run_id, **run_kwargs)
             else:
                 # 普通渲染模式
-                final_video = orchestrator.run(
-                    task.prompt,
-                    dry_run=self.config.dry_run,
-                    output_path=output_path,
-                )
+                run_kwargs = {
+                    "dry_run": self.config.dry_run,
+                    "output_path": output_path,
+                }
+                if self.config.backend is not None:
+                    run_kwargs["backend"] = self.config.backend
+                final_video = orchestrator.run(task.prompt, **run_kwargs)
 
             if self._interrupted.is_set():
                 task.status = "interrupted"

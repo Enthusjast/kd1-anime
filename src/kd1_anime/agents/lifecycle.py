@@ -13,51 +13,51 @@ from dataclasses import dataclass
 
 from kd1_anime.agents.technical_planner import TechnicalSpec
 
-_INTRODUCERS = {
-    "AddTextLetterByLetter",
-    "AddTextWordByWord",
-    "Create",
-    "DrawBorderThenFill",
-    "FadeIn",
-    "GrowArrow",
-    "GrowFromCenter",
-    "GrowFromEdge",
-    "GrowFromPoint",
-    "ShowIncreasingSubsets",
-    "ShowSubmobjectsOneByOne",
-    "SpinInFromNothing",
-    "Write",
-}
-_REMOVERS = {
-    "DisappearToPoint",
-    "FadeOut",
-    "FadeOutToPoint",
-    "ShrinkToCenter",
-    "Uncreate",
-}
-_TRANSFORMS = {
-    "Transform",
-    "ReplacementTransform",
-    "TransformMatchingTex",
-    "TransformMatchingShapes",
-}
+# 这些集合只用于识别少量能安全推断参数角色的常见调用，以及兼容修复
+# 函数。它们不是技术合同的能力白名单；未知调用会进入 warning。
+_INTRODUCERS = {"Create", "Write", "FadeIn"}
+_REMOVERS = {"FadeOut", "Uncreate"}
+_TRANSFORMS = {"Transform", "ReplacementTransform"}
 _IN_PLACE_ANIMATIONS = {
     "ApplyMethod",
     "ApplyPointwiseFunction",
-    "ApplyWave",
     "Circumscribe",
     "Flash",
-    "FocusOn",
     "Indicate",
     "MoveToTarget",
     "Restore",
-    "ShowPassingFlash",
-    "ShowPassingFlashAround",
     "UpdateFromFunc",
     "Wiggle",
 }
+_POINT_SENSITIVE_ANIMATIONS = {"Flash", "Indicate", "Circumscribe", "Wiggle"}
+_EMPTY_GROUP_CONSTRUCTORS = {"VGroup", "Group", "VDict"}
+_NONEMPTY_MOBJECT_CONSTRUCTORS = {
+    "Arc",
+    "Arrow",
+    "Arrow3D",
+    "Axes",
+    "Circle",
+    "Dot",
+    "Line",
+    "MathTex",
+    "NumberPlane",
+    "ParametricFunction",
+    "Polygon",
+    "Rectangle",
+    "Square",
+    "Surface",
+    "Text",
+    "Tex",
+    "ThreeDAxes",
+    "Vector",
+}
 _CONTAINER_ANIMATIONS = {"AnimationGroup", "LaggedStart", "Succession", "Group"}
 _SCENE_SIDE_EFFECTS = {"play", "add", "remove", "clear"}
+_EVENT_MARKER_RE = re.compile(
+    r"^\s*#\s*KD1_ANIMATION_EVENT:\s*"
+    r"(?P<event_id>[A-Za-z_][A-Za-z0-9_.-]{0,99})\s*$"
+)
+_AUTO_EVENT_PREFIX = "__auto_"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +67,7 @@ class LifecycleValidationResult:
     is_valid: bool
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    unknown_animations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,7 @@ class _AnimationInvocation:
     operation: str
     source_names: tuple[str, ...] = ()
     target_names: tuple[str, ...] = ()
+    unknown: bool = False
 
 
 def repair_required_export_alias_lifecycle(
@@ -245,6 +247,330 @@ def repair_required_export_alias_lifecycle(
     return source_bytes.decode("utf-8"), tuple(dict.fromkeys(repairs))
 
 
+def repair_required_export_transform_alias_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """收敛“变换后把临时 target 重绑定为导出变量”的生命周期写法。
+
+    生成代码常写成 ``ReplacementTransform(grid, sheared_grid)``，随后
+    ``grid = sheared_grid``。这在 Python 中看似更新了引用，但技术合同
+    导出的对象身份已经被 ReplacementTransform 移除，且 ``sheared_grid``
+    不是合同变量，静态检查会把 ``grid`` 判定为不 active。若能确认临时
+    名称确实是某个必需导出变量的 Transform target，则把替换变换收敛为
+    原地 ``Transform``，删除重绑定，并把重绑定之后的临时引用改回合同
+    变量。所有判断均来自 AST，不执行生成代码。
+    """
+
+    if not code or not technical_spec.export_element_ids:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+
+    exported_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.element_id in technical_spec.export_element_ids and item.variable_name
+    }
+    if not exported_variables:
+        return code, ()
+
+    statements = _statement_nodes(construct)
+    rebinding_candidates: list[tuple[ast.Assign, str, str]] = []
+    for node in statements:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in exported_variables:
+            continue
+        if not isinstance(node.value, ast.Name) or node.value.id == target.id:
+            continue
+        rebinding_candidates.append((node, target.id, node.value.id))
+    if not rebinding_candidates:
+        return code, ()
+
+    # 找到“导出变量 -> 临时 target”的变换调用。只接受发生在重绑定前的
+    # Transform/ReplacementTransform，避免把普通业务别名误判为场景边界。
+    target_transforms: dict[tuple[str, str], list[ast.Call]] = {}
+    for node in statements:
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "play"
+        ):
+            continue
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call) or _call_name(child) not in {
+                "Transform",
+                "ReplacementTransform",
+            }:
+                continue
+            if len(child.args) < 2:
+                continue
+            source_names = _root_names(child.args[0])
+            target_names = _root_names(child.args[1])
+            for variable in source_names & exported_variables:
+                for alias in target_names:
+                    target_transforms.setdefault((variable, alias), []).append(child)
+
+    selected: list[tuple[ast.Assign, str, str, ast.Call]] = []
+    for rebind, variable, alias in rebinding_candidates:
+        calls = [
+            call
+            for call in target_transforms.get((variable, alias), ())
+            if call.lineno < rebind.lineno
+        ]
+        if calls:
+            selected.append((rebind, variable, alias, calls[-1]))
+    if not selected:
+        return code, ()
+
+    source_bytes = code.encode("utf-8")
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+
+    def offset(lineno: int, column: int) -> int:
+        if lineno < 1 or lineno > len(lines):
+            return len(source_bytes)
+        return line_offsets[lineno - 1] + column
+
+    def node_range(node: ast.AST) -> tuple[int, int]:
+        start = offset(node.lineno, node.col_offset)  # type: ignore[attr-defined]
+        end_line = getattr(node, "end_lineno", node.lineno)
+        end_col = getattr(node, "end_col_offset", node.col_offset)
+        return start, offset(end_line, end_col)
+
+    def inside_any(start: int, end: int, ranges: list[tuple[int, int]]) -> bool:
+        return any(start >= left and end <= right for left, right in ranges)
+
+    edits: list[tuple[int, int, bytes]] = []
+    skipped_ranges: list[tuple[int, int]] = []
+    replacements: dict[str, str] = {}
+    repairs: list[str] = []
+    for rebind, variable, alias, transform in selected:
+        # 只转换 ReplacementTransform。原地 Transform 已保留 source 的
+        # active 身份，仍需删除重绑定并收敛后续 alias 引用。
+        if _call_name(transform) == "ReplacementTransform":
+            func_start, func_end = node_range(transform.func)
+            edits.append((func_start, func_end, b"Transform"))
+        rebind_start, rebind_end = node_range(rebind)
+        edits.append((rebind_start, rebind_end, b"pass"))
+        skipped_ranges.append((rebind_start, rebind_end))
+        replacements[alias] = variable
+        repairs.append(f"将 {variable} 的变换 target {alias} 收敛到导出变量")
+
+    # 保留临时 target 的构造定义和变换调用；重绑定之后对它的引用应当
+    # 指向已经原地变换完成的导出对象。定义自身可能出现在重绑定之后，
+    # 这种不确定写法不自动改写，交给 Coder 修复。
+    definition_ranges: list[tuple[int, int]] = []
+    for node in ast.walk(construct):
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id in replacements for target in node.targets
+        ):
+            definition_ranges.append(node_range(node))
+
+    for node in ast.walk(construct):
+        if not isinstance(node, ast.Name) or node.id not in replacements:
+            continue
+        start, end = node_range(node)
+        if inside_any(start, end, skipped_ranges) or inside_any(start, end, definition_ranges):
+            continue
+        # 仅改写重绑定之后的使用；变换调用的 target 必须保留临时对象，
+        # 否则会变成 Transform(variable, variable)。
+        matching_rebinds = [
+            item for item in selected if item[2] == node.id and node.lineno > item[0].lineno
+        ]
+        if not matching_rebinds:
+            continue
+        variable = matching_rebinds[-1][1]
+        edits.append((start, end, variable.encode("utf-8")))
+
+    for start, end, replacement in sorted(edits, key=lambda item: (item[0], item[1]), reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    return source_bytes.decode("utf-8"), tuple(dict.fromkeys(repairs))
+
+
+def repair_required_export_replacement_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """保留必需导出 source 的身份，避免替换到未声明的临时 target。
+
+    当代码没有写 ``grid = grid_target`` 这样的重绑定时，前一个兼容修复
+    没有可处理的赋值，但 ``ReplacementTransform(grid, grid_target)`` 仍会
+    把合同要求导出的 ``grid`` 从 Scene 中移除。若 target 不是另一个已
+    声明的合同变量，也将其降为原地 ``Transform``；TechnicalSpec 的
+    ``transform`` 语义不会让 target 自动成为 active，而导出 source 的
+    active 身份必须得到保留。
+    """
+
+    if not code or not technical_spec.export_element_ids:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+    exported_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.element_id in technical_spec.export_element_ids and item.variable_name
+    }
+    if not exported_variables:
+        return code, ()
+
+    replacements: list[ast.Call] = []
+    for node in _statement_nodes(construct):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "play"
+        ):
+            continue
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Call)
+                and _call_name(child) == "ReplacementTransform"
+                and len(child.args) >= 2
+            ):
+                sources = _root_names(child.args[0])
+                targets = _root_names(child.args[1])
+                if sources & exported_variables and targets:
+                    replacements.append(child)
+    if not replacements:
+        return code, ()
+
+    source_bytes = code.encode("utf-8")
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+
+    def offset(lineno: int, column: int) -> int:
+        if lineno < 1 or lineno > len(lines):
+            return len(source_bytes)
+        return line_offsets[lineno - 1] + column
+
+    edits: list[tuple[int, int, bytes]] = []
+    for call in replacements:
+        start = offset(call.func.lineno, call.func.col_offset)  # type: ignore[attr-defined]
+        end = offset(
+            getattr(call.func, "end_lineno", call.func.lineno),
+            getattr(call.func, "end_col_offset", call.func.col_offset),
+        )
+        edits.append((start, end, b"Transform"))
+    for start, end, replacement in sorted(edits, reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    return (
+        source_bytes.decode("utf-8"),
+        (
+            "将必需导出对象到未声明 target 的 ReplacementTransform 降为 Transform: "
+            + ", ".join(
+                sorted(
+                    {
+                        variable
+                        for call in replacements
+                        for variable in _root_names(call.args[0]) & exported_variables
+                    }
+                )
+            ),
+        ),
+    )
+
+
+def repair_removed_active_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+    errors: tuple[str, ...] | list[str],
+) -> tuple[str, tuple[str, ...]]:
+    """为明确报告为 active 的移除对象补一条最小 FadeOut。
+
+    ``elements_to_remove`` 是结构化边界合同。Coder 有时能正确实现主体
+    动画，却因为阅读了互相矛盾的自然语言 transition_out，漏掉最后的
+    FadeOut。此时把场景判死没有必要：生命周期错误已经精确指出了应退出
+    的合同变量，可以在 construct() 末尾补一条退出动画，再由完整校验链
+    复核。只有错误文本明确列出“已移除对象仍 active”的变量才会触发，
+    不会为普通运行时错误或未确认的对象擅自添加动画。
+    """
+
+    if not code or not technical_spec.removed_element_ids:
+        return code, ()
+    reported: set[str] = set()
+    marker = "场景结束时已移除对象仍 active:"
+    for error in errors:
+        text = str(error)
+        if marker not in text:
+            continue
+        reported.update(item.strip() for item in text.split(marker, 1)[1].split(","))
+    if not reported:
+        return code, ()
+
+    removed_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.element_id in set(technical_spec.removed_element_ids) and item.variable_name
+    }
+    variables = sorted(reported & removed_variables)
+    if not variables:
+        return code, ()
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None or not construct.body:
+        return code, ()
+    defined = {
+        name
+        for node in _statement_nodes(construct)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for name in _assignment_names(node)
+    }
+    variables = [name for name in variables if name in defined]
+    if not variables:
+        return code, ()
+
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+    last_body = construct.body[-1]
+    last_line = int(getattr(last_body, "end_lineno", last_body.lineno))
+    insert_at = (
+        line_offsets[last_line] if last_line < len(line_offsets) else len(code.encode("utf-8"))
+    )
+    first_body_line = lines[construct.body[0].lineno - 1] if lines else ""
+    indentation = first_body_line[: len(first_body_line) - len(first_body_line.lstrip())]
+    cleanup = (
+        f"{indentation}# KD1_ANIMATION_EVENT: __auto_remove_active\n"
+        f"{indentation}self.play(FadeOut({', '.join(variables)}), run_time=0.5)\n"
+    )
+    source_bytes = code.encode("utf-8")
+    if insert_at == 0 or (insert_at > 0 and source_bytes[insert_at - 1 : insert_at] != b"\n"):
+        cleanup = "\n" + cleanup
+    source_bytes = source_bytes[:insert_at] + cleanup.encode("utf-8") + source_bytes[insert_at:]
+    return (
+        source_bytes.decode("utf-8"),
+        ("为仍 active 的移除对象补齐 FadeOut: " + ", ".join(variables),),
+    )
+
+
 def _call_name(node: ast.Call) -> str:
     if isinstance(node.func, ast.Name):
         return node.func.id
@@ -274,11 +600,109 @@ def _contains_animate(node: ast.AST) -> bool:
     )
 
 
+def _is_self_camera_path(node: ast.AST) -> bool:
+    """判断属性链是否从 ``self.camera`` 开始。"""
+
+    current = node
+    while isinstance(current, ast.Attribute):
+        current = current.value
+    return (
+        isinstance(current, ast.Name)
+        and current.id == "self"
+        and isinstance(node, ast.Attribute)
+        and (node.attr == "camera" or _is_self_camera_path(node.value))
+    )
+
+
+def _animate_source_names(node: ast.AST) -> set[str]:
+    """提取 Mobject.animate 的根变量，忽略 ThreeDScene 相机运镜。"""
+
+    for child in ast.walk(node):
+        if isinstance(child, ast.Attribute) and child.attr == "animate":
+            if _is_self_camera_path(child.value):
+                return set()
+            return _root_names(child.value)
+    return _root_names(node)
+
+
+def _contains_camera_animate(node: ast.AST) -> bool:
+    """判断一段动画表达式是否只是在驱动 Scene 相机。"""
+
+    return any(
+        isinstance(child, ast.Attribute)
+        and child.attr == "animate"
+        and _is_self_camera_path(child.value)
+        for child in ast.walk(node)
+    )
+
+
+def _contains_camera_reference(node: ast.AST) -> bool:
+    """判断表达式是否引用 ``self.camera``/``self.camera.frame``。"""
+
+    return any(
+        isinstance(child, ast.Attribute) and _is_self_camera_path(child) for child in ast.walk(node)
+    )
+
+
+def _event_markers(code: str) -> list[tuple[int, str]]:
+    """读取源代码中的语义动画事件标记。"""
+
+    markers: list[tuple[int, str]] = []
+    for line_number, line in enumerate(code.splitlines(), start=1):
+        match = _EVENT_MARKER_RE.match(line)
+        if match:
+            markers.append((line_number, match.group("event_id")))
+    return markers
+
+
+def _marker_before_line(lines: list[str], line_number: int) -> str | None:
+    """返回 self.play 前最近的事件标记。
+
+    Coder 常会先在 marker 后准备 ``copy()``/目标 Mobject，再调用
+    ``self.play``。这些准备语句没有 Scene 副作用，允许 marker 跨过它们，
+    但遇到另一个 ``self.*`` 或控制流就停止，避免把事件错误绑定到后续动画。
+    单个 ``self.wait(...)`` 也作为无副作用的时间桥接处理，兼容模型把
+    “保持后淡出”写在同一个事件下的情况。
+    """
+
+    def is_safe_preparation(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            return True
+        if stripped.startswith(("self.", "if ", "for ", "while ", "with ", "return ", "raise ")):
+            return False
+        if re.match(r"^[A-Za-z_]\w*(?:\[[^\n]*\])?\s*(?:[+\-*/%]?=)", stripped):
+            return True
+        if re.match(r"^[A-Za-z_]\w*(?:\[[^\n]*\])?(?:\.[A-Za-z_]\w*)+\s*\(", stripped):
+            return True
+        return stripped[0] in ")]}," or stripped.endswith((",", "(", "[", "{"))
+
+    index = line_number - 2
+    wait_bridges = 0
+    while index >= 0:
+        if lines[index].strip().startswith("self.wait("):
+            wait_bridges += 1
+            if wait_bridges > 1:
+                return None
+            index -= 1
+            continue
+        if is_safe_preparation(lines[index]):
+            match = _EVENT_MARKER_RE.match(lines[index])
+            if match:
+                return match.group("event_id")
+            index -= 1
+            continue
+        break
+    return None
+
+
 def _animation_invocations(node: ast.AST) -> list[_AnimationInvocation]:
     """从 self.play 参数中提取动画操作，忽略普通参数表达式。"""
 
     if isinstance(node, ast.Call):
         name = _call_name(node)
+        if _contains_camera_reference(node):
+            return [_AnimationInvocation("camera")]
         if name in _INTRODUCERS or name in _REMOVERS:
             source: set[str] = set()
             arguments = node.args if name == "FadeOut" else node.args[:1]
@@ -301,11 +725,386 @@ def _animation_invocations(node: ast.AST) -> list[_AnimationInvocation]:
             )
             return [_AnimationInvocation("animate", tuple(sorted(source)))]
         if _contains_animate(node):
-            return [_AnimationInvocation("animate", tuple(sorted(_root_names(node.func))))]
-        return []
+            source_names = _animate_source_names(node)
+            operation = (
+                "camera" if not source_names and _contains_camera_animate(node) else "animate"
+            )
+            return [_AnimationInvocation(operation, tuple(sorted(source_names)))]
+        # 未知的动画工厂不应被当成非法 API。调用方会通过语义事件标记
+        # 提供状态解释，这里仅提取可能的对象根名并记录 warning。
+        source: set[str] = set()
+        for argument in node.args:
+            source.update(_root_names(argument))
+        return [
+            _AnimationInvocation(f"unknown:{name or 'call'}", tuple(sorted(source)), unknown=True)
+        ]
     if isinstance(node, ast.Attribute) and node.attr == "animate":
+        if _is_self_camera_path(node.value):
+            return [_AnimationInvocation("camera")]
         return [_AnimationInvocation("animate", tuple(sorted(_root_names(node.value))))]
+    if isinstance(node, ast.Name):
+        return [_AnimationInvocation(f"unknown:{node.id}", (node.id,), unknown=True)]
     return []
+
+
+def repair_missing_animation_markers(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """为可确定归属的未标记 ``self.play`` 补上语义事件标记。
+
+    代码模型在局部重写后偶尔会遗漏 marker。直接把所有缺失 marker 的
+    调用标成同一个合同事件会掩盖真正的生命周期错误，因此这里只接受
+    两种安全情况：
+
+    * 调用中出现的合同变量能唯一匹配一个尚未使用的技术事件；或
+    * 调用完全没有合同变量，此时使用 ``__auto_*`` 诊断 marker，让
+      生命周期分析器按实际动画类型做最小状态模拟。
+
+    如果已知合同变量无法唯一确定事件，原样返回，继续让 Coder 根据
+    确定性错误重写，而不是猜测事件归属。
+    """
+
+    if not code or not technical_spec.animations:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+
+    object_variables = {item.variable_name for item in technical_spec.objects if item.variable_name}
+    variable_by_element = {
+        item.element_id: item.variable_name for item in technical_spec.objects if item.variable_name
+    }
+    event_by_id = {event.event_id: event for event in technical_spec.animations}
+    source_lines = code.splitlines(keepends=True)
+    used_event_ids = {event_id for _, event_id in _event_markers(code) if event_id in event_by_id}
+    events = sorted(
+        technical_spec.animations,
+        key=lambda item: (item.start_seconds, item.event_id),
+    )
+
+    def expected_variables(event) -> set[str]:
+        if event.semantic_action == "introduce":
+            element_ids = {*event.target_element_ids, *event.create_element_ids}
+        elif event.semantic_action == "update":
+            element_ids = {*event.source_element_ids, *event.target_element_ids}
+        elif event.semantic_action == "remove":
+            element_ids = {*event.source_element_ids, *event.remove_element_ids}
+        elif event.semantic_action == "hold":
+            element_ids = set(event.source_element_ids)
+        else:
+            element_ids = set()
+        return {
+            variable_by_element[element_id]
+            for element_id in element_ids
+            if element_id in variable_by_element
+        }
+
+    def operation_kinds(invocations: list[_AnimationInvocation]) -> set[str]:
+        operations = {invocation.operation for invocation in invocations}
+        if "camera" in operations:
+            return {"camera"}
+        if operations and operations <= _REMOVERS:
+            return {"remove"}
+        if operations and operations <= _INTRODUCERS:
+            return {"introduce"}
+        if operations & (_TRANSFORMS | {"animate"}):
+            return {"update", "hold"}
+        return {"introduce", "update", "remove", "hold"}
+
+    missing: list[tuple[ast.Call, str]] = []
+    repair_notes: list[str] = []
+    auto_index = 1
+    for node in _statement_nodes(construct):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "play"
+        ):
+            continue
+        if _marker_before_line(source_lines, node.lineno) is not None:
+            continue
+
+        invocations: list[_AnimationInvocation] = []
+        for argument in node.args:
+            invocations.extend(_animation_invocations(argument))
+        actual_variables = {
+            name
+            for invocation in invocations
+            for name in (*invocation.source_names, *invocation.target_names)
+            if name in object_variables
+        }
+        kinds = operation_kinds(invocations)
+        candidates: list[tuple[int, object]] = []
+        for event in events:
+            if event.semantic_action not in kinds:
+                continue
+            if event.event_id in used_event_ids and event.semantic_action != "remove":
+                continue
+            expected = expected_variables(event)
+            overlap = len(actual_variables & expected)
+            if overlap:
+                candidates.append((overlap, event))
+            elif not actual_variables and event.semantic_action == "camera":
+                candidates.append((1, event))
+
+        selected = None
+        if candidates:
+            best_score = max(score for score, _ in candidates)
+            best = [event for score, event in candidates if score == best_score]
+            if len(best) == 1:
+                selected = best[0]
+            elif best and kinds & {"update", "hold"}:
+                # 同一 source 在连续的 update 事件中反复出现时，代码
+                # 顺序就是唯一稳定的额外信息。优先选择时间线中最早的
+                # 尚未使用事件，避免因为一次遗漏 marker 就让整轮候选
+                # 无法接纳；后续事件仍会继续消费剩余的 marker。
+                selected = best[0]
+
+        if selected is not None:
+            marker_id = selected.event_id
+            if selected.semantic_action != "remove":
+                used_event_ids.add(marker_id)
+            repair_notes.append(f"为第 {node.lineno} 行 self.play() 补齐事件标记: {marker_id}")
+        elif not actual_variables:
+            operations = {invocation.operation for invocation in invocations}
+            if operations and operations <= _REMOVERS:
+                prefix = "__auto_remove"
+            elif operations and operations <= _INTRODUCERS:
+                prefix = "__auto_introduce"
+            elif "camera" in operations:
+                prefix = "__auto_update_camera"
+            else:
+                prefix = "__auto_update"
+            marker_id = f"{prefix}_{auto_index}"
+            auto_index += 1
+            repair_notes.append(
+                f"为无合同对象的第 {node.lineno} 行 self.play() 补齐诊断标记: {marker_id}"
+            )
+        else:
+            return code, ()
+        missing.append((node, marker_id))
+
+    if not missing:
+        return code, ()
+
+    source_bytes = code.encode("utf-8")
+    line_offsets: list[int] = [0]
+    for line in source_lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+    edits: list[tuple[int, bytes]] = []
+    for node, marker_id in missing:
+        line_index = node.lineno - 1
+        if line_index < 0 or line_index >= len(source_lines):
+            return code, ()
+        line = source_lines[line_index]
+        indentation = line[: len(line) - len(line.lstrip())]
+        edits.append(
+            (
+                line_offsets[line_index],
+                f"{indentation}# KD1_ANIMATION_EVENT: {marker_id}\n".encode(),
+            )
+        )
+    for offset, replacement in sorted(edits, reverse=True):
+        source_bytes = source_bytes[:offset] + replacement + source_bytes[offset:]
+    return source_bytes.decode("utf-8"), tuple(repair_notes)
+
+
+def repair_initial_active_alias_lifecycle(
+    code: str,
+    technical_spec: TechnicalSpec,
+) -> tuple[str, tuple[str, ...]]:
+    """将继承对象的临时 source 别名收敛回其合同变量。
+
+    Coder 常把合同对象复制成 ``grid_initial`` 或 ``grid_transformed``，
+    然后让后者成为 ``Transform``/``FadeOut`` 的 source。副本并没有接管
+    Scene 中的 active 身份，因而技术合同会报告 update 没有操作任何 source。
+    只改写动画参数中的 source 位置，不改写 Transform target 或临时对象
+    定义，随后仍由完整生命周期校验复核。
+    """
+
+    if not code or not technical_spec.animations:
+        return code, ()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, ()
+    construct = _construct_node(tree)
+    if construct is None:
+        return code, ()
+
+    contract_variables = {
+        item.variable_name for item in technical_spec.objects if item.variable_name
+    }
+    if not contract_variables:
+        return code, ()
+
+    statements = _statement_nodes(construct)
+    active_contract_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.variable_name and item.initially_active
+    }
+    for node in statements:
+        if isinstance(node, ast.Assign):
+            continue
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ):
+            continue
+        if node.func.attr in {"add", "remove"}:
+            names = {
+                name
+                for argument in node.args
+                for name in _root_names(argument)
+                if name in contract_variables
+            }
+            if node.func.attr == "add":
+                active_contract_variables.update(names)
+            else:
+                active_contract_variables.difference_update(names)
+        elif node.func.attr == "play":
+            invocations = [
+                invocation
+                for argument in node.args
+                for invocation in _animation_invocations(argument)
+            ]
+            for invocation in invocations:
+                if invocation.operation in _INTRODUCERS:
+                    active_contract_variables.update(
+                        name for name in invocation.source_names if name in contract_variables
+                    )
+                elif invocation.operation in _REMOVERS:
+                    active_contract_variables.difference_update(invocation.source_names)
+
+    aliases: dict[str, str] = {}
+    alias_assignments: list[tuple[str, set[str]]] = []
+    for node in _statement_nodes(construct):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        base_candidates = {
+            base for base in active_contract_variables if target.id.startswith(f"{base}_")
+        }
+        if not base_candidates:
+            continue
+        referenced_names = {
+            child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)
+        }
+        alias_assignments.append((target.id, referenced_names))
+    # 解析 ``grid_standard -> grid_rotated -> grid_stretched`` 这样的复制
+    # 链。每一层仍必须是以 active 合同变量为前缀的赋值，且表达式引用
+    # 了已确认的上一层，避免把无关的同名业务变量当成 active source。
+    pending = list(alias_assignments)
+    while pending:
+        unresolved: list[tuple[str, set[str]]] = []
+        progressed = False
+        for alias, roots in pending:
+            resolved_roots = {root for root in roots if root in active_contract_variables}
+            resolved_roots.update(aliases[root] for root in roots if root in aliases)
+            if resolved_roots:
+                aliases[alias] = sorted(resolved_roots)[0]
+                progressed = True
+            else:
+                unresolved.append((alias, roots))
+        if not progressed:
+            break
+        pending = unresolved
+    if not aliases:
+        return code, ()
+
+    def root_name_nodes(expression: ast.AST) -> list[ast.Name]:
+        if isinstance(expression, ast.Name):
+            return [expression]
+        if isinstance(expression, (ast.Attribute, ast.Subscript, ast.Starred)):
+            return root_name_nodes(expression.value)
+        return []
+
+    def source_expressions(node: ast.AST) -> list[ast.AST]:
+        if not isinstance(node, ast.Call):
+            return []
+        name = _call_name(node)
+        if name in _INTRODUCERS:
+            return list(node.args[:1])
+        if name in _REMOVERS:
+            return list(node.args)
+        if name in _TRANSFORMS:
+            return list(node.args[:1])
+        if name in _CONTAINER_ANIMATIONS:
+            return [child for argument in node.args for child in source_expressions(argument)]
+        if name in _IN_PLACE_ANIMATIONS:
+            source_index = 1 if name == "ApplyPointwiseFunction" else 0
+            return list(node.args[source_index : source_index + 1])
+        if _contains_animate(node):
+            return [
+                child.value
+                for child in ast.walk(node)
+                if isinstance(child, ast.Attribute)
+                and child.attr == "animate"
+                and not _is_self_camera_path(child.value)
+            ]
+        return []
+
+    source_bytes = code.encode("utf-8")
+    lines = code.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for line in lines:
+        line_offsets.append(line_offsets[-1] + len(line.encode("utf-8")))
+
+    def node_range(node: ast.AST) -> tuple[int, int]:
+        start = line_offsets[node.lineno - 1] + node.col_offset  # type: ignore[attr-defined]
+        end_line = getattr(node, "end_lineno", node.lineno)
+        end_col = getattr(node, "end_col_offset", node.col_offset)
+        end = line_offsets[end_line - 1] + end_col
+        return start, end
+
+    edits: dict[tuple[int, int], tuple[bytes, str]] = {}
+    for node in _statement_nodes(construct):
+        expressions: list[ast.AST] = []
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ):
+            if node.func.attr == "play":
+                expressions = [
+                    expression
+                    for argument in node.args
+                    for expression in source_expressions(argument)
+                ]
+            elif node.func.attr in {"add", "remove"}:
+                expressions = list(node.args)
+        for expression in expressions:
+            for name_node in root_name_nodes(expression):
+                base = aliases.get(name_node.id)
+                if base is None:
+                    continue
+                start, end = node_range(name_node)
+                edits[(start, end)] = (base.encode(), name_node.id)
+
+    if not edits:
+        return code, ()
+    for (start, end), (replacement, _) in sorted(edits.items(), reverse=True):
+        source_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    changed_aliases = {alias for _, alias in edits.values()}
+    repairs = tuple(
+        f"将合同对象的 active source 别名 {alias} 收敛到 {base}"
+        for alias, base in sorted(aliases.items())
+        if alias in changed_aliases
+    )
+    return source_bytes.decode("utf-8"), repairs
 
 
 def _construct_node(tree: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
@@ -384,16 +1183,63 @@ def _assignment_aliases(node: ast.Assign | ast.AnnAssign) -> dict[str, set[str]]
     return {name: set(roots) for name in _assignment_names(node)}
 
 
+def _mobject_state(value: ast.AST, states: dict[str, str]) -> str:
+    """保守判断一个赋值是否可能产生空 Mobject。
+
+    这里只拦截能确定的 ``VGroup()``/``Group()`` 空构造；列表推导、条件
+    过滤和 ``copy`` 等无法在不执行用户代码的情况下证明时返回
+    ``maybe_empty``，由调用方记录风险并要求 Smoke Render，而不是误报为
+    确定性错误。
+    """
+
+    if isinstance(value, ast.Name):
+        return states.get(value.id, "unknown")
+    if isinstance(value, ast.Call):
+        name = _call_name(value)
+        if name in _EMPTY_GROUP_CONSTRUCTORS:
+            if not value.args and not value.keywords:
+                return "empty"
+            if any(isinstance(argument, ast.Starred) for argument in value.args):
+                starred = [
+                    argument.value for argument in value.args if isinstance(argument, ast.Starred)
+                ]
+                if all(
+                    isinstance(item, (ast.List, ast.Tuple, ast.Set)) and not item.elts
+                    for item in starred
+                ):
+                    return "empty"
+                return "maybe_empty"
+            return "nonempty"
+        if name in _NONEMPTY_MOBJECT_CONSTRUCTORS:
+            return "nonempty"
+        if (
+            isinstance(value.func, ast.Attribute)
+            and value.func.attr == "copy"
+            and isinstance(value.func.value, ast.Name)
+        ):
+            return states.get(value.func.value.id, "unknown")
+        if name in {"always_redraw", "become", "set_points_as_corners"}:
+            return "maybe_empty"
+    return "unknown"
+
+
 def validate_animation_lifecycle(
     code: str,
     technical_spec: TechnicalSpec,
     *,
     renderer: str | None = None,
 ) -> LifecycleValidationResult:
-    """以保守规则检查代码中的对象生命周期。"""
+    """以语义事件合同检查代码中的对象生命周期。
+
+    具体动画类不是稳定的能力边界。代码只需要在每个 ``self.play`` 前写
+    ``# KD1_ANIMATION_EVENT: <event_id>``，其状态变化由 TechnicalSpec 的
+    ``semantic_action`` 决定；无法识别的动画调用只产生 warning。这样
+    新的 Manim 动画可以先用于实验，而不会被旧的名称列表阻断。
+    """
 
     errors: list[str] = []
     warnings: list[str] = []
+    unknown_animations: list[str] = []
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
@@ -404,12 +1250,24 @@ def validate_animation_lifecycle(
         return LifecycleValidationResult(False, ("生命周期检查找不到 construct()",))
 
     errors.extend(_side_effects_outside_construct(tree, construct))
+    lines = code.splitlines()
+    event_by_id = {event.event_id: event for event in technical_spec.animations}
+    markers = _event_markers(code)
+    marker_ids = [event_id for _, event_id in markers]
+    for event_id in sorted({item for item in marker_ids if marker_ids.count(item) > 1}):
+        event = event_by_id.get(event_id)
+        if event is not None and event.semantic_action in {"remove", "update", "camera"}:
+            detail = "分段清理事件" if event.semantic_action == "remove" else "分段执行"
+            warnings.append(f"动画事件标记重复: {event_id}；按同一语义事件的{detail}合并校验")
 
     object_by_variable = {
         item.variable_name: item for item in technical_spec.objects if item.variable_name
     }
     element_by_variable = {
         item.variable_name: item.element_id for item in technical_spec.objects if item.variable_name
+    }
+    variable_by_element = {
+        item.element_id: item.variable_name for item in technical_spec.objects if item.variable_name
     }
     required_export_variables = {
         item.variable_name
@@ -422,6 +1280,12 @@ def validate_animation_lifecycle(
         for item in technical_spec.objects
         if item.element_id in removed_ids and item.variable_name
     }
+    optional_variables = set(object_by_variable) - required_export_variables
+    initially_active_variables = {
+        item.variable_name
+        for item in technical_spec.objects
+        if item.initially_active and item.variable_name
+    }
 
     defined: set[str] = set()
     aliases: dict[str, set[str]] = {}
@@ -430,7 +1294,23 @@ def validate_animation_lifecycle(
         for item in technical_spec.objects
         if item.initially_active and item.variable_name
     }
+    ever_active: set[str] = set(active)
     seen_assignments: set[str] = set()
+    mobject_states: dict[str, str] = {}
+    group_add_lines: dict[str, list[int]] = {}
+    for candidate in ast.walk(construct):
+        if (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Attribute)
+            and candidate.func.attr == "add"
+            and isinstance(candidate.func.value, ast.Name)
+            and candidate.args
+        ):
+            group_add_lines.setdefault(candidate.func.value.id, []).append(candidate.lineno)
+    used_event_ids: set[str] = set()
+    event_actual_objects: dict[str, set[str]] = {}
+    scene_added: set[str] = set()
+    markers_required = bool(technical_spec.animations)
 
     def mapped(names: set[str]) -> set[str]:
         result: set[str] = set()
@@ -446,19 +1326,24 @@ def validate_animation_lifecycle(
             pending.extend(aliases.get(name, ()))
         return result
 
-    def require_defined(names: set[str], location: int, operation: str) -> None:
+    def require_defined(names: set[str], location: int, description: str) -> None:
         missing = names - defined
         if missing:
             errors.append(
-                f"第 {location} 行 {operation} 使用了尚未定义的对象: " + ", ".join(sorted(missing))
+                f"第 {location} 行 {description} 使用了尚未定义的对象: "
+                + ", ".join(sorted(missing))
             )
+
+    def contract_variables(event, field_name: str) -> set[str]:
+        ids = getattr(event, field_name)
+        return {
+            variable_by_element[element_id]
+            for element_id in ids
+            if element_id in variable_by_element
+        }
 
     for node in _statement_nodes(construct):
         if isinstance(node, (ast.For, ast.AsyncFor)):
-            # 循环变量在 Python 中会在第一次迭代前绑定。生成代码中常用
-            # ``for formula in formulas: Write(formula)``，忽略这个绑定
-            # 会把合法的循环体误报为“Write 使用未定义对象”。这里只
-            # 记录变量名，不执行迭代器或循环体。
             loop_names = _root_names(node.target)
             defined.update(loop_names)
             seen_assignments.update(loop_names)
@@ -466,6 +1351,16 @@ def validate_animation_lifecycle(
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             names = set(_assignment_names(node))
             redefined = names & active & seen_assignments
+            safely_grouped_inherited = {
+                name
+                for name in redefined
+                if name in initially_active_variables
+                and name not in scene_added
+                and isinstance(node.value, ast.Call)
+                and _call_name(node.value) == "VGroup"
+                and name in {root for argument in node.value.args for root in _root_names(argument)}
+            }
+            redefined -= safely_grouped_inherited
             if redefined:
                 errors.append(
                     f"第 {node.lineno} 行重定义仍处于 active 的对象: "
@@ -473,6 +1368,16 @@ def validate_animation_lifecycle(
                 )
             defined.update(names)
             seen_assignments.update(names)
+            state = (
+                _mobject_state(node.value, mobject_states)
+                if isinstance(node, ast.Assign) or node.value is not None
+                else "unknown"
+            )
+            for name in names:
+                if state != "unknown":
+                    mobject_states[name] = state
+                else:
+                    mobject_states.pop(name, None)
             for alias, roots in _assignment_aliases(node).items():
                 aliases[alias] = roots
             continue
@@ -499,54 +1404,291 @@ def validate_animation_lifecycle(
             mapped_names = mapped(names)
             if method == "add":
                 active.update(mapped_names)
+                ever_active.update(mapped_names)
+                scene_added.update(mapped_names)
             else:
                 active.difference_update(mapped_names)
             continue
 
         if method != "play":
             continue
+
+        marker_id = _marker_before_line(lines, node.lineno)
+        event = event_by_id.get(marker_id or "")
+        repeated_marker = False
+        if marker_id is None and markers_required:
+            errors.append(
+                f"第 {node.lineno} 行 self.play() 缺少语义事件标记；"
+                "请在上一行写 # KD1_ANIMATION_EVENT: <event_id>"
+            )
+        elif marker_id is not None:
+            repeated_marker = marker_id in used_event_ids
+            used_event_ids.add(marker_id)
+            if event is None and not marker_id.startswith(_AUTO_EVENT_PREFIX):
+                errors.append(
+                    f"第 {node.lineno} 行动画事件标记未在 TechnicalSpec 中声明: {marker_id}"
+                )
+
+        invocations: list[_AnimationInvocation] = []
         for argument in node.args:
-            for invocation in _animation_invocations(argument):
-                source_names = set(invocation.source_names)
-                target_names = set(invocation.target_names)
-                require_defined(source_names | target_names, node.lineno, invocation.operation)
+            invocations.extend(_animation_invocations(argument))
+        if not invocations and node.args:
+            invocations.append(_AnimationInvocation("unknown:expression", unknown=True))
+
+        # Flash/Indicate/Circumscribe/Wiggle 会在构造动画时读取目标的几何
+        # 中心；空 VGroup 会直接触发 shapes (0,) 与 (3,) 的广播错误。
+        # 对明确的空 group 阻断候选，对条件列表/未知别名只记录风险，
+        # 让 dry-run 追加 Smoke Render，而不是把合法的新动画 API 拒之门外。
+        for animation_node in ast.walk(node):
+            if not isinstance(animation_node, ast.Call):
+                continue
+            animation_name = _call_name(animation_node)
+            if animation_name not in _POINT_SENSITIVE_ANIMATIONS or not animation_node.args:
+                continue
+            target_names = _root_names(animation_node.args[0])
+            for target_name in sorted(target_names):
+                target_state = mobject_states.get(target_name, "unknown")
+                if any(line < node.lineno for line in group_add_lines.get(target_name, [])):
+                    target_state = "nonempty"
+                if target_state == "empty":
+                    errors.append(
+                        f"第 {node.lineno} 行 {animation_name} 的目标 {target_name} 是空 Mobject；"
+                        "请构造至少一个点/线/图形，或在目标为空时跳过该动画"
+                    )
+                elif target_state in {"maybe_empty", "unknown"}:
+                    detail = (
+                        f"[runtime-risk] 第 {node.lineno} 行 {animation_name} 的目标 "
+                        f"{target_name} 可能没有几何点；请避免把空 VGroup 传给指示动画"
+                    )
+                    warnings.append(detail)
+                    unknown_animations.append(detail)
+
+        if repeated_marker and event is not None and event.semantic_action == "introduce":
+            # 一个“首次展示后再变换”的复合引入阶段可能合理地使用
+            # 同一 marker 两次，但第二次必须是对已经 active 对象的原地
+            # 更新，不能再次 FadeIn/Create 一个新对象。这个判断放在
+            # 解析实际调用之后，避免把合法的 Transform 误判成重复引入。
+            has_introducer = any(invocation.operation in _INTRODUCERS for invocation in invocations)
+            if has_introducer:
+                errors.append(f"第 {node.lineno} 行重复使用动画事件标记: {marker_id}")
+
+        for invocation in invocations:
+            source_names = set(invocation.source_names)
+            target_names = set(invocation.target_names)
+            if invocation.operation == "camera":
+                continue
+            require_defined(
+                source_names | target_names,
+                node.lineno,
+                invocation.operation,
+            )
+            if invocation.unknown:
+                detail = f"第 {node.lineno} 行 {invocation.operation}"
+                unknown_animations.append(detail)
+                warnings.append(
+                    f"[unknown-animation] {detail} 未被生命周期分析器识别，"
+                    f"按事件 {marker_id or '未标记'} 的语义合同继续"
+                )
+
+            # 对少量能可靠识别参数角色的调用保留安全检查；未知调用
+            # 不猜测 source/target，不因新动画名称而误报。
+            if not invocation.unknown and invocation.operation in _REMOVERS | _TRANSFORMS | {
+                "animate"
+            }:
                 source_mapped = mapped(source_names)
-                target_mapped = mapped(target_names)
-                if invocation.operation in _INTRODUCERS:
-                    duplicate = target_mapped & active
-                    if duplicate:
-                        errors.append(
-                            f"第 {node.lineno} 行 {invocation.operation} 重复引入 active 对象: "
-                            + ", ".join(sorted(duplicate))
-                        )
-                    active.update(target_mapped or source_mapped)
-                elif invocation.operation in _REMOVERS:
-                    missing = source_mapped - active
-                    if missing:
-                        errors.append(
-                            f"第 {node.lineno} 行 {invocation.operation} 作用于未 active 对象: "
-                            + ", ".join(sorted(missing))
-                        )
-                    active.difference_update(source_mapped)
-                elif invocation.operation in _TRANSFORMS:
-                    missing = source_mapped - active
-                    if missing:
-                        errors.append(
+                missing = source_mapped - active
+                previously_removed = {
+                    name for name in missing if name in ever_active and name in optional_variables
+                }
+                if previously_removed:
+                    warnings.append(
+                        f"第 {node.lineno} 行 {invocation.operation} 重复作用于已退出的可选对象: "
+                        + ", ".join(sorted(previously_removed))
+                    )
+                    missing -= previously_removed
+                if missing:
+                    if invocation.operation == "animate":
+                        message = f"第 {node.lineno} 行 animate 作用于未 active 对象: "
+                    else:
+                        message = (
                             f"第 {node.lineno} 行 {invocation.operation} 的 source 未 active: "
-                            + ", ".join(sorted(missing))
                         )
-                    if invocation.operation == "ReplacementTransform":
+                    errors.append(message + ", ".join(sorted(missing)))
+
+        if event is None:
+            # 仅用于没有技术事件的独立生命周期检查，或窄范围自动修复。
+            # 有事件的正式候选在上面已经报告未声明 marker；不再猜测状态。
+            if marker_id is None and not markers_required:
+                for invocation in invocations:
+                    source_mapped = mapped(set(invocation.source_names))
+                    target_mapped = mapped(set(invocation.target_names))
+                    if invocation.operation in _INTRODUCERS:
+                        active.update(target_mapped or source_mapped)
+                    elif invocation.operation in _REMOVERS:
+                        active.difference_update(source_mapped)
+                    elif invocation.operation == "ReplacementTransform":
                         active.difference_update(source_mapped)
                         active.update(target_mapped)
-                    # Transform 原地修改 source；target 是目标快照，不能在
-                    # 后续事件中当成已经加入 Scene 的对象。
-                elif invocation.operation == "animate":
-                    missing = source_mapped - active
+                    elif invocation.unknown:
+                        # 没有技术事件时无法判断未知动画是入场还是原地
+                        # 更新；保守地把它的参数视为可能被引入的对象。
+                        active.update(source_mapped)
+            elif marker_id is not None and marker_id.startswith(_AUTO_EVENT_PREFIX):
+                # 后备代码/窄范围自动修复使用的 marker 不属于技术计划，
+                # 但其状态变化仍按实际参数做最小、可验证的模拟。
+                auto_sources = mapped(
+                    {name for invocation in invocations for name in invocation.source_names}
+                )
+                if marker_id.startswith("__auto_remove"):
+                    missing = auto_sources - active
                     if missing:
                         errors.append(
-                            f"第 {node.lineno} 行 animate 作用于未 active 对象: "
+                            f"第 {node.lineno} 行自动 remove 作用于未 active 对象: "
                             + ", ".join(sorted(missing))
                         )
+                    active.difference_update(auto_sources)
+                elif marker_id.startswith("__auto_introduce"):
+                    active.update(auto_sources)
+                elif marker_id.startswith("__auto_update"):
+                    missing = auto_sources - active
+                    if missing:
+                        errors.append(
+                            f"第 {node.lineno} 行自动 update 作用于未 active 对象: "
+                            + ", ".join(sorted(missing))
+                        )
+            continue
+
+        action = event.semantic_action
+        event_sources = contract_variables(event, "source_element_ids")
+        event_targets = contract_variables(event, "target_element_ids")
+        event_creates = contract_variables(event, "create_element_ids")
+        event_removes = contract_variables(event, "remove_element_ids")
+        actual_sources = mapped({name for call in invocations for name in call.source_names})
+        actual_targets = mapped({name for call in invocations for name in call.target_names})
+        expected = event_sources | event_targets | event_creates | event_removes
+        event_actual_objects.setdefault(event.event_id, set()).update(
+            actual_sources | actual_targets
+        )
+        already_exited_optional = {
+            name
+            for name in expected
+            if name in ever_active and name not in active and name in optional_variables
+        }
+        missing_expected = expected - (actual_sources | actual_targets) - already_exited_optional
+        if missing_expected and action not in {"remove", "hold", "update"}:
+            errors.append(
+                f"第 {node.lineno} 行事件 {event.event_id} 未操作合同对象: "
+                + ", ".join(sorted(missing_expected))
+            )
+        actual_exits = mapped(
+            {
+                name
+                for call in invocations
+                if call.operation in _REMOVERS or call.operation == "ReplacementTransform"
+                for name in call.source_names
+            }
+        )
+        if actual_exits and action != "remove":
+            protected_exits = actual_exits & required_export_variables
+            unexpected_exits = actual_exits - protected_exits
+            if protected_exits:
+                errors.append(
+                    f"第 {node.lineno} 行实际退出必需导出对象与 {action} 语义不符: "
+                    + ", ".join(sorted(protected_exits))
+                )
+            elif action == "introduce" and unexpected_exits <= optional_variables:
+                warnings.append(
+                    f"第 {node.lineno} 行 introduce 同时退出可选对象（视为交叉淡出）: "
+                    + ", ".join(sorted(unexpected_exits))
+                )
+            else:
+                errors.append(f"第 {node.lineno} 行实际退出对象与 {action} 语义不符")
+            active.difference_update(actual_exits)
+        if action == "introduce":
+            missing = event_sources & active
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 introduce source 已 active: " + ", ".join(sorted(missing))
+                )
+            introduced = event_targets | event_creates
+            if introduced - defined:
+                require_defined(introduced - defined, node.lineno, "introduce")
+            introduced_active = introduced & (actual_sources | actual_targets)
+            active.update(introduced_active)
+            ever_active.update(introduced_active)
+        elif action == "update":
+            missing = event_sources - active
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 update source 未 active: " + ", ".join(sorted(missing))
+                )
+            if event_sources and not (event_sources & actual_sources):
+                errors.append(
+                    f"第 {node.lineno} 行 update 未操作任何合同 source: "
+                    + ", ".join(sorted(event_sources))
+                )
+            if event_creates:
+                errors.append(
+                    f"第 {node.lineno} 行 update 不能引入对象: " + ", ".join(sorted(event_creates))
+                )
+            if event_removes:
+                errors.append(
+                    f"第 {node.lineno} 行 update 不能移除对象: " + ", ".join(sorted(event_removes))
+                )
+        elif action == "remove":
+            exit_names = event_sources | event_removes
+            missing = exit_names - active
+            previously_removed = {
+                name for name in missing if name in ever_active and name in optional_variables
+            }
+            if previously_removed:
+                warnings.append(
+                    f"第 {node.lineno} 行 remove 重复退出可选对象: "
+                    + ", ".join(sorted(previously_removed))
+                )
+                missing -= previously_removed
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 remove 作用于未 active 对象: "
+                    + ", ".join(sorted(missing))
+                )
+            active.difference_update(exit_names)
+        elif action == "hold":
+            missing = event_sources - active
+            if missing:
+                errors.append(
+                    f"第 {node.lineno} 行 hold source 未 active: " + ", ".join(sorted(missing))
+                )
+        elif action == "camera":
+            # 相机事件不改变 Mobject 状态。
+            pass
+
+    # 清理事件可能被 Coder 拆成多个连续的 self.play；此时按同一 marker
+    # 的实际对象并集检查，而不是要求每一段重复操作整个合同集合。
+    for event_id, event in event_by_id.items():
+        if event.semantic_action != "remove":
+            continue
+        expected = {
+            variable_by_element[element_id]
+            for element_id in (*event.source_element_ids, *event.remove_element_ids)
+            if element_id in variable_by_element
+        }
+        actual = event_actual_objects.get(event_id, set())
+        already_exited_optional = {
+            name
+            for name in expected
+            if name in ever_active and name not in active and name in optional_variables
+        }
+        missing = expected - actual - already_exited_optional
+        if missing:
+            errors.append(f"事件 {event_id} 未操作合同对象: " + ", ".join(sorted(missing)))
+
+    if markers_required:
+        unused = set(event_by_id) - used_event_ids
+        if unused:
+            warnings.append(
+                "TechnicalSpec 中没有在代码中找到对应 marker 的事件: " + ", ".join(sorted(unused))
+            )
 
     missing_exports = required_export_variables - active
     if missing_exports:
@@ -582,4 +1724,36 @@ def validate_animation_lifecycle(
 
     deduped_errors = tuple(dict.fromkeys(errors))
     deduped_warnings = tuple(dict.fromkeys(warnings))
-    return LifecycleValidationResult(not deduped_errors, deduped_errors, deduped_warnings)
+    return LifecycleValidationResult(
+        not deduped_errors,
+        deduped_errors,
+        deduped_warnings,
+        tuple(dict.fromkeys(unknown_animations)),
+    )
+
+
+def detect_unknown_animations(
+    code: str,
+    technical_spec: TechnicalSpec,
+    *,
+    renderer: str | None = None,
+) -> tuple[str, ...]:
+    """返回无法由静态分析器识别的动画调用位置。
+
+    这是诊断信息，不代表代码无效；调用方可据此开启额外 Smoke Render。
+    """
+
+    return validate_animation_lifecycle(code, technical_spec, renderer=renderer).unknown_animations
+
+
+__all__ = [
+    "LifecycleValidationResult",
+    "detect_unknown_animations",
+    "repair_initial_active_alias_lifecycle",
+    "repair_missing_animation_markers",
+    "repair_removed_active_lifecycle",
+    "repair_required_export_alias_lifecycle",
+    "repair_required_export_replacement_lifecycle",
+    "repair_required_export_transform_alias_lifecycle",
+    "validate_animation_lifecycle",
+]

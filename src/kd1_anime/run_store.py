@@ -15,7 +15,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kd1_anime.agents.capability import CapabilityContract
 from kd1_anime.agents.planner import (
@@ -31,7 +31,7 @@ from kd1_anime.agents.state_ledger import StateLedger
 from kd1_anime.agents.technical_planner import TechnicalSpec
 from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.cluster.slurm import SlurmJob
-from kd1_anime.config import resolve_runtime_path
+from kd1_anime.config import GenerationMode, resolve_runtime_path
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.rendering import (
     MergeProfile,
@@ -39,10 +39,11 @@ from kd1_anime.rendering import (
     SceneArtifact,
     VideoMetadata,
 )
+from kd1_anime.verification import ExecutionVerification, StaticVerification, VisualVerification
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 7
-READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7})
+MANIFEST_SCHEMA_VERSION = 8
+READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8})
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -234,7 +235,7 @@ class StoredSlurmJob(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str = Field(pattern=r"^\d+$")
+    job_id: str = Field(pattern=r"^(?:\d+|local-[0-9a-f]{12})$")
     scene_id: int = Field(ge=1)
     script_path: str
     log_out: str
@@ -251,6 +252,7 @@ class StoredSlurmJob(BaseModel):
     output_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     elapsed_seconds: float | None = Field(default=None, ge=0)
     status: str = Field(min_length=1, max_length=100)
+    backend: Literal["slurm", "local"] = "slurm"
     failure_reason: str = Field(default="", max_length=50_000)
     cancelled: bool = False
     environment_fingerprint: dict[str, str] = Field(default_factory=dict, max_length=20)
@@ -267,6 +269,9 @@ class VisualEvalProfile(BaseModel):
     frame_count: int = Field(default=6, ge=1, le=8)
     threshold: float = Field(default=3.5, ge=1.0, le=5.0)
     max_fix_attempts: int = Field(default=2, ge=0, le=5)
+    # 本次运行是否允许视觉评估驱动 Planner/Coder 修复；旧清单默认保持
+    # strict 兼容，由 Orchestrator 再结合 generation_mode 和配置判定。
+    repair_enabled: bool = True
     evaluator_version: Literal["1"] = "1"
 
     def digest(self) -> str:
@@ -315,6 +320,35 @@ class StoredCodeCandidate(BaseModel):
 class StoredSceneState(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def mark_legacy_technical_contract(cls, value: object) -> object:
+        """读取旧技术合同但绝不按新语义猜测其生命周期。
+
+        旧清单仍可用于 ``status`` 诊断；恢复会由 ``validate_for_resume``
+        明确拒绝，避免旧的 concrete operation 被静默解释为 semantic_action。
+        """
+
+        if not isinstance(value, dict):
+            return value
+        technical = value.get("technical_spec")
+        if technical is None:
+            return value
+        version = (
+            technical.get("contract_version")
+            if isinstance(technical, dict)
+            else getattr(technical, "contract_version", None)
+        )
+        if version == 2:
+            return value
+        updated = dict(value)
+        updated["technical_spec"] = None
+        updated["technical_spec_sha256"] = ""
+        updated["technical_input_sha256"] = ""
+        updated["technical_status"] = "pending"
+        updated["technical_contract_stale"] = True
+        return updated
+
     plan: ScenePlan
     code_file: str = ""
     code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
@@ -330,6 +364,9 @@ class StoredSceneState(BaseModel):
     plan_review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
     identical_plan_review_count: int = Field(default=0, ge=0)
     technical_spec: TechnicalSpec | None = None
+    technical_contract_stale: bool = False
+    unknown_animation_detected: bool = False
+    unknown_animation_details: list[str] = Field(default_factory=list, max_length=30)
     technical_spec_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     technical_input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     technical_status: TechnicalStatus = "pending"
@@ -337,6 +374,9 @@ class StoredSceneState(BaseModel):
     capability_contract: CapabilityContract | None = None
     capability_status: str = Field(default="pending", max_length=40)
     resource_profile: RenderResourceProfile | None = None
+    static_verification: StaticVerification = Field(default_factory=StaticVerification)
+    execution_verification: ExecutionVerification = Field(default_factory=ExecutionVerification)
+    visual_verification: VisualVerification = Field(default_factory=VisualVerification)
     local_smoke_status: LocalSmokeStatus = "pending"
     rewrite_feedback: str = Field(default="", max_length=50_000)
     review_signature: str = Field(default="", pattern=r"^(?:[0-9a-f]{16})?$")
@@ -394,7 +434,7 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[4, 5, 6, 7] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[4, 5, 6, 7, 8] = MANIFEST_SCHEMA_VERSION
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -405,6 +445,7 @@ class RunManifest(BaseModel):
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
+    generation_mode: GenerationMode = "relaxed"
     local_smoke_enabled: bool = False
     # Direct ``render`` runs contain user-supplied code and intentionally skip
     # every generation/review LLM stage, including on resume.
@@ -412,6 +453,8 @@ class RunManifest(BaseModel):
     approve_plan: bool = False
     plan_approved: bool = False
     output_path: str
+    # 新运行固定渲染后端；旧 v7 清单缺少该字段时按历史行为兼容为 slurm。
+    backend: Literal["slurm", "local"] = "slurm"
     render_profile: RenderProfile = Field(default_factory=RenderProfile.current)
     merge_profile: MergeProfile = Field(default_factory=MergeProfile.current)
     outlines: list[SceneOutline] = Field(default_factory=list)
@@ -478,6 +521,8 @@ class RunManifest(BaseModel):
                 errors.append(f"Scene key {scene_id} 与 plan.scene_id {scene.plan.scene_id} 不一致")
             if scene.plan_reviewed and not scene.plan_ready:
                 errors.append(f"Scene {scene_id} 标记为 plan_reviewed 但 plan_ready=false")
+            if scene.technical_contract_stale:
+                errors.append(f"Scene {scene_id} 使用旧版 TechnicalSpec 合同，不能按当前语义恢复")
             if scene.technical_status == "passed":
                 if scene.technical_spec is None:
                     errors.append(f"Scene {scene_id} 标记为 technical passed 但缺少 TechnicalSpec")
@@ -499,6 +544,37 @@ class RunManifest(BaseModel):
                 scene.technical_spec_sha256 or scene.technical_input_sha256
             ):
                 errors.append(f"Scene {scene_id} 存在 TechnicalSpec 哈希但缺少 TechnicalSpec")
+            static = scene.static_verification
+            if static.status == "passed":
+                if not scene.code_sha256 or static.code_sha256 != scene.code_sha256:
+                    errors.append(f"Scene {scene_id} 的静态验证代码哈希不一致")
+                if (
+                    scene.technical_spec_sha256
+                    and static.technical_spec_sha256
+                    and static.technical_spec_sha256 != scene.technical_spec_sha256
+                ):
+                    errors.append(f"Scene {scene_id} 的静态验证 TechnicalSpec 哈希不一致")
+            execution = scene.execution_verification
+            if execution.status == "passed" and execution.scope == "formal_video":
+                if not scene.rendered or scene.artifact is None:
+                    errors.append(f"Scene {scene_id} 正式执行验证通过但没有渲染产物")
+                elif execution.artifact_sha256 != scene.artifact.video_sha256:
+                    errors.append(f"Scene {scene_id} 的正式执行验证视频哈希不一致")
+            if (
+                execution.status == "passed"
+                and execution.code_sha256
+                and scene.code_sha256
+                and execution.code_sha256 != scene.code_sha256
+            ):
+                errors.append(f"Scene {scene_id} 的执行验证代码哈希不一致")
+            visual_receipt = scene.visual_verification
+            if visual_receipt.status in {"passed", "warning", "unknown"}:
+                if not scene.rendered or scene.artifact is None:
+                    errors.append(f"Scene {scene_id} 视觉验证为终态但没有渲染产物")
+                if visual_receipt.artifact_sha256 != (
+                    scene.artifact.video_sha256 if scene.artifact else ""
+                ):
+                    errors.append(f"Scene {scene_id} 的视觉验证视频哈希不一致")
             if scene.rendered and scene.artifact is None:
                 errors.append(f"Scene {scene_id} 标记为 rendered 但缺少 artifact")
             if scene.reviewed and not scene.code_file:
@@ -521,6 +597,11 @@ class RunManifest(BaseModel):
                     errors.append(f"Scene {scene_id} 的 artifact 渲染配置哈希不一致")
                 if artifact.origin == "rendered" and artifact.source_run_id != self.run_id:
                     errors.append(f"Scene {scene_id} 的 rendered artifact 来源运行不一致")
+                if artifact.backend != self.backend:
+                    errors.append(
+                        f"Scene {scene_id} 的 artifact 后端 {artifact.backend} "
+                        f"与运行后端 {self.backend} 不一致"
+                    )
                 if scene.code_sha256 and artifact.code_sha256 != scene.code_sha256:
                     errors.append(f"Scene {scene_id} 的 artifact 代码哈希不一致")
             if scene.slurm_job is not None:
@@ -529,6 +610,11 @@ class RunManifest(BaseModel):
                     errors.append(f"Scene {scene_id} 的 Slurm Job 场景 ID 不一致")
                 if scene.code_sha256 and job.code_sha256 != scene.code_sha256:
                     errors.append(f"Scene {scene_id} 的 Slurm Job 代码哈希不一致")
+                if job.backend != self.backend:
+                    errors.append(
+                        f"Scene {scene_id} 的 Job 后端 {job.backend} "
+                        f"与运行后端 {self.backend} 不一致"
+                    )
             if scene.visual_status in {"passed", "warning", "unknown"} and not scene.rendered:
                 errors.append(f"Scene {scene_id} 视觉状态为 {scene.visual_status} 但没有渲染产物")
             if bool(scene.visual_report_file) != bool(scene.visual_report_sha256):
@@ -553,6 +639,16 @@ class RunManifest(BaseModel):
                     errors.append(f"Scene {scene_id} 的最佳视觉候选代码哈希不一致")
                 if candidate.slurm_job and candidate.slurm_job.code_sha256 != candidate.code_sha256:
                     errors.append(f"Scene {scene_id} 的最佳视觉候选 Job 代码哈希不一致")
+                if candidate.artifact.backend != self.backend:
+                    errors.append(
+                        f"Scene {scene_id} 的最佳视觉候选产物后端 "
+                        f"{candidate.artifact.backend} 与运行后端 {self.backend} 不一致"
+                    )
+                if candidate.slurm_job and candidate.slurm_job.backend != self.backend:
+                    errors.append(
+                        f"Scene {scene_id} 的最佳视觉候选 Job 后端 "
+                        f"{candidate.slurm_job.backend} 与运行后端 {self.backend} 不一致"
+                    )
                 if candidate.slurm_job and (
                     candidate.slurm_job.render_profile.digest() != self.render_profile.digest()
                 ):
@@ -729,6 +825,7 @@ def store_slurm_job(job: SlurmJob, root: Path) -> StoredSlurmJob:
         output_sha256=job.output_sha256,
         elapsed_seconds=job.elapsed_seconds,
         status=job.status,
+        backend=job.backend,
         failure_reason=job.failure_reason,
         cancelled=job.cancelled,
         environment_fingerprint=dict(job.environment_fingerprint),
@@ -759,7 +856,20 @@ def restore_slurm_job(stored: StoredSlurmJob, root: Path) -> SlurmJob:
         cancelled=stored.cancelled,
         environment_fingerprint=dict(stored.environment_fingerprint),
         environment_warning=stored.environment_warning,
+        backend=stored.backend,
     )
+
+
+# 新代码使用 RenderJob 语义；保留旧名字读取已有 v7 manifest 和第三方集成。
+StoredRenderJob = StoredSlurmJob
+
+
+def store_render_job(job: SlurmJob, root: Path) -> StoredRenderJob:
+    return store_slurm_job(job, root)
+
+
+def restore_render_job(stored: StoredRenderJob, root: Path) -> SlurmJob:
+    return restore_slurm_job(stored, root)
 
 
 def atomic_write_text(path: Path, payload: str, *, mode: int = 0o600) -> None:
@@ -972,11 +1082,21 @@ def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
 
 
 def migrate_manifest_data(raw: dict, root: Path) -> dict:
-    """读取 v4-v7 清单；旧版本只允许查看，不进行猜测迁移。"""
+    """读取旧清单；仅迁移不改变语义的 v7 -> v8 字段升级。
+
+    v8 只新增了可选的 generation_mode，v7 已经使用当前的语义动画
+    合同和合并配置，因此可以安全补默认值。更早版本仍保持只读，避免
+    把旧的具体动画合同或缺失教学状态静默解释成当前格式。
+    """
 
     version = raw.get("schema_version", 1)
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
+    if version == 7 and MANIFEST_SCHEMA_VERSION == 8:
+        migrated = dict(raw)
+        migrated["schema_version"] = 8
+        migrated.setdefault("generation_mode", "relaxed")
+        return migrated
     if version in READABLE_MANIFEST_SCHEMA_VERSIONS:
         if version >= 5:
             required_fields = {"lesson_spec", "teaching_graph", "state_ledger"}
