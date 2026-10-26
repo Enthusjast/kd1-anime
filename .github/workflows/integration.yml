@@ -33,24 +33,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "manim==0.20.1"
-          python -m pip install -e .
-      - name: Render a real CJK and MathTex scene
-        run: |
-          rm -rf "$RUNNER_TEMP/kd1-anime-media"
-          python -m manim render \
-            --renderer=cairo \
-            -ql \
-            --resolution 320,180 \
-            --fps 15 \
-            --disable_caching \
-            --media_dir "$RUNNER_TEMP/kd1-anime-media" \
-            tests/fixtures/integration_scene.py IntegrationScene
-          video="$(find "$RUNNER_TEMP/kd1-anime-media" -type f -name 'IntegrationScene.mp4' -print -quit)"
-          test -n "$video"
-          test -s "$video"
-          ffprobe -v error \
-            -show_entries stream=width,height,avg_frame_rate \
-            -of default=nw=1 "$video"
+          python -m pip install -e . build
+      - name: Render trusted fixed scenes through the run lifecycle
+        run: python tools/render_trusted_scenes.py
+      - name: Preserve trusted execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusted-local-render
+          path: /tmp/kd1-trusted-render-*/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Run Manim health check and recipe corpus
         run: |
           manim checkhealth

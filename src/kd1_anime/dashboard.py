@@ -755,9 +755,7 @@ class SceneDashboard:
         warnings = sum(1 for s in self.scenes.values() if s.state == "warning")
         static_verified = sum(s.static_verification == "passed" for s in self.scenes.values())
         execution_verified = sum(s.execution_verification == "passed" for s in self.scenes.values())
-        visual_verified = sum(
-            s.visual_verification in {"passed", "warning", "unknown"} for s in self.scenes.values()
-        )
+        visual_verified = sum(s.visual_verification == "passed" for s in self.scenes.values())
 
         header = Text()
         header.append(f"  {self.stage_label or '流水线'}  ", style="bold white")

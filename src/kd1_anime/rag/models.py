@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
+
+from kd1_anime.models import ValidatedModel as BaseModel
 
 RagStatus = Literal["disabled", "active", "degraded"]
 

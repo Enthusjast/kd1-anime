@@ -140,12 +140,10 @@ def rag_search(
 
 
 def _ensure_llm_api_available() -> None:
-    """在进入会话/流水线前验证 LLM 配置、网络和模型路由。"""
-
-    from kd1_anime.agents.base import BaseAgent
+    """检查配置；运行端点探测在私有清单建立后计入请求预算。"""
 
     try:
-        BaseAgent().check_api_available()
+        settings.main_llm_profile().require()
     except Exception as exc:
         console.print(f"LLM API 不可用: {exc}", style="bold red", markup=False)
         raise typer.Exit(1) from exc
@@ -165,6 +163,8 @@ def _ensure_visual_llm_api_available(
     except Exception as exc:
         console.print(f"视觉 LLM 配置不可用: {exc}", style="bold red", markup=False)
         raise typer.Exit(1) from exc
+    if not endpoint_required:
+        return True
     try:
         VisualEvaluator(model_override).check_api_available()
     except Exception as exc:
@@ -435,9 +435,11 @@ def generate(
     try:
         # 纯渲染监控、合并或已完成运行不需要重新调用 LLM；恢复命令应能在
         # 用户暂时未配置 API Key 时继续处理已有代码和远端 Job。
+        if incremental:
+            RunRepository(settings.WORKSPACE_DIR).load_for_resume(incremental)
         requires_llm = not resume
         if resume:
-            manifest = RunRepository(settings.WORKSPACE_DIR).load(resume)
+            manifest = RunRepository(settings.WORKSPACE_DIR).load_for_resume(resume)
             # 恢复任务的 dry-run 属性以 manifest 为准；不能因为用户省略
             # --dry-run 就把 dry-run 运行误报为普通视频生成成功。
             dry_run = manifest.dry_run
@@ -862,7 +864,7 @@ def resume(
 
     repository = RunRepository(settings.WORKSPACE_DIR)
     try:
-        manifest = repository.load(run_id)
+        manifest = repository.load_for_resume(run_id)
         if _manifest_requires_generation_apis(manifest):
             _ensure_llm_api_available()
             _ensure_rag_apis_available()
@@ -905,7 +907,7 @@ def retry(
 
     repository = RunRepository(settings.WORKSPACE_DIR)
     try:
-        manifest = repository.load(run_id)
+        manifest = repository.load_for_resume(run_id)
         if manifest.dry_run:
             raise ValueError("dry-run 运行请使用 resume，而不是 retry")
         if _manifest_requires_generation_apis(manifest):

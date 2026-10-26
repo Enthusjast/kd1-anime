@@ -574,12 +574,20 @@ class ChatSession:
 
         try:
             orchestrator = Orchestrator()
-            final_video = orchestrator.run(
-                prompt,
-                callback=callback,
-                dry_run=self.dry_run,
-                interactive=True,
-            )
+            from kd1_anime.events import BufferedCallback
+
+            def resync():
+                snapshot = orchestrator._committed_context
+                if snapshot is not None:
+                    orchestrator._emit_scene_snapshot(snapshot)
+
+            with BufferedCallback(callback, resync=resync) as buffered:
+                final_video = orchestrator.run(
+                    prompt,
+                    callback=buffered,
+                    dry_run=self.dry_run,
+                    interactive=True,
+                )
             if dashboard_active:
                 dashboard.stop()
             self._show_completion(final_video, dry_run=self.dry_run)

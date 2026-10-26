@@ -15,10 +15,15 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, create_model, field_validator, model_validator
 
-from kd1_anime.agents.capability import CapabilityContract
-from kd1_anime.agents.planner import (
+from kd1_anime.cluster.resource_estimator import RenderResourceProfile
+from kd1_anime.cluster.slurm import SlurmJob
+from kd1_anime.config import GenerationMode, resolve_runtime_path, settings
+from kd1_anime.domain.capability import CapabilityContract
+from kd1_anime.domain.dependencies import DependencyGraph
+from kd1_anime.domain.execution import RETRY_LIMIT_NAMES, RunPhase, StageAttempts, SubmissionAttempt
+from kd1_anime.domain.planning import (
     ContinuityBible,
     ElementManifest,
     ExtractedElement,
@@ -27,11 +32,10 @@ from kd1_anime.agents.planner import (
     ScenePlan,
     TeachingGraph,
 )
-from kd1_anime.agents.state_ledger import StateLedger
-from kd1_anime.agents.technical_planner import TechnicalSpec
-from kd1_anime.cluster.resource_estimator import RenderResourceProfile
-from kd1_anime.cluster.slurm import SlurmJob
-from kd1_anime.config import GenerationMode, resolve_runtime_path
+from kd1_anime.domain.runtime import ExecutionSpec, RunConfig
+from kd1_anime.domain.state_ledger import StateLedger
+from kd1_anime.domain.technical import TechnicalSpec
+from kd1_anime.models import ValidatedModel as BaseModel
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.rendering import (
     MergeProfile,
@@ -39,11 +43,12 @@ from kd1_anime.rendering import (
     SceneArtifact,
     VideoMetadata,
 )
+from kd1_anime.request_budget import RequestBudget
 from kd1_anime.verification import ExecutionVerification, StaticVerification, VisualVerification
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 8
-READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8})
+MANIFEST_SCHEMA_VERSION = 10
+READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10})
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -235,6 +240,7 @@ class StoredSlurmJob(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    execution_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     job_id: str = Field(pattern=r"^(?:\d+|local-[0-9a-f]{12})$")
     scene_id: int = Field(ge=1)
     script_path: str
@@ -310,7 +316,7 @@ class StoredCodeCandidate(BaseModel):
     code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     class_name: str = Field(min_length=1, max_length=200)
     verification: CandidateVerification = "validated"
-    inherited_elements_sha256: str = Field(default="", max_length=64)
+    inherited_elements_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     exported_elements_code: str = Field(default="", max_length=30_000)
     exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
     artifact: SceneArtifact | None = None
@@ -349,7 +355,13 @@ class StoredSceneState(BaseModel):
         updated["technical_contract_stale"] = True
         return updated
 
+    snapshot: SceneSnapshot | None = None
     plan: ScenePlan
+    revision: int = Field(default=0, ge=0)
+    input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    submission: SubmissionAttempt | None = None
+    submission_attempts: list[SubmissionAttempt] = Field(default_factory=list)
+    stage_attempts: list[StageAttempts] = Field(default_factory=list)
     code_file: str = ""
     code_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     class_name: str = Field(default="", max_length=200)
@@ -358,6 +370,7 @@ class StoredSceneState(BaseModel):
     infra_retries: int = Field(default=0, ge=0)
     reviewed: bool = False
     plan_ready: bool = False
+    plan_replan_attempts: int = Field(default=0, ge=0)
     plan_review_round: int = Field(default=0, ge=0)
     plan_reviewed: bool = False
     plan_review_feedback: str = Field(default="", max_length=50_000)
@@ -429,23 +442,92 @@ class StoredSceneState(BaseModel):
     candidates: list[StoredCodeCandidate] = Field(default_factory=list, max_length=3)
 
 
+def scene_field_group(name: str) -> str:
+    if name == "plan" or name.startswith(("plan_", "technical_", "capability_")):
+        return "planning"
+    if "verification" in name or name.startswith(("visual_", "local_smoke")):
+        return "verification"
+    if name in {
+        "submission",
+        "submission_attempts",
+        "slurm_job",
+        "artifact",
+        "rendered",
+        "fix_attempts",
+        "infra_retries",
+        "stage_attempts",
+        "resource_profile",
+    } or name.startswith(("last_", "identical_error", "stagnant_")):
+        return "execution"
+    if name in {
+        "revision",
+        "input_sha256",
+        "phase",
+        "failed",
+        "give_up",
+        "failure_reason",
+        "failure_category",
+    }:
+        return "lifecycle"
+    return "code"
+
+
+# Each nested group uses the exact validated field schemas of the compatibility
+# projection. Rebuilding the full state revalidates all nested model values.
+_groups = {}
+for _group in ("planning", "code", "execution", "verification", "lifecycle"):
+    _groups[_group] = create_model(
+        "Stored" + _group.title(),
+        __config__=ConfigDict(extra="forbid"),
+        **{
+            name: (field.annotation, field)
+            for name, field in StoredSceneState.model_fields.items()
+            if name != "snapshot" and scene_field_group(name) == _group
+        },
+    )
+SceneSnapshot = create_model(
+    "SceneSnapshot",
+    __config__=ConfigDict(extra="forbid"),
+    **{name: (model, ...) for name, model in _groups.items()},
+)
+StoredSceneState.model_rebuild()
+
+
+def scene_snapshot(scene: StoredSceneState):
+    groups = {name: {} for name in _groups}
+    for name, value in scene.model_dump(mode="json", exclude={"snapshot"}).items():
+        groups[scene_field_group(name)][name] = value
+    return SceneSnapshot.model_validate(groups)
+
+
 class RunManifest(BaseModel):
     """版本化运行清单。未知字段会被拒绝，防止静默误读未来格式。"""
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[4, 5, 6, 7, 8] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[4, 5, 6, 7, 8, 9, 10] = MANIFEST_SCHEMA_VERSION
+    run_config: RunConfig = Field(default_factory=RunConfig.capture)
+    execution_spec: ExecutionSpec = Field(default_factory=ExecutionSpec.capture)
+    artifact_refs: dict[str, str] = Field(default_factory=dict)
+    _legacy_raw: dict | None = PrivateAttr(default=None)
     revision: int = Field(default=0, ge=0)
     run_id: str
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
     status: RunStatus = "running"
+    run_phase: RunPhase = "initializing"
     state: FSMState = "INIT"
     user_prompt: str = Field(max_length=1_000_000)
     dry_run: bool = False
     interactive: bool = False
     auto_fix: bool = True
     generation_mode: GenerationMode = "relaxed"
+    request_budget: RequestBudget = Field(default_factory=RequestBudget)
+    dependency_graph: DependencyGraph = Field(default_factory=DependencyGraph)
+    scene_codegen_mode: Literal["llm", "compiler_first"] = "llm"
+    retry_limits: dict[str, int] = Field(
+        default_factory=lambda: {name: getattr(settings, name) for name in RETRY_LIMIT_NAMES}
+    )
     local_smoke_enabled: bool = False
     # Direct ``render`` runs contain user-supplied code and intentionally skip
     # every generation/review LLM stage, including on resume.
@@ -473,10 +555,10 @@ class RunManifest(BaseModel):
     plan_review_cycle_count: int = Field(default=0, ge=0)
     continuity_review_status: Literal["pending", "reviewing", "passed", "warning"] = "passed"
     continuity_review_round: int = Field(default=0, ge=0)
-    # 连续性审查耗尽后，resume 最多自动重查一次；默认值兼容已有清单。
+    # 历史诊断字段；v9 恢复保留计数，不补发连续性修正预算。
     continuity_resume_recheck_used: bool = False
     continuity_warnings: list[str] = Field(default_factory=list, max_length=100)
-    # 并发 worker 造成的检查点乱序只记录诊断，不阻断可恢复运行。
+    # 保留诊断警告；新的非法运行/场景转移会在提交边界拒绝。
     fsm_warnings: list[str] = Field(default_factory=list, max_length=100)
     final_video: str | None = None
     final_video_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
@@ -491,6 +573,37 @@ class RunManifest(BaseModel):
     rag_profile: RagRuntimeProfile = Field(default_factory=RagRuntimeProfile)
     rag_receipts: dict[str, RagReceipt] = Field(default_factory=dict, max_length=256)
     rag_warnings: list[str] = Field(default_factory=list, max_length=100)
+
+    def model_dump(self, **kwargs):
+        if self._legacy_raw is not None:
+            from copy import deepcopy
+
+            return deepcopy(self._legacy_raw)
+        return super().model_dump(**kwargs)
+
+    def model_dump_json(self, **kwargs):
+        if self._legacy_raw is not None:
+            return json.dumps(self._legacy_raw, ensure_ascii=False, indent=kwargs.get("indent"))
+        return super().model_dump_json(**kwargs)
+
+    @field_validator("retry_limits", mode="before")
+    @classmethod
+    def validate_retry_limits(cls, value):
+        if not isinstance(value, dict):
+            return value
+        for name, limit in value.items():
+            if name not in RETRY_LIMIT_NAMES:
+                raise ValueError(f"未知的重试限额 {name}")
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise ValueError(f"重试限额 {name} 必须是整数")
+            for constraint in type(settings).model_fields[name].metadata:
+                minimum = getattr(constraint, "ge", None)
+                maximum = getattr(constraint, "le", None)
+                if (minimum is not None and limit < minimum) or (
+                    maximum is not None and limit > maximum
+                ):
+                    raise ValueError(f"重试限额 {name} 超出配置允许范围")
+        return value
 
     @field_validator("run_id")
     @classmethod
@@ -514,9 +627,43 @@ class RunManifest(BaseModel):
         """
 
         errors: list[str] = []
+        if self.schema_version == MANIFEST_SCHEMA_VERSION:
+            if json.loads(self.execution_spec.render_json) != self.render_profile.model_dump(
+                mode="json"
+            ):
+                errors.append("执行合同与固定渲染配置不一致")
+            errors.extend(self.request_budget.integrity_errors())
+            if set(self.retry_limits) != set(RETRY_LIMIT_NAMES):
+                errors.append("运行缺少完整的重试限额快照或包含未知限额")
+            for name, value in self.retry_limits.items():
+                if isinstance(value, bool) or value < 0:
+                    errors.append(f"重试限额 {name} 必须是非负整数")
+            for edge in self.dependency_graph.bindings:
+                if (
+                    edge.source_scene_id not in self.scenes
+                    or edge.consumer_scene_id not in self.scenes
+                    or edge.source_scene_id >= edge.consumer_scene_id
+                ):
+                    errors.append("依赖绑定引用无效场景或非先行场景")
         if self.schema_version not in READABLE_MANIFEST_SCHEMA_VERSIONS:
             errors.append(f"不支持的 manifest schema_version: {self.schema_version}")
         for scene_id, scene in self.scenes.items():
+            if self.schema_version == MANIFEST_SCHEMA_VERSION:
+                if scene.snapshot is not None and scene.snapshot != scene_snapshot(scene):
+                    errors.append(f"Scene {scene_id} 嵌套状态与兼容投影不一致")
+                attempt_keys = set()
+                for counter in scene.stage_attempts:
+                    key = (counter.operation, counter.input_sha256)
+                    if key in attempt_keys:
+                        errors.append(f"Scene {scene_id} 的阶段尝试计数重复")
+                    attempt_keys.add(key)
+                    limit_name = (
+                        "CODE_VALIDATION_ATTEMPTS"
+                        if counter.operation == "generation"
+                        else "MAX_TECHNICAL_SPEC_ATTEMPTS"
+                    )
+                    if counter.used > self.retry_limits.get(limit_name, 0):
+                        errors.append(f"Scene {scene_id} 的 {counter.operation} 尝试超过原限额")
             if scene.plan.scene_id != scene_id:
                 errors.append(f"Scene key {scene_id} 与 plan.scene_id {scene.plan.scene_id} 不一致")
             if scene.plan_reviewed and not scene.plan_ready:
@@ -568,7 +715,9 @@ class RunManifest(BaseModel):
             ):
                 errors.append(f"Scene {scene_id} 的执行验证代码哈希不一致")
             visual_receipt = scene.visual_verification
-            if visual_receipt.status in {"passed", "warning", "unknown"}:
+            if visual_receipt.status in {"passed", "warning"} or (
+                visual_receipt.status == "unknown" and visual_receipt.artifact_sha256
+            ):
                 if not scene.rendered or scene.artifact is None:
                     errors.append(f"Scene {scene_id} 视觉验证为终态但没有渲染产物")
                 if visual_receipt.artifact_sha256 != (
@@ -808,6 +957,7 @@ def restore_run_path(root: Path, relative: str) -> Path:
 
 def store_slurm_job(job: SlurmJob, root: Path) -> StoredSlurmJob:
     return StoredSlurmJob(
+        execution_sha256=job.execution_sha256,
         job_id=job.job_id,
         scene_id=job.scene_id,
         script_path=_run_relative(root, job.script_path),
@@ -835,6 +985,7 @@ def store_slurm_job(job: SlurmJob, root: Path) -> StoredSlurmJob:
 
 def restore_slurm_job(stored: StoredSlurmJob, root: Path) -> SlurmJob:
     return SlurmJob(
+        execution_sha256=stored.execution_sha256,
         job_id=stored.job_id,
         scene_id=stored.scene_id,
         script_path=restore_run_path(root, stored.script_path),
@@ -873,32 +1024,47 @@ def restore_render_job(stored: StoredRenderJob, root: Path) -> SlurmJob:
 
 
 def atomic_write_text(path: Path, payload: str, *, mode: int = 0o600) -> None:
-    """以同目录临时文件 + fsync + os.replace 原子写入私有文本文件。"""
-
+    """Publish a complete private file, restoring the old name on sync failure."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError("Atomic destination cannot be a symbolic link")
     fd, temporary_name = tempfile.mkstemp(prefix=".atomic-", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
+    backup = temporary.with_suffix(".previous")
     fd_open = True
+    published = False
+    directory_fd = None
     try:
         os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd_open = False  # fdopen 接管描述符，离开 with 后负责关闭
+            fd_open = False
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        path.chmod(mode)
+        if path.exists():
+            os.link(path, backup, follow_symlinks=False)
         directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except Exception:
+        os.replace(temporary, path)
+        published = True
+        os.fsync(directory_fd)
+    except BaseException:
+        if published:
+            if backup.exists():
+                os.replace(backup, path)
+            else:
+                path.unlink(missing_ok=True)
+            if directory_fd is not None:
+                with suppress(OSError):
+                    os.fsync(directory_fd)
+        raise
+    finally:
         if fd_open:
             with suppress(OSError):
                 os.close(fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
         temporary.unlink(missing_ok=True)
-        raise
+        backup.unlink(missing_ok=True)
 
 
 def atomic_write_json(path: Path, payload: Any, *, mode: int = 0o600) -> None:
@@ -919,6 +1085,8 @@ def write_manifest(path: Path, manifest: RunManifest) -> None:
             f"只允许写入 v{MANIFEST_SCHEMA_VERSION} manifest，"
             f"不能修改 v{manifest.schema_version} 旧清单"
         )
+    for scene in manifest.scenes.values():
+        scene.snapshot = scene_snapshot(scene)
     manifest.updated_at = utc_now()
     atomic_write_text(path, manifest.model_dump_json(indent=2) + "\n")
 
@@ -952,6 +1120,8 @@ class RunRepository:
             raise ValueError("运行清单顶层必须是 JSON 对象")
         migrated = migrate_manifest_data(raw, self.run_root(run_id))
         manifest = RunManifest.model_validate(migrated)
+        if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+            manifest._legacy_raw = raw
         if manifest.run_id != run_id:
             raise ValueError("运行目录与 manifest.run_id 不一致")
         return manifest
@@ -1082,29 +1252,64 @@ def _latest_video_candidate(media_dir: Path, class_name: str) -> Path | None:
 
 
 def migrate_manifest_data(raw: dict, root: Path) -> dict:
-    """读取旧清单；仅迁移不改变语义的 v7 -> v8 字段升级。
-
-    v8 只新增了可选的 generation_mode，v7 已经使用当前的语义动画
-    合同和合并配置，因此可以安全补默认值。更早版本仍保持只读，避免
-    把旧的具体动画合同或缺失教学状态静默解释成当前格式。
-    """
+    """Read supported manifests without upgrading their execution semantics."""
 
     version = raw.get("schema_version", 1)
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
-    if version == 7 and MANIFEST_SCHEMA_VERSION == 8:
-        migrated = dict(raw)
-        migrated["schema_version"] = 8
-        migrated.setdefault("generation_mode", "relaxed")
-        return migrated
     if version in READABLE_MANIFEST_SCHEMA_VERSIONS:
         if version >= 5:
             required_fields = {"lesson_spec", "teaching_graph", "state_ledger"}
             if version == MANIFEST_SCHEMA_VERSION:
-                required_fields.add("merge_profile")
+                required_fields.update(
+                    {
+                        "run_config",
+                        "execution_spec",
+                        "artifact_refs",
+                        "merge_profile",
+                        "run_phase",
+                        "request_budget",
+                        "retry_limits",
+                        "dependency_graph",
+                        "scene_codegen_mode",
+                    }
+                )
             missing_fields = sorted(required_fields - raw.keys())
             if missing_fields:
                 raise ValueError(f"v{version} manifest 缺少必需字段: " + ", ".join(missing_fields))
+        if version == MANIFEST_SCHEMA_VERSION and isinstance(raw.get("scenes"), dict):
+            scene_fields = {
+                "snapshot",
+                "revision",
+                "input_sha256",
+                "submission",
+                "submission_attempts",
+                "stage_attempts",
+                "review_round",
+                "fix_attempts",
+                "infra_retries",
+                "plan_replan_attempts",
+                "plan_review_round",
+                "visual_fix_attempts",
+            }
+            for scene_id, scene in raw["scenes"].items():
+                if isinstance(scene, dict) and (missing := sorted(scene_fields - scene.keys())):
+                    raise ValueError(f"v10 Scene {scene_id} 缺少必需字段: " + ", ".join(missing))
+        if version == MANIFEST_SCHEMA_VERSION:
+            if not isinstance(raw.get("run_config"), dict) or not isinstance(
+                raw.get("execution_spec"), dict
+            ):
+                raise ValueError("v10 requires complete run and execution contracts")
+            if not set(ExecutionSpec.model_fields) <= set(raw["execution_spec"]):
+                raise ValueError("v10 requires a complete execution contract")
+            if "values_json" not in raw["run_config"]:
+                raise ValueError("v10 requires a complete run configuration")
+            for scene_id, data in raw.get("scenes", {}).items():
+                if not isinstance(data.get("snapshot"), dict):
+                    raise ValueError(f"v10 Scene {scene_id} requires a nested snapshot")
+                parsed = StoredSceneState.model_validate(data)
+                if parsed.snapshot != scene_snapshot(parsed):
+                    raise ValueError(f"v10 Scene {scene_id} 嵌套状态与兼容投影不一致")
         return raw
     if version < MANIFEST_SCHEMA_VERSION:
         raise ValueError(

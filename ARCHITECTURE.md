@@ -6,6 +6,7 @@
 [docs/configuration.md](docs/configuration.md)，常见故障见
 [docs/troubleshooting.md](docs/troubleshooting.md)，开发约定见
 [CONTRIBUTING.md](CONTRIBUTING.md)。
+执行状态、预算、提交恢复、依赖失效与编译能力详见 [docs/execution.md](docs/execution.md)。
 
 ## 1. 设计目标
 
@@ -52,7 +53,14 @@ kd1_anime.cli / kd1_anime.tui
 kd1_anime.orchestrator ───── callback events ───────────▶ TUI/Rich
        │
        ├── services/rendering.py 后端预检、提交、监控边界
-       ├── services/planning.py 计划指纹与纯计划辅助
+       ├── domain/                 计划、技术、审查、边界、执行与程序合同
+       ├── request_budget.py       持久化模型请求预占与用量诊断
+       ├── events.py / telemetry.py 事件适配与运行/场景/阶段跨度
+       ├── services/planning.py    规划结果校验、计划指纹与时长计算
+       ├── services/generation.py  有限生成和确定性候选检查
+       ├── services/reviewing.py   绑定源码身份的审查结果
+       ├── services/dependencies.py 依赖类型、版本与摘要计算
+       ├── services/program_compiler.py SceneProgram v2 内容保真编译
        ├── services/recovery.py 恢复时的进程/Job 接管策略
        ├── services/visual_evaluation.py 独立视觉调用边界
        ├── services/recipe_learning.py 匿名配方学习边界
@@ -79,7 +87,11 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── agents/math_verifier.py 受限 AST 数值采样核验
        ├── agents/scene_ir.py      结构化 Scene IR 与确定性编译回退
        ├── agents/render_context.py renderer 能力与对象生命周期约束
-       ├── cluster/slurm.py        sbatch、状态查询、产物验证、超时取消
+       ├── cluster/jobs.py         后端无关的 RenderJob 与轮询观测
+       ├── cluster/monitoring.py   统一监控、超时和取消
+       ├── cluster/execution.py    正式渲染及 smoke 共用的执行隔离策略
+       ├── cluster/render_backend.py 独立本地后端与 Slurm 适配器
+       ├── cluster/slurm.py        sbatch、状态查询与远端取消
        ├── cluster/resource_estimator.py 按场景估计 CPU/内存/时间/GPU
        ├── rendering.py            RenderProfile/MergeProfile、ffprobe、SceneArtifact
        ├── resources.py            跨批量项目的进程级 LLM/RAG/Slurm 配额
@@ -87,9 +99,10 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── rag/                    SQLite 索引、独立 Embedding/Reranker 检索
        ├── eval/                   代码/效率评估、边界帧健康检查与视觉质量门
        ├── stats.py                清单/事件日志离线统计
-       ├── agents/state_ledger.py  场景边界语义账本与渲染证据
+       ├── domain/state_ledger.py  场景边界语义账本与渲染证据
+       ├── api_catalog.py         精确版本公开 API 核验，与语义 RAG 分工
        ├── security.py             脱敏和 JSON-safe 诊断序列化
-       └── run_store.py            Manifest v8、原子检查点、运行锁
+       └── run_store.py            Manifest v10、原子检查点、运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
@@ -123,17 +136,17 @@ CODING → Code REVIEWING，彼此并行；共享 ElementManifest/StateLedger �
                                       └── FIXING ◀────┘
 
 任一场景渲染完成：即时 VISUAL_EVALUATING → (低分回到 CODING，失效后继交接)
-全部线程结束：补评剩余场景 → MERGING
+所有阶段任务结束：补评剩余场景 → MERGING
                                       → 成片视觉报告
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-FSM 枚举同时用于清单检查点和 TUI 阶段提示。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜和初始计划审查并行；Technical Planner 按依赖链生成结构化 TechnicalSpec。每份合同的 `handoff_out` 只包含当前场景最终导出的对象状态，下一场景以 `handoff_in` 接收相同的 element ID、变量名、对象类型和最终状态，不必等待前一场景的生成代码。前一场景 TechnicalSpec 就绪后，后一场景即可开始技术设计，同时前一场景继续 Code→Code Review；各 Scene 拥有自己的 TechnicalSpec 后，在独立 worker 中执行 Code→Code Review。某个 Scene 的 Code Review 通过后立即进入自己的渲染 worker，其他 Scene 可以继续编码/审查。代码审查结果先保存在各自 SceneState，随后 Orchestrator 按 Scene ID 顺序更新 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。没有结构化 handoff 的 legacy manifest 会回退到旧的顺序代码屏障。默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则以前台本地进程执行（默认一个在途任务）。每个 worker 使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。后端边界统一执行产物定位、ffprobe 和哈希验证。
+运行生命周期和场景生命周期分别记录，原有 FSM 枚举保留为兼容检查点与 TUI 投影。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜和初始计划审查使用有界工作池；Technical Planner 按依赖链生成结构化 TechnicalSpec。每份合同的 `handoff_out` 只包含当前场景最终导出的对象状态，下一场景以 `handoff_in` 接收相同的 element ID、变量名、对象类型和最终状态，不必等待前一场景的生成代码。FIFO 就绪队列按依赖派发技术规划、编码、审查、提交及结果处理任务，每场景最多一个改变状态的在途任务，远端等待不占用工作线程。具备完整结构化交接的场景可并行生成和渲染；需要源码上下文或全片审查的路径保留必要屏障。代码审查结果提交后，Orchestrator 按 Scene ID 顺序更新 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。v4–v9 清单仅供查看和导出。默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则使用受控本地进程（默认一个在途任务）。每个任务使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。后端边界统一执行产物定位、ffprobe 和哈希验证。
 
 LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
-CLI 在进入 chat、规划、生成或恢复需要 Agent 的运行前，会用短超时发送一次主 LLM 请求；启用 RAG 时还会确认索引存在且未过期，并探测 Embedding 和 Reranker。探测失败直接退出，不把明显的配置/网络问题拖到 Clarifier 或 Planner 阶段才暴露。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
+CLI 先检查模型配置；运行建立并保存预算后，以短超时探测主模型，探测同样占用持久化请求计数。启用 RAG 时确认索引存在且未过期，并探测 Embedding 和 Reranker。探测失败直接退出。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
 
-`ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job。顶层检查点使用显式转移表；并发 worker 或恢复入口产生的非典型回退只写入 `fsm_warnings`，不把可恢复的运行误判为失败。
+`ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job，并持久化取消成功或失败的观测。运行和场景使用独立转移规则；非法生命周期转移被拒绝。场景修订变化和显式恢复只能沿允许的重新执行路径推进。
 
 RAG 索引使用 SQLite 保存文本分块、元数据和 Embedding BLOB。Markdown 和 reStructuredText 按标题/段落切分，Python 按顶层定义切分；索引构建通过临时数据库原子替换，并按文本哈希复用未变化分块的向量。运行时先做本地余弦初排，再调用独立 Reranker；服务故障只记录 `degraded` 并继续原有流水线。Planner、Technical Planner、Coder 和 AutoFixer 收到的检索内容均标记为不可信资料，且每次注入都保存查询、索引和分块哈希收据。正式渲染成功的场景可在本地保存不含用户提示词、运行身份和凭据的匿名配方，配方也作为 `recipe` 来源参与后续检索。
 
@@ -144,7 +157,7 @@ Planner 使用分层结构化输出：
 1. `plan_draft()` 一次性生成 `PlanningDraft`：LessonSpec 固定学习目标、实体、数学断言、定义域和时长；TeachingGraph 固定断言依赖与场景分配；`SceneOutline` 按最小必要视觉单元生成。概要按返回顺序规范化 scene ID 为 `1..N`。同一画布中逐个出现、保留并对比的对象属于同一个场景；当用户明确要求同屏/整体展示而模型仍按对象拆分时，Planner 会将概要确定性合并为一个场景。只有用户明确要求多场景，或镜头/布局/叙事弧线确实独立时才拆分。
 2. `plan_continuity_bible()` 在分镜并行前固定全片背景、调色板、字体、布局、数学符号、持续对象、镜头语言和转场规则，并写入运行清单。
 3. 每个 worker 的 `plan_detail()` 接收原始需求、教学合同、全部概要、相邻概要和 continuity bible，生成视觉设计、镜头、动画流、关键时刻、计算说明以及 opening/closing state、结构化 `inherited_elements` / `elements_to_remove` / `new_elements` 和转场合同。
-4. 所有 Detail 完成后先运行 Plan Compiler，检查场景 ID、断言覆盖/依赖、时间线覆盖、可解析等式、多边形鞋带面积、画布边界和元素生命周期。初始 Plan Review 使用同一份全片计划快照并行检查数学正确性、几何可实现性和交接合同；问题只回到 Planner 重规划，strict 模式的审查轮数和 Planner 总重调用次数受 `MAX_PLAN_REVIEW_ROUNDS` / `MAX_PLAN_REPLAN_ATTEMPTS` 限制。relaxed 模式不限制正常重规划次数，但若 Planner 对确定性问题原样返回同一计划，会停止无效循环并优先切换保守方案；未通过的计划不会进入 Coder。
+4. 所有 Detail 完成后先运行 Plan Compiler，检查场景 ID、断言覆盖/依赖、时间线覆盖、可解析等式、多边形鞋带面积、画布边界和元素生命周期。初始 Plan Review 使用同一份全片计划快照并行检查数学正确性、几何可实现性和交接合同；问题只回到 Planner 重规划，strict 模式的审查轮数和 Planner 总重调用次数受 `MAX_PLAN_REVIEW_ROUNDS` / `MAX_PLAN_REPLAN_ATTEMPTS` 限制。两种模式均遵守有限预算；若 Planner 对确定性问题原样返回同一计划，会停止无效循环并优先切换保守方案；未通过的计划不会进入 Coder。
 5. Plan Review 通过后执行全片连续性审查；冲突只重规划未进入编码的相关场景，受 `MAX_CONTINUITY_FIX_ROUNDS` 限制。高风险几何方案在计划审查或代码审查耗尽后，可切换为保守的面积/等式教学方案。
 
 Pydantic 模型拒绝未知字段并限制字符串、列表和场景数量。ScenePlan 还包含 timeline、math_claims、geometry_specs 和 handoff 四类结构化合同；无法确定的数学表达式不会被编译器擅自判定为正确。用户需求被明确标记为不可信数据，不能改变系统规则。
@@ -180,7 +193,7 @@ Coder 为每个 Scene 生成一个 Python 文件，并明确禁止网络、文�
 - Scene 类必须实现 `construct()`；
 - 使用 `Tex`/`MathTex` 时必须显式使用注册到 `config.tex_template` 的 XeLaTeX `.xdv` 模板并加载 `ctex`。
 
-若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；strict 模式最多尝试 `CODE_VALIDATION_ATTEMPTS` 次，relaxed 模式允许继续生成不同候选，只有候选完全停滞时才终止。每个 `self.play` 的标记必须对应合同事件；静态分析器无法识别的具体动画调用只记录 warning，不因此拒绝候选。包含未知调用的 dry-run 场景会自动强制低质量 frame+短视频 Smoke Render。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。下一场景优先消费前一场景 TechnicalSpec 的 `handoff_in`，只在 legacy manifest 没有结构化 handoff 时才通过 AST 提取 `[Inherited Elements Code]`；最终代码导出区仍会更新运行级 ElementManifest，作为后置验证和恢复凭据。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；relaxed 模式下这些 LLM 意见只在确定性校验通过后作为 warning，不会触发重复重写；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
+若 TechnicalSpec 编译失败，先在有限次数内重新生成技术合同，不会把语义错误转嫁给 Coder。合同通过后，生成结果先经过 `validate_manim_code()` 和 AST 生命周期校验；两种模式均受 `CODE_VALIDATION_ATTEMPTS` 和持久化请求预算限制；支持零次禁用的修复配置保留零次语义。每个 `self.play` 的标记必须对应合同事件；静态分析器无法识别的具体动画调用只记录 warning，不因此拒绝候选。包含未知调用的 dry-run 场景会自动强制低质量 frame+短视频 Smoke Render。Coder 必须在代码中提供 `KD1_CONTINUITY_EXPORT_BEGIN/END` 区，区内允许纯 Mobject 定义以及作用于区内对象的白名单样式/布局调用；复合 Mobject 所需的坐标数组和子 Mobject 可以作为 helper 一并放入带有 `element_id` 的分组，但不能包含动画或外部依赖。下一场景优先消费前一场景 TechnicalSpec 的 `handoff_in`，只在当前计划明确需要源码上下文时通过 AST 提取 `[Inherited Elements Code]`；最终代码导出区仍会更新运行级 ElementManifest，作为后置验证和恢复凭据。清单记录 element_id、变量名、类型、依赖、语义状态、源代码及哈希；Coder 只接收当前场景需要的最小 entries。Reviewer 再检查数学、LaTeX、Manim API、动画生命周期、布局、安全、分镜符合度和元素交接，并要求 major finding 提供代码中可验证的证据；relaxed 模式下这些 LLM 意见只在确定性校验通过后作为 warning，不会触发重复重写；若 evidence 协议不通过，最多重试一次，仍不明确则停止而不是接受无依据的阻断。结构化输出只允许：
 
 - valid / `info`：通过；
 - `minor`：至少一条可精确唯一匹配的查找替换；
@@ -207,12 +220,12 @@ Scene IR 是混合模式下的确定性后备路径：它从已经批准的 Scen
 
 Plan Review 和 Code Review 使用独立状态与计数。Plan Review 不通过只允许 Planner 重规划，不会生成代码；Code Review 只检查已确认计划对应的 Manim 实现，受 `MAX_REVIEW_ROUNDS` 限制。任何代码变化都会把 `reviewed` 重置为 false。AutoFix 输出也必须重新进入 Code Review；major 反馈仍回到 CODING，绝不直接提交。
 
-连续性审查与代码审查同样分离。relaxed 模式的 Coder/AutoFix 无进展时会优先尝试已通过确定性校验的 IR/安全代码候选；回退不可用时仍可继续调用 LLM，不把该升级阈值当作固定修复上限。relaxed Review 仍会修复带可核验证据的 high-confidence blocker，只有低置信度或无法验证的意见降级为 warning。连续性修正轮数耗尽时，系统会把当时已经通过确定性
+连续性审查与代码审查同样分离。relaxed 模式的 Coder/AutoFix 无进展时会优先尝试已通过确定性校验的 IR/安全代码候选；回退不可用时仅在剩余修复预算内继续调用 LLM。relaxed Review 仍会修复带可核验证据的 high-confidence blocker，只有低置信度或无法验证的意见降级为 warning。连续性修正轮数耗尽时，系统会把当时已经通过确定性
 检查的计划标记为 warning 并继续编码/渲染；恢复时最多自动重查一次，避免每次启动都
 重新进入同一循环。代码审查中的数学/连续性 finding 只有在证据明确指向计划本身时才回到
 Planner/Continuity；带有唯一代码替换证据的实现错误留在 Coder 层修复。
 
-连续性审查结果和警告也保存到 `manifest.json`；resume 会复用已保存的 continuity bible，不会因为重启而重新生成一套风格规范。AutoFix 只改变当前场景代码，不改变 TechnicalSpec/handoff，因此不会清空后续场景；只有计划、TechnicalSpec 或结构化交接合同改变时，尚未提交渲染的下游场景才会清除过期交接代码并按顺序重新编码。恢复时会优先重新提取导出区，提取失败不会静默复用下游状态。
+连续性审查结果和警告保存到 `manifest.json`；resume 复用已保存的 continuity bible 与计数。AutoFix、精确修复及候选回滚若改变源码，会使消费该源码的下游失效；纯结构化消费者仅在导出合同变化时失效，教学消费者依据教学摘要判断。独立场景保留，依赖声明不完整时保守失效。提交 worker 结果前核对场景修订号及完整输入摘要。
 
 当 `LOCAL_SMOKE_RENDER_ENABLED=true` 且不是 dry-run 时，或 CLI 显式使用 `--smoke` 时，代码在进入 Reviewer 前会以低质量、
 同 renderer 的本地命令运行一次；若配置了 Apptainer，则沿用 containall/cleanenv/no-home、当前
@@ -266,7 +279,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v8 包含单调 revision、`generation_mode`、LessonSpec、TeachingGraph、StateLedger、场景 phase、能力合同、代码哈希、审查/修复次数、候选版本、精确 Job、RenderProfile、资源配置、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 与端点不写入清单；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
+Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v10 包含单调 revision、`generation_mode`、LessonSpec、TeachingGraph、StateLedger、场景 phase、能力合同、代码哈希、审查/修复次数、候选版本、精确 Job、RenderProfile、资源配置、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 不写入清单；端点与非敏感配置经脱敏后固定在 RunConfig；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -275,16 +288,16 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v8 清单保存当前教学合同、`generation_mode`、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
+v10 清单保存当前教学合同、`generation_mode`、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
 
-`resume` 在持有 `.run.lock` 后读取清单：
+`resume` 先只读检查格式，拒绝 v4–v9；随后持有 `.run.lock` 重新读取 v10 清单：
 
 - 代码必须位于规范 run 路径且 SHA-256 匹配；
 - 未确认终态或成功取消前不会复用/重提 Job ID；
 - COMPLETED/GONE 只有产物验证成功才恢复为 rendered；
 - 已完成、失败、在途场景的事件快照会补发给 TUI；
 - 两个进程不能同时恢复同一 run。
-本地后端不把 PID 写入清单；恢复时不会认领已有本地进程，而是安全重启未完成场景。
+本地后端不把 PID 写入清单；恢复时不会认领已有本地进程。只有已确认终态的旧任务可以重新启动，状态不明则保留作业身份并禁止自动重提。
 直接 `render --wait` 创建的运行会持久化 `direct_render` 标记；这类运行在等待和恢复时都
 跳过所有 Planner、Technical Planner、Coder 和 Reviewer 调用，只执行渲染监控与合并。
 
@@ -317,7 +330,7 @@ Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
 - 代码和效率指标由确定性逻辑计算；运行对比会聚合同一指标的所有场景分数。
 - 每个场景在合并前从精确 `SceneArtifact` 抽取 1–8 帧；抽样优先覆盖开场、首个数学状态、中段、结论和结束状态。多场景合并前另抽取真实相邻场景的 `boundary_end`/`boundary_start` 帧，先用可选 Pillow 做尺寸、近黑帧和亮度突变的确定性健康检查，再检查交接对象是否丢失。每帧保存可信时间戳、语义 role 和 SHA-256，一次多模态请求联合检查数学正确性、相关性、可读性、布局与跨帧一致性；场景产物完成后立即启动该检查。
 - 响应使用关闭的 Pydantic schema；问题必须引用本次存在的帧 ID。视觉输出被当作不可信诊断，不能直接提供或执行代码。
-- strict 模式下低于阈值或存在 major 问题时，按 `repair_target` 路由：数学/叙事问题回到 Planner，元素交接问题回到 Continuity，布局/可读性问题才交给主 Coder。relaxed 模式默认只做视觉诊断并保留 warning；只有 `RELAXED_VISUAL_AUTO_FIX=true` 才启用该修复链路。所有代码重新经过 AST 校验、Reviewer 和 Slurm 渲染；修复无进展时，relaxed 先升级到 IR/安全代码候选而不设置固定总上限，失败时可恢复完整、哈希可验证的最佳候选。
+- strict 模式下低于阈值或存在 major 问题时，按 `repair_target` 路由：数学/叙事问题回到 Planner，元素交接问题回到 Continuity，布局/可读性问题才交给主 Coder。relaxed 模式默认只做视觉诊断并保留 warning；只有 `RELAXED_VISUAL_AUTO_FIX=true` 才启用该修复链路。所有代码重新经过 AST 校验、Reviewer 和 Slurm 渲染；修复无进展时，relaxed 在有限修复预算内先升级到显式标注的 IR/安全代码候选，失败时可恢复完整、哈希可验证的最佳候选。
 - 抽帧、端点或结构化响应失败时记录为 `unknown`，不填充假分数，也不丢弃已经成功渲染的视频。`passed`、`warning`、`unknown` 收据都必须绑定当前视频哈希，合并前再次校验。
 - 合并后再生成一份成片视觉报告，但不依据难以归因的成片问题直接改写代码。
 - 自动改进只有在低分可定位到具体场景代码时才重生成；无法归因时停止循环并保留报告。
@@ -381,4 +394,15 @@ pytest -q
 python -m build --sdist --wheel
 ```
 
-测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v8、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
+测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v10、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
+
+
+## v10 提交与任务边界
+
+运行配置与执行身份由不可变 `RunConfig` / `ExecutionSpec` 固定；镜像、资源、隔离及工具身份参与复用判定。场景运行态分为计划、代码修订、执行尝试、验证收据和生命周期，兼容属性从分组投影。`stage_transactions.py` 在编排边界隔离阶段提案，服务仅接收明确快照并返回绑定输入身份的结果；`CommitCommand` 校验修订、合并计数、归一化、验证、持久化不可变对象、原子发布清单，再替换内存及发布事件。
+
+源码位于 `scenes/revisions/scene_<id>/<sha256>.py`；报告按内容摘要保存。展示副本不参与执行或恢复。未确认的外部提交继续保留 attempt，Job ID 落盘失败尝试取消并保留紧急诊断身份，禁止自动重提。
+
+有界 FIFO 阶段队列替代场景常驻线程。依赖决定就绪性，每场景只派发一个状态任务，远端等待由统一监控器承担。监控器提供公开观测，最终结果先提交再发布。`RunControl` 控制配额、请求、退避和总截止时间；模型与 RAG 客户端由端点隔离的运行连接池管理。TUI 使用 4096 容量队列、进度合并和快照重同步，显示异常不改变流水线结果。
+
+性能及证据说明见 `docs/benchmarks/runtime-comparison.md`；完整执行合同见 `docs/execution.md`。

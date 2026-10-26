@@ -12,9 +12,6 @@ import json
 import math
 import re
 from fractions import Fraction
-from typing import Literal
-
-from pydantic import BaseModel, ConfigDict, Field
 
 from kd1_anime.agents.math_verifier import (
     verify_expression_samples,
@@ -27,36 +24,13 @@ from kd1_anime.agents.planner import (
     ScenePlan,
     TeachingGraph,
 )
+from kd1_anime.domain.plan_review import (
+    PlanCompileResult as PlanCompileResult,
+)
+from kd1_anime.domain.plan_review import (
+    PlanCompilerIssue as PlanCompilerIssue,
+)
 from kd1_anime.rendering import effective_transition_duration
-
-
-class PlanCompilerIssue(BaseModel):
-    """确定性计划错误，字段与计划审查输出保持一致。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    category: Literal[
-        "math",
-        "geometry",
-        "feasibility",
-        "timing",
-        "continuity",
-        "contract",
-        "renderer",
-        "style",
-    ]
-    severity: Literal["minor", "major"] = "major"
-    scene_ids: list[int] = Field(default_factory=list, max_length=20)
-    field: str = Field(default="", max_length=200)
-    message: str = Field(min_length=1, max_length=5_000)
-    fix_instruction: str = Field(min_length=1, max_length=5_000)
-
-
-class PlanCompileResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    is_valid: bool
-    issues: list[PlanCompilerIssue] = Field(default_factory=list, max_length=200)
 
 
 def _is_exit_timeline_action(action: str) -> bool:

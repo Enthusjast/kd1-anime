@@ -12,9 +12,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
 
 from kd1_anime.config import settings
+from kd1_anime.models import ValidatedModel as BaseModel
 
 
 class RenderProfile(BaseModel):
@@ -68,6 +69,9 @@ class RenderProfile(BaseModel):
     @classmethod
     def current(cls) -> RenderProfile:
         manim_version, ffmpeg_version, xelatex_version = cls._environment_versions()
+        if settings.SLURM_CONTAINER_IMAGE:
+            # Host metadata is not evidence about packages inside the image.
+            manim_version = ffmpeg_version = xelatex_version = ""
         return cls(
             renderer=settings.MANIM_RENDERER,
             quality=settings.MANIM_QUALITY,
@@ -148,6 +152,7 @@ class SceneArtifact(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
+    execution_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     origin: Literal["rendered", "reused"]
     source_run_id: str = Field(pattern=r"^\d{8}-\d{6}-[0-9a-f]{8}$")
     job_id: str | None = Field(default=None, pattern=r"^(?:\d+|local-[0-9a-f]{12})$")

@@ -1384,6 +1384,9 @@ def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_pa
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): pass\n"
     code_path = root / "scenes" / "scene_1.py"
     code_path.write_text(code, encoding="utf-8")
+    from kd1_anime.objects import ObjectStore
+
+    reference = ObjectStore(root).source(1, code)
     manifest = RunManifest(
         run_id=run_id,
         status="failed",
@@ -1393,7 +1396,7 @@ def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_pa
         scenes={
             1: StoredSceneState(
                 plan=plan(),
-                code_file="scenes/scene_1.py",
+                code_file=reference,
                 code_sha256=sha256_text(code),
                 class_name="Demo",
                 plan_ready=True,
@@ -1420,8 +1423,8 @@ def test_resume_resets_failed_scene_from_monitoring_snapshot(monkeypatch, tmp_pa
     assert captured["context"].scene_states[1].failure_reason == ""
 
 
-def test_resume_rechecks_continuity_warning_once(monkeypatch, tmp_path):
-    """连续性 warning 的恢复只重新开启一次修正预算。"""
+def test_resume_preserves_exhausted_continuity_budget(monkeypatch, tmp_path):
+    """恢复不能重置连续性修正次数或补发预算。"""
     from kd1_anime.config import settings
 
     run_id = "20260728-120000-1234abcd"
@@ -1451,9 +1454,9 @@ def test_resume_rechecks_continuity_warning_once(monkeypatch, tmp_path):
     monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
 
     assert Orchestrator().resume(run_id) is None
-    assert captured["context"].continuity_review_status == "pending"
-    assert captured["context"].continuity_review_round == 0
-    assert captured["context"].continuity_resume_recheck_used is True
+    assert captured["context"].continuity_review_status == "warning"
+    assert captured["context"].continuity_review_round == 3
+    assert captured["context"].continuity_resume_recheck_used is False
 
 
 def test_resume_does_not_recheck_continuity_warning_twice(monkeypatch, tmp_path):
@@ -1607,7 +1610,7 @@ def test_unknown_animation_forces_dry_run_smoke_canary(tmp_path):
     assert Orchestrator._local_smoke_enabled(ctx, state) is True
 
 
-def test_resume_invalidation_discards_legacy_technical_contract(tmp_path):
+def test_current_manifest_rejects_stale_technical_contract_without_mutation(tmp_path):
     run_root = paths(tmp_path).root
     run_root.mkdir(parents=True)
     legacy = StoredSceneState.model_validate(
@@ -1629,13 +1632,10 @@ def test_resume_invalidation_discards_legacy_technical_contract(tmp_path):
         output_path=str(run_root / "out.mp4"),
         scenes={1: legacy},
     )
-    orchestrator = Orchestrator()
-
-    assert orchestrator._invalidate_legacy_technical_contracts(manifest, run_root) is True
-    assert manifest.scenes[1].technical_contract_stale is False
-    assert manifest.scenes[1].technical_spec is None
-    assert manifest.scenes[1].reviewed is False
-    assert manifest.state == "CODING"
+    before = manifest.model_dump_json()
+    with pytest.raises(ValueError, match=r"TechnicalSpec|技术合同|stale"):
+        manifest.validate_for_resume()
+    assert manifest.model_dump_json() == before
 
 
 def test_stagnation_fallback_produces_a_different_valid_candidate(monkeypatch, tmp_path):
@@ -1663,9 +1663,7 @@ def test_code_candidate_history_keeps_at_most_three_versions(tmp_path):
         orchestrator._record_code_candidate(ctx, state, verification="validated")
 
     assert len(state.candidates) == 3
-    assert all(
-        item.code_file.startswith("artifacts/candidates/scene_1/") for item in state.candidates
-    )
+    assert all(item.code_file.startswith("scenes/revisions/scene_1/") for item in state.candidates)
 
 
 def test_rollback_restores_a_previous_smoke_candidate(monkeypatch, tmp_path):
@@ -2091,7 +2089,7 @@ def test_identical_review_feedback_stops_repeated_rewrites(monkeypatch, tmp_path
     assert "相同代码和审查反馈" in state.failure_reason
 
 
-def test_relaxed_review_does_not_stop_on_identical_feedback(monkeypatch, tmp_path):
+def test_relaxed_review_stops_at_configured_budget(monkeypatch, tmp_path):
     monkeypatch.setattr(module.settings, "MAX_IDENTICAL_REVIEW_ATTEMPTS", 2)
     run_paths = paths(tmp_path)
     state = SceneState(
@@ -2115,9 +2113,9 @@ def test_relaxed_review_does_not_stop_on_identical_feedback(monkeypatch, tmp_pat
     orchestrator._apply_review_result(ctx, 1, state, result, allow_relaxed_soft_pass=False)
     orchestrator._apply_review_result(ctx, 1, state, result, allow_relaxed_soft_pass=False)
 
-    assert state.give_up is False
+    assert state.give_up is True
     assert state.review_round == 2
-    assert state.rewrite_feedback
+    assert state.failure_reason
 
 
 def test_safe_fallback_is_not_repeated_after_resume(monkeypatch, tmp_path):
@@ -2478,7 +2476,7 @@ class Demo(Scene):
     assert "完全相同" in coder.calls[2]
 
 
-def test_relaxed_code_generation_can_continue_past_validation_attempt_default(monkeypatch):
+def test_relaxed_code_generation_obeys_validation_attempt_limit(monkeypatch):
     from kd1_anime.agents.validator import CodeValidationResult
 
     scene_plan = plan().model_copy(
@@ -2526,16 +2524,14 @@ class Demo(Scene):
     orchestrator = Orchestrator()
     orchestrator._ctx = PipelineContext("prompt", generation_mode="relaxed")
 
-    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+    from kd1_anime.exceptions import ValidationError
 
-    assert generated == valid
-    assert class_name == "Demo"
-    assert len(coder.calls) == 4
+    with pytest.raises(ValidationError, match="确定性校验"):
+        orchestrator._generate_validated_code(scene_plan, stream=False)
+    assert len(coder.calls) == settings.CODE_VALIDATION_ATTEMPTS
 
 
-def test_relaxed_code_generation_does_not_stop_on_identical_invalid_candidates(
-    monkeypatch, tmp_path
-):
+def test_relaxed_code_generation_bounds_identical_invalid_candidates(monkeypatch, tmp_path):
     from kd1_anime.agents.validator import CodeValidationResult
 
     scene_plan = plan().model_copy(
@@ -2578,22 +2574,14 @@ class Demo(Scene):
     orchestrator = Orchestrator()
     orchestrator._ctx = PipelineContext("prompt", paths=paths(tmp_path), generation_mode="relaxed")
 
-    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+    from kd1_anime.exceptions import ValidationError
 
-    assert generated == valid
-    assert class_name == "Demo"
-    assert len(coder.calls) == 4
-    assert [item[1]["candidate_index"] for item in coder.calls] == [1, 2, 3, 4]
-    assert [item[1]["candidate_budget"] for item in coder.calls] == [1, 2, 3, 4]
-    assert "不得停止重试" in coder.calls[2][0]
-    assert coder.calls[2][1]["previous_code"] == ""
-    assert coder.calls[2][1]["strategy_hint"]
-    assert coder.calls[2][1]["temperature_override"] > settings.LLM_CODE_TEMPERATURE
+    with pytest.raises(ValidationError, match="确定性校验"):
+        orchestrator._generate_validated_code(scene_plan, stream=False)
+    assert len(coder.calls) == settings.CODE_VALIDATION_ATTEMPTS
 
 
-def test_relaxed_code_generation_escalates_after_different_invalid_candidates(
-    monkeypatch, tmp_path
-):
+def test_relaxed_code_generation_bounds_different_invalid_candidates(monkeypatch, tmp_path):
     scene_plan = plan()
     safe_code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
 
@@ -2617,12 +2605,11 @@ def test_relaxed_code_generation_escalates_after_different_invalid_candidates(
     events = []
     orchestrator._callback = lambda event, data: events.append((event, data))
 
-    generated, class_name = orchestrator._generate_validated_code(scene_plan, stream=False)
+    from kd1_anime.exceptions import ValidationError
 
-    assert generated == safe_code
-    assert class_name == "Demo"
-    assert coder.calls == 4
-    assert any(event == "scene_code_stagnation_fallback" for event, _ in events)
+    with pytest.raises(ValidationError, match="确定性校验"):
+        orchestrator._generate_validated_code(scene_plan, stream=False)
+    assert coder.calls == settings.CODE_VALIDATION_ATTEMPTS
 
 
 def test_state_ledger_keeps_removed_element_as_historical_tombstone(tmp_path):
@@ -3135,7 +3122,12 @@ def test_dry_run_with_failed_scene_is_not_marked_complete(monkeypatch, tmp_path)
 
 def test_dry_run_repeats_after_continuity_rebuild(monkeypatch, tmp_path):
     run_paths = paths(tmp_path)
-    state = SceneState(plan=plan(), plan_ready=True)
+    state = SceneState(
+        plan=plan(),
+        plan_ready=True,
+        code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+        class_name="Demo",
+    )
     ctx = PipelineContext(
         "x",
         paths=run_paths,
@@ -3194,6 +3186,7 @@ def test_infrastructure_error_does_not_invoke_auto_fixer(monkeypatch, tmp_path):
         scene_class_name="Demo",
         submitted_at=time.time(),
         status="FAILED",
+        code_sha256=sha256_text(state.code),
     )
     ctx = PipelineContext("x", paths=run_paths, scene_states={1: state})
     orchestrator = Orchestrator()
@@ -3218,7 +3211,7 @@ def test_infrastructure_error_does_not_invoke_auto_fixer(monkeypatch, tmp_path):
     assert "环境或 Slurm" in state.failure_reason
 
 
-def test_autofix_code_change_does_not_reset_downstream_scene(monkeypatch, tmp_path):
+def test_autofix_preserves_structural_consumer_with_unchanged_contract(monkeypatch, tmp_path):
     import time
 
     from kd1_anime.cluster.slurm import SlurmJob
@@ -3253,6 +3246,13 @@ def test_autofix_code_change_does_not_reset_downstream_scene(monkeypatch, tmp_pa
         scene_states={1: first, 2: downstream},
     )
     orchestrator = Orchestrator()
+    from kd1_anime.domain.dependencies import SceneDependency
+
+    ctx.dependency_graph.bind(
+        2,
+        [SceneDependency(source_scene_id=1, kind="handoff")],
+        orchestrator._dependency_nodes(ctx),
+    )
     orchestrator._llm_sem = threading.Semaphore(1)
     monkeypatch.setattr(orchestrator, "_checkpoint", lambda *args, **kwargs: None)
     monkeypatch.setattr(orchestrator.slurm, "get_error_log", lambda **kwargs: "render boom")
@@ -3294,6 +3294,7 @@ def test_dispatch_respects_max_in_flight(monkeypatch, tmp_path):
             plan=scene_plan,
             code=code,
             class_name="Demo",
+            reviewed=True,
         )
         (run_paths.scenes / f"scene_{scene_id}.py").write_text(code, encoding="utf-8")
 
@@ -3334,7 +3335,7 @@ def test_dispatch_rejects_code_changed_on_disk(monkeypatch, tmp_path):
         directory.mkdir(parents=True)
     expected = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
     (run_paths.scenes / "scene_1.py").write_text(expected + "# tampered\n", encoding="utf-8")
-    scene_state = SceneState(plan=plan(), code=expected, class_name="Demo")
+    scene_state = SceneState(reviewed=True, plan=plan(), code=expected, class_name="Demo")
     ctx = PipelineContext("x", paths=run_paths, scene_states={1: scene_state})
     orchestrator = Orchestrator()
     monkeypatch.setattr(
@@ -3343,11 +3344,14 @@ def test_dispatch_rejects_code_changed_on_disk(monkeypatch, tmp_path):
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not submit")),
     )
 
-    next_state = orchestrator._handle_dispatching(ctx)
-
-    assert next_state is State.MERGING
-    assert scene_state.failed is True
-    assert "一致性" in scene_state.failure_reason
+    orchestrator._checkpoint(ctx, State.REVIEWING)
+    reference = orchestrator._manifest.scenes[1].code_file
+    (run_paths.root / reference).write_text(expected + "# object tampered\n", encoding="utf-8")
+    before = (run_paths.root / "manifest.json").read_bytes()
+    with pytest.raises(ValueError, match="一致性"):
+        orchestrator._handle_dispatching(ctx)
+    assert orchestrator._stop_event.is_set()
+    assert (run_paths.root / "manifest.json").read_bytes() == before
 
 
 def test_merging_reuses_only_checkpointed_run_local_output(monkeypatch, tmp_path):
@@ -3387,6 +3391,7 @@ def test_merging_reuses_only_checkpointed_run_local_output(monkeypatch, tmp_path
         class_name="Demo",
         artifact=artifact,
         rendered=True,
+        reviewed=True,
     )
     ctx = PipelineContext(
         "x",
@@ -3449,6 +3454,7 @@ def test_failed_run_local_remerge_preserves_previous_output(monkeypatch, tmp_pat
                 class_name="Demo",
                 artifact=artifact,
                 rendered=True,
+                reviewed=True,
             )
         },
         render_profile=profile,
@@ -3517,6 +3523,7 @@ def test_eval_remerge_may_replace_only_matching_checkpointed_external_output(mon
                 class_name="Demo",
                 artifact=artifact,
                 rendered=True,
+                reviewed=True,
             )
         },
         final_video=external_output,
@@ -3565,7 +3572,15 @@ def test_execute_failure_preserves_latest_checkpointed_stage(monkeypatch, tmp_pa
     ctx = PipelineContext(
         "x",
         paths=run_paths,
-        scene_states={1: SceneState(plan=plan(), plan_ready=True, reviewed=True)},
+        scene_states={
+            1: SceneState(
+                plan=plan(),
+                plan_ready=True,
+                reviewed=True,
+                code="from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n",
+                class_name="Demo",
+            )
+        },
     )
     orchestrator = Orchestrator()
     monkeypatch.setattr(orchestrator, "_run_scheduler", lambda context: None)
@@ -3785,6 +3800,41 @@ def test_visual_gate_records_endpoint_failure_as_unknown_without_rewrite(monkeyp
     assert any(event == "scene_visual_unknown" for event, _ in events)
 
 
+def test_visual_restore_rejects_revised_inputs_before_writing(monkeypatch, tmp_path):
+    from kd1_anime.domain.dependencies import StaleWorkError
+    from kd1_anime.orchestrator import VisualCandidate
+
+    ctx, state = _make_visual_eval_context(tmp_path)
+    orchestrator = Orchestrator()
+    before = (ctx.paths.scenes / "scene_1.py").read_bytes()
+    inspect_candidate = orchestrator.candidate_acceptor.inspect
+    candidate = VisualCandidate(
+        score=4,
+        has_major_issue=False,
+        passed=True,
+        inherited_elements_sha256=sha256_text(""),
+        code=state.code,
+        class_name="Demo",
+        slurm_job=None,
+        artifact=state.artifact,
+        exported_elements_code="",
+        exported_elements=[],
+        report_file="report.json",
+        report_sha256="a" * 64,
+    )
+
+    def inspect_then_change(*args, **kwargs):
+        result = inspect_candidate(*args, **kwargs)
+        state.revision += 1
+        return result
+
+    monkeypatch.setattr(orchestrator.candidate_acceptor, "inspect", inspect_then_change)
+    with pytest.raises(StaleWorkError):
+        orchestrator._restore_visual_candidate_into_state(ctx, 1, state, candidate)
+    assert (ctx.paths.scenes / "scene_1.py").read_bytes() == before
+    assert state.visual_status == "pending"
+
+
 def test_visual_gate_low_score_schedules_bounded_coder_rewrite(monkeypatch, tmp_path):
     from kd1_anime.eval.visual_eval import VisualAnalysisResult
 
@@ -3833,7 +3883,7 @@ def test_visual_gate_low_score_schedules_bounded_coder_rewrite(monkeypatch, tmp_
     stored_candidate = manifest.scenes[1].visual_best_candidate
     assert stored_candidate is not None
     (ctx.paths.root / stored_candidate.code_file).write_text("# tampered\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="最佳视觉候选代码哈希"):
+    with pytest.raises(ValueError, match=r"代码.*哈希"):
         Orchestrator._context_from_manifest(manifest, ctx.paths.root)
 
 
@@ -3957,6 +4007,7 @@ def test_visual_rebuild_preserves_and_reuses_compatible_passed_downstream_candid
     # 继承上下文，应直接恢复而不是再次调用 Coder 或 Slurm。
     first_candidate = first.visual_best_candidate
     assert first_candidate is not None
+    first.revision += 1
     first.code = first_candidate.code
     first.class_name = first_candidate.class_name
     first.artifact = first_candidate.artifact
@@ -3990,14 +4041,17 @@ def test_visual_rebuild_preserves_and_reuses_compatible_passed_downstream_candid
     assert second.visual_artifact_sha256 == artifact2.video_sha256
 
 
-def test_auto_eval_invalidates_downstream_continuity_dependents(monkeypatch, tmp_path):
+@pytest.mark.parametrize("dependency_mode", ["legacy", "independent", "handoff"])
+def test_auto_eval_invalidates_only_dependency_consumers(monkeypatch, tmp_path, dependency_mode):
     from kd1_anime.config import settings
+    from kd1_anime.domain.dependencies import SceneDependency
     from kd1_anime.eval.metrics import EvalMetric, EvalResult, QualityScore
 
     run_paths = paths(tmp_path)
     for directory in (run_paths.root, run_paths.scenes, run_paths.logs, run_paths.videos):
         directory.mkdir(parents=True, exist_ok=True)
     states = {}
+    profile = PipelineContext("prompt").render_profile
     for scene_id in (1, 2, 3):
         source = (
             "from manim import *\n"
@@ -4005,7 +4059,39 @@ def test_auto_eval_invalidates_downstream_continuity_dependents(monkeypatch, tmp
             "    def construct(self): self.wait()\n"
         )
         (run_paths.scenes / f"scene_{scene_id}.py").write_text(source, encoding="utf-8")
-        scene_plan = plan().model_copy(update={"scene_id": scene_id})
+        updates = {"scene_id": scene_id}
+        if dependency_mode != "legacy":
+            updates["dependencies_complete"] = True
+            if scene_id == 2 and dependency_mode == "handoff":
+                updates["dependencies"] = [SceneDependency(source_scene_id=1, kind="handoff")]
+            elif scene_id == 3:
+                updates["dependencies"] = [
+                    SceneDependency(
+                        source_scene_id=1 if dependency_mode == "independent" else 2,
+                        kind="code_context",
+                    )
+                ]
+        scene_plan = plan().model_copy(update=updates)
+        video = run_paths.videos / f"scene_{scene_id}.mp4"
+        video.write_bytes(f"fixture-{scene_id}".encode())
+        artifact = SceneArtifact(
+            origin="rendered",
+            source_run_id=run_paths.run_id,
+            job_id=str(120 + scene_id),
+            scene_id=scene_id,
+            scene_class_name=f"Scene{scene_id}",
+            code_sha256=sha256_text(source),
+            render_profile_sha256=profile.digest(),
+            video_path=video.relative_to(run_paths.root).as_posix(),
+            video_sha256=sha256_file(video),
+            metadata=VideoMetadata(
+                size_bytes=video.stat().st_size,
+                duration_seconds=1,
+                width=profile.pixel_width,
+                height=profile.pixel_height,
+                frame_rate=profile.frame_rate,
+            ),
+        )
         states[scene_id] = SceneState(
             plan=scene_plan,
             code=source,
@@ -4013,6 +4099,7 @@ def test_auto_eval_invalidates_downstream_continuity_dependents(monkeypatch, tmp
             plan_ready=True,
             reviewed=True,
             rendered=True,
+            artifact=artifact,
         )
     run_paths.output.write_bytes(b"merged")
     ctx = PipelineContext(
@@ -4020,7 +4107,17 @@ def test_auto_eval_invalidates_downstream_continuity_dependents(monkeypatch, tmp
         paths=run_paths,
         scene_states=states,
         final_video=run_paths.output,
+        render_profile=profile,
     )
+    orchestrator = Orchestrator()
+    if dependency_mode != "legacy":
+        for scene_id in (2, 3):
+            ctx.dependency_graph.bind(
+                scene_id,
+                states[scene_id].plan.dependencies,
+                orchestrator._dependency_nodes(ctx),
+            )
+    original_codes = {sid: state.code for sid, state in states.items()}
 
     low = EvalResult(run_id="low")
     low.add_score(QualityScore(EvalMetric.CODE_STYLE, 1))
@@ -4042,7 +4139,10 @@ def test_auto_eval_invalidates_downstream_continuity_dependents(monkeypatch, tmp
     monkeypatch.setattr(settings, "MAX_EVAL_ROUNDS", 2)
     monkeypatch.setattr(settings, "EVAL_THRESHOLD", 3.5)
 
-    assert Orchestrator()._eval(ctx) is True
+    assert orchestrator._eval(ctx) is True
     assert ctx.final_video is None
-    assert [state.code for state in states.values()] == ["", "", ""]
-    assert [state.rendered for state in states.values()] == [False, False, False]
+    invalidated = {"legacy": {1, 2, 3}, "independent": {1, 3}, "handoff": {1}}[dependency_mode]
+    for scene_id, state in states.items():
+        assert state.code == ("" if scene_id in invalidated else original_codes[scene_id])
+        assert state.rendered is (scene_id not in invalidated)
+        assert (state.artifact is not None) is (scene_id not in invalidated)

@@ -10,7 +10,9 @@ import ast
 from dataclasses import dataclass
 from typing import Literal
 
-from kd1_anime.agents.planner import ScenePlan
+from kd1_anime.agents.api_symbols import ApiResolver, signature_errors
+from kd1_anime.api_catalog import lookup_symbol
+from kd1_anime.domain.planning import ScenePlan
 
 Renderer = Literal["cairo", "opengl"]
 
@@ -76,6 +78,7 @@ def lint_manim_api(
     *,
     renderer: Renderer | None = None,
     scene_plan: ScenePlan | None = None,
+    manim_version: str | None = None,
 ) -> ApiLintResult:
     """检查常见的 ManimCE API 错误，无法确定的情况只给 warning。"""
 
@@ -86,6 +89,23 @@ def lint_manim_api(
 
     errors: list[str] = []
     warnings: list[str] = []
+    resolver = ApiResolver(tree)
+    symbols = resolver.imported | set(resolver.calls.values())
+    for symbol in sorted(symbols):
+        fact = lookup_symbol(symbol, manim_version)
+        if fact.status == "missing":
+            errors.append(f"Manim {fact.version} 不提供公开 API {symbol}")
+        elif fact.status == "unknown":
+            warnings.append(
+                f"Manim API 目录版本不匹配（{fact.version or 'unknown'}），未验证 {symbol}"
+            )
+    for call, symbol in resolver.calls.items():
+        fact = lookup_symbol(symbol, manim_version)
+        if fact.status == "found":
+            errors.extend(
+                f"第 {call.lineno} 行 {symbol}: {message}"
+                for message in signature_errors(call, fact.signature)
+            )
     bases = _scene_bases(tree)
     effective_renderer = renderer or "cairo"
     has_updater = False

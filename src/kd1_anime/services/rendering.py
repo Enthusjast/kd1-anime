@@ -6,8 +6,11 @@ import importlib.util
 import shutil
 from pathlib import Path
 
+from kd1_anime.cluster.adapters import adapt_backend
+from kd1_anime.cluster.execution import ExecutionPolicy
+from kd1_anime.cluster.jobs import RenderJob
+from kd1_anime.cluster.monitoring import RenderMonitorCoordinator
 from kd1_anime.cluster.render_backend import RenderBackend, RenderBackendName
-from kd1_anime.cluster.slurm import SlurmJob, SlurmMonitorCoordinator
 from kd1_anime.config import settings
 from kd1_anime.rendering import RenderProfile
 
@@ -19,18 +22,25 @@ class RenderingService:
         self.backend = backend
         self.name = name
 
+    def bind_execution(self, spec) -> None:
+        self.backend.execution_spec = spec
+
     def set_backend(self, backend: RenderBackend, name: RenderBackendName) -> None:
         self.backend = backend
         self.name = name
 
     def preflight(self, profile: RenderProfile) -> None:
+        policy = ExecutionPolicy.from_spec(getattr(self.backend, "execution_spec", None))
+        policy.validate()
         if self.name == "local":
             missing = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
             try:
                 manim_available = importlib.util.find_spec("manim") is not None
             except (ImportError, ModuleNotFoundError, ValueError):
                 manim_available = False
-            if not manim_available:
+            if policy.image and not shutil.which("apptainer"):
+                missing.append("apptainer")
+            if not manim_available and not policy.image:
                 missing.append("manim")
             if missing:
                 raise RuntimeError(
@@ -55,8 +65,8 @@ class RenderingService:
         if missing:
             raise RuntimeError("运行环境缺少命令: " + ", ".join(dict.fromkeys(missing)))
 
-    def submit_scene(self, *args, **kwargs) -> SlurmJob:
-        return self.backend.submit_scene(*args, **kwargs)
+    def submit_scene(self, *args, **kwargs) -> RenderJob:
+        return adapt_backend(self.backend).submit_scene(*args, **kwargs)
 
     def cancel_job(self, job_id: str) -> bool:
         return self.backend.cancel_job(job_id)
@@ -64,19 +74,16 @@ class RenderingService:
     def get_error_log(self, *args, **kwargs) -> str | None:
         return self.backend.get_error_log(*args, **kwargs)
 
-    def classify_gone(self, job: SlurmJob) -> str | None:
-        classifier = getattr(self.backend, "_classify_gone", None)
-        if not callable(classifier):
-            return None
-        return classifier(job)
+    def classify_gone(self, job: RenderJob) -> str | None:
+        return adapt_backend(self.backend).classify_gone(job)
 
     def monitor(
         self,
         *,
         run_timeout: int | None = None,
         on_job_update=None,
-    ) -> SlurmMonitorCoordinator:
-        return SlurmMonitorCoordinator(
+    ) -> RenderMonitorCoordinator:
+        return RenderMonitorCoordinator(
             self.backend,
             run_timeout=run_timeout,
             on_job_update=on_job_update,

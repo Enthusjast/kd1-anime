@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from kd1_anime.clients import CURRENT_CLIENTS
+from kd1_anime.control import CURRENT_CONTROL, OperationDeadlineExceeded, RunCancelled
 from kd1_anime.security import redact_text
 
 
@@ -44,6 +47,19 @@ def _safe_endpoint(url: str) -> str:
         return "<invalid-endpoint>"
 
 
+@contextmanager
+def _http_client(url, headers, timeout, trust_env):
+    import httpx
+
+    pool = CURRENT_CLIENTS.get()
+    if pool is None:
+        with httpx.Client(timeout=timeout, trust_env=trust_env) as client:
+            yield client
+    else:
+        key = ("rag", url, headers.get("Authorization", ""), trust_env)
+        yield pool.get(key, lambda: httpx.Client(timeout=timeout, trust_env=trust_env))
+
+
 def _post_json(
     url: str,
     headers: dict[str, str],
@@ -53,13 +69,17 @@ def _post_json(
     trust_env: bool = True,
 ) -> Any:
     try:
-        import httpx
+        control = CURRENT_CONTROL.get()
+        if control is not None:
+            remaining = control.remaining()
+            if remaining is not None:
+                timeout = min(timeout, remaining)
 
         # 使用 streaming + 上限读取，而不是先访问 response.content；后者
         # 会在检查大小前把异常大的响应完整放入内存。
         with (
-            httpx.Client(timeout=timeout, trust_env=trust_env) as client,
-            client.stream("POST", url, headers=headers, json=payload) as response,
+            _http_client(url, headers, timeout, trust_env) as client,
+            client.stream("POST", url, headers=headers, json=payload, timeout=timeout) as response,
         ):
             response.raise_for_status()
             content_length = response.headers.get("content-length")
@@ -73,6 +93,8 @@ def _post_json(
             chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_bytes():
+                if control is not None:
+                    control.check()
                 total += len(chunk)
                 if total > MAX_RESPONSE_BYTES:
                     raise RagClientError("RAG 服务响应超过大小限制")
@@ -84,6 +106,8 @@ def _post_json(
                 return json.loads(content)
             except (TypeError, json.JSONDecodeError) as exc:
                 raise RagClientError("RAG 服务返回的 JSON 无法解析") from exc
+    except (RunCancelled, OperationDeadlineExceeded):
+        raise
     except Exception as exc:
         if isinstance(exc, RagClientError):
             raise

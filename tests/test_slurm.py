@@ -329,7 +329,7 @@ def test_render_script_records_compute_environment(monkeypatch, tmp_path):
     )
 
     script = script_path.read_text(encoding="utf-8")
-    assert "environment_scene_1.json" in script
+    assert "videos/scene_1/environment.json" in script
     assert "importlib.metadata" in script
 
 

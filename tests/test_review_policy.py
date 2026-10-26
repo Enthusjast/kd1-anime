@@ -43,7 +43,7 @@ def test_high_risk_review_uses_global_budget():
     assert budget.max_rounds == 5
 
 
-def test_relaxed_review_has_no_fixed_round_budget():
+def test_relaxed_review_uses_configured_round_budget():
     budget = review_budget(
         make_plan(visual_design="三维 Surface 曲面"),
         None,
@@ -51,15 +51,17 @@ def test_relaxed_review_has_no_fixed_round_budget():
         generation_mode="relaxed",
     )
 
-    assert budget.max_rounds is None
+    assert budget.max_rounds == 8
     assert budget.deterministic_checks_required is True
-    assert review_mode_policy("relaxed").limit(8) is None
+    assert review_mode_policy("relaxed").limit(8) == 8
 
 
-def test_strict_review_budget_is_capped_at_eight():
+def test_review_budget_preserves_configured_limits_and_zero():
     policy = review_mode_policy("strict")
 
-    assert policy.limit(20) == 8
+    assert policy.limit(20) == 20
+    assert policy.limit(0) == 0
+    assert review_mode_policy("relaxed").limit(0) == 0
     assert policy.limit(3) == 3
 
 

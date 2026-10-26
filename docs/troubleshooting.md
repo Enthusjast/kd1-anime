@@ -278,7 +278,7 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
 恢复使用原子 manifest 和运行级锁。它会重新核对代码 SHA-256、Renderer/Merge Profile、精确
 Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因为重启而默认为未开始。
 
-恢复要求 manifest schema v8。请保留运行目录用于诊断，不要手工修改 manifest；如果清单损坏，重新生成新的运行。
+恢复要求 manifest schema v10。请保留运行目录用于诊断，不要手工修改 manifest；如果清单损坏，重新生成新的运行。
 
 ## 12. 运行很慢或看起来卡住
 
@@ -291,8 +291,9 @@ Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因�
 
 选择 `RENDER_BACKEND=local` 时，检查 `status <run-id>` 中的 backend、运行目录下的
 `logs/scene_*_local-*.out/.err`，以及 `LOCAL_RENDER_TIMEOUT` 和
-`LOCAL_RENDER_MEMORY_MB`。本地渲染必须前台等待；中断后不要期待已有 PID 被认领，直接
-执行 `kd1-anime resume <run-id>` 即可安全重启未完成场景。
+`LOCAL_RENDER_MEMORY_MB`。本地渲染必须前台等待；恢复不会认领历史 PID。
+`resume` 只会重启已确认终态的旧任务。状态不明的任务保留身份并禁止自动重提，
+需要先核对原任务；不要通过删除 Job 记录绕过检查。
 
 如果任务在 Slurm 中仍为 PENDING，通常是队列、分区、账户、QoS 或 GPU 资源问题，不是 Coder
 问题。先检查 sbatch 提交输出和集群队列，不要反复触发代码修复。

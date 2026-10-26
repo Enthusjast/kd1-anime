@@ -9,6 +9,8 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -210,6 +212,7 @@ class LLMRuntimeProfile:
     use_json_mode: bool
     debug: bool
     trust_env: bool = True
+    timeout_total: float = 0.0
 
     def require(self) -> None:
         """验证端点凭据，不把 secret 写入异常文本。"""
@@ -517,6 +520,7 @@ class Settings(BaseSettings):
     LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     # 单次 LLM 请求的连接/读取超时(秒)。读取超时对非流式是"等待完整响应"，
     # 对流式是"等待下一个 chunk"——静默流式下 600s 只是兜底，不会拖慢任何请求。
+    LLM_TIMEOUT_TOTAL: float = Field(default=0.0, ge=0, le=86400)
     LLM_TIMEOUT_CONNECT: float = Field(default=30.0, ge=1.0, le=300.0)
     LLM_TIMEOUT_READ: float = Field(default=600.0, ge=10.0, le=3600.0)
     # 非流式(stream=False)调用是否仍使用流式传输但静默收集(不打印内容)。
@@ -607,6 +611,7 @@ class Settings(BaseSettings):
     VISUAL_LLM_MAX_TOKENS: int | None = Field(default=3000, ge=1, le=1_000_000)
     VISUAL_LLM_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
     VISUAL_LLM_RETRY_BASE_DELAY: float = Field(default=2.0, ge=0.1, le=120.0)
+    VISUAL_LLM_TIMEOUT_TOTAL: float = Field(default=0.0, ge=0, le=86400)
     VISUAL_LLM_TIMEOUT_CONNECT: float = Field(default=30.0, ge=1.0, le=300.0)
     VISUAL_LLM_TIMEOUT_READ: float = Field(default=300.0, ge=10.0, le=3600.0)
     VISUAL_LLM_HEALTHCHECK_TIMEOUT: float = Field(default=20.0, ge=1.0, le=120.0)
@@ -841,6 +846,9 @@ class Settings(BaseSettings):
         default="relaxed",
         description="生成策略：relaxed 放宽 LLM 审查，strict 使用严格有限审查",
     )
+    MAX_SCENE_LLM_REQUESTS: int = Field(default=64, ge=1)
+    MAX_RUN_LLM_REQUESTS: int = Field(default=512, ge=1)
+    SCENE_CODEGEN_MODE: Literal["llm", "compiler_first"] = "llm"
     MAX_REVIEW_ROUNDS: int = Field(default=8, ge=1, le=10)
     MAX_LOW_RISK_REVIEW_ROUNDS: int = Field(
         default=2,
@@ -881,8 +889,7 @@ class Settings(BaseSettings):
     # Slurm 节点故障/抢占等与代码无关的终态，允许自动重新排队的次数。
     MAX_INFRA_RETRIES: int = Field(default=2, ge=0, le=10)
     # 连续无进展时触发 IR/安全代码候选升级。strict 模式会在回退失败后
-    # 终止；relaxed 模式不把该阈值当作固定修复上限，回退不可用时仍可
-    # 继续调用 AutoFixer。
+    # 终止；relaxed 在 MAX_FIX_ATTEMPTS 和请求预算内继续尝试。
     # strict 模式还会用该阈值识别连续相同的环境/渲染错误。
     MAX_FIX_IDENTICAL_ERRORS: int = Field(default=3, ge=1, le=10)
     MAX_CLARIFY_ROUNDS: int = Field(default=12, ge=1, le=20)
@@ -1115,6 +1122,7 @@ class Settings(BaseSettings):
             max_tokens=max_tokens,
             max_retries=self.LLM_MAX_RETRIES,
             retry_base_delay=self.LLM_RETRY_BASE_DELAY,
+            timeout_total=self.LLM_TIMEOUT_TOTAL,
             timeout_connect=self.LLM_TIMEOUT_CONNECT,
             timeout_read=self.LLM_TIMEOUT_READ,
             healthcheck_timeout=self.LLM_HEALTHCHECK_TIMEOUT,
@@ -1141,6 +1149,7 @@ class Settings(BaseSettings):
             max_tokens=self.VISUAL_LLM_MAX_TOKENS,
             max_retries=self.VISUAL_LLM_MAX_RETRIES,
             retry_base_delay=self.VISUAL_LLM_RETRY_BASE_DELAY,
+            timeout_total=self.VISUAL_LLM_TIMEOUT_TOTAL,
             timeout_connect=self.VISUAL_LLM_TIMEOUT_CONNECT,
             timeout_read=self.VISUAL_LLM_TIMEOUT_READ,
             healthcheck_timeout=self.VISUAL_LLM_HEALTHCHECK_TIMEOUT,
@@ -1225,4 +1234,30 @@ def migrate_user_env_to_toml(
 
 
 migrate_user_env_to_toml()
-settings = Settings()
+_base_settings = Settings()
+
+# A run binds its immutable snapshot; CLI overrides still validate on Settings.
+
+_active_settings: ContextVar[Settings | None] = ContextVar("kd1_run_settings", default=None)
+
+
+class _SettingsAccess:
+    model_fields = Settings.model_fields
+
+    def __getattr__(self, name):
+        return getattr(_active_settings.get() or _base_settings, name)
+
+    def __setattr__(self, name, value):
+        setattr(_active_settings.get() or _base_settings, name, value)
+
+
+@contextmanager
+def runtime_settings(snapshot):
+    token = _active_settings.set(snapshot)
+    try:
+        yield
+    finally:
+        _active_settings.reset(token)
+
+
+settings = _SettingsAccess()

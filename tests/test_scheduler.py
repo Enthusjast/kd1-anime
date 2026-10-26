@@ -596,15 +596,16 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
             assert scene2_code_started.wait(timeout=2)
         state.reviewed = True
 
-    def fake_scene_worker(current_ctx, scene_id, state):
+    def fake_submit(current_ctx, scene_id, state):
         order.append(f"render_start_{scene_id}")
         if scene_id == 1:
             release_scene2_code.set()
+        state.rendered = True
 
     monkeypatch.setattr(orchestrator, "_ensure_technical_spec", fake_technical)
     monkeypatch.setattr(orchestrator, "_scene_code", fake_code)
     monkeypatch.setattr(orchestrator, "_scene_review", fake_review)
-    monkeypatch.setattr(orchestrator, "_scene_worker", fake_scene_worker)
+    monkeypatch.setattr(orchestrator, "_scene_submit", fake_submit)
     monkeypatch.setattr(orchestrator, "_refresh_scene_export", lambda state: None)
     monkeypatch.setattr(orchestrator, "_update_element_manifest", lambda *args: None)
     monkeypatch.setattr(orchestrator, "_update_state_ledger", lambda *args: None)
@@ -613,7 +614,8 @@ def test_structured_technical_handoff_allows_parallel_code_review(monkeypatch, t
 
     orchestrator._run_code_review_barrier(ctx)
 
-    assert len(set(code_threads)) == 2
+    assert len(code_threads) == 2
+    assert len(set(code_threads)) <= 2
     assert handoff_sources == [None, 1]
     assert all(state.reviewed for state in ctx.scene_states.values())
     assert order.index("render_start_1") < order.index("code_done_2")

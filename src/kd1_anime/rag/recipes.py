@@ -17,9 +17,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
 
 from kd1_anime.config import resolve_runtime_path, settings
+from kd1_anime.models import ValidatedModel as BaseModel
 from kd1_anime.security import redact_text
 
 _RUN_ID_RE = re.compile(r"\b\d{8}-\d{6}-[0-9a-f]{8}\b", re.IGNORECASE)

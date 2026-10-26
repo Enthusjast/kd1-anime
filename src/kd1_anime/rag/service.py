@@ -20,6 +20,7 @@ from kd1_anime.config import (
     resolve_runtime_path,
     settings,
 )
+from kd1_anime.control import CURRENT_CONTROL
 from kd1_anime.rag.chunker import (
     CHUNKER_VERSION,
     SourceChunk,
@@ -424,7 +425,11 @@ class RagService:
                 cached = self._query_cache.get(cache_key)
             if cached is not None:
                 return cached
-            with self._semaphore:
+            with (
+                CURRENT_CONTROL.get().slot(self._semaphore)
+                if CURRENT_CONTROL.get()
+                else self._semaphore
+            ):
                 vector = self.embedding.embed([query])[0]
             candidates = index.search_verified(
                 vector,
@@ -459,7 +464,11 @@ class RagService:
         ranked = candidates
         if self.reranker_configured and candidates:
             try:
-                with self._semaphore:
+                with (
+                    CURRENT_CONTROL.get().slot(self._semaphore)
+                    if CURRENT_CONTROL.get()
+                    else self._semaphore
+                ):
                     reranked = self.reranker.rerank(
                         query,
                         [item.chunk.text for item in candidates],
@@ -634,7 +643,11 @@ class RagService:
         for start in range(0, len(pending_indexes), batch_size):
             indexes = pending_indexes[start : start + batch_size]
             batch = [chunks[index] for index in indexes]
-            with self._semaphore:
+            with (
+                CURRENT_CONTROL.get().slot(self._semaphore)
+                if CURRENT_CONTROL.get()
+                else self._semaphore
+            ):
                 vectors = self.embedding.embed([item.text for item in batch])
             for index, vector in zip(indexes, vectors, strict=True):
                 embeddings[index] = vector
@@ -782,12 +795,20 @@ class RagService:
         """验证 Embedding 和 Reranker 的最小标准响应。"""
 
         self.embedding.require()
-        with self._semaphore:
+        with (
+            CURRENT_CONTROL.get().slot(self._semaphore)
+            if CURRENT_CONTROL.get()
+            else self._semaphore
+        ):
             vectors = self.embedding.embed(["kd1-anime RAG health check"])
         if not vectors or not vectors[0]:
             raise RagClientError("Embedding 健康检查返回空向量")
         self.reranker.require()
-        with self._semaphore:
+        with (
+            CURRENT_CONTROL.get().slot(self._semaphore)
+            if CURRENT_CONTROL.get()
+            else self._semaphore
+        ):
             results = self.reranker.rerank(
                 "RAG health check",
                 ["A short reference document."],

@@ -10,10 +10,19 @@ import json
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
-
 from kd1_anime.agents.planner import ScenePlan, VisualElementState
 from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.domain.degraded_program import (
+    DegradedSceneProgram as DegradedSceneProgram,
+)
+from kd1_anime.domain.degraded_program import (
+    ProgramAnimation as ProgramAnimation,
+)
+from kd1_anime.domain.degraded_program import (
+    ProgramObject as ProgramObject,
+)
+from kd1_anime.domain.program import SceneProgram as SceneProgram
+from kd1_anime.services.program_compiler import ProgramCompileError, compile_program
 
 ProgramOperation = Literal[
     "add",
@@ -26,48 +35,6 @@ ProgramOperation = Literal[
     "fade_out",
     "wait",
 ]
-
-
-class ProgramObject(BaseModel):
-    """SceneProgram 中的一个受约束对象。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    element_id: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,99}$")
-    variable_name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,99}$")
-    kind: str = Field(default="Text", min_length=1, max_length=80)
-    label: str = Field(default="", max_length=500)
-    color_key: str = Field(default="primary", max_length=80)
-    initially_active: bool = False
-    exported: bool = False
-    removed: bool = False
-    dependencies: list[str] = Field(default_factory=list, max_length=50)
-
-
-class ProgramAnimation(BaseModel):
-    """SceneProgram 中的一条动画操作。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    operation: ProgramOperation
-    source_ids: list[str] = Field(default_factory=list, max_length=20)
-    target_ids: list[str] = Field(default_factory=list, max_length=20)
-    run_time: float = Field(default=1.0, gt=0, le=30)
-
-
-class SceneProgram(BaseModel):
-    """可编译为单个 Manim Scene 的结构化程序。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal[1] = 1
-    scene_id: int = Field(ge=1)
-    class_name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,199}$")
-    parent: Literal["Scene", "ThreeDScene", "MovingCameraScene"] = "Scene"
-    objects: list[ProgramObject] = Field(default_factory=list, max_length=200)
-    animations: list[ProgramAnimation] = Field(default_factory=list, max_length=300)
-    summary: str = Field(default="", max_length=500)
-    wait_seconds: float = Field(default=1.0, ge=0, le=30)
 
 
 class SceneProgramCompileError(ValueError):
@@ -154,7 +121,7 @@ def _object_expression(item: ProgramObject, variables: set[str]) -> str:
 def build_scene_program_from_contract(
     scene_plan: ScenePlan,
     technical_spec: TechnicalSpec | None = None,
-) -> SceneProgram:
+) -> DegradedSceneProgram:
     """从已批准的 ScenePlan/TechnicalSpec 构造最小确定性程序。"""
 
     technical_objects = {
@@ -217,7 +184,7 @@ def build_scene_program_from_contract(
             animations.append(
                 ProgramAnimation(operation="fade_in", source_ids=[item.element_id], run_time=0.3)
             )
-    return SceneProgram(
+    return DegradedSceneProgram(
         scene_id=scene_plan.scene_id,
         class_name=f"Scene{scene_plan.scene_id}",
         parent="ThreeDScene"
@@ -230,7 +197,7 @@ def build_scene_program_from_contract(
     )
 
 
-def compile_scene_program(program: SceneProgram, scene_plan: ScenePlan) -> str:
+def _compile_degraded_program(program: DegradedSceneProgram, scene_plan: ScenePlan) -> str:
     """把 SceneProgram 编译为不含动态执行的 Manim Python。"""
 
     if len({item.element_id for item in program.objects}) != len(program.objects):
@@ -317,6 +284,17 @@ def compile_scene_program(program: SceneProgram, scene_plan: ScenePlan) -> str:
             raise SceneProgramCompileError(f"后备编译器暂不支持动画: {animation.operation}")
     lines.append(f"        self.wait({program.wait_seconds:g})")
     return "\n".join(lines) + "\n"
+
+
+def compile_scene_program(
+    program: SceneProgram | DegradedSceneProgram, scene_plan: ScenePlan
+) -> str:
+    if isinstance(program, DegradedSceneProgram):
+        return _compile_degraded_program(program, scene_plan)
+    try:
+        return compile_program(program, scene_plan)
+    except ProgramCompileError as exc:
+        raise SceneProgramCompileError(str(exc)) from exc
 
 
 __all__ = [

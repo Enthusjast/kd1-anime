@@ -78,7 +78,10 @@ def test_checkpoint_round_trip_rejects_tampered_code(tmp_path):
     restored = orchestrator._context_from_manifest(manifest, paths.root)
     assert restored.scene_states[1].code == code
 
-    code_path.write_text(code + "# changed\n", encoding="utf-8")
+    # Display aliases cannot affect recovery; only the manifest object is authoritative.
+    code_path.write_text(code + "# display changed\n", encoding="utf-8")
+    assert orchestrator._context_from_manifest(manifest, paths.root).scene_states[1].code == code
+    (paths.root / manifest.scenes[1].code_file).write_text(code + "# changed\n", encoding="utf-8")
     with pytest.raises(ValueError, match="哈希"):
         orchestrator._context_from_manifest(manifest, paths.root)
 
@@ -522,10 +525,10 @@ def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_current_manifest_uses_v8_schema_and_merge_profile():
+def test_current_manifest_uses_v10_schema_and_merge_profile():
     assert (
         RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
-        == 8
+        == 10
     )
     assert (
         RunManifest(
@@ -537,7 +540,7 @@ def test_current_manifest_uses_v8_schema_and_merge_profile():
     )
 
 
-def test_v7_manifest_migrates_safe_generation_mode_field_for_resume(tmp_path):
+def test_v7_manifest_remains_read_only_without_version_upgrade(tmp_path):
     workspace = tmp_path / "workspace"
     root = workspace / "runs" / RUN_ID
     root.mkdir(parents=True)
@@ -551,10 +554,12 @@ def test_v7_manifest_migrates_safe_generation_mode_field_for_resume(tmp_path):
     (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
 
     repository = RunRepository(workspace)
-    loaded = repository.load_for_resume(RUN_ID)
-
-    assert loaded.schema_version == 8
-    assert loaded.generation_mode == "relaxed"
+    before = (root / "manifest.json").read_bytes()
+    loaded = repository.load(RUN_ID)
+    assert loaded.schema_version == 7
+    with pytest.raises(ValueError, match="只读"):
+        repository.load_for_resume(RUN_ID)
+    assert (root / "manifest.json").read_bytes() == before
 
 
 def test_v4_manifest_is_readable_but_read_only(tmp_path):
@@ -575,7 +580,7 @@ def test_v4_manifest_is_readable_but_read_only(tmp_path):
     assert loaded.schema_version == 4
     with pytest.raises(ValueError, match="仅支持只读查看"):
         loaded.validate_for_resume()
-    with pytest.raises(ValueError, match="只允许写入 v8"):
+    with pytest.raises(ValueError, match="只允许写入 v10"):
         write_manifest(path, loaded)
 
 

@@ -55,6 +55,7 @@ class CandidateAcceptor:
         *,
         technical_spec: TechnicalSpec | None = None,
         renderer: str | None = None,
+        manim_version: str | None = None,
         expected_class_name: str | None = None,
         validator: Callable[..., CodeValidationResult] | None = None,
     ) -> AcceptedCandidate:
@@ -76,7 +77,9 @@ class CandidateAcceptor:
                 f"候选代码不包含期望 Scene 类 {expected_class_name!r}，"
                 f"可用类: {validation.scene_classes}"
             )
-        api_result = lint_manim_api(code, renderer=renderer, scene_plan=plan)
+        api_result = lint_manim_api(
+            code, renderer=renderer, scene_plan=plan, manim_version=manim_version
+        )
         if not api_result.is_valid:
             raise CandidateRejected("Manim API 校验失败:\n" + "\n".join(api_result.errors))
         try:
@@ -113,6 +116,7 @@ class CandidateAcceptor:
         *,
         technical_spec: TechnicalSpec | None = None,
         renderer: str | None = None,
+        manim_version: str | None = None,
         expected_class_name: str | None = None,
         destination: Path | None = None,
         validator: Callable[..., CodeValidationResult] | None = None,
@@ -124,6 +128,7 @@ class CandidateAcceptor:
             plan,
             technical_spec=technical_spec,
             renderer=renderer,
+            manim_version=manim_version,
             expected_class_name=expected_class_name,
             validator=validator,
         )

@@ -21,7 +21,7 @@ class ReviewBudget:
 class ReviewModePolicy:
     """统一的 Review/修复预算策略。
 
-    ``None`` 表示不使用固定轮数上限；停滞检测仍由状态机负责。
+    两种模式都使用配置的有限上限；零保留为禁用语义。
     """
 
     mode: GenerationMode
@@ -31,11 +31,8 @@ class ReviewModePolicy:
     def relaxed(self) -> bool:
         return self.mode == "relaxed"
 
-    def limit(self, configured: int | None) -> int | None:
-        if self.relaxed:
-            return None
-        value = self.strict_cap if configured is None else int(configured)
-        return max(1, min(self.strict_cap, value))
+    def limit(self, configured: int | None) -> int:
+        return max(0, self.strict_cap if configured is None else int(configured))
 
     def prompt_guidance(self) -> str:
         """返回给审查模型的模式约束。
@@ -77,12 +74,10 @@ def review_budget(
     """返回 LLM 审查上限；确定性校验不受该预算影响。"""
 
     risk = assess_scene_risk(scene_plan, technical_spec)
-    if generation_mode == "relaxed":
-        return ReviewBudget(risk_level=risk.level, max_rounds=None)
     limit = low_risk_max_rounds if risk.level == "low" else global_max_rounds
     return ReviewBudget(
         risk_level=risk.level,
-        max_rounds=max(1, min(8, int(limit))),
+        max_rounds=max(1, int(limit)),
     )
 
 

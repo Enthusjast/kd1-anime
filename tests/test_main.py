@@ -46,10 +46,12 @@ def test_render_copies_source_into_private_run_directory(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     copied = captured["python_file"]
     assert copied != source
-    assert copied.parent.name == "scenes"
+    assert copied.parent.name == "scene_1"
+    assert copied.parent.parent.name == "revisions"
+    assert copied.stem == __import__("hashlib").sha256(source.read_bytes()).hexdigest()
     assert copied.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
     assert copied.stat().st_mode & 0o777 == 0o600
-    manifest = RunRepository(settings.WORKSPACE_DIR).load(copied.parent.parent.name)
+    manifest = RunRepository(settings.WORKSPACE_DIR).load(copied.parents[3].name)
     assert manifest.state == "MONITORING"
     assert manifest.status == "running"
     assert manifest.auto_fix is False

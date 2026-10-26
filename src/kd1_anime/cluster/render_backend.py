@@ -7,7 +7,9 @@ Slurm 与本地前台进程因此可以复用同一套 Orchestrator/JobMonitor �
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -19,19 +21,21 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
 
+from kd1_anime.cluster.artifacts import RenderArtifactValidator
+from kd1_anime.cluster.execution import ExecutionPolicy
+from kd1_anime.cluster.jobs import PollObservation, RenderJob
+from kd1_anime.cluster.launch import LOCAL_LAUNCH, VERIFY_IMAGE_LAUNCH
 from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.cluster.slurm import (
     SlurmDispatcher,
-    SlurmJob,
-    SlurmPollSnapshot,
     _dashboard_quiet,
 )
 from kd1_anime.config import settings
+from kd1_anime.domain.execution import SubmissionAttempt
 from kd1_anime.rendering import RenderProfile
 
 RenderBackendName = Literal["slurm", "local"]
 # 兼容旧代码的名字；作业字段已经被抽象为可由任一后端承载的 RenderJob。
-RenderJob = SlurmJob
 
 
 class RenderBackend(Protocol):
@@ -51,7 +55,16 @@ class RenderBackend(Protocol):
         code_sha256: str = "",
         render_profile: RenderProfile | None = None,
         resource_profile: RenderResourceProfile | None = None,
+        attempt_token: str | None = None,
     ) -> RenderJob: ...
+
+    def poll(self, job_ids: list[str]) -> PollObservation: ...
+
+    def forward_log(self, job: RenderJob, positions: dict[str, int]) -> None: ...
+
+    def classify_gone(self, job: RenderJob) -> str | None: ...
+
+    def recover_submission(self, attempt, **inputs) -> RenderJob | None: ...
 
     def poll_all_statuses(self, job_ids: list[str]) -> dict[str, str]: ...
 
@@ -73,8 +86,67 @@ class SlurmRenderBackend(SlurmDispatcher):
 
     name: RenderBackendName = "slurm"
 
+    def recover_submission(
+        self,
+        attempt: SubmissionAttempt,
+        *,
+        scene_id: int,
+        source: Path,
+        root: Path,
+        render_profile: RenderProfile,
+    ) -> RenderJob | None:
+        safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "-", root.name)[:48]
+        name = f"kd1-{safe_run}-s{scene_id}"[:80] + "-" + attempt.token
+        identifiers: set[str] = set()
+        commands = [
+            ["squeue", "--noheader", f"--name={name}", "--format=%i|%j"],
+            [
+                "sacct",
+                "-n",
+                "-X",
+                f"--name={name}",
+                f"--starttime={attempt.created_at.strftime('%Y-%m-%dT%H:%M:%S')}",
+                "--format=JobIDRaw,JobName%128",
+                "--parsable2",
+            ],
+        ]
+        for command in commands:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=30, check=False
+            )
+            if result.returncode != 0:
+                raise RuntimeError("无法确认上次提交状态，禁止自动重提")
+            for line in result.stdout.splitlines():
+                fields = line.strip().split("|")
+                if (
+                    len(fields) >= 2
+                    and fields[1].strip() == name
+                    and re.fullmatch(r"\d+", fields[0].strip())
+                ):
+                    identifiers.add(fields[0].strip())
+        if len(identifiers) > 1:
+            raise RuntimeError("提交标识对应多个作业，禁止自动认领或重提")
+        if not identifiers:
+            return None
+        identifier = identifiers.pop()
+        return RenderJob(
+            execution_sha256=self.execution_spec.digest()
+            if getattr(self, "execution_spec", None)
+            else "",
+            job_id=identifier,
+            scene_id=scene_id,
+            script_path=root / "scenes" / f"render_{scene_id}.sh",
+            log_out=root / "logs" / f"scene_{scene_id}_{identifier}.out",
+            log_err=root / "logs" / f"scene_{scene_id}_{identifier}.err",
+            media_dir=root / "videos" / f"scene_{scene_id}" / f"attempt_{attempt.token}",
+            scene_class_name="",
+            submitted_at=attempt.created_at.timestamp(),
+            code_sha256=attempt.code_sha256,
+            render_profile=render_profile,
+        )
 
-class LocalRenderBackend(SlurmDispatcher):
+
+class LocalRenderBackend(RenderArtifactValidator):
     """在当前主机前台启动 Manim 的正式渲染后端。
 
     每次尝试都有独立 media/log 目录；进程使用新的 session，因此取消时
@@ -85,10 +157,11 @@ class LocalRenderBackend(SlurmDispatcher):
     name: RenderBackendName = "local"
 
     def __init__(self) -> None:
-        super().__init__()
+        self.last_start_times: dict[str, float] = {}
+        self.last_status_diagnostic = ""
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._log_handles: dict[str, tuple[object, object]] = {}
-        self._jobs: dict[str, SlurmJob] = {}
+        self._jobs: dict[str, RenderJob] = {}
         self._process_lock = threading.RLock()
 
     @staticmethod
@@ -171,7 +244,8 @@ class LocalRenderBackend(SlurmDispatcher):
         code_sha256: str = "",
         render_profile: RenderProfile | None = None,
         resource_profile: RenderResourceProfile | None = None,
-    ) -> SlurmJob:
+        attempt_token: str | None = None,
+    ) -> RenderJob:
         scene_id = self._validate_scene_id(scene_id)
         scene_class_name = self._validate_scene_class_name(scene_class_name)
         source = Path(python_file).expanduser().resolve()
@@ -180,7 +254,9 @@ class LocalRenderBackend(SlurmDispatcher):
             raise RuntimeError(f"本地渲染场景代码不存在或不安全: {source}")
         _scenes_root, logs_root, videos_root = self._validate_dirs(scenes_dir, logs_dir, videos_dir)
         profile = render_profile or RenderProfile.current()
-        attempt = uuid4().hex[:12]
+        attempt = attempt_token or uuid4().hex[:12]
+        if not re.fullmatch(r"[0-9a-f]{12}", attempt):
+            raise ValueError("渲染尝试标识格式无效")
         job_id = self._local_job_id()
         media_dir = videos_root / f"scene_{scene_id}" / f"attempt_{attempt}"
         if media_dir.is_symlink():
@@ -190,6 +266,35 @@ class LocalRenderBackend(SlurmDispatcher):
         log_out = logs_root / f"scene_{scene_id}_{job_id}.out"
         log_err = logs_root / f"scene_{scene_id}_{job_id}.err"
         command = self._build_command(source, scene_class_name, media_dir, profile)
+        spec = getattr(self, "execution_spec", None)
+        policy = ExecutionPolicy.from_spec(spec)
+        if spec is not None:
+            identity = json.dumps(
+                {"execution_sha256": spec.digest(), "container_sha256": spec.image_sha256}
+            )
+            command = [
+                sys.executable,
+                "-c",
+                LOCAL_LAUNCH,
+                identity,
+                str(media_dir / "environment.json"),
+                *command,
+            ]
+        command = policy.wrap(
+            command,
+            _scenes_root.parent,
+            renderer=profile.renderer,
+            platform=profile.opengl_platform,
+        )
+        if policy.image_sha256:
+            command = [
+                sys.executable,
+                "-c",
+                VERIFY_IMAGE_LAUNCH,
+                policy.image,
+                policy.image_sha256,
+                *command,
+            ]
         prlimit = shutil.which("prlimit")
         if prlimit:
             command = [
@@ -199,12 +304,7 @@ class LocalRenderBackend(SlurmDispatcher):
                 "--",
                 *command,
             ]
-        env = os.environ.copy()
-        env["MANIM_RENDERER"] = profile.renderer
-        if profile.renderer == "opengl":
-            env["PYOPENGL_PLATFORM"] = profile.opengl_platform
-        # 不让本地调用继承一个指向不同项目/用户的媒体配置。
-        env.pop("MANIM_MEDIA_DIR", None)
+        env = policy.environment(renderer=profile.renderer, platform=profile.opengl_platform)
         out_handle = None
         err_handle = None
         try:
@@ -228,7 +328,10 @@ class LocalRenderBackend(SlurmDispatcher):
                     err_handle.close()
             raise
         submitted_at = time.time()
-        job = SlurmJob(
+        job = RenderJob(
+            execution_sha256=self.execution_spec.digest()
+            if getattr(self, "execution_spec", None)
+            else "",
             job_id=job_id,
             scene_id=scene_id,
             script_path=source,
@@ -256,7 +359,7 @@ class LocalRenderBackend(SlurmDispatcher):
             with suppress(OSError, AttributeError):
                 handle.close()  # type: ignore[union-attr]
 
-    def poll_all_statuses_snapshot(self, job_ids: list[str]) -> SlurmPollSnapshot:
+    def poll_all_statuses_snapshot(self, job_ids: list[str]) -> PollObservation:
         statuses: dict[str, str] = {}
         start_times: dict[str, float] = {}
         diagnostics: list[str] = []
@@ -280,10 +383,16 @@ class LocalRenderBackend(SlurmDispatcher):
                 else:
                     statuses[job_id] = "CANCELLED" if return_code < 0 else "FAILED"
                     self._close_handles(job_id)
-        snapshot = SlurmPollSnapshot(statuses, start_times, "；".join(diagnostics))
+        snapshot = PollObservation(statuses, start_times, "；".join(diagnostics))
         self.last_start_times = dict(start_times)
         self.last_status_diagnostic = snapshot.diagnostic
         return snapshot
+
+    def poll(self, job_ids):
+        return self.poll_all_statuses_snapshot(job_ids)
+
+    def recover_submission(self, attempt, **inputs):
+        raise RuntimeError("A historical local process cannot be adopted; submission is uncertain")
 
     def poll_all_statuses(self, job_ids: list[str]) -> dict[str, str]:
         return dict(self.poll_all_statuses_snapshot(job_ids).statuses)
@@ -292,9 +401,8 @@ class LocalRenderBackend(SlurmDispatcher):
         with self._process_lock:
             process = self._processes.get(job_id)
         if process is None:
-            # 当前进程没有这个句柄时不假装重新获取它；它可能是恢复出来的
-            # 旧作业，调用方会把它作为不可认领任务重新排队。
-            return True
+            # 没有句柄就无法确认取消成功；历史 PID 不能提供进程身份。
+            return False
         if process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -303,10 +411,16 @@ class LocalRenderBackend(SlurmDispatcher):
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                with suppress(OSError, ProcessLookupError):
+                try:
                     os.killpg(process.pid, signal.SIGKILL)
-                with suppress(OSError):
+                except OSError:
+                    return False
+                try:
                     process.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    return False
+        if process.poll() is None:
+            return False
         self._close_handles(job_id)
         return True
 

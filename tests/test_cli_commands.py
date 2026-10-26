@@ -428,6 +428,14 @@ def test_generate_resume_uses_manifest_dry_run_for_completion_message(monkeypatc
             )
         },
     )
+    from kd1_anime.run_store import sha256_text
+
+    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+    (root / "scenes").mkdir()
+    (root / "scenes" / "scene_1.py").write_text(code)
+    manifest.scenes[1].code_file = "scenes/scene_1.py"
+    manifest.scenes[1].code_sha256 = sha256_text(code)
+    manifest.scenes[1].class_name = "Demo"
     write_manifest(root / "manifest.json", manifest)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
 

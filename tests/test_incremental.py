@@ -5,6 +5,7 @@ from pathlib import Path
 from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.agents.reviewer import ReviewResult
 from kd1_anime.config import settings
+from kd1_anime.domain.runtime import ExecutionSpec
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState
 from kd1_anime.rendering import RenderProfile, SceneArtifact, VideoMetadata, sha256_file
 from kd1_anime.run_store import RunManifest, StoredSceneState, get_reusable_video_path, sha256_text
@@ -48,7 +49,19 @@ def make_base(workspace: Path, profile: RenderProfile) -> tuple[RunManifest, Pat
     video = root / "videos" / "scene_1" / "Demo.mp4"
     video.parent.mkdir(parents=True)
     video.write_bytes(b"verified old video")
+    spec = ExecutionSpec.capture(profile)
+    fingerprint = {
+        "execution_sha256": spec.digest(),
+        "container_sha256": spec.image_sha256,
+        "python": spec.python_version or "3.12.0",
+        "manim": profile.manim_version or "0.20.1",
+        "ffmpeg": profile.ffmpeg_version or "test",
+        "xelatex": profile.xelatex_version or "test",
+        "renderer": profile.renderer,
+    }
     artifact = SceneArtifact(
+        execution_sha256=spec.digest(),
+        environment_fingerprint=fingerprint,
         origin="rendered",
         source_run_id=RUN_ID,
         job_id="12345",
@@ -99,6 +112,7 @@ def test_incremental_reuses_verified_matching_artifact(monkeypatch, tmp_path):
         "updated",
         paths=paths,
         scene_states={1: state},
+        execution_spec=ExecutionSpec.capture(profile),
         incremental=True,
         base_run_id=RUN_ID,
         base_manifest=base,
@@ -142,6 +156,7 @@ def test_incremental_reuse_is_self_contained_after_base_cleanup(monkeypatch, tmp
         "updated",
         paths=paths,
         scene_states={1: state},
+        execution_spec=ExecutionSpec.capture(profile),
         incremental=True,
         base_run_id=RUN_ID,
         base_manifest=base,
@@ -172,6 +187,7 @@ def test_incremental_rejects_render_profile_change(monkeypatch, tmp_path):
         "updated",
         paths=paths,
         scene_states={1: state},
+        execution_spec=ExecutionSpec.capture(changed_profile),
         incremental=True,
         base_run_id=RUN_ID,
         base_manifest=base,
@@ -197,6 +213,7 @@ def test_incremental_rejects_code_change(monkeypatch, tmp_path):
         "updated",
         paths=paths,
         scene_states={1: state},
+        execution_spec=ExecutionSpec.capture(profile),
         incremental=True,
         base_run_id=RUN_ID,
         base_manifest=base,

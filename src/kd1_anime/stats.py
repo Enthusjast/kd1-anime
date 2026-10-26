@@ -22,7 +22,11 @@ def _read_events(root: Path) -> list[dict[str, Any]]:
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(item, dict) and isinstance(item.get("event"), str):
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("event"), str)
+                and isinstance(item.get("data", {}), dict)
+            ):
                 events.append(item)
     except OSError:
         return []
@@ -30,6 +34,15 @@ def _read_events(root: Path) -> list[dict[str, Any]]:
 
 
 def _stage_durations(events: list[dict[str, Any]], updated_at: datetime) -> dict[str, float]:
+    spans = [item.get("data", {}) for item in events if item.get("event") == "stage_span_finished"]
+    if spans:
+        durations: dict[str, float] = {}
+        for span in spans:
+            stage = span.get("stage")
+            seconds = span.get("duration_seconds")
+            if isinstance(stage, str) and isinstance(seconds, (int, float)) and seconds >= 0:
+                durations[stage] = round(durations.get(stage, 0) + seconds, 3)
+        return durations
     starts: list[tuple[str, datetime]] = []
     for event in events:
         if event.get("event") != "stage_start":
@@ -61,6 +74,25 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
         scene.failure_category or "unknown" for scene in scenes if scene.failed or scene.give_up
     )
     events = _read_events(root) if root is not None else []
+    reserved_ids = {item.request_id for item in manifest.request_budget.reservations}
+    request_events = {
+        item.get("data", {}).get("request_id"): item.get("data", {})
+        for item in events
+        if item.get("event") == "model_request_finished"
+        and item.get("data", {}).get("request_id")
+        and (manifest.schema_version < 9 or item["data"]["request_id"] in reserved_ids)
+    }
+    token_usage = {}
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        values = [(item.get("usage") or {}).get(name) for item in request_events.values()]
+        measured = [value for value in values if isinstance(value, int)]
+        token_usage[name] = {
+            "known_total": sum(measured) if measured else None,
+            "measured_requests": len(measured),
+            "unknown_requests": max(0, len(manifest.request_budget.reservations) - len(measured))
+            if manifest.schema_version >= 9
+            else None,
+        }
     event_counts = Counter(str(event["event"]) for event in events)
     review_artifacts = (
         len(list((root / "artifacts").glob("code_review_scene_*.json"))) if root else 0
@@ -112,11 +144,37 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
             "execution_verified": sum(
                 scene.execution_verification.status == "passed" for scene in scenes
             ),
+            "visual_unknown": sum(
+                scene.visual_verification.status == "unknown" for scene in scenes
+            ),
+            "visual_accepted": sum(
+                scene.visual_verification.status in {"passed", "warning"} for scene in scenes
+            ),
             "visual_verified": sum(
-                scene.visual_verification.status in {"passed", "warning", "unknown"}
-                for scene in scenes
+                scene.visual_verification.status == "passed" for scene in scenes
             ),
         },
+        "model_requests": len(manifest.request_budget.reservations)
+        if manifest.schema_version >= 9
+        else None,
+        "model_retry_requests": sum(
+            item.attempt > 1 or item.json_repair_attempt > 0
+            for item in manifest.request_budget.reservations
+        )
+        if manifest.schema_version >= 9
+        else None,
+        "model_usage_available_requests": sum(
+            bool(item.get("data", {}).get("usage"))
+            for item in events
+            if item.get("event") == "model_request_finished"
+        ),
+        "model_request_details": [
+            item["data"] for item in events if item.get("event") == "model_request_finished"
+        ],
+        "model_token_usage": token_usage,
+        "stage_duration_source": "spans"
+        if any(item.get("event") == "stage_span_finished" for item in events)
+        else "legacy_estimate",
         "review_attempts": review_artifacts,
         "plan_review_attempts": plan_review_artifacts,
         "fix_attempts": sum(int(scene.fix_attempts) for scene in scenes),

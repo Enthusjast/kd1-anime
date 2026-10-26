@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -125,6 +126,7 @@ class VerifiedIndexSnapshot:
     info: RagIndexInfo
     chunks: tuple[RagChunk, ...]
     vectors: tuple[tuple[float, ...], ...]
+    norms: tuple[float, ...] = ()
 
 
 class RagIndex:
@@ -360,6 +362,7 @@ class RagIndex:
             info=info,
             chunks=tuple(chunks),
             vectors=tuple(decoded_vectors),
+            norms=tuple(math.sqrt(sum(v * v for v in vector)) for vector in decoded_vectors),
         )
 
     def verify_integrity(self) -> RagIndexInfo:
@@ -444,9 +447,10 @@ class RagIndex:
             raise ValueError(f"查询向量维度不一致: {len(query)} != {info.embedding_dimension}")
         if any(not math.isfinite(value) for value in query):
             raise ValueError("查询向量包含非有限数值")
+        query_norm = math.sqrt(sum(value * value for value in query))
         candidates: list[RetrievedChunk] = []
 
-        def append_candidate(chunk: RagChunk, vector: Sequence[float]) -> None:
+        def append_candidate(chunk: RagChunk, vector: Sequence[float], norm=None) -> None:
             if source_kinds is not None and chunk.source_kind not in source_kinds:
                 return
             if (
@@ -454,14 +458,33 @@ class RagIndex:
                 and chunk.metadata.get("framework", "") in exclude_frameworks
             ):
                 return
-            candidates.append(RetrievedChunk(chunk=chunk, score=_cosine_similarity(query, vector)))
+            vector_norm = (
+                norm if norm is not None else math.sqrt(sum(value * value for value in vector))
+            )
+            score = (
+                max(
+                    -1.0,
+                    min(
+                        1.0,
+                        sum(a * b for a, b in zip(query, vector, strict=True))
+                        / (query_norm * vector_norm),
+                    ),
+                )
+                if query_norm and vector_norm
+                else 0.0
+            )
+            candidates.append(RetrievedChunk(chunk=chunk, score=score))
 
         try:
             if snapshot is not None:
                 if snapshot.info.index_sha256 != info.index_sha256:
                     raise ValueError("RAG 索引快照与元数据不一致")
-                for chunk, vector in zip(snapshot.chunks, snapshot.vectors, strict=True):
-                    append_candidate(chunk, vector)
+                for index, (chunk, vector) in enumerate(
+                    zip(snapshot.chunks, snapshot.vectors, strict=True)
+                ):
+                    append_candidate(
+                        chunk, vector, snapshot.norms[index] if snapshot.norms else None
+                    )
             else:
                 with sqlite3.connect(self.path) as connection:
                     rows = connection.execute(
@@ -489,5 +512,6 @@ class RagIndex:
             if isinstance(exc, ValueError) and "维度" in str(exc):
                 raise
             raise ValueError(f"RAG 索引检索失败: {self.path}") from exc
-        candidates.sort(key=lambda item: item.score, reverse=True)
-        return candidates[:top_k]
+        return heapq.nsmallest(
+            top_k, candidates, key=lambda item: (-item.score, item.chunk.chunk_id)
+        )

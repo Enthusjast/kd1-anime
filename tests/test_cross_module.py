@@ -88,12 +88,17 @@ def test_local_backend_identity_round_trips_through_manifest(tmp_path: Path):
     assert restored.scene_states[1].slurm_job.backend == "local"
 
 
-def test_local_resume_detaches_old_job_and_reuses_code(monkeypatch, tmp_path: Path):
+def test_local_resume_preserves_unconfirmed_job_and_blocks_resubmission(
+    monkeypatch, tmp_path: Path
+):
     workspace = tmp_path / "workspace"
     root = workspace / "runs" / RUN_ID
     scenes = root / "scenes"
     scenes.mkdir(parents=True)
     (scenes / "scene_1.py").write_text(CODE, encoding="utf-8")
+    from kd1_anime.objects import ObjectStore
+
+    reference = ObjectStore(root).source(1, CODE)
     code_hash = hashlib.sha256(CODE.encode()).hexdigest()
     job = {
         "job_id": "local-abcdef123456",
@@ -119,7 +124,7 @@ def test_local_resume_detaches_old_job_and_reuses_code(monkeypatch, tmp_path: Pa
         scenes={
             1: StoredSceneState(
                 plan=make_plan(),
-                code_file="scenes/scene_1.py",
+                code_file=reference,
                 code_sha256=code_hash,
                 class_name="Demo",
                 plan_ready=True,
@@ -129,6 +134,7 @@ def test_local_resume_detaches_old_job_and_reuses_code(monkeypatch, tmp_path: Pa
             )
         },
     )
+    manifest.scenes[1].slurm_job.execution_sha256 = manifest.execution_spec.digest()
     write_manifest(root / "manifest.json", manifest)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
     captured = {}
@@ -141,5 +147,8 @@ def test_local_resume_detaches_old_job_and_reuses_code(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(Orchestrator, "_execute", fake_execute)
     assert Orchestrator().resume(RUN_ID) is None
     assert captured["context"].backend == "local"
-    assert captured["context"].scene_states[1].slurm_job is None
+    restored = captured["context"].scene_states[1]
+    assert restored.slurm_job.job_id == job["job_id"]
+    assert restored.failed and restored.give_up
+    assert "禁止自动重提" in restored.failure_reason
     assert captured["state"] is State.MONITORING

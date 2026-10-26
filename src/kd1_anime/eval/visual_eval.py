@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
 
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.config import settings
 from kd1_anime.eval.metrics import EvalMetric, QualityScore
 from kd1_anime.eval.prompts import VISUAL_EVAL_PROMPT, VISUAL_EVAL_SYSTEM_PROMPT
+from kd1_anime.models import ValidatedModel as BaseModel
 from kd1_anime.rendering import sha256_file
 
 MAX_FRAME_COUNT = 8

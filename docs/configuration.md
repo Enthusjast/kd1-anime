@@ -83,6 +83,7 @@ URL。API Key 不会写入 manifest 或事件日志。
 | LLM_RETRY_BASE_DELAY | 2.0 | 重试退避初始秒数 |
 | LLM_TIMEOUT_CONNECT | 30 | 连接超时秒数 |
 | LLM_TIMEOUT_READ | 600 | 读取超时秒数 |
+| LLM_TIMEOUT_TOTAL | 0 | 单次逻辑调用总时限，含等待配额、重试和响应；0 不限制总时长 |
 | LLM_HEALTHCHECK_TIMEOUT | 15 | 启动探测超时秒数 |
 | LLM_SILENT_STREAM | true | 非流式业务请求是否静默收集流式响应 |
 | LLM_EMPTY_RETRY_MAX_TOKENS | 32000 | 空响应重试时使用的预算 |
@@ -119,6 +120,7 @@ URL。API Key 不会写入 manifest 或事件日志。
 | VISUAL_LLM_RETRY_BASE_DELAY | 2.0 | 重试退避初始秒数 |
 | VISUAL_LLM_TIMEOUT_CONNECT | 30 | 连接超时秒数 |
 | VISUAL_LLM_TIMEOUT_READ | 300 | 读取超时秒数 |
+| VISUAL_LLM_TIMEOUT_TOTAL | 0 | 视觉逻辑调用总时限；0 不限制总时长 |
 | VISUAL_LLM_HEALTHCHECK_TIMEOUT | 20 | 视觉端点探测超时秒数 |
 | VISUAL_LLM_JSON_REPAIR_ATTEMPTS | 1 | 结构化报告修复次数 |
 | VISUAL_LLM_USE_JSON_MODE | true | 是否请求 JSON 模式 |
@@ -249,17 +251,20 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | 配置项 | 默认值 | 说明 |
 |---|---:|---|
 | GENERATION_MODE | relaxed | 生成策略；relaxed 放宽 LLM Review，strict 使用严格有限审查 |
-| MAX_REVIEW_ROUNDS | 8 | strict 模式单场景代码审查/重写轮数；relaxed 不使用固定上限 |
+| SCENE_CODEGEN_MODE | llm | 可选 compiler_first；完整 SceneProgram v2 优先编译，不支持或参数缺失时回退 Coder |
+| MAX_SCENE_LLM_REQUESTS | 64 | 单场景主/视觉模型实际请求总限额，必须为正整数 |
+| MAX_RUN_LLM_REQUESTS | 512 | 运行请求总限额，含探测、网络重试、结构修复和兼容回退，必须为正整数 |
+| MAX_REVIEW_ROUNDS | 8 | 两种模式的单场景代码审查/重写轮数 |
 | MAX_LOW_RISK_REVIEW_ROUNDS | 2 | strict 模式低风险场景的代码审查轮数；确定性检查不跳过 |
-| MAX_PLAN_REVIEW_ROUNDS | 2 | strict 模式单场景计划审查轮数；relaxed 不使用固定上限 |
-| MAX_PLAN_REPLAN_ATTEMPTS | 3 | strict 模式计划反馈后的 Planner 总重调用次数；relaxed 不使用固定上限 |
+| MAX_PLAN_REVIEW_ROUNDS | 2 | 两种模式的单场景计划审查轮数 |
+| MAX_PLAN_REPLAN_ATTEMPTS | 3 | 两种模式计划反馈后的 Planner 总重调用次数 |
 | MAX_CONTINUITY_FIX_ROUNDS | 2 | 连续性局部重规划次数；耗尽后 warning 放行 |
 | CONTINUITY_CONTEXT_MODE | minimal | 跨场景代码上下文范围：minimal、full 或 stateless |
 | SKIP_REVIEW | false | 是否跳过语义代码审查；确定性校验仍保留 |
 | SAFE_FALLBACK_ENABLED | true | 高风险几何失败后是否切换保守方案 |
 | MAX_IDENTICAL_REVIEW_ATTEMPTS | 2 | strict 模式相同代码/反馈重复次数上限 |
 | MAX_STAGNANT_ATTEMPTS | 2 | strict 模式渲染修复无进展后切换确定性回退的次数 |
-| MAX_FIX_ATTEMPTS | 8 | strict 模式渲染失败后的最大代码修复次数；relaxed 不使用固定上限 |
+| MAX_FIX_ATTEMPTS | 8 | 两种模式的渲染修复次数；0 禁用自动修复 |
 | MAX_INFRA_RETRIES | 2 | 基础设施故障重排队次数 |
 | MAX_FIX_IDENTICAL_ERRORS | 3 | 相同渲染错误指纹的放弃阈值 |
 | MAX_CLARIFY_ROUNDS | 12 | Clarifier 最大轮数 |
@@ -267,7 +272,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 | MAX_PROMPT_CHARS | 50000 | 用户需求字符上限 |
 | MAX_CLARIFY_CONTEXT_CHARS | 40000 | 多轮澄清上下文上限 |
 | MAX_LOG_CHARS | 30000 | AutoFixer 接收的日志上限 |
-| CODE_VALIDATION_ATTEMPTS | 3 | strict 模式代码校验失败后的重生成次数；relaxed 模式无固定上限，并在重复候选时要求切换实现 |
+| CODE_VALIDATION_ATTEMPTS | 3 | 两种模式代码校验失败后的重生成次数；重复无进展可提前结束 |
 | MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH | 1/2/3 | 按场景风险允许的不同代码实现策略数 |
 | MONITOR_POLL_INTERVAL | 10 | Slurm 轮询间隔秒数 |
 | MONITOR_QUEUE_TIMEOUT | 3600 | 排队超时秒数 |
@@ -311,7 +316,7 @@ MANIM_RENDERER 决定 Cairo/OpenGL；MANIM_OPENGL_PLATFORM 只决定 OpenGL 上�
 环境会优先复用。
 
 本地正式渲染在当前进程的前台执行，`render` 命令必须使用 `--wait`；本地任务不会把
-PID 写入 manifest，恢复时会重新启动未完成任务，不会认领已有 PID。若只想验证计划和代码，
+PID 写入 manifest，恢复时只允许重新启动已确认终态的任务；状态不明时保留任务身份并阻止自动重提。若只想验证计划和代码，
 使用 `--dry-run`，它不会提交正式本地任务。
 
 ### HPC/Slurm：Cairo
@@ -364,3 +369,9 @@ OpenGL 代码不能使用 self.camera.frame 或 MovingCameraScene 的 Cairo 运�
 
 诊断输出会显示模型名和 URL，但不会显示 API Key。若怀疑读取了错误的配置，可
 暂时使用进程环境变量覆盖并重新运行 doctor；不要在日志或 issue 中粘贴完整配置文件。
+
+
+新运行将非敏感配置固定为不可变 `RunConfig`，执行策略保存为 `ExecutionSpec`。
+恢复时保留原配置、重试上限和预算；API Key 从当前运行环境解析，允许轮换凭据。
+容器镜像以文件 SHA-256 绑定，提交前及启动时复核；修改镜像后应创建新运行。
+同步请求的取消按传输超时收敛；排队、配额等待及退避可以中断，已预占请求不退还。

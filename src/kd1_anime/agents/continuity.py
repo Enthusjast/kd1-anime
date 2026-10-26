@@ -9,8 +9,6 @@ import textwrap
 from collections.abc import Sequence
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.planner import (
     ContinuityBible,
@@ -28,6 +26,12 @@ from kd1_anime.agents.planner import (
 from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
 from kd1_anime.config import settings
+from kd1_anime.domain.plan_review import (
+    ContinuityIssue as ContinuityIssue,
+)
+from kd1_anime.domain.plan_review import (
+    ContinuityReviewResult as ContinuityReviewResult,
+)
 
 CONTINUITY_EXPORT_BEGIN = "KD1_CONTINUITY_EXPORT_BEGIN"
 CONTINUITY_EXPORT_END = "KD1_CONTINUITY_EXPORT_END"
@@ -1534,39 +1538,6 @@ def normalize_scene_plan_contract(
         updates["timeline"] = normalized_timeline
 
     return (plan.model_copy(update=updates) if updates else plan), repairs
-
-
-class ContinuityIssue(BaseModel):
-    """一个可定位到场景的连续性冲突。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    scene_ids: list[int] = Field(min_length=1, max_length=10)
-    category: str = Field(min_length=1, max_length=100)
-    severity: Literal["minor", "major"] = "major"
-    message: str = Field(min_length=1, max_length=5_000)
-    fix_instruction: str = Field(default="", max_length=5_000)
-    # 让重规划只改真正冲突的字段；旧版 Reviewer 没有输出此字段时由
-    # Orchestrator 根据 message/fix_instruction 里的字段名兼容推断。
-    target_fields: list[str] = Field(default_factory=list, max_length=12)
-
-
-class ContinuityReviewResult(BaseModel):
-    """全片连续性审查的闭合输出契约。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    is_valid: bool
-    summary: str = ""
-    issues: list[ContinuityIssue] = Field(default_factory=list, max_length=100)
-
-    @model_validator(mode="after")
-    def normalize_contract(self) -> ContinuityReviewResult:
-        if self.is_valid:
-            self.issues = []
-        elif not self.issues:
-            raise ValueError("连续性审查失败时必须提供 issues")
-        return self
 
 
 def apply_deterministic_continuity_repairs(

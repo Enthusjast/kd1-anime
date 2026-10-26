@@ -1,0 +1,25 @@
+"""Render lifecycle status categories shared by adapters and monitors."""
+
+TERMINAL_STATES = {
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMEOUT",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "BOOT_FAIL",
+    "PREEMPTED",
+    "DEADLINE",
+    "REVOKED",
+    "SPECIAL_EXIT",
+}
+FAILURE_STATES = TERMINAL_STATES - {"COMPLETED"}
+RUNNING_STATES = {"RUNNING", "COMPLETING", "STAGE_OUT"}
+QUEUED_STATES = {"PENDING", "CONFIGURING", "REQUEUED", "SUSPENDED"}
+MONITOR_ABORT_STATES = {
+    "QUEUE_TIMEOUT",
+    "RUN_TIMEOUT",
+    "UNKNOWN_TIMEOUT",
+    "MONITOR_QUERY_FAILED",
+    "CANCEL_FAILED",
+}

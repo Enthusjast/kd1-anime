@@ -16,10 +16,11 @@ python -m pip install -e '.[dev]'
 
 # Quality gates
 ruff check .
+ruff format --check .
 python -m compileall -q .
 bash -n install.sh
 pytest -q
-python -m build --wheel
+python -m build --sdist --wheel
 
 # CLI
 python main.py
@@ -62,7 +63,7 @@ Key invariants:
 5. Review attempts, validation attempts, and render-fix attempts are bounded.
 6. Cairo jobs never request a GPU; OpenGL jobs require a configured GPU type.
 7. Scheduler timeout/unknown failures must cancel the remote Slurm job.
-8. Video merge inputs must come from the exact current `SlurmJob`, never a shared directory scan.
+8. Video merge inputs must come from the exact current `RenderJob`, never a shared directory scan.
 9. Partial output is rejected unless `ALLOW_PARTIAL_OUTPUT=true`.
 10. Parallel workers must not stream to or read from shared stdin.
 11. Slurm directive values must pass validated single-line schemas; never concatenate unchecked CLI input.
@@ -74,6 +75,16 @@ Key invariants:
 17. Resume must verify generated-code hashes and hold the per-run lock before reusing any Slurm Job ID.
 18. Visual reports and repair candidates must be bound to exact code, inherited-context, frame, and video hashes.
 19. A visual endpoint failure is `unknown`, never a fabricated low score or a reason to delete a valid render.
+20. Main/visual requests, probes, retries and compatibility fallbacks reserve and checkpoint their budget before dispatch; unknown outcomes still count.
+21. Resume/retry preserve request limits, reservations and retry counters. Incremental runs have independent budgets.
+22. Manifest v10 is executable; v4-v9 are read-only and must be rejected before probes, job access, run locking or file changes.
+23. Commit worker results only when their scene revision and complete input digest match; invalidate consumers by teaching, handoff or source dependencies.
+24. Persist a unique submission attempt before external submission and the returned Job ID immediately afterward. Uncertain submission or failed cancellation prohibits automatic resubmission.
+25. Slurm, local rendering and smoke use the same environment whitelist and container policy. Never adopt a local process by historical PID.
+26. All source/report objects are immutable and content addressed; display aliases cannot authorize execution or recovery.
+27. Stage drafts merge only through `CommitCommand`; preserve transport reservations during concurrent commits.
+28. Pin non-sensitive run settings and execution identity; missing or mismatched actual environment forbids reuse.
+29. `SCENE_CODEGEN_MODE=llm` remains the default; v2 compilation requires complete inputs and falls back explicitly when unsupported.
 
 ## Module map
 
@@ -82,9 +93,15 @@ Key invariants:
 - `src/kd1_anime/tui.py`: Rich + prompt_toolkit clarification UI and callback rendering.
 - `src/kd1_anime/config.py`: validated pydantic-settings configuration.
 - `src/kd1_anime/orchestrator.py`: FSM, per-run paths, scene state, parallel LLM stages.
-- `src/kd1_anime/run_store.py`: versioned manifests, atomic checkpoints, code hashes and run locks.
+- `src/kd1_anime/run_store.py`: v10 manifests, read-only legacy formats, atomic checkpoints, code hashes and run locks.
+- `src/kd1_anime/domain/`: planning, technical, review, execution, dependency, boundary and program contracts; old Agent paths re-export them.
+- `src/kd1_anime/commits.py`, `stage_transactions.py`, `objects.py`: isolated stage proposals, durable state commit and immutable objects.
+- `src/kd1_anime/control.py`, `scheduling.py`, `clients.py`: cancellation/deadlines, bounded workers and run-owned clients.
+- `src/kd1_anime/request_budget.py`: durable request reservations and request-scoped usage diagnostics.
+- `src/kd1_anime/services/`: explicit planning/generation/review/recovery/visual inputs and results, dependency calculations and v2 compiler.
+- `src/kd1_anime/events.py`, `telemetry.py`: TUI callback adapter and correlated run/scene/stage spans.
 - `src/kd1_anime/agents/base.py`: OpenAI-compatible calls, retries, streaming, JSON/code parsing.
-- `src/kd1_anime/agents/planner.py`: outline and detailed scene planning models/prompts.
+- `src/kd1_anime/agents/planner.py`: outline and detailed scene planning prompts/calls, with compatible model exports.
 - `src/kd1_anime/agents/plan_reviewer.py`: pre-code mathematical and feasibility review of ScenePlan.
 - `src/kd1_anime/agents/coder.py`: ManimCE code generation and rewrite prompt.
 - `src/kd1_anime/agents/reviewer.py`: closed structured review contract and checklist.
@@ -92,6 +109,10 @@ Key invariants:
 - `src/kd1_anime/agents/auto_fixer.py`: render-log-driven repair.
 - `src/kd1_anime/eval/`: deterministic metrics, keyframe sampling, and independent multimodal visual evaluation.
 - `src/kd1_anime/cluster/slurm.py`: sbatch script generation, submission, batch polling, cancellation.
+- `src/kd1_anime/cluster/jobs.py`, `monitoring.py`, `render_backend.py`: neutral render jobs, shared monitoring and independent local execution.
+- `src/kd1_anime/cluster/execution.py`: shared environment whitelist, resource execution policy and container isolation.
+- `src/kd1_anime/api_catalog.py`, `manim_catalog_0201.py`: exact-version public API metadata, independent of semantic RAG.
+- `src/kd1_anime/eval/benchmark.py`: 24 fixed tasks, offline compiler checks and evidence-aware runtime comparisons.
 - `src/kd1_anime/media/merger.py`: exact inputs and FFmpeg xfade/acrossfade atomic merge.
 - `install.sh`: no-sudo Ubuntu/HPC environment installer.
 - `tests/`: deterministic tests with LLM/Slurm/FFmpeg behavior mocked or isolated.

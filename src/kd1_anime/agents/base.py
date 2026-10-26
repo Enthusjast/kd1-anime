@@ -13,8 +13,10 @@ import re
 import time
 from contextlib import suppress
 from copy import deepcopy
+from threading import Event
 from typing import ClassVar, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from openai import (
     APIConnectionError,
@@ -28,7 +30,16 @@ from pydantic import BaseModel, ValidationError
 from rich.console import Console
 from rich.panel import Panel
 
+from kd1_anime.clients import CURRENT_CLIENTS
 from kd1_anime.config import LLMRuntimeProfile, settings
+from kd1_anime.control import (
+    CURRENT_CONTROL,
+    OperationDeadlineExceeded,
+    RunCancelled,
+    RunControl,
+    controlled_call,
+)
+from kd1_anime.request_budget import ObservedStream, RequestBudgetExceeded, RequestContext
 from kd1_anime.security import redact_text
 
 T = TypeVar("T", bound=BaseModel)
@@ -56,13 +67,90 @@ class BaseAgent:
             stage=getattr(self, "llm_stage", "default")
         )
         self._client: OpenAI | None = None
+        self.control = None
+        self._shared_client = False
+        self._shared_pool = None
         self.model = self.profile.model
         self.last_call_metrics: dict[str, object] = {}
+        self.request_context: RequestContext | None = None
+        self._request_call_id = uuid4().hex
+        self._request_attempt = 0
+        self._json_repair_attempt = 0
         self._last_usage: dict[str, int] = {}
+
+    def _create_completion(self, client, **kwargs):
+        control = CURRENT_CONTROL.get() or self.control or RunControl(Event())
+        control.check()
+        context = self.request_context
+        receipt = None
+        if context is not None:
+            self._request_attempt += 1
+            receipt = context.reserve(
+                self.profile.label,
+                self.model,
+                call_id=self._request_call_id,
+                attempt=self._request_attempt,
+                json_repair_attempt=self._json_repair_attempt,
+            )
+        started = time.monotonic()
+        try:
+            # A durable reservation can take time or coincide with cancellation.
+            # Recheck before transport; reserved attempts are never refunded.
+            client = self._completion_client(client, control)
+            response = client.chat.completions.create(**kwargs)
+        except BaseException as exc:
+            if context is not None:
+                context.complete(receipt, started, error=exc)
+            raise
+        if context is not None:
+            if kwargs.get("stream"):
+                return ObservedStream(response, context, receipt, started)
+            context.complete(receipt, started, response)
+        control.check()
+        return response
+
+    def _completion_client(self, client, control):
+        remaining = control.remaining()
+        if remaining is not None and callable(getattr(client, "with_options", None)):
+            import httpx
+
+            original_timeout = getattr(client, "timeout", None)
+            prior_read = (
+                original_timeout.read
+                if isinstance(original_timeout, httpx.Timeout)
+                else original_timeout
+            )
+            prior_connect = (
+                original_timeout.connect
+                if isinstance(original_timeout, httpx.Timeout)
+                else original_timeout
+            )
+            read_limit = (
+                min(self.profile.timeout_read, prior_read)
+                if isinstance(prior_read, (int, float))
+                else self.profile.timeout_read
+            )
+            connect_limit = (
+                min(self.profile.timeout_connect, prior_connect)
+                if isinstance(prior_connect, (int, float))
+                else self.profile.timeout_connect
+            )
+            client = client.with_options(
+                timeout=httpx.Timeout(
+                    remaining,
+                    connect=min(remaining, connect_limit),
+                    read=min(remaining, read_limit),
+                ),
+                max_retries=0,
+            )
+        return client
 
     @property
     def client(self) -> OpenAI:
         """懒加载 OpenAI client"""
+        if self._shared_client and self._shared_pool is not CURRENT_CLIENTS.get():
+            self._client = None
+            self._shared_client = False
         if self._client is None:
             import httpx
 
@@ -77,17 +165,32 @@ class BaseAgent:
                 "max_retries": 0,
                 "timeout": timeout,
             }
-            if not self.profile.trust_env:
-                client_kwargs["http_client"] = httpx.Client(timeout=timeout, trust_env=False)
-            self._client = OpenAI(
-                **client_kwargs,
-                # BaseAgent 已经在外层实现了带退避的重试。关闭 SDK 自带的
-                # 隐式重试，避免一次超时被 SDK 再重复发送，导致单个请求
-                # 实际阻塞数倍于 LLM_TIMEOUT_READ，表现为 dry-run 长时间
-                # 停在连续性审查且无法及时进入失败收敛路径。
-            )
+
+            def create_client():
+                options = dict(client_kwargs)
+                if not self.profile.trust_env:
+                    options["http_client"] = httpx.Client(timeout=timeout, trust_env=False)
+                return OpenAI(**options)
+
+            pool = CURRENT_CLIENTS.get()
+            if pool is not None:
+                key = (
+                    "model",
+                    self.profile.env_prefix,
+                    self.profile.base_url,
+                    self.profile.api_key,
+                    self.profile.timeout_connect,
+                    self.profile.timeout_read,
+                    self.profile.trust_env,
+                )
+                self._client = pool.get(key, create_client)
+                self._shared_client = True
+                self._shared_pool = pool
+                return self._client
+            self._client = create_client()
         return self._client
 
+    @controlled_call
     def check_api_available(
         self,
         *,
@@ -103,6 +206,8 @@ class BaseAgent:
         """
 
         self.profile.require()
+        self._request_call_id = uuid4().hex
+        self._request_attempt = 0
         health_timeout = self.profile.healthcheck_timeout if timeout is None else float(timeout)
         request = {
             "model": self.model,
@@ -116,16 +221,20 @@ class BaseAgent:
             with_options = getattr(client, "with_options", None)
             if callable(with_options):
                 client = with_options(timeout=health_timeout, max_retries=0)
-            response = client.chat.completions.create(**request)
+            response = self._create_completion(client, **request)
         except BadRequestError as exc:
             # 兼容只支持 max_completion_tokens 或完全忽略 token 上限的端点。
             if "max_tokens" not in request or "max_tokens" not in str(exc).lower():
                 raise RuntimeError(self._healthcheck_error(exc)) from exc
             request.pop("max_tokens")
             try:
-                response = client.chat.completions.create(**request)
+                response = self._create_completion(client, **request)
+            except (RequestBudgetExceeded, RunCancelled, OperationDeadlineExceeded):
+                raise
             except Exception as retry_error:
                 raise RuntimeError(self._healthcheck_error(retry_error)) from retry_error
+        except (RequestBudgetExceeded, RunCancelled, OperationDeadlineExceeded):
+            raise
         except Exception as exc:
             raise RuntimeError(self._healthcheck_error(exc)) from exc
 
@@ -199,6 +308,7 @@ class BaseAgent:
     # LLM 调用
     # ------------------------------------------------------------------
 
+    @controlled_call
     def call_llm(
         self,
         system_prompt: str = "",
@@ -231,6 +341,8 @@ class BaseAgent:
             RuntimeError: 重试耗尽后抛出
         """
         self.profile.require()
+        self._request_call_id = uuid4().hex
+        self._request_attempt = 0
 
         temp = temperature if temperature is not None else self.profile.temperature
         tokens = max_tokens if max_tokens is not None else self.profile.max_tokens
@@ -290,7 +402,7 @@ class BaseAgent:
                 if use_stream_transport:
                     content, finish_reason = self._stream_llm(kwargs, display=stream)
                 else:
-                    response = self.client.chat.completions.create(**kwargs)
+                    response = self._create_completion(self.client, **kwargs)
                     content = response.choices[0].message.content or ""
                     finish_reason = getattr(response.choices[0], "finish_reason", None)
                     self._last_usage = self._extract_usage(getattr(response, "usage", None))
@@ -325,7 +437,7 @@ class BaseAgent:
                         last_error = TruncatedResponseError("LLM 输出被截断且内容为空")
                         if attempt < self.profile.max_retries:
                             delay = self._retry_delay(attempt, last_error)
-                            time.sleep(delay)
+                            self._wait(delay)
                         continue
                     if json_mode and "response_format" in kwargs and not json_fallback_used:
                         self._log(
@@ -375,7 +487,7 @@ class BaseAgent:
                     last_error = RuntimeError("LLM 返回空响应")
                     if attempt < self.profile.max_retries:
                         delay = self._retry_delay(attempt, last_error)
-                        time.sleep(delay)
+                        self._wait(delay)
                     continue
                 if finish_reason == "length":
                     if allow_truncated:
@@ -403,7 +515,7 @@ class BaseAgent:
                     last_error = TruncatedResponseError("LLM 输出被截断")
                     self._log("LLM 响应仍被截断，将重新生成", style="bold yellow")
                     if attempt < self.profile.max_retries:
-                        time.sleep(self._retry_delay(attempt, last_error))
+                        self._wait(self._retry_delay(attempt, last_error))
                     continue
                 if self.profile.debug and (not use_stream_transport or not stream):
                     preview = content[:500] + ("..." if len(content) > 500 else "")
@@ -422,7 +534,7 @@ class BaseAgent:
                 old_client = self._client
                 self._client = None
                 close = getattr(old_client, "close", None)
-                if callable(close):
+                if callable(close) and not self._shared_client:
                     with suppress(Exception):
                         close()
                 if attempt < self.profile.max_retries:
@@ -431,7 +543,7 @@ class BaseAgent:
                         f"API 限流/超时/连接错误, {delay:.1f}s 后重试... ({self._safe_error(e)})",
                         style="bold yellow",
                     )
-                    time.sleep(delay)
+                    self._wait(delay)
 
             except StreamCancelledError:
                 raise
@@ -495,8 +607,10 @@ class BaseAgent:
                 last_error = e
                 if attempt < self.profile.max_retries:
                     delay = self._retry_delay(attempt, e)
-                    time.sleep(delay)
+                    self._wait(delay)
 
+            except (RequestBudgetExceeded, RunCancelled, OperationDeadlineExceeded):
+                raise
             except Exception as e:
                 raise RuntimeError(
                     f"[{self.name}] LLM 调用发生未知错误: {self._safe_error(e)}"
@@ -508,6 +622,18 @@ class BaseAgent:
             f"[{self.name}] LLM 调用在 {self.profile.max_retries} 次重试后仍然失败: "
             f"{self._safe_error(last_error)}"
         )
+
+    def _wait(self, seconds):
+        control = CURRENT_CONTROL.get()
+        if control is None:
+            time.sleep(seconds)
+        else:
+            control.wait(seconds)
+
+    def close(self):
+        if self._client is not None and not self._shared_client:
+            self._client.close()
+        self._client = None
 
     def _retry_delay(self, attempt: int, error: Exception | None = None) -> float:
         """指数退避加随机抖动，并优先尊重服务端 Retry-After。"""
@@ -574,8 +700,10 @@ class BaseAgent:
         stream = None
         user_cancelled = False
         try:
-            stream = self.client.chat.completions.create(**kwargs)
+            stream = self._create_completion(self.client, **kwargs)
             for chunk in stream:
+                if CURRENT_CONTROL.get() or self.control:
+                    (CURRENT_CONTROL.get() or self.control).check()
                 chunk_usage = self._extract_usage(getattr(chunk, "usage", None))
                 if chunk_usage:
                     self._last_usage.update(chunk_usage)
@@ -644,6 +772,7 @@ class BaseAgent:
             console.print()
         return "".join(chunks).strip(), last_finish
 
+    @controlled_call
     def call_llm_json(
         self,
         system_prompt: str,
@@ -687,10 +816,14 @@ class BaseAgent:
             }
             if allow_truncated:
                 call_kwargs["allow_truncated"] = True
-            raw = self.call_llm(
-                **call_kwargs,
-                stream=stream,
-            )
+            self._json_repair_attempt = attempt
+            try:
+                raw = self.call_llm(
+                    **call_kwargs,
+                    stream=stream,
+                )
+            finally:
+                self._json_repair_attempt = 0
 
             json_str = self._extract_json(raw, expected_type="object")
             try:
@@ -761,6 +894,7 @@ class BaseAgent:
         # 理论不可达 (循环内要么 return 要么 raise)
         raise RuntimeError(f"[{self.name}] LLM 输出不符合预期结构")
 
+    @controlled_call
     def call_llm_json_list(
         self,
         system_prompt: str,
@@ -792,7 +926,11 @@ class BaseAgent:
             }
             if allow_truncated:
                 call_kwargs["allow_truncated"] = True
-            raw = self.call_llm(**call_kwargs)
+            self._json_repair_attempt = attempt
+            try:
+                raw = self.call_llm(**call_kwargs)
+            finally:
+                self._json_repair_attempt = 0
 
             json_str = self._extract_json(raw, expected_type="array")
             try:

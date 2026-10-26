@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "scope": "trusted_fixed_local_render",
+  "semantic_quality_evaluated": false,
+  "visual_evaluation": "not_run",
+  "slurm_submissions": 0,
+  "tasks": [
+    {
+      "task_id": "geometry_circle",
+      "run_id": "20261019-235919-354b37fa",
+      "job_id": "local-21d3404c6d25",
+      "code_sha256": "246b97fadf80225fbfef9d289fc0289a79b323bb1704ccdcf68427e5e50d0882",
+      "video_sha256": "d8fd3c8d18fa2220ba0b730daad49fdab0314481a42b678f3195f4193448acfb",
+      "metadata": {
+        "size_bytes": 8980,
+        "duration_seconds": 4.0,
+        "width": 320,
+        "height": 180,
+        "frame_rate": 15.0,
+        "has_audio": false
+      },
+      "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+      "environment": {
+        "python": "3.12.13",
+        "manim": "0.20.1",
+        "ffmpeg": "ffmpeg version 8.0.1-3ubuntu2 Copyright (c) 2000-2025 the FFmpeg developers",
+        "xelatex": "XeTeX 3.141592653-2.6-0.999998 (TeX Live 2026)",
+        "renderer": "cairo",
+        "pyopengl_platform": "",
+        "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+        "container_sha256": ""
+      },
+      "elapsed_seconds": 2.3483542379981373,
+      "model_requests": 0,
+      "manifest_schema": 10,
+      "manifest_revision": 12,
+      "source_reference": "scenes/revisions/scene_1/246b97fadf80225fbfef9d289fc0289a79b323bb1704ccdcf68427e5e50d0882.py",
+      "request_reservations": 0
+    },
+    {
+      "task_id": "graph_sine",
+      "run_id": "20261019-235921-fb572fab",
+      "job_id": "local-38fc0bf1a973",
+      "code_sha256": "d28f70b7ff115760ce709596491654ddc7c8d30bfa48fc3e8cd21d5c33b1cb09",
+      "video_sha256": "f750438380218f03ebf22cc0205e5028325118994823dc5ee8a11b122b726d54",
+      "metadata": {
+        "size_bytes": 9291,
+        "duration_seconds": 4.0,
+        "width": 320,
+        "height": 180,
+        "frame_rate": 15.0,
+        "has_audio": false
+      },
+      "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+      "environment": {
+        "python": "3.12.13",
+        "manim": "0.20.1",
+        "ffmpeg": "ffmpeg version 8.0.1-3ubuntu2 Copyright (c) 2000-2025 the FFmpeg developers",
+        "xelatex": "XeTeX 3.141592653-2.6-0.999998 (TeX Live 2026)",
+        "renderer": "cairo",
+        "pyopengl_platform": "",
+        "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+        "container_sha256": ""
+      },
+      "elapsed_seconds": 2.3562600500008557,
+      "model_requests": 0,
+      "manifest_schema": 10,
+      "manifest_revision": 12,
+      "source_reference": "scenes/revisions/scene_1/d28f70b7ff115760ce709596491654ddc7c8d30bfa48fc3e8cd21d5c33b1cb09.py",
+      "request_reservations": 0
+    },
+    {
+      "task_id": "formula_quadratic",
+      "run_id": "20261019-235924-107be59e",
+      "job_id": "local-57582020b28b",
+      "code_sha256": "0459b959183f006c0299cc945d8ccec12d1ec13c6a92b9fa8f80e50264473388",
+      "video_sha256": "d78c854d8e8d361c36c0e4d207b702b291120eec2ca4046df23a0a77c023d4e8",
+      "metadata": {
+        "size_bytes": 7570,
+        "duration_seconds": 4.0,
+        "width": 320,
+        "height": 180,
+        "frame_rate": 15.0,
+        "has_audio": false
+      },
+      "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+      "environment": {
+        "python": "3.12.13",
+        "manim": "0.20.1",
+        "ffmpeg": "ffmpeg version 8.0.1-3ubuntu2 Copyright (c) 2000-2025 the FFmpeg developers",
+        "xelatex": "XeTeX 3.141592653-2.6-0.999998 (TeX Live 2026)",
+        "renderer": "cairo",
+        "pyopengl_platform": "",
+        "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+        "container_sha256": ""
+      },
+      "elapsed_seconds": 4.433667565994256,
+      "model_requests": 0,
+      "manifest_schema": 10,
+      "manifest_revision": 12,
+      "source_reference": "scenes/revisions/scene_1/0459b959183f006c0299cc945d8ccec12d1ec13c6a92b9fa8f80e50264473388.py",
+      "request_reservations": 0
+    },
+    {
+      "task_id": "unicode_tex",
+      "run_id": "20261019-235928-5b14c46f",
+      "job_id": "local-4b5573a144b7",
+      "code_sha256": "08ce1d4c94aeb0e0f4163b4efd84e94ff916fc9fc529334ddcf68ae9fc247a18",
+      "video_sha256": "f69e29781d157975917377187e096baa5e40b84c8f97bbdaee3a0359c68c7aa7",
+      "metadata": {
+        "size_bytes": 7248,
+        "duration_seconds": 4.0,
+        "width": 320,
+        "height": 180,
+        "frame_rate": 15.0,
+        "has_audio": false
+      },
+      "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+      "environment": {
+        "python": "3.12.13",
+        "manim": "0.20.1",
+        "ffmpeg": "ffmpeg version 8.0.1-3ubuntu2 Copyright (c) 2000-2025 the FFmpeg developers",
+        "xelatex": "XeTeX 3.141592653-2.6-0.999998 (TeX Live 2026)",
+        "renderer": "cairo",
+        "pyopengl_platform": "",
+        "execution_sha256": "f8ea7602fdb34bbd43cf09da54a7e39153457091fe550231c738435a0f1b4902",
+        "container_sha256": ""
+      },
+      "elapsed_seconds": 3.3725390339968726,
+      "model_requests": 0,
+      "manifest_schema": 10,
+      "manifest_revision": 12,
+      "source_reference": "scenes/revisions/scene_1/08ce1d4c94aeb0e0f4163b4efd84e94ff916fc9fc529334ddcf68ae9fc247a18.py",
+      "request_reservations": 0
+    }
+  ]
+}

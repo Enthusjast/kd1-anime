@@ -6,8 +6,6 @@ import json
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
 from kd1_anime.agents.base import BaseAgent, TruncatedResponseError
 from kd1_anime.agents.plan_compiler import expressions_are_equivalent
 from kd1_anime.agents.planner import (
@@ -22,73 +20,15 @@ from kd1_anime.agents.prompt_context import PromptSection, build_bounded_prompt
 from kd1_anime.agents.render_context import renderer_guidance
 from kd1_anime.agents.review_policy import review_mode_guidance
 from kd1_anime.config import GenerationMode, settings
-
-
-class PlanReviewIssue(BaseModel):
-    """一个可定位到分镜字段的计划问题。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    category: Literal[
-        "math",
-        "geometry",
-        "feasibility",
-        "timing",
-        "continuity",
-        "contract",
-        "renderer",
-        "style",
-    ]
-    severity: Literal["minor", "major"] = "major"
-    confidence: Literal["high", "medium", "low"] = "medium"
-    evidence_type: Literal["deterministic", "calculation", "contract", "uncertain"] = "uncertain"
-    evidence: str = Field(default="", max_length=5_000)
-    field: str = Field(default="", max_length=100)
-    message: str = Field(min_length=1, max_length=5_000)
-    fix_instruction: str = Field(min_length=1, max_length=5_000)
-
-
-class PlanReviewResult(BaseModel):
-    """计划审查的闭合 JSON 输出契约。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    is_valid: bool
-    severity: Literal["info", "minor", "major"] = "minor"
-    summary: str = Field(default="", max_length=2_000)
-    issues: list[PlanReviewIssue] = Field(default_factory=list, max_length=50)
-    warnings: list[PlanReviewIssue] = Field(default_factory=list, max_length=50)
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_severity(cls, data):
-        if not isinstance(data, dict):
-            return data
-        value = data.get("severity")
-        if value is None or str(value).strip().lower() in {"", "none", "null", "n/a"}:
-            normalized = dict(data)
-            normalized["severity"] = "info" if data.get("is_valid") else "major"
-            return normalized
-        return data
-
-    @model_validator(mode="after")
-    def validate_contract(self) -> PlanReviewResult:
-        if self.is_valid:
-            self.severity = "info"
-            if self.issues:
-                self.warnings = [*self.warnings, *self.issues][:50]
-            self.issues = []
-            return self
-        if self.severity == "info":
-            self.severity = "major"
-        if not self.issues:
-            if self.warnings:
-                self.is_valid = True
-                self.severity = "info"
-                return self
-            raise ValueError("计划审查失败时必须提供 issues")
-        return self
-
+from kd1_anime.domain.plan_review import (
+    PlanReviewBatchItem as PlanReviewBatchItem,
+)
+from kd1_anime.domain.plan_review import (
+    PlanReviewIssue as PlanReviewIssue,
+)
+from kd1_anime.domain.plan_review import (
+    PlanReviewResult as PlanReviewResult,
+)
 
 PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 Manim 代码前审查一个 ScenePlan。
 
@@ -162,12 +102,6 @@ PLAN_REVIEW_PROMPT = r"""你是数学动画的计划审查专家，负责在写 
   "warnings": []
 }
 """
-
-
-class PlanReviewBatchItem(PlanReviewResult):
-    """批量计划审查中的一个场景结果。"""
-
-    scene_id: int = Field(ge=1)
 
 
 _PLAN_HARD_CATEGORIES = frozenset(

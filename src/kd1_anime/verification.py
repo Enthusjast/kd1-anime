@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ConfigDict, Field
+
+from kd1_anime.models import ValidatedModel as BaseModel
 
 VerificationStatus = Literal["passed", "failed", "not_run", "unknown"]
 ExecutionScope = Literal["import", "frame", "short_video", "formal_video"]

@@ -6,11 +6,12 @@ import math
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator
 
-from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.agents.risk import assess_scene_risk
-from kd1_anime.agents.technical_planner import TechnicalSpec
+from kd1_anime.domain.planning import ScenePlan
+from kd1_anime.domain.technical import TechnicalSpec
+from kd1_anime.models import ValidatedModel as BaseModel
 from kd1_anime.rendering import RenderProfile
 
 

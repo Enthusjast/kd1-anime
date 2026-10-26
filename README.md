@@ -116,7 +116,7 @@ kd1-anime render scene.py --class MyScene --backend local --wait
 ```
 
 本地后端以前台进程运行，默认最多并发一个场景；Ctrl-C 会终止整个进程组。
-本地 Job 的进程句柄不会写入 manifest，`resume` 不会凭 PID 认领已有进程，而是使用相同代码安全重新启动未完成场景。
+本地 Job 的进程句柄不会写入 manifest，`resume` 不会凭历史 PID 认领进程。只有已确认终态的旧任务可以重新启动；状态不明的任务保留身份并阻止自动重提。
 
 ## 快速开始
 
@@ -291,7 +291,7 @@ INIT
 - **Render Fix** 只处理渲染日志暴露的代码问题；环境、Slurm、字体和显示服务错误不会盲目交给模型重写。
 - **Continuity Review** 只处理跨场景边界。达到 `MAX_CONTINUITY_FIX_ROUNDS` 后会记录 warning 并沿用当时的可验证计划继续，不会因为连续性审查耗尽而阻断整条流水线。
 - **relaxed 快速路径**：没有确定性连续性冲突时跳过不会阻断生成的连续性 LLM 审查；LLM 审查会收到明确的宽松策略，只把主观布局/风格建议记录为 warning；若 Planner 对确定性问题原样返回同一计划，会停止无效重规划并优先切换保守方案，避免无效的长上下文调用。
-- **生成模式**：默认 `relaxed` 模式只让确定性校验或带可核验证据的高置信度阻断结论阻断错误；低置信度意见或调用失败会记录 warning，但 verified blocker 仍会进入修复。使用 `--strict` 或 `[pipeline] generation_mode = "strict"` 保留严格 Review，所有计划、代码、连续性和渲染修复阶段最多 8 轮。`resume` 始终沿用运行清单中的模式。
+- **生成模式**：默认 `relaxed` 模式将主观建议记录为 warning，确定性错误或有可核验证据的高置信度问题仍进入修复。使用 `--strict` 或 `[pipeline] generation_mode = "strict"` 保留严格 Review。两种模式都遵守各阶段的 `MAX_*` 限额以及场景/运行请求预算；预算耗尽不能当作审查通过。`resume` 沿用运行清单中的模式、限额和计数。
 - **可靠性回退**：精确 traceback 证据和修复停滞检测默认启用；确定性 Scene IR、稳定场景模板等模板化生成路径属于实验性功能，只有设置 `CODEGEN_MODE=hybrid/ir` 才启用。
 
 ### 场景粒度与并行
@@ -372,7 +372,7 @@ kd1-anime stats <run-id> --json
 kd1-anime clean --older-than 30d --yes
 ```
 
-使用 `status` 找到 run ID，再显式执行 `resume`。当前运行清单使用 manifest schema v8；恢复时会沿用清单中的 `generation_mode`。
+使用 `status` 找到 run ID，再显式执行 `resume`。当前执行清单为 manifest schema v10；恢复沿用清单中的生成模式、请求计数及预算。v4–v9 仅支持只读查看与 JSON 导出，禁止恢复、重试及增量复用，不会自动改写版本。
 
 ### 环境和模型诊断
 
@@ -424,16 +424,19 @@ kd1-anime test-llm --no-json-mode --verbose
 | `LOCAL_SMOKE_RENDER_ENABLED` | `false` | 是否在本地编码后执行额外运行时预检 |
 | `LOCAL_SMOKE_RENDER_MODE` | `frame` | 本地预检模式：最后一帧、MP4 或两者 |
 | `CODEGEN_MODE` | `python` | 普通 Python 生成；`hybrid/ir` 为实验性模板化路径 |
+| `SCENE_CODEGEN_MODE` | `llm` | 可选 `compiler_first`，仅编译完整的 SceneProgram v2；不支持则回到 Coder |
+| `MAX_SCENE_LLM_REQUESTS` | `64` | 单场景实际主/视觉请求总限额，正整数 |
+| `MAX_RUN_LLM_REQUESTS` | `512` | 整次运行实际主/视觉请求总限额，含探测、重试与兼容回退 |
 | `MAX_CODE_CANDIDATES_LOW/MEDIUM/HIGH` | `1/2/3` | 按场景风险允许的备选实现策略数 |
 | `MAX_SCENES` | `12` | 单次规划的最大场景数 |
-| `MAX_PLAN_REVIEW_ROUNDS` | `2` | strict 模式单场景计划审查/重规划轮数；relaxed 不使用固定上限 |
-| `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | strict 模式计划反馈后的 Planner 总重调用次数；relaxed 不使用固定上限 |
+| `MAX_PLAN_REVIEW_ROUNDS` | `2` | 两种模式的单场景计划审查/重规划轮数 |
+| `MAX_PLAN_REPLAN_ATTEMPTS` | `3` | 两种模式计划反馈后的 Planner 总重调用次数 |
 | `MAX_CONTINUITY_FIX_ROUNDS` | `2` | 连续性局部重规划次数；耗尽后 warning 放行 |
-| `MAX_REVIEW_ROUNDS` | `8` | strict 模式单场景代码审查/重写轮数；relaxed 不使用固定上限 |
+| `MAX_REVIEW_ROUNDS` | `8` | 两种模式的单场景代码审查/重写轮数 |
 | `MAX_LOW_RISK_REVIEW_ROUNDS` | `2` | strict 模式低风险场景审查轮数；确定性检查始终执行 |
 | `GENERATION_MODE` | `relaxed` | 默认生成策略：`relaxed` 或 `strict` |
 | `MAX_STAGNANT_ATTEMPTS` | `2` | 渲染修复无进展后尝试 IR/安全代码候选的阈值；strict 回退失败会终止，relaxed 仍可继续修复 |
-| `MAX_FIX_ATTEMPTS` | `8` | strict 模式渲染失败后的代码修复次数；relaxed 不使用固定上限 |
+| `MAX_FIX_ATTEMPTS` | `8` | 两种模式的渲染修复次数；0 禁用自动修复 |
 | `SAFE_FALLBACK_ENABLED` | `true` | 高风险几何方案失败后是否切换保守方案 |
 | `SLURM_MAX_IN_FLIGHT` | `0` | 最大在途场景作业数；`0` 表示不额外限制 |
 | `AUTO_RESOURCE_ESTIMATION` | `true` | 是否按场景复杂度只向上增加 Slurm 资源 |
@@ -558,7 +561,7 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
     ├── eval_results/            # 独立 evaluate 命令的报告
     └── runs/<run-id>/
         ├── prompt.md            # 需求文件；不是 prompt.txt
-        ├── manifest.json        # 当前为 schema v8
+        ├── manifest.json        # 当前为 schema v10
         ├── events.jsonl         # 脱敏事件轨迹
         ├── scenes/              # Python Scene 与 sbatch 脚本
         ├── logs/                # stdout/stderr
@@ -580,7 +583,7 @@ kd1-anime status
 kd1-anime resume 20260831-120000-1234abcd
 ```
 
-用户配置统一放在 `~/.kd1-anime/`；相对 `workspace/` 路径按当前配置解析，程序不会自动复制大型运行目录。manifest schema v8 保存每次运行的 `generation_mode`，恢复时沿用该模式。
+用户配置统一放在 `~/.kd1-anime/`；相对 `workspace/` 路径按当前配置解析，程序不会自动复制大型运行目录。manifest schema v10 保存每次运行的 `generation_mode`，恢复时沿用该模式。
 
 ## 增量渲染与批量处理
 

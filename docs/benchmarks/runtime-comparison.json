@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "scope": "offline_runtime_operations",
+  "baseline": "start-of-task source snapshot, manifest v9",
+  "current": "manifest v10 implementation",
+  "python": "3.12.13",
+  "timings_are_diagnostic": true,
+  "client_connections_mean": "SDK client constructions with fake transport; no TCP or TLS requests",
+  "before": [
+    {
+      "scenes": 10,
+      "checkpoints": 4,
+      "checkpoint_seconds": [
+        0.0036334969991003163,
+        0.002651886999956332,
+        0.0032898979989113286,
+        0.0039843220001785085
+      ],
+      "lock_wait_seconds": 2.9790026019327343e-06,
+      "lock_acquisitions": 4,
+      "dependency_digest_calls": 800,
+      "rag_seconds_10_queries": 0.004511270999500994,
+      "rag_sqrt_calls_10_queries": 2000,
+      "client_connections": 10
+    },
+    {
+      "scenes": 50,
+      "checkpoints": 4,
+      "checkpoint_seconds": [
+        0.031700864994490985,
+        0.029109406998031773,
+        0.03153809999639634,
+        0.024897235998651013
+      ],
+      "lock_wait_seconds": 3.8380021578632295e-06,
+      "lock_acquisitions": 4,
+      "dependency_digest_calls": 20000,
+      "rag_seconds_10_queries": 0.022104373994807247,
+      "rag_sqrt_calls_10_queries": 10000,
+      "client_connections": 50
+    },
+    {
+      "scenes": 100,
+      "checkpoints": 4,
+      "checkpoint_seconds": [
+        0.11500773199804826,
+        0.09754676200100221,
+        0.08774068400089163,
+        0.1324195690031047
+      ],
+      "lock_wait_seconds": 4.816989530809224e-06,
+      "lock_acquisitions": 4,
+      "dependency_digest_calls": 80000,
+      "rag_seconds_10_queries": 0.10570393400121247,
+      "rag_sqrt_calls_10_queries": 20000,
+      "client_connections": 100
+    }
+  ],
+  "after": [
+    {
+      "scenes": 10,
+      "checkpoints": 4,
+      "checkpoint_seconds": [
+        0.0321636459993897,
+        0.014270965999457985,
+        0.015580833001877181,
+        0.013045551000686828
+      ],
+      "lock_wait_seconds": 9.530995157547295e-06,
+      "lock_acquisitions": 12,
+      "dependency_digest_calls": 20,
+      "rag_seconds_10_queries": 0.004255289997672662,
+      "rag_sqrt_calls_10_queries": 10,
+      "client_connections": 1
+    },
+    {
+      "scenes": 50,
+      "checkpoints": 4,
+      "checkpoint_seconds": [
+        0.04444251099630492,
+        0.042805439996300265,
+        0.0437121759969159,
+        0.043242852996627335
+      ],
+      "lock_wait_seconds": 1.2655007594730705e-05,
+      "lock_acquisitions": 12,
+      "dependency_digest_calls": 100,
+      "rag_seconds_10_queries": 0.012340729997958988,
+      "rag_sqrt_calls_10_queries": 10,
+      "client_connections": 1
+    },
+    {
+      "scenes": 100,
+      "checkpoints": 4,
+      "checkpoint_seconds": [
+        0.1277324070033501,
+        0.08564174400089541,
+        0.08258743199985474,
+        0.09401387000252726
+      ],
+      "lock_wait_seconds": 1.637899549677968e-05,
+      "lock_acquisitions": 12,
+      "dependency_digest_calls": 200,
+      "rag_seconds_10_queries": 0.029417199002637062,
+      "rag_sqrt_calls_10_queries": 10,
+      "client_connections": 1
+    }
+  ]
+}
