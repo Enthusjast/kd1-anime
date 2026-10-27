@@ -63,6 +63,27 @@ Context 不持有基础运行 manifest。FSM 状态和转移规则集中到 `dom
 该路径只复制被修改的场景及 run 字段；旧 Orchestrator 暂时仍使用 legacy
 StageTransaction，不在此阶段切换可执行 manifest 版本。
 
+### 2.1 专用 Runtime 协议（尚未切换执行路径）
+
+`agent_runtime/contracts.py` 用闭合 union 定义领域动作、消息、intent、invocation、
+grant、usage 和 v3 事件。模型不能提出 shell、任意文件/Python 执行或自我批准动作。
+Policy 只检查已提交快照、FSM、依赖、权限、预算及精确批准，不执行 I/O。
+ToolExecutor 先持久化 intent，再消费 grant、创建 invocation、执行声明的工具、立即
+保存外部 ID，最后通过 typed commit 发布结果。查询可有限重试；渲染/取消/合并不使用
+通用重试。未确认 intent 必须 reconcile，不重新派发；超时采用合作式检查和有界 transport，
+不把遗弃线程伪称为已停止副作用。已提交结果的事件通知失败可补发，不回滚执行事实。
+
+Session 在独立私有目录保存用户目标、可见命令、run 关联和一次性批准；grant 绑定
+action/resource/input/run/session/WorkIdentity，同一 intent 可幂等消费，不可跨动作重放。
+`event_store.py` 的 v3 committed 日志只通知 manifest 事实；ephemeral 只分配序号，不持久化
+正文。私有 sequence reservation 在 run lock 内原子预留，允许崩溃造成间隙，不允许倒退；
+v2 只读，中间损坏或身份冲突拒绝，尾部半行作为中断处理。`queries.py` 返回已提交视图和
+高水位，不读取 worker Context，不凭事件重放执行工具。
+
+`prompt_identity.py` 分别计算稳定 generation identity 和单次最终消息 hash；schema、
+prompt pack、generator、validator 或策略变化使旧身份不兼容，旧 v10 缺失身份不会伪造。
+现有运行仍由 legacy v10 路径执行，v11 垂直切片在下一独立阶段启用。
+
 ```text
 kd1_anime.cli / kd1_anime.tui
        │

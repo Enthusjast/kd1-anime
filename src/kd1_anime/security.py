@@ -21,7 +21,7 @@ _QUERY_SECRET_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 _HEADER_SECRET_PATTERN = re.compile(
-    r"((?:authorization|x-api-key|api-key|token|secret|password)\s*[:=]\s*)"
+    r"((?:authorization|x[-_]api[-_]key|api[-_]key|token|secret|password)\s*[:=]\s*)"
     r"(?:bearer\s+)?[^\s,;]+",
     flags=re.IGNORECASE,
 )
