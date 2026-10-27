@@ -6,6 +6,7 @@ import json
 import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -46,6 +47,7 @@ from kd1_anime.agent_runtime.tools import (
     action_signature,
     current_invocation,
 )
+from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.capability import build_capability_contract
 from kd1_anime.agents.coder import CoderAgent
@@ -60,6 +62,7 @@ from kd1_anime.commits import CommitCommand, RunCommitter, RunPatch, ScenePatch
 from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.control import RunControl
 from kd1_anime.domain.dependencies import WorkIdentity, digest
+from kd1_anime.domain.diagnostics import Diagnostic
 from kd1_anime.domain.execution import SubmissionAttempt
 from kd1_anime.domain.planning import (
     ContinuityBible,
@@ -68,7 +71,7 @@ from kd1_anime.domain.planning import (
     ScenePlan,
     TeachingGraph,
 )
-from kd1_anime.domain.runtime import ExecutionSpec, RunConfig
+from kd1_anime.domain.runtime import ExecutionSpec, RunConfig, VisualEvalProfile
 from kd1_anime.domain.state import RunPaths
 from kd1_anime.event_store import EventStore
 from kd1_anime.events import CallbackAdapter, PipelineEvent
@@ -88,7 +91,15 @@ from kd1_anime.pipeline.contracts import (
 from kd1_anime.pipeline.finalization import FinalizationPipeline
 from kd1_anime.pipeline.planning import PlanningPipeline, PlanningStageError
 from kd1_anime.pipeline.render import RenderPipeline
+from kd1_anime.pipeline.repair import RenderRepairOutput, RenderRepairPipeline
 from kd1_anime.pipeline.scene import CodeReviewOutput, InspectionOutput, ScenePipeline
+from kd1_anime.pipeline.smoke import SmokePipeline
+from kd1_anime.pipeline.visual import (
+    BoundaryVisualOutput,
+    VisualRepairProposal,
+    VisualSceneOutput,
+    scene_binding,
+)
 from kd1_anime.prompt_identity import capture_generation_identity, verify_generation_identity
 from kd1_anime.rag.service import RagService
 from kd1_anime.rendering import MergeProfile, RenderProfile, sha256_file
@@ -100,6 +111,7 @@ from kd1_anime.run_store import (
     StoredSceneState,
     atomic_write_json,
     lock_run,
+    restore_render_job,
     restore_run_path,
     sha256_text,
     write_manifest,
@@ -148,6 +160,8 @@ class AgentDependencies:
     probe: Callable = _probe
     after_commit: Callable | None = None
     rag_factory: Callable = RagService
+    fixer_factory: Callable = AutoFixerAgent
+    evaluator_factory: Callable | None = None
 
 
 class CompletionOutput(RuntimeRecord):
@@ -241,6 +255,25 @@ class AgentRuntime:
             imported=payload,
         )
 
+    def submit_existing_scene(
+        self, source_code, class_name, *, scene_id=1, wait=False, backend=None
+    ):
+        if (backend or settings.RENDER_BACKEND) == "local" and not wait:
+            raise ValueError("本地渲染必须等待完成")
+        output = self._start(
+            f"Render user source {class_name}",
+            operation="render",
+            backend=backend,
+            direct_source=(source_code, class_name, scene_id),
+            no_wait=not wait,
+            planning_review=False,
+            planning_preflight=False,
+        )
+        scene = self.manifest.scenes[scene_id]
+        if scene.slurm_job is None or self.manifest.status == "failed":
+            raise RuntimeError(self.manifest.agent.stop_reason or "Direct render submission failed")
+        return restore_render_job(scene.slurm_job, self.root), output, self.manifest.run_id
+
     def resume(
         self,
         run_id: str,
@@ -325,6 +358,8 @@ class AgentRuntime:
         planning_review=True,
         planning_preflight=True,
         imported=None,
+        direct_source=None,
+        no_wait=False,
     ):
         prompt = actions.sanitize_record(prompt, self._secrets())
         config = RunConfig.capture()
@@ -361,6 +396,17 @@ class AgentRuntime:
                 state="PLANNING",
                 run_phase="planning",
                 scene_codegen_mode=settings.SCENE_CODEGEN_MODE,
+                visual_eval_profile=VisualEvalProfile(
+                    enabled=settings.ENABLE_VISUAL_EVAL and operation != "render",
+                    model=(settings.VISUAL_LLM_MODEL or settings.EVAL_VISUAL_MODEL or "")
+                    if settings.ENABLE_VISUAL_EVAL
+                    else "",
+                    frame_count=settings.VISUAL_EVAL_FRAME_COUNT,
+                    threshold=settings.VISUAL_EVAL_THRESHOLD,
+                    max_fix_attempts=settings.MAX_VISUAL_FIX_ATTEMPTS,
+                    repair_enabled=settings.GENERATION_MODE != "relaxed"
+                    or settings.RELAXED_VISUAL_AUTO_FIX,
+                ),
                 request_budget=RequestBudget(
                     scene_limit=settings.MAX_SCENE_LLM_REQUESTS,
                     run_limit=settings.MAX_RUN_LLM_REQUESTS,
@@ -371,6 +417,7 @@ class AgentRuntime:
                     operation=operation,
                     planning_review=planning_review,
                     planning_preflight=planning_preflight,
+                    smoke_requested=smoke,
                     run_input_sha256=digest(
                         {
                             "prompt": prompt,
@@ -386,20 +433,79 @@ class AgentRuntime:
                     manifest.artifact_refs = {
                         "imported_plan": ObjectStore(root).put("artifacts/objects", text, ".json")
                     }
+                if direct_source is not None:
+                    from kd1_anime.candidate_acceptor import CandidateAcceptor
+                    from kd1_anime.verification import StaticVerification
+
+                    source, class_name, scene_id = direct_source
+                    plan = ScenePlan(
+                        scene_id=scene_id,
+                        title=class_name,
+                        duration_seconds=1,
+                        purpose="Render user source",
+                        math_concept="User source",
+                        visual_design="User source",
+                        camera_movement="User source",
+                        visual_flow=["Render supplied scene"],
+                        key_moments=["User source"],
+                        computation="User-supplied source; no generated mathematical contract",
+                    )
+                    inspection = CandidateAcceptor().inspect_candidate(
+                        source,
+                        plan,
+                        renderer=profile.renderer,
+                        manim_version=profile.manim_version,
+                        expected_class_name=class_name,
+                        allow_repair=False,
+                        continuity_mode="none",
+                    )
+                    if not inspection.accepted:
+                        raise ValueError(
+                            "Direct render inspection rejected: " + inspection.feedback
+                        )
+                    path = ObjectStore(root).source(scene_id, source)
+                    input_hash = digest(
+                        {
+                            "source": inspection.code_sha256,
+                            "render": profile.digest(),
+                            "execution": execution.digest(),
+                        }
+                    )
+                    scene = StoredSceneState(
+                        plan=plan,
+                        input_sha256=input_hash,
+                        code_file=path,
+                        code_sha256=inspection.code_sha256,
+                        class_name=class_name,
+                        static_verification=StaticVerification(
+                            status="passed",
+                            code_sha256=inspection.code_sha256,
+                            checked_at=utc_now().isoformat(),
+                        ),
+                        reviewed=True,
+                        phase="reviewed",
+                        plan_ready=True,
+                        plan_reviewed=False,
+                        technical_status="pending",
+                    )
+                    manifest.scenes = {scene_id: scene}
+                    manifest.auto_fix = False
+                    scene.input_sha256 = self._scene_digest(scene, manifest=manifest)
+                    manifest.direct_render = True
+                    manifest.state = "DISPATCHING"
+                    manifest.agent = manifest.agent.model_copy(
+                        update={
+                            "next_action": "submit_render",
+                            "continuity_published": True,
+                            "reviewed_identities": {scene_id: WorkIdentity(0, scene.input_sha256)},
+                            "scene_next_actions": {scene_id: "submit_render"},
+                        }
+                    )
                 write_manifest(root / "manifest.json", manifest)
                 self._bind(root, manifest, callback)
                 self._notify("run_started", {"run_id": run_id})
-                if (
-                    smoke
-                    or (
-                        (settings.ENABLE_VISUAL_EVAL or settings.ENABLE_AUTO_EVAL)
-                        and operation != "plan"
-                    )
-                    or settings.CODEGEN_MODE != "python"
-                ):
-                    self._stop(
-                        "P5 does not support smoke, automated visual evaluation/repair or standalone IR generation"
-                    )
+                if no_wait:
+                    self._run_action(self._next_action(self._snapshot()))
                     return None
                 return self._drive(approve_plan=approve_plan, interactive=interactive)
 
@@ -437,7 +543,14 @@ class AgentRuntime:
             rag_service=self._rag,
             rag_profile=manifest.rag_profile if manifest.rag_profile.enabled else None,
         )
-        self.finalization = FinalizationPipeline(self.dependencies.merger_factory())
+        self.finalization = FinalizationPipeline(
+            self.dependencies.merger_factory(),
+            evaluator_factory=self.dependencies.evaluator_factory,
+            fixer_factory=self.dependencies.fixer_factory,
+            request_context=self._request_context,
+            control=self.control,
+        )
+        self.visual = self.finalization.visual
         self.registry = ToolRegistry()
         declarations = (
             (actions.DetailScene, DetailOutput, "write", "commit", True),
@@ -455,6 +568,7 @@ class AgentRuntime:
             (actions.ProposeCodeCandidate, SceneOutput, "write", "commit", True),
             (actions.InspectCandidate, InspectionOutput, "write", "commit", False),
             (actions.ReviewCode, CodeReviewOutput, "write", "commit", True),
+            (actions.SmokeScene, ObjectRef, "exec", "external", False),
             (
                 actions.SubmitRender,
                 RenderingOutput,
@@ -463,6 +577,17 @@ class AgentRuntime:
                 False,
             ),
             (actions.PollRender, RenderingOutput, "read", "none", False),
+            (actions.ProposeRenderFix, RenderRepairOutput, "write", "commit", True),
+            (
+                actions.CancelRender,
+                RenderingOutput,
+                "cluster" if manifest.backend == "slurm" else "exec",
+                "external",
+                False,
+            ),
+            (actions.EvaluateVisual, VisualSceneOutput, "write", "commit", True),
+            (actions.EvaluateBoundary, BoundaryVisualOutput, "write", "commit", True),
+            (actions.ProposeVisualFix, VisualRepairProposal, "write", "commit", True),
             (actions.MergeVideo, FinalizationOutput, "exec", "external", False),
             (actions.EvaluateRun, FinalizationOutput, "write", "commit", False),
             (actions.Finish, CompletionOutput, "write", "commit", False),
@@ -660,6 +785,8 @@ class AgentRuntime:
                 "reviewed_identities",
                 "pending_candidates",
                 "scene_review_counters",
+                "plan_repair_proposals",
+                "visual_repairs",
             ):
                 values = dict(getattr(latest, name))
                 incoming = getattr(proposed, name)
@@ -671,6 +798,22 @@ class AgentRuntime:
                 semantic[name] = values
             if proposed.stop_reason:
                 semantic["stop_reason"] = proposed.stop_reason
+        reviewed = dict(semantic.get("reviewed_identities", latest.reviewed_identities))
+        for patch in updates.get("scenes", ()):
+            previous = self.manifest.scenes.get(patch.scene_id)
+            replacement = patch.replacement
+            if (
+                previous is not None
+                and previous.input_sha256 == replacement.input_sha256
+                and previous.reviewed
+                and replacement.reviewed
+            ):
+                reviewed[patch.scene_id] = WorkIdentity(
+                    previous.revision + 1, replacement.input_sha256
+                )
+            elif previous is not None and previous.input_sha256 != replacement.input_sha256:
+                semantic["continuity_published"] = False
+        semantic["reviewed_identities"] = reviewed
         if "artifact_refs" in updates:
             updates["artifact_refs"] = {**self.manifest.artifact_refs, **updates["artifact_refs"]}
         if "rag_receipts" in updates:
@@ -692,7 +835,15 @@ class AgentRuntime:
                 "committed_invocations": (*latest.committed_invocations, invocation.invocation_id),
             }
         )
-        manifest = self._patch(RunPatch(**updates), phase=intent.action.kind)
+        try:
+            manifest = self._patch(RunPatch(**updates), phase=intent.action.kind)
+        except Exception:
+            if intent.action.kind == "submit_render" and invocation.external_job_id is not None:
+                with suppress(Exception):
+                    self._render().backend.cancel_job(invocation.external_job_id)
+                # The durable attempt and returned ID remain reserved even when
+                # cancellation fails; recovery must reconcile, never resubmit.
+            raise
         if "rag_profile" in updates and manifest.rag_profile.enabled:
             self.scene_pipeline.pin_profile(manifest.rag_profile)
         return manifest.revision
@@ -838,6 +989,12 @@ class AgentRuntime:
             "review_plan": "MAX_PLAN_REVIEW_ROUNDS",
         }
         maximum = self.manifest.retry_limits.get(limits.get(action.kind), 1)
+        if action.kind == "propose_render_fix":
+            maximum = (
+                self.manifest.run_config.resolve().MAX_FIX_ATTEMPTS
+                + self.manifest.run_config.resolve().MAX_INFRA_RETRIES
+                + 1
+            )
         if used > maximum:
             raise RuntimeError("Durable stage attempt budget exhausted")
         attempt = AgentStageAttempt(
@@ -940,6 +1097,30 @@ class AgentRuntime:
             rag_receipts=receipts,
         )
 
+    @staticmethod
+    def _dispatch_identity(manifest, scene_id):
+        scene = manifest.scenes[scene_id]
+        attempt = scene.submission
+        if attempt is None:
+            return None
+        if not any(
+            item.scene_id == scene_id and item.attempt == attempt
+            for item in manifest.agent.submissions
+        ):
+            raise ValueError("Current submission differs from its durable attempt")
+        matches = [
+            intent.action.work_identity
+            for intent in manifest.agent.intents
+            if intent.action.kind == "submit_render"
+            and intent.action.scene_id == scene_id
+            and intent.action.work_identity.revision == attempt.scene_revision
+            and intent.action.source.sha256 == scene.code_sha256
+            and intent.action.work_identity.input_sha256 == scene.input_sha256
+        ]
+        if len(matches) != 1:
+            raise ValueError("Current submission has no unique durable dispatch identity")
+        return matches[0]
+
     def _scene_inputs(self, scene_id, *, manifest=None, inherit=False):
         manifest = manifest or self.manifest
         previous = manifest.scenes.get(scene_id - 1)
@@ -963,6 +1144,11 @@ class AgentRuntime:
             previous_technical_handoff=previous.technical_spec.handoff_out.model_copy(deep=True)
             if previous and previous.technical_spec and previous.technical_spec.handoff_out
             else None,
+            dry_run=manifest.dry_run,
+            direct_render=manifest.direct_render,
+            auto_fix=manifest.auto_fix,
+            visual_eval_profile=manifest.visual_eval_profile,
+            submission_identity=self._dispatch_identity(manifest, scene_id),
         )
         if inherit:
             prior = tuple(
@@ -983,6 +1169,16 @@ class AgentRuntime:
             manifest.merge_profile,
             tuple(scene.model_copy(deep=True) for _, scene in sorted(manifest.scenes.items())),
             Path(manifest.output_path),
+            user_prompt=manifest.user_prompt,
+            lesson_spec=manifest.lesson_spec,
+            teaching_graph=manifest.teaching_graph,
+            continuity_bible=manifest.continuity_bible,
+            state_ledger=manifest.state_ledger,
+            allow_partial=manifest.run_config.resolve().ALLOW_PARTIAL_OUTPUT,
+            visual_eval_profile=manifest.visual_eval_profile,
+            auto_fix=manifest.auto_fix,
+            eval_round=manifest.eval_round,
+            existing_output_sha256=manifest.final_video_sha256,
         )
 
     def _render(self):
@@ -1073,6 +1269,38 @@ class AgentRuntime:
         manifest = manifest or (active[1] if active else self.manifest)
         scene_id = replacement.plan.scene_id
         stored = manifest.scenes.get(scene_id)
+        if stored is not None:
+            changed = stored.code_sha256 != replacement.code_sha256
+            if (
+                replacement.slurm_job is not None
+                and replacement.slurm_job.code_sha256 != replacement.code_sha256
+            ):
+                replacement.slurm_job = replacement.submission = None
+            if (
+                replacement.artifact is not None
+                and replacement.artifact.code_sha256 != replacement.code_sha256
+            ):
+                replacement.artifact, replacement.rendered = None, False
+            if replacement.static_verification.code_sha256 != replacement.code_sha256:
+                replacement.static_verification = type(replacement.static_verification)()
+            receipt = replacement.execution_verification
+            if receipt.code_sha256 != replacement.code_sha256 or (
+                receipt.scope == "formal_video" and replacement.artifact is None
+            ):
+                replacement.execution_verification = type(receipt)()
+            visual = replacement.visual_verification
+            if (visual.code_sha256 != replacement.code_sha256 or replacement.artifact is None) and (
+                visual.status != "pending"
+                or replacement.visual_report_file
+                or replacement.visual_status in {"passed", "warning", "unknown", "needs_fix"}
+            ):
+                replacement.visual_verification = type(visual)()
+                replacement.visual_status, replacement.visual_score = "pending", None
+                replacement.visual_report_file = replacement.visual_report_sha256 = (
+                    replacement.visual_artifact_sha256
+                ) = ""
+            if changed:
+                replacement.local_smoke_status = "pending"
         if identity is None:
             identity = (
                 active[0].work_identity
@@ -1342,11 +1570,34 @@ class AgentRuntime:
                 )
                 next_action = "finish" if agent.operation == "plan" else "review_plan"
         elif kind == "revise_plan":
+            if action.proposals != tuple(
+                agent.plan_repair_proposals[key] for key in sorted(agent.plan_repair_proposals)
+            ):
+                raise ValueError("Safe plan proposal binding mismatch")
+            proposed_plans = []
+            for identifier, reference in sorted(agent.plan_repair_proposals.items()):
+                path = restore_run_path(self.root, reference.path)
+                if reference.kind != "report" or sha256_file(path) != reference.sha256:
+                    raise ValueError("Safe plan report identity mismatch")
+                report = json.loads(path.read_text())
+                scene = manifest.scenes[identifier]
+                if (
+                    report.get("kind") != "render_repair"
+                    or report.get("scene_id") != identifier
+                    or report.get("original_code_sha256") != scene.code_sha256
+                    or report.get("identity", {}).get("input_sha256") != scene.input_sha256
+                ):
+                    raise ValueError("Safe plan proposal is stale")
+                proposal = ScenePlan.model_validate(report["proposed_plan"])
+                if proposal.scene_id != identifier:
+                    raise ValueError("Safe plan proposal resource mismatch")
+                proposed_plans.append(proposal)
             output = self.planning.revise(
                 self._planning_output(),
                 action.feedback,
                 manifest.render_profile.renderer,
                 user_prompt=manifest.user_prompt,
+                proposed_plans=tuple(proposed_plans),
             )
             replacements = []
             for plan in output.plans:
@@ -1359,6 +1610,7 @@ class AgentRuntime:
                     "plan_review_complete": False,
                     "approved_plan_sha256": None,
                     "plan_repair_feedback": "",
+                    "plan_repair_proposals": {},
                     "approved_plan_identity": None,
                     "run_revision": agent.run_revision + 1,
                     "run_input_sha256": digest(
@@ -1490,7 +1742,32 @@ class AgentRuntime:
                 )
                 agent = agent.model_copy(update={"stop_reason": updates["error"]})
             updates["artifact_refs"] = {f"inspection:{action.scene_id}": output.report.path}
-            next_action = "review_code"
+            config = manifest.run_config.resolve()
+            smoke_enabled = (
+                agent.smoke_requested
+                or (not manifest.dry_run and config.LOCAL_SMOKE_RENDER_ENABLED)
+                or (manifest.dry_run and scene.unknown_animation_detected)
+            )
+            next_action = "smoke_scene" if smoke_enabled else "review_code"
+        elif kind == "smoke_scene":
+            inputs = self._scene_inputs(action.scene_id, manifest=manifest)
+            with inputs.config.activate():
+                output = SmokePipeline().run(inputs, context)
+            scene = inputs.scene
+            scene.local_smoke_status = "passed"
+            scene.execution_verification = ExecutionVerification(
+                status="passed",
+                scope="short_video"
+                if inputs.config.resolve().LOCAL_SMOKE_RENDER_MODE in {"video", "both"}
+                or (manifest.dry_run and scene.unknown_animation_detected)
+                else "frame",
+                code_sha256=scene.code_sha256,
+                checked_at=utc_now().isoformat(),
+            )
+            self._record_candidate(scene, "smoke")
+            patches = (self._scene_patch(scene),)
+            updates["artifact_refs"] = {f"smoke:{action.scene_id}": output.path}
+            next_action = "submit_render" if scene.reviewed else "review_code"
         elif kind == "review_code":
             inputs = self._scene_inputs(action.scene_id, manifest=manifest, inherit=True)
             counters = agent.scene_review_counters.get(
@@ -1552,6 +1829,12 @@ class AgentRuntime:
                 reviewed[action.scene_id] = WorkIdentity(scene.revision + 1, scene.input_sha256)
                 candidates.pop(action.scene_id, None)
                 next_action = "submit_render"
+                if scene.code_sha256 != inputs.scene.code_sha256 and (
+                    agent.smoke_requested
+                    or (not manifest.dry_run and config.LOCAL_SMOKE_RENDER_ENABLED)
+                    or (manifest.dry_run and scene.unknown_animation_detected)
+                ):
+                    next_action = "smoke_scene"
             elif output.repair_route == "approval" and output.proposal is not None:
                 ref = self._store_output(output.proposal)
                 candidates[action.scene_id] = AgentPendingCandidate(
@@ -1662,12 +1945,200 @@ class AgentRuntime:
                 )
                 self._record_candidate(scene, "rendered")
                 next_action = "merge_video"
+                if manifest.visual_eval_profile.enabled:
+                    scene.visual_status = "pending"
+                    scene.phase = "visual_evaluating"
+                    next_action = "evaluate_visual"
             elif output.status in {"failed", "unknown", "cancelled"}:
-                reason = "Render did not complete safely; P4 does not resubmit or run render fixes"
-                agent = agent.model_copy(update={"stop_reason": reason})
-                updates.update(state="ERROR", status="failed", run_phase="failed", error=reason)
                 scene.phase = "failed"
                 scene.failed = True
+                if output.status == "failed" and manifest.auto_fix and not manifest.direct_render:
+                    updates.update(state="FIXING")
+                    next_action = "propose_render_fix"
+                else:
+                    reason = "Render failed or requires safe submission/cancellation reconciliation"
+                    agent = agent.model_copy(update={"stop_reason": reason})
+                    updates.update(state="ERROR", status="failed", run_phase="failed", error=reason)
+            patches = (self._scene_patch(scene),)
+        elif kind == "propose_render_fix":
+            inputs = self._scene_inputs(action.scene_id, manifest=manifest, inherit=True)
+            output = RenderRepairPipeline(
+                RenderingService(self._render().backend, manifest.backend),
+                fixer_factory=self.dependencies.fixer_factory,
+                request_context=self._request_context,
+                control=self.control,
+            ).repair(inputs, context)
+            if (
+                output.identity != action.work_identity
+                or output.original_code_sha256 != inputs.scene.code_sha256
+            ):
+                raise ValueError("Render repair result identity mismatch")
+            scene = output.scene
+            if output.repair_route in {"review", "coder"}:
+                scene.reviewed = scene.failed = False
+                scene.phase = "coded"
+                scene.slurm_job = scene.submission = scene.artifact = None
+                scene.rendered = False
+                scene.rewrite_feedback = output.feedback
+                next_action = (
+                    "inspect_candidate"
+                    if output.repair_route == "review"
+                    else "propose_code_candidate"
+                )
+                updates.update(state="CODING")
+                counters = dict(agent.scene_review_counters)
+                counters[action.scene_id] = AgentReviewState()
+                agent = agent.model_copy(update={"scene_review_counters": counters})
+                agent = agent.model_copy(update={"continuity_published": False})
+            elif output.repair_route == "plan":
+                proposals = dict(agent.plan_repair_proposals)
+                if output.proposed_plan is not None:
+                    proposals[action.scene_id] = output.report
+                agent = agent.model_copy(update={"plan_repair_proposals": proposals})
+                agent = agent.model_copy(
+                    update={"plan_repair_feedback": output.feedback, "continuity_published": False}
+                )
+                updates.update(state="CODING")
+                next_action = "revise_plan"
+            elif output.repair_route == "infrastructure":
+                scene.slurm_job = scene.submission = None
+                scene.phase, scene.failed = "reviewed", False
+                updates.update(state="DISPATCHING")
+                next_action = "submit_render"
+                reviewed = dict(agent.reviewed_identities)
+                reviewed[action.scene_id] = WorkIdentity(scene.revision + 1, scene.input_sha256)
+                agent = agent.model_copy(update={"reviewed_identities": reviewed})
+            else:
+                reason = output.feedback or "Finite render repair budget exhausted"
+                if manifest.run_config.resolve().ALLOW_PARTIAL_OUTPUT:
+                    scene.give_up = True
+                    updates.update(state="MONITORING")
+                    next_action = "merge_video"
+                else:
+                    agent = agent.model_copy(update={"stop_reason": reason})
+                    updates.update(state="ERROR", status="failed", run_phase="failed", error=reason)
+                    next_action = "propose_render_fix"
+            patches = (self._scene_patch(scene),)
+            updates["artifact_refs"] = {f"render_repair:{action.scene_id}": output.report.path}
+        elif kind == "cancel_render":
+            output = self._render().cancel(
+                self._scene_inputs(action.scene_id, manifest=manifest), context
+            )
+            scene = manifest.scenes[action.scene_id].model_copy(deep=True)
+            scene.slurm_job = output.job
+            scene.failed, scene.phase = True, "failed"
+            patches = (self._scene_patch(scene),)
+            reason = (
+                "Render cancelled"
+                if output.status == "cancelled"
+                else "Cancellation failed; resubmission forbidden"
+            )
+            updates.update(state="ERROR", status="failed", run_phase="failed", error=reason)
+            agent = agent.model_copy(update={"stop_reason": reason})
+            next_action = "cancel_render"
+        elif kind in {"evaluate_visual", "evaluate_boundary"}:
+            if kind == "evaluate_visual":
+                scene = manifest.scenes[action.scene_id]
+                if (
+                    action.video.sha256 != scene.artifact.video_sha256
+                    or action.snapshot_sha256 != digest(scene_binding(scene))
+                ):
+                    raise ValueError("Visual action input identity mismatch")
+                output = self.visual.scene(
+                    self._scene_inputs(action.scene_id, manifest=manifest), context
+                )
+                scenes, target_id = (output.scene,), action.scene_id
+            else:
+                if action.snapshot_sha256 != self._visual_input_digest(manifest):
+                    raise ValueError("Boundary action input identity mismatch")
+                output = self.visual.boundary(self._final_inputs(), context)
+                scenes, target_id = output.scenes, output.scene_id
+                updates["state_ledger"] = output.state_ledger
+            route = output.repair_route
+            next_action = "merge_video"
+            if route in {"planner", "continuity"}:
+                agent = agent.model_copy(
+                    update={"plan_repair_feedback": output.feedback, "continuity_published": False}
+                )
+                updates.update(state="CODING")
+                next_action = "revise_plan"
+            elif route == "coder":
+                pending = dict(agent.visual_repairs)
+                pending[target_id] = output.report
+                names = dict(agent.scene_next_actions)
+                names[target_id] = "propose_visual_fix"
+                agent = agent.model_copy(
+                    update={"visual_repairs": pending, "scene_next_actions": names}
+                )
+                updates.update(state="VISUAL_EVALUATING")
+                next_action = "propose_visual_fix"
+            elif route == "rebuild":
+                for scene in scenes:
+                    if scene.plan.scene_id == target_id:
+                        scene.reviewed, scene.phase = False, "coded"
+                names = dict(agent.scene_next_actions)
+                names[target_id] = "review_code"
+                agent = agent.model_copy(
+                    update={"scene_next_actions": names, "continuity_published": False}
+                )
+                updates.update(state="CODING")
+                next_action = "review_code"
+            else:
+                for scene in scenes:
+                    scene.phase = "visual_accepted"
+                if kind == "evaluate_boundary":
+                    agent = agent.model_copy(
+                        update={"boundary_input_sha256": self._visual_input_digest(manifest)}
+                    )
+                    updates.update(state="MERGING", run_phase="merging")
+                else:
+                    updates.update(state="MONITORING")
+            patches = tuple(self._scene_patch(scene) for scene in scenes)
+            if output.report is not None:
+                updates["artifact_refs"] = {f"{kind}:{target_id}": output.report.path}
+        elif kind == "propose_visual_fix":
+            inputs = self._scene_inputs(action.scene_id, manifest=manifest)
+            if agent.visual_repairs.get(action.scene_id) != action.report:
+                raise ValueError("Visual repair report identity mismatch")
+            boundary = (
+                action.report if action.report.path != inputs.scene.visual_report_file else None
+            )
+            output = self.visual.propose_fix(inputs, context, boundary_report=boundary)
+            if (
+                output.identity != action.work_identity
+                or output.base_source.sha256 != inputs.scene.code_sha256
+            ):
+                raise ValueError("Visual repair candidate identity mismatch")
+            scene = inputs.scene
+            if output.accepted:
+                scene.code_file, scene.code_sha256, scene.class_name = (
+                    output.candidate_source.path,
+                    output.candidate_source.sha256,
+                    output.class_name,
+                )
+                scene.reviewed = scene.rendered = scene.failed = False
+                scene.slurm_job = scene.submission = scene.artifact = None
+                scene.visual_status, scene.phase = "pending", "coded"
+                scene.static_verification = type(scene.static_verification)()
+                scene.execution_verification = type(scene.execution_verification)()
+                scene.visual_verification = type(scene.visual_verification)()
+                updates.update(state="CODING")
+                next_action = "inspect_candidate"
+                agent = agent.model_copy(update={"continuity_published": False})
+            else:
+                restored = self.visual.reject_proposal(inputs, context)
+                scene = restored.scene
+                scene.phase = "visual_accepted"
+                next_action = "merge_video"
+                updates.update(state="MONITORING")
+                if restored.repair_route == "rebuild":
+                    scene.reviewed, scene.phase = False, "coded"
+                    next_action = "review_code"
+                    updates.update(state="CODING")
+                    agent = agent.model_copy(update={"continuity_published": False})
+            pending = dict(agent.visual_repairs)
+            pending.pop(action.scene_id, None)
+            agent = agent.model_copy(update={"visual_repairs": pending})
             patches = (self._scene_patch(scene),)
         elif kind in {"merge_video", "evaluate_run"}:
             output = (
@@ -1683,6 +2154,34 @@ class AgentRuntime:
                 run_phase="evaluating",
             )
             next_action = "evaluate_run" if kind == "merge_video" else "finish"
+            if kind == "evaluate_run":
+                updates["eval_round"] = output.eval_round
+            agent = agent.model_copy(
+                update={
+                    "final_visual_report": output.visual_report,
+                    "final_evaluation_report": output.evaluation_report,
+                    "final_visual_status": output.visual_status,
+                }
+            )
+            if kind == "evaluate_run" and output.scenes_to_improve:
+                changed = []
+                names = dict(agent.scene_next_actions)
+                for identifier in output.scenes_to_improve:
+                    scene = manifest.scenes[identifier].model_copy(deep=True)
+                    scene.reviewed = scene.rendered = False
+                    scene.phase = "coded"
+                    scene.slurm_job = scene.submission = scene.artifact = None
+                    scene.rewrite_feedback = "Improve the committed run evaluation: " + str(
+                        output.evaluation_report
+                    )
+                    changed.append(self._scene_patch(scene))
+                    names[identifier] = "propose_code_candidate"
+                patches = tuple(changed)
+                agent = agent.model_copy(
+                    update={"scene_next_actions": names, "continuity_published": False}
+                )
+                updates.update(state="CODING")
+                next_action = "propose_code_candidate"
         elif kind == "finish":
             output = CompletionOutput(
                 output=self._final_output().video if manifest.final_video else None
@@ -1727,12 +2226,17 @@ class AgentRuntime:
                 kind="video",
             ),
             output_path=manifest.final_video,
+            visual_report=manifest.agent.final_visual_report,
+            evaluation_report=manifest.agent.final_evaluation_report,
+            visual_status=manifest.agent.final_visual_status,
+            eval_round=manifest.eval_round,
         )
 
     def _completed_video(self):
         if not self.manifest.final_video:
             return None
         result = self._final_output()
+        self.finalization._validate_video(self._final_inputs(), result)
         private = restore_run_path(self.root, result.video.path)
         public = Path(result.output_path)
         if (
@@ -1761,6 +2265,7 @@ class AgentRuntime:
             ScenePolicyState(
                 scene_id=scene_id,
                 phase=scene.phase,
+                give_up=scene.give_up,
                 work_identity=WorkIdentity(scene.revision, scene.input_sha256),
                 dependencies=tuple(
                     PolicyDependency(
@@ -1809,6 +2314,7 @@ class AgentRuntime:
             waiting_for_approval=agent.pending_approval is not None,
             plan_only=agent.operation == "plan",
             dry_run=manifest.dry_run,
+            allow_partial=manifest.run_config.resolve().ALLOW_PARTIAL_OUTPUT,
         )
 
     def _budget(self):
@@ -1941,16 +2447,44 @@ class AgentRuntime:
                 source=ObjectRef(path=scene.code_file, sha256=scene.code_sha256, kind="code"),
                 class_name=scene.class_name,
             )
+        elif name == "evaluate_visual":
+            scene = manifest.scenes[scene_id]
+            values.update(
+                video=ObjectRef(
+                    path=scene.artifact.video_path, sha256=scene.artifact.video_sha256, kind="video"
+                ),
+                snapshot_sha256=digest(scene_binding(scene)),
+            )
+        elif name == "evaluate_boundary":
+            values["snapshot_sha256"] = self._visual_input_digest(manifest)
+        elif name == "propose_visual_fix":
+            values["report"] = manifest.agent.visual_repairs[scene_id]
         elif name == "poll_render":
             values["job_id"] = manifest.scenes[scene_id].slurm_job.job_id
+        elif name == "propose_render_fix":
+            scene = manifest.scenes[scene_id]
+            values["diagnostic"] = Diagnostic(
+                code="render.failed",
+                stage="render",
+                category="execution",
+                summary=scene.slurm_job.failure_reason or "Render failed",
+                code_sha256=scene.code_sha256,
+                scene_id=scene_id,
+                revision=scene.revision,
+            )
         elif name == "merge_video":
             values["artifacts"] = tuple(
                 ObjectRef(
                     path=scene.artifact.video_path, sha256=scene.artifact.video_sha256, kind="video"
                 )
                 for _, scene in sorted(manifest.scenes.items())
+                if scene.rendered
             )
         elif name == "revise_plan":
+            values["proposals"] = tuple(
+                manifest.agent.plan_repair_proposals[key]
+                for key in sorted(manifest.agent.plan_repair_proposals)
+            )
             values["feedback"] = manifest.agent.plan_repair_feedback or "\n".join(
                 counters.feedback
                 for identifier, counters in manifest.agent.scene_review_counters.items()
@@ -1973,10 +2507,16 @@ class AgentRuntime:
                 if item.scene_id not in manifest.scenes
             )
         if manifest.state == "CODING":
-            if manifest.scenes and all(scene.reviewed for scene in manifest.scenes.values()):
-                return (self._make_action("publish_continuity", snapshot),)
             if any(name == "revise_plan" for name in agent.scene_next_actions.values()):
                 return (self._make_action("revise_plan", snapshot),)
+            for identifier, name in sorted(agent.scene_next_actions.items()):
+                if (
+                    name == "smoke_scene"
+                    and manifest.scenes[identifier].local_smoke_status != "passed"
+                ):
+                    return (self._make_action(name, snapshot, identifier),)
+            if manifest.scenes and all(scene.reviewed for scene in manifest.scenes.values()):
+                return (self._make_action("publish_continuity", snapshot),)
             technical = [
                 identifier
                 for identifier, scene in sorted(manifest.scenes.items())
@@ -2001,9 +2541,22 @@ class AgentRuntime:
             if coding:
                 return coding
             return tuple(ready[:1])
+        if manifest.state == "FIXING":
+            for identifier, name in sorted(agent.scene_next_actions.items()):
+                if name == "propose_render_fix":
+                    return (self._make_action(name, snapshot, identifier),)
+        if manifest.state == "VISUAL_EVALUATING":
+            for identifier, scene in sorted(manifest.scenes.items()):
+                if scene.give_up:
+                    continue
+                if agent.scene_next_actions.get(identifier) == "propose_visual_fix":
+                    return (self._make_action("propose_visual_fix", snapshot, identifier),)
+                if scene.visual_status not in {"passed", "warning", "unknown", "skipped"}:
+                    return (self._make_action("evaluate_visual", snapshot, identifier),)
+            return (self._make_action("evaluate_boundary", snapshot),)
         if manifest.state in {"DISPATCHING", "MONITORING"}:
             for identifier, scene in sorted(manifest.scenes.items()):
-                if not scene.rendered:
+                if not scene.rendered and not scene.give_up:
                     name = "poll_render" if scene.slurm_job is not None else "submit_render"
                     return (self._make_action(name, snapshot, identifier),)
         return (self._make_action(agent.next_action, snapshot),)
@@ -2011,6 +2564,16 @@ class AgentRuntime:
     def _next_action(self, snapshot):
         ready = self._ready_actions(snapshot)
         return ready[0] if ready else None
+
+    @staticmethod
+    def _visual_input_digest(manifest):
+        return digest(
+            {
+                "scenes": [scene_binding(scene) for _, scene in sorted(manifest.scenes.items())],
+                "profile": manifest.visual_eval_profile.digest(),
+                "ledger": manifest.state_ledger.digest(),
+            }
+        )
 
     @_serialized
     def _advance_barriers(self):
@@ -2048,17 +2611,27 @@ class AgentRuntime:
             if patches:
                 self._patch(RunPatch(scenes=tuple(patches)))
         elif manifest.state in {"DISPATCHING", "MONITORING"}:
-            if all(scene.rendered for scene in manifest.scenes.values()):
+            if all(scene.rendered or scene.give_up for scene in manifest.scenes.values()):
                 self._patch(
                     RunPatch(
-                        state="MERGING",
-                        run_phase="merging",
-                        agent=self._agent_update(next_action="merge_video"),
+                        state="VISUAL_EVALUATING"
+                        if manifest.visual_eval_profile.enabled
+                        else "MERGING",
+                        run_phase="evaluating"
+                        if manifest.visual_eval_profile.enabled
+                        else "merging",
+                        agent=self._agent_update(
+                            next_action="evaluate_boundary"
+                            if manifest.visual_eval_profile.enabled
+                            else "merge_video"
+                        ),
                     )
                 )
             else:
                 scene = next(
-                    scene for _, scene in sorted(manifest.scenes.items()) if not scene.rendered
+                    scene
+                    for _, scene in sorted(manifest.scenes.items())
+                    if not scene.rendered and not scene.give_up
                 )
                 target = "MONITORING" if scene.slurm_job else "DISPATCHING"
                 if target != manifest.state:
@@ -2071,6 +2644,25 @@ class AgentRuntime:
                 "review_plan",
                 requires_approval=continuation,
                 uses_model=not continuation and self.manifest.agent.planning_review,
+            )
+        elif action.kind == "propose_render_fix":
+            job = self.manifest.scenes[action.scene_id].slurm_job
+            self.registry.configure(
+                "propose_render_fix",
+                uses_model=job.status
+                not in {
+                    "PREEMPTED",
+                    "NODE_FAIL",
+                    "BOOT_FAIL",
+                    "DEADLINE",
+                    "REVOKED",
+                    "SPECIAL_EXIT",
+                },
+            )
+        elif action.kind == "propose_code_candidate":
+            self.registry.configure(
+                "propose_code_candidate",
+                uses_model=self.manifest.run_config.resolve().CODEGEN_MODE != "ir",
             )
 
     def _run_action(self, action):

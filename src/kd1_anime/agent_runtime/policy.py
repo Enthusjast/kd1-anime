@@ -60,6 +60,7 @@ class ScenePolicyState(RuntimeRecord):
     external_job_id: str | None = None
     static_verified: bool = False
     source_ref: ObjectRef | None = None
+    give_up: bool = False
 
 
 class PolicySnapshot(RuntimeRecord):
@@ -75,6 +76,7 @@ class PolicySnapshot(RuntimeRecord):
     waiting_for_job: bool = False
     plan_only: bool = False
     dry_run: bool = False
+    allow_partial: bool = False
     now: datetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
@@ -151,12 +153,14 @@ _PHASES: dict[str, frozenset[str]] = {
     "review_plan": frozenset({"PLANNING", "DETAILING", "PLAN_REVIEWING"}),
     "review_code": frozenset({"CODING", "REVIEWING", "FIXING"}),
     "inspect_candidate": frozenset({"CODING", "REVIEWING", "FIXING"}),
+    "smoke_scene": frozenset({"CODING", "REVIEWING", "FIXING"}),
     "submit_render": frozenset({"DISPATCHING"}),
     "poll_render": frozenset({"MONITORING"}),
     "cancel_render": frozenset({"DISPATCHING", "MONITORING", "ERROR"}),
     "propose_render_fix": frozenset({"FIXING"}),
     "propose_visual_fix": frozenset({"VISUAL_EVALUATING", "FIXING"}),
     "evaluate_visual": frozenset({"VISUAL_EVALUATING", "MONITORING"}),
+    "evaluate_boundary": frozenset({"VISUAL_EVALUATING"}),
     "merge_video": frozenset({"MERGING"}),
     "evaluate_run": frozenset({"EVALUATING"}),
     "reuse_scene": frozenset({"CODING", "REVIEWING", "DISPATCHING"}),
@@ -172,6 +176,7 @@ _SCENE_PHASES: dict[str, frozenset[str]] = {
     ),
     "review_code": frozenset({"coded", "reviewed"}),
     "inspect_candidate": frozenset({"coded", "reviewed"}),
+    "smoke_scene": frozenset({"coded", "reviewed"}),
     "submit_render": frozenset({"reviewed"}),
     "poll_render": frozenset({"monitoring"}),
     "cancel_render": frozenset({"monitoring"}),
@@ -188,6 +193,8 @@ def required_permission(action: AgentAction) -> Permission:
         return "cluster" if action.backend == "slurm" else "exec"
     if action.kind == "cancel_render":
         return "exec" if action.job_id.startswith("local-") else "cluster"
+    if action.kind == "smoke_scene":
+        return "exec"
     if action.kind == "merge_video":
         return "exec"
     return "read" if action.kind in _READ_ACTIONS else "write"
@@ -396,7 +403,7 @@ class Policy:
                     or bound.work_identity != committed.work_identity
                     or bound.source != committed.source_ref
                     or bound.source.kind != "code"
-                    or committed.phase != "reviewed"
+                    or committed.phase not in {"reviewed", "rendered", "visual_accepted"}
                     or not committed.static_verified
                     or committed.approved_code_identity != committed.work_identity
                     or committed.approved_code_sha256 != committed.code_sha256
@@ -487,9 +494,13 @@ class Policy:
                     )
                 )
             )
+            eligible = tuple(
+                item
+                for item in snapshot.scenes
+                if not (snapshot.allow_partial and item.give_up and item.phase == "failed")
+            )
             if not valid_early_finish and (
-                not snapshot.scenes
-                or any(item.phase != "visual_accepted" for item in snapshot.scenes)
+                not eligible or any(item.phase != "visual_accepted" for item in eligible)
             ):
                 return deny("unfinished_scenes")
         needs_grant = tool.requires_approval or diff

@@ -48,8 +48,8 @@
 
 CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
 `plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
-`run_incremental`。生成、规划和计划文件继续执行默认使用 v11 Agent Runtime；
-直接渲染、增量、TUI 和 batch 暂留 legacy v10，恢复严格按清单版本选择运行时。
+`run_incremental`。生成、规划、计划文件继续执行和直接渲染默认使用 v11 Agent Runtime；
+增量、TUI 和 batch 暂留 legacy v10，恢复严格按清单版本选择运行时。
 计划导出只读取已提交 manifest，不把 worker Context 暴露给 CLI。
 
 `domain/scene_fields.py` 是运行态字段所有权和 v10 存储投影的唯一元数据；领域
@@ -94,8 +94,22 @@ ElementManifest 和 StateLedger 发布，再进行 local/Slurm 提交、精确�
 WorkIdentity 判断有效性，不因无关请求预占或 transport revision 增加而过期。
 CLI 从已提交查询区分等待、失败和完成，不把 `None` 输出伪报为视频成功。
 
-当前未迁移的显式 smoke、自动视觉/渲染修复保存明确停止状态，不静默降级到另一实现。
-直接渲染、完整 retry/incremental 和展示层在后续独立阶段迁移；旧 v10 不补造新身份。
+显式 Smoke 是受 `exec` 权限约束的独立领域动作，导入、帧和短视频使用正式渲染相同的
+ExecutionPolicy、环境白名单、容器和进程组超时清理。改码时失效旧执行/视觉收据，新的
+Smoke 与 Review 精确绑定新源码；不能用安全模板隐藏确定性 AST/合同拒绝。
+
+渲染修复按原始 dispatch WorkIdentity（而非轮询递增后的 revision）绑定 Job、源码、
+TechnicalSpec 和错误指纹。基础设施重投使用独立持久化限额；新修复候选重新检查、Review，
+失效消费者并重新发布连续性。安全教学提案进入完整计划校验和新批准，不丢弃为自由文本。
+提交 ID 已保存但结果 checkpoint 失败时仍尝试取消；未知提交和取消失败均不得自动重提。
+
+Scene、boundary 和 final visual gate 保持独立端点，报告/帧/视频按内容寻址且验证完整身份。
+端点失败记录 `unknown`，保留有效视频和空分数；修复拒绝/耗尽恢复已验证最佳候选，不重复
+调用同一保留尝试。合并只使用当前精确 Job/artifact，部分输出须显式允许；同一运行的再次
+合并只有旧输出 hash 完全匹配时才能原子替换。完成恢复也核验成片和报告身份。
+
+直接渲染将外部源码复制进私有内容对象，只做只读静态验收，不调用生成/Review LLM，且
+持久化禁用自动改码。完整 retry/incremental 和展示层在后续独立阶段迁移；旧 v10 不补造身份。
 
 ```text
 kd1_anime.cli / kd1_anime.tui

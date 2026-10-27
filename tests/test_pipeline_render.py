@@ -296,16 +296,28 @@ def test_merge_does_not_replace_existing_final_on_atomic_merger_failure(stage, m
     assert final.output_path.read_bytes() == b"previous final"
 
 
-def test_enabled_visual_evaluation_stops_explicitly(stage):
+def test_enabled_visual_evaluation_retains_final_video_when_endpoint_is_unknown(stage):
     inputs = rendered(stage)
     final = final_inputs(inputs)
-    pipeline = FinalizationPipeline(ArtifactMerger())
+    from types import SimpleNamespace
+
+    def unavailable(**kwargs):
+        raise RuntimeError("visual endpoint unavailable")
+
+    pipeline = FinalizationPipeline(
+        ArtifactMerger(),
+        evaluator_factory=unavailable,
+        request_context=lambda *_: None,
+        control=SimpleNamespace(check=lambda: None),
+    )
     output = pipeline.merge(final, stage[2])
     values = json.loads(final.config.values_json)
     values["ENABLE_VISUAL_EVAL"] = True
     final = replace(final, config=RunConfig(values_json=json.dumps(values)))
-    with pytest.raises(NotImplementedError):
-        pipeline.evaluate(final, output, stage[2])
+    evaluated = pipeline.evaluate(final, output, stage[2])
+    assert evaluated.visual_status == "unknown"
+    assert evaluated.visual_report is not None
+    assert Path(evaluated.output_path).read_bytes() == b"merged:" + VIDEO
 
 
 def test_tampered_immutable_source_is_rejected_without_repair(stage):

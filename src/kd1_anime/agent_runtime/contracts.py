@@ -8,11 +8,19 @@ from pathlib import PurePosixPath
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import ConfigDict, Field, JsonValue, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from kd1_anime.domain.dependencies import WorkIdentity
 from kd1_anime.domain.diagnostics import Diagnostic
-from kd1_anime.domain.execution import FSMState
+from kd1_anime.domain.execution import FSMState, SubmissionAttempt
 from kd1_anime.models import ValidatedModel
 from kd1_anime.security import redact_text, redact_value
 
@@ -29,12 +37,14 @@ ActionName = Literal[
     "review_plan",
     "review_code",
     "inspect_candidate",
+    "smoke_scene",
     "submit_render",
     "poll_render",
     "cancel_render",
     "propose_render_fix",
     "propose_visual_fix",
     "evaluate_visual",
+    "evaluate_boundary",
     "merge_video",
     "evaluate_run",
     "reuse_scene",
@@ -61,8 +71,24 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _is_submission_attempt(value: dict) -> bool:
+    """Recognize only the complete persisted domain schema, never display aliases."""
+    if value.keys() != SubmissionAttempt.model_fields.keys():
+        return False
+    try:
+        SubmissionAttempt.model_validate(value)
+    except ValidationError:
+        return False
+    return True
+
+
 def sanitize_record(value, secrets: tuple[str, ...] = ()):
-    """Persist visible JSON only; never stringify an exception or arbitrary object."""
+    """Persist visible JSON, retaining only validated submission tokens as public IDs.
+
+    Complete SubmissionAttempt dumps must survive nested record roundtrips. Their
+    token is an identity, not a credential; configured secrets still redact it.
+    All other token fields keep the ordinary credential policy.
+    """
     if isinstance(value, ValidatedModel):
         value = value.model_dump(mode="json")
     if isinstance(value, str):
@@ -70,9 +96,17 @@ def sanitize_record(value, secrets: tuple[str, ...] = ()):
     if isinstance(value, dict):
         if any(str(key).lower().replace("-", "_") in _HIDDEN_KEYS for key in value):
             raise ValueError("Hidden reasoning cannot be persisted")
-        return redact_value(
-            {key: sanitize_record(item, secrets) for key, item in value.items()}, secrets
-        )
+        submission = _is_submission_attempt(value)
+        result = {}
+        for key, item in value.items():
+            safe_item = sanitize_record(item, secrets)
+            if (
+                not (submission and key == "token")
+                and redact_value({key: None})[key] == "<redacted>"
+            ):
+                safe_item = "<redacted>"
+            result[key] = safe_item
+        return result
     if isinstance(value, (list, tuple)):
         return [sanitize_record(item, secrets) for item in value]
     if value is None or isinstance(value, (int, float, bool, datetime, WorkIdentity)):
@@ -126,6 +160,7 @@ class ProposePlan(ActionBase):
 class RevisePlan(ActionBase):
     kind: Literal["revise_plan"] = "revise_plan"
     feedback: str
+    proposals: tuple[ObjectRef, ...] = ()
 
 
 class DetailScene(ActionBase):
@@ -196,6 +231,11 @@ class InspectCandidate(ActionBase):
     proposal: DiffBinding | None = None
 
 
+class SmokeScene(ActionBase):
+    kind: Literal["smoke_scene"] = "smoke_scene"
+    scene_id: int = Field(ge=1)
+
+
 class SubmitRender(ActionBase):
     kind: Literal["submit_render"] = "submit_render"
     scene_id: int = Field(ge=1)
@@ -231,7 +271,14 @@ class ProposeVisualFix(ActionBase):
 class EvaluateVisual(ActionBase):
     kind: Literal["evaluate_visual"] = "evaluate_visual"
     video: ObjectRef
+    scene_id: int = Field(ge=1)
+    snapshot_sha256: Sha256 | None = None
     frames: tuple[ObjectRef, ...] = ()
+
+
+class EvaluateBoundary(ActionBase):
+    kind: Literal["evaluate_boundary"] = "evaluate_boundary"
+    snapshot_sha256: Sha256
 
 
 class MergeVideo(ActionBase):
@@ -275,12 +322,14 @@ AgentAction = Annotated[
     | ReviewPlan
     | ReviewCode
     | InspectCandidate
+    | SmokeScene
     | SubmitRender
     | PollRender
     | CancelRender
     | ProposeRenderFix
     | ProposeVisualFix
     | EvaluateVisual
+    | EvaluateBoundary
     | MergeVideo
     | EvaluateRun
     | ReuseScene

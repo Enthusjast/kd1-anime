@@ -10,7 +10,9 @@ from kd1_anime.agent_runtime.contracts import (
     ObjectRef,
     ProposePlan,
     UsageReceipt,
+    sanitize_record,
 )
+from kd1_anime.domain.execution import SubmissionAttempt
 
 RUN = "20261027-120000-1234abcd"
 SESSION = "session-1234abcd"
@@ -97,3 +99,69 @@ def test_unknown_usage_is_not_reported_as_zero_cost():
     assert receipt.total_tokens is None and receipt.cost is None
     with pytest.raises(ValidationError):
         UsageReceipt(request_id="request-1", cost_status="unknown", cost=0)
+
+
+@pytest.mark.parametrize("mode", ["typed", "python", "json"])
+def test_submission_public_identity_survives_nested_sanitization(mode):
+    attempt = SubmissionAttempt(
+        token="012345abcdef", backend="local", scene_revision=2, code_sha256="a" * 64
+    )
+    value = attempt if mode == "typed" else attempt.model_dump(mode=mode)
+    safe = sanitize_record(
+        {"scene": {"submission": value, "submission_attempts": [value]}, "token": attempt.token}
+    )
+    assert safe["scene"]["submission"]["token"] == attempt.token
+    assert safe["scene"]["submission_attempts"][0]["token"] == attempt.token
+    assert safe["token"] == "<redacted>"
+    assert sanitize_record(safe) == safe
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"backend": "credential"},
+        {"code_sha256": "invalid"},
+        {"token": "not-a-public-identity"},
+        {"kind": "SubmissionAttempt"},
+        {"type": "submission_attempt"},
+    ],
+)
+def test_submission_lookalikes_do_not_whitelist_credential_tokens(change):
+    attempt = SubmissionAttempt(
+        token="012345abcdef", backend="local", scene_revision=2, code_sha256="a" * 64
+    ).model_dump(mode="json")
+    assert sanitize_record({**attempt, **change})["token"] == "<redacted>"
+    assert sanitize_record({"submission": {"token": attempt["token"]}}) == {
+        "submission": {"token": "<redacted>"}
+    }
+    attempt.pop("created_at")
+    assert sanitize_record(attempt)["token"] == "<redacted>"
+
+
+def test_public_submission_identity_never_overrides_known_secret_redaction():
+    attempt = SubmissionAttempt(
+        token="012345abcdef", backend="local", scene_revision=2, code_sha256="a" * 64
+    )
+    assert sanitize_record(attempt, (attempt.token,))["token"] == "<redacted>"
+    assert sanitize_record(attempt.model_dump(mode="json"), ("345abc",))["token"] == (
+        "012<redacted>def"
+    )
+    assert (
+        sanitize_record(
+            {"attempt": attempt, "authorization": "Bearer credential", "message": "secret-value"},
+            ("secret-value",),
+        )["message"]
+        == "<redacted>"
+    )
+
+
+@pytest.mark.parametrize("container", ["submission", "token", "authorization"])
+def test_submission_preservation_still_rejects_nested_hidden_reasoning(container):
+    attempt = SubmissionAttempt(backend="local", scene_revision=2, code_sha256="a" * 64).model_dump(
+        mode="json"
+    )
+    with pytest.raises(ValueError, match="Hidden reasoning"):
+        sanitize_record({container: [{**attempt, "reasoning_content": "private"}]})
+    assert sanitize_record({"message": "<think>private</think>visible"}) == {
+        "message": "<redacted>visible"
+    }

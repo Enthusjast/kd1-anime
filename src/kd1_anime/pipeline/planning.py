@@ -21,7 +21,7 @@ from kd1_anime.config import settings
 from kd1_anime.control import OperationDeadlineExceeded, RunCancelled, RunControl
 from kd1_anime.domain.diagnostics import Diagnostic, diagnostic_from_plan_issue
 from kd1_anime.domain.plan_review import ContinuityIssue
-from kd1_anime.domain.planning import PlanningDraft
+from kd1_anime.domain.planning import PlanningDraft, ScenePlan
 from kd1_anime.domain.runtime import RunConfig
 from kd1_anime.models import validated_copy
 from kd1_anime.pipeline.contracts import (
@@ -535,10 +535,45 @@ class PlanningPipeline:
         return self._validate(revised)[0]
 
     def revise(
-        self, output: PlanningOutput, feedback: str, renderer: Renderer, *, user_prompt: str = ""
+        self,
+        output: PlanningOutput,
+        feedback: str,
+        renderer: Renderer,
+        *,
+        user_prompt: str = "",
+        proposed_plans: tuple[ScenePlan, ...] = (),
     ) -> PlanningOutput:
         """Explicit root repair; callers must invalidate affected technical/code consumers."""
         with self._config.activate():
+            if proposed_plans:
+                plans = {plan.scene_id: plan for plan in output.plans}
+                if len({plan.scene_id for plan in proposed_plans}) != len(proposed_plans) or any(
+                    plan.scene_id not in plans for plan in proposed_plans
+                ):
+                    raise ValueError("Safe plan proposal scene identity mismatch")
+                plans.update(
+                    (plan.scene_id, validated_copy(plan, deep=True)) for plan in proposed_plans
+                )
+                candidate = output.model_copy(
+                    update={
+                        "plans": tuple(plans[item.scene_id] for item in output.outlines),
+                        "outlines": tuple(
+                            item.model_copy(
+                                update={
+                                    name: getattr(plans[item.scene_id], name)
+                                    for name in (
+                                        "title",
+                                        "duration_seconds",
+                                        "purpose",
+                                        "math_concept",
+                                    )
+                                }
+                            )
+                            for item in output.outlines
+                        ),
+                    }
+                )
+                return self._validate(candidate)[0]
             return self._revise_targets(
                 validated_copy(output, deep=True),
                 {item.scene_id: feedback for item in output.outlines},

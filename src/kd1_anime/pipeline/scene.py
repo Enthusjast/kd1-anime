@@ -267,6 +267,46 @@ class ScenePipeline:
             result.receipt,
         )
 
+    def _fallback_source(self, inputs, *, use_ir, reason):
+        from kd1_anime.agents.scene_ir import (
+            build_scene_program_from_contract,
+            compile_scene_program,
+        )
+        from kd1_anime.agents.scene_templates import build_safe_scene_code
+
+        if use_ir:
+            code = compile_scene_program(
+                build_scene_program_from_contract(inputs.scene.plan, inputs.scene.technical_spec),
+                inputs.scene.plan,
+            )
+        else:
+            code = build_safe_scene_code(inputs.scene.plan, inputs.scene.technical_spec)
+        inspection = self._inspect(inputs, code, allow_repair=True)
+        if not inspection.accepted:
+            raise SceneStageError(
+                "Explicit fallback failed complete inspection: " + inspection.feedback
+            )
+        return SceneOutput(
+            source=ObjectRef(
+                path=ObjectStore(inputs.root).source(inputs.scene.plan.scene_id, inspection.code),
+                sha256=inspection.code_sha256,
+                kind="code",
+            ),
+            class_name=inspection.class_name,
+            diagnostics=(
+                *inspection.diagnostics,
+                Diagnostic(
+                    code="scene_codegen_fallback",
+                    stage="ast",
+                    category="compiler",
+                    severity="minor",
+                    scene_id=inputs.scene.plan.scene_id,
+                    summary="Explicit degraded generation; teaching equivalence is not guaranteed",
+                    detail=sanitize_record(reason, self._secrets()),
+                ),
+            ),
+        )
+
     def generate(
         self,
         inputs: SceneInputs,
@@ -326,32 +366,61 @@ class ScenePipeline:
                         class_name=inspection.class_name,
                         diagnostics=inspection.diagnostics,
                     )
+            if config.CODEGEN_MODE == "ir":
+                return self._fallback_source(inputs, use_ir=True, reason="Explicit IR mode")
             rag_context, receipts = self._rag(inputs)
-            generated = GenerationService(
-                agent=self._agent(self.coder_factory, inputs, "code"),
-                validator=validate_manim_code,
-                candidate_acceptor=self.acceptor,
-                generation_mode=config.GENERATION_MODE,
-                manim_version=inputs.render_profile.manim_version,
-                run_config=inputs.config,
-            ).generate(
-                inputs.scene.plan,
-                feedback=feedback,
-                previous_code=previous_code,
-                stream=False,
-                renderer=inputs.render_profile.renderer,
-                continuity_bible=inputs.continuity_bible,
-                inherited_elements_code=inputs.scene.inherited_elements_code,
-                inherited_elements=inputs.scene.plan.inherited_elements,
-                elements_to_remove=inputs.scene.plan.elements_to_remove,
-                element_manifest=inputs.element_manifest,
-                technical_spec=inputs.scene.technical_spec,
-                rag_context=rag_context,
-                lesson_spec=inputs.lesson_spec,
-                teaching_graph=inputs.teaching_graph,
-                attempts_used=attempts_used,
-                reserve_attempt=reserve_attempt,
-            )
+            try:
+                generated = GenerationService(
+                    agent=self._agent(self.coder_factory, inputs, "code"),
+                    validator=validate_manim_code,
+                    candidate_acceptor=self.acceptor,
+                    generation_mode=config.GENERATION_MODE,
+                    manim_version=inputs.render_profile.manim_version,
+                    run_config=inputs.config,
+                ).generate(
+                    inputs.scene.plan,
+                    feedback=feedback,
+                    previous_code=previous_code,
+                    stream=False,
+                    renderer=inputs.render_profile.renderer,
+                    continuity_bible=inputs.continuity_bible,
+                    inherited_elements_code=inputs.scene.inherited_elements_code,
+                    inherited_elements=inputs.scene.plan.inherited_elements,
+                    elements_to_remove=inputs.scene.plan.elements_to_remove,
+                    element_manifest=inputs.element_manifest,
+                    technical_spec=inputs.scene.technical_spec,
+                    rag_context=rag_context,
+                    lesson_spec=inputs.lesson_spec,
+                    teaching_graph=inputs.teaching_graph,
+                    attempts_used=attempts_used,
+                    reserve_attempt=reserve_attempt,
+                )
+            except Exception as exc:
+                from kd1_anime.agent_runtime.tools import ToolCancelled
+                from kd1_anime.control import OperationDeadlineExceeded, RunCancelled
+                from kd1_anime.exceptions import ValidationError
+                from kd1_anime.request_budget import RequestBudgetExceeded
+
+                if isinstance(
+                    exc,
+                    (
+                        RequestBudgetExceeded,
+                        OperationDeadlineExceeded,
+                        RunCancelled,
+                        ToolCancelled,
+                        ValidationError,
+                        OSError,
+                    ),
+                ):
+                    raise
+                if config.CODEGEN_MODE == "python" and config.GENERATION_MODE != "relaxed":
+                    raise
+                if config.CODEGEN_MODE == "hybrid":
+                    try:
+                        return self._fallback_source(inputs, use_ir=True, reason=str(exc))
+                    except SceneStageError:
+                        pass
+                return self._fallback_source(inputs, use_ir=False, reason=str(exc))
             return SceneOutput(
                 source=ObjectRef(
                     path=ObjectStore(inputs.root).source(

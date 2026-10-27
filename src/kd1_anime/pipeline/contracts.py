@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from kd1_anime.agent_runtime.contracts import ObjectRef, RuntimeRecord
+from kd1_anime.domain.dependencies import WorkIdentity
 from kd1_anime.domain.diagnostics import Diagnostic
 from kd1_anime.domain.planning import (
     ContinuityBible,
@@ -16,7 +17,7 @@ from kd1_anime.domain.planning import (
     ScenePlan,
     TeachingGraph,
 )
-from kd1_anime.domain.runtime import ExecutionSpec, RunConfig
+from kd1_anime.domain.runtime import ExecutionSpec, RunConfig, VisualEvalProfile
 from kd1_anime.domain.state_ledger import StateLedger
 from kd1_anime.domain.technical import TechnicalHandoff, TechnicalSpec
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
@@ -41,6 +42,10 @@ class SceneInputs:
     previous_technical_handoff: TechnicalHandoff | None = None
     rag_context: str = ""
     direct_render: bool = False
+    dry_run: bool = False
+    auto_fix: bool = True
+    visual_eval_profile: VisualEvalProfile | None = None
+    submission_identity: WorkIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +73,16 @@ class FinalizationInputs:
     merge_profile: MergeProfile
     scenes: tuple[StoredSceneState, ...]
     output_path: Path
+    user_prompt: str = ""
+    lesson_spec: LessonSpec = field(default_factory=LessonSpec)
+    teaching_graph: TeachingGraph = field(default_factory=TeachingGraph)
+    continuity_bible: ContinuityBible | None = None
+    state_ledger: StateLedger = field(default_factory=StateLedger)
+    auto_fix: bool = True
+    allow_partial: bool = False
+    eval_round: int = 0
+    visual_eval_profile: VisualEvalProfile | None = None
+    existing_output_sha256: str = ""
 
 
 class PlanningOutput(RuntimeRecord):
@@ -111,3 +126,8 @@ class FinalizationOutput(RuntimeRecord):
     video: ObjectRef
     output_path: str
     diagnostics: tuple[Diagnostic, ...] = ()
+    visual_report: ObjectRef | None = None
+    evaluation_report: ObjectRef | None = None
+    visual_status: Literal["skipped", "accepted", "rejected", "unknown"] = "skipped"
+    eval_round: int = 0
+    scenes_to_improve: tuple[int, ...] = ()

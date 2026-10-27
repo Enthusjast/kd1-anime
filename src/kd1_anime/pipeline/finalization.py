@@ -2,17 +2,34 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from kd1_anime.agent_runtime.contracts import ObjectRef
+from kd1_anime.agent_runtime.contracts import ObjectRef, sanitize_record
 from kd1_anime.agent_runtime.tools import ToolContext
+from kd1_anime.eval.metrics import EvalResult
 from kd1_anime.pipeline.contracts import FinalizationInputs, FinalizationOutput
 from kd1_anime.pipeline.render import validate_artifact
+from kd1_anime.pipeline.visual import (
+    _PROPAGATE,
+    VisualPipeline,
+    _preserve_frames,
+    _read_report,
+    _secrets,
+    _source,
+    frame_bindings,
+    scene_binding,
+    store_report,
+    verify_scene_receipt,
+    visual_profile,
+)
 from kd1_anime.rendering import sha256_file
-from kd1_anime.run_store import restore_run_path
+from kd1_anime.run_store import restore_run_path, sha256_text
+from kd1_anime.services.visual_evaluation import verify_samples
 
 
 def _immutable_video(root: Path, source: Path) -> ObjectRef:
@@ -60,8 +77,24 @@ def _immutable_video(root: Path, source: Path) -> ObjectRef:
 
 
 class FinalizationPipeline:
-    def __init__(self, merger):
+    def __init__(
+        self,
+        merger,
+        *,
+        evaluator_factory=None,
+        fixer_factory=None,
+        request_context=None,
+        control=None,
+    ):
         self.merger = merger
+        from kd1_anime.eval import Evaluator
+
+        self.visual = VisualPipeline(
+            evaluator_factory=evaluator_factory or Evaluator,
+            fixer_factory=fixer_factory,
+            request_context=request_context,
+            control=control,
+        )
 
     def merge(self, inputs: FinalizationInputs, context: ToolContext) -> FinalizationOutput:
         context.checkpoint()
@@ -70,10 +103,26 @@ class FinalizationPipeline:
         scene_ids = [scene.plan.scene_id for scene in inputs.scenes]
         if len(scene_ids) != len(set(scene_ids)):
             raise ValueError("Finalization contains duplicate scene identities")
-        videos = [
-            validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
-            for scene in sorted(inputs.scenes, key=lambda item: item.plan.scene_id)
-        ]
+        settings = inputs.config.resolve()
+        incomplete = [scene.plan.scene_id for scene in inputs.scenes if not scene.rendered]
+        if incomplete and not (inputs.allow_partial or settings.ALLOW_PARTIAL_OUTPUT):
+            raise ValueError(f"Partial output is disabled; incomplete scenes: {incomplete}")
+        rendered = sorted(
+            (scene for scene in inputs.scenes if scene.rendered),
+            key=lambda item: item.plan.scene_id,
+        )
+        if not rendered:
+            raise ValueError("Finalization requires at least one verified scene artifact")
+        videos = []
+        for scene in rendered:
+            _source(inputs, scene)
+            videos.append(
+                validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+            )
+            if visual_profile(inputs).enabled:
+                if scene.visual_status not in {"passed", "warning", "unknown"}:
+                    raise ValueError("Current scene has not completed its visual gate")
+                verify_scene_receipt(inputs, scene)
         requested = inputs.output_path.expanduser().absolute()
         if requested.is_symlink() or requested.resolve() in videos:
             raise ValueError("Final output must not alias an input artifact")
@@ -85,6 +134,12 @@ class FinalizationPipeline:
                     requested,
                     render_profile=inputs.render_profile,
                     merge_profile=inputs.merge_profile,
+                    replace_existing=requested.resolve().is_relative_to(inputs.root.resolve())
+                    or bool(
+                        inputs.existing_output_sha256
+                        and requested.is_file()
+                        and sha256_file(requested) == inputs.existing_output_sha256
+                    ),
                 )
             )
         if (
@@ -101,11 +156,22 @@ class FinalizationPipeline:
         self, inputs: FinalizationInputs, video: FinalizationOutput, context: ToolContext
     ) -> FinalizationOutput:
         context.checkpoint()
+        self._validate_video(inputs, video)
         settings = inputs.config.resolve()
-        if settings.ENABLE_VISUAL_EVAL or settings.ENABLE_AUTO_EVAL:
-            raise NotImplementedError(
-                "视觉/visual evaluation is unsupported in the single-scene runtime"
+        changes = {}
+        if visual_profile(inputs).enabled and video.visual_report is None:
+            reference, status = self._final_visual(inputs, video, context)
+            changes.update(visual_report=reference, visual_status=status)
+        if settings.ENABLE_AUTO_EVAL and video.evaluation_report is None:
+            reference, scenes, eval_round = self._automatic_evaluation(inputs, video, context)
+            changes.update(
+                evaluation_report=reference, scenes_to_improve=scenes, eval_round=eval_round
             )
+        self._validate_video(inputs, video)
+        return video.model_copy(update=changes)
+
+    @staticmethod
+    def _validate_video(inputs, video):
         if video.video.kind != "video":
             raise ValueError("Final output reference must identify a video")
         private = restore_run_path(inputs.root, video.video.path)
@@ -120,4 +186,195 @@ class FinalizationPipeline:
             or sha256_file(requested) != video.video.sha256
         ):
             raise ValueError("Final video hash or output identity mismatch")
-        return video
+        for scene in inputs.scenes:
+            if scene.rendered:
+                _source(inputs, scene)
+                validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+        for reference, scope in (
+            (video.visual_report, "complete_video"),
+            (video.evaluation_report, "run_evaluation"),
+        ):
+            if reference is None:
+                continue
+            report = _read_report(inputs, reference)
+            scenes = (
+                [s for s in inputs.scenes if s.rendered]
+                if scope == "complete_video"
+                else inputs.scenes
+            )
+            if (
+                report.get("scope") != scope
+                or report.get("video_sha256") != video.video.sha256
+                or report.get("scene_bindings") != [scene_binding(s) for s in scenes]
+            ):
+                raise ValueError("Final report does not bind the current video and scenes")
+            if scope == "complete_video" and (
+                report.get("visual_profile_sha256") != visual_profile(inputs).digest()
+                or report.get("state_ledger_digest") != inputs.state_ledger.digest()
+            ):
+                raise ValueError("Final visual report context identity mismatch")
+            if scope == "run_evaluation" and report.get("config_sha256") != sha256_text(
+                inputs.config.values_json
+            ):
+                raise ValueError("Final evaluation configuration identity mismatch")
+            for frame in report.get("frames", []):
+                path = restore_run_path(inputs.root, frame["path"])
+                if (
+                    not frame.get("sha256")
+                    or not path.is_file()
+                    or sha256_file(path) != frame["sha256"]
+                ):
+                    raise ValueError("Final report frame hash mismatch")
+
+    def _final_visual(self, inputs, video, context):
+        profile = visual_profile(inputs)
+        samples, result, error = [], None, ""
+        rendered = [
+            (
+                scene.plan.scene_id,
+                validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile),
+            )
+            for scene in sorted(inputs.scenes, key=lambda item: item.plan.scene_id)
+            if scene.rendered
+        ]
+        with inputs.config.activate():
+            try:
+                evaluator = self.visual.evaluator(inputs, context)
+                boundary_count = min(3, profile.frame_count // 2) if len(rendered) >= 2 else 0
+                regular_count = profile.frame_count - 2 * boundary_count
+                private = restore_run_path(inputs.root, video.video.path)
+                regular = (
+                    evaluator.extract_video_samples(
+                        private,
+                        inputs.root / "eval_frames" / "final" / video.video.sha256,
+                        frame_count=regular_count,
+                    )
+                    if regular_count
+                    else []
+                )
+                boundaries = (
+                    evaluator.extract_boundary_samples(
+                        rendered,
+                        inputs.root / "eval_frames" / "final_boundaries" / video.video.sha256,
+                        max_boundaries=boundary_count,
+                    )
+                    if boundary_count
+                    else []
+                )
+                samples = [
+                    sample.model_copy(update={"frame_id": f"F{index:02d}"})
+                    for index, sample in enumerate([*regular, *boundaries], start=1)
+                ]
+                samples = _preserve_frames(inputs, samples)
+                if not samples:
+                    raise RuntimeError("没有可用于成片视觉评估的关键帧")
+                result = self.visual.service.evaluate_frames(
+                    evaluator.visual_evaluator,
+                    samples,
+                    self.visual._description(inputs),
+                    scene_context=json.dumps(
+                        {
+                            "lesson_spec": inputs.lesson_spec.model_dump(mode="json")
+                            if inputs.lesson_spec
+                            else None,
+                            "teaching_graph": inputs.teaching_graph.model_dump(mode="json")
+                            if inputs.teaching_graph
+                            else None,
+                            "scene_plans": [s.plan.model_dump(mode="json") for s in inputs.scenes],
+                        },
+                        ensure_ascii=False,
+                    )[:30_000],
+                    scope="complete video",
+                )
+            except _PROPAGATE:
+                raise
+            except Exception as exc:
+                error = sanitize_record(str(exc) or type(exc).__name__, _secrets())
+            self.visual._checkpoint(context)
+            self._validate_video(inputs, video)
+            verify_samples(samples)
+            reference = store_report(
+                inputs,
+                {
+                    "schema_version": 1,
+                    "scope": "complete_video",
+                    "model": profile.model,
+                    "visual_profile_sha256": profile.digest(),
+                    "video_sha256": video.video.sha256,
+                    "scene_bindings": [scene_binding(s) for s in inputs.scenes if s.rendered],
+                    "state_ledger_digest": inputs.state_ledger.digest(),
+                    "frames": frame_bindings(inputs, samples),
+                    "result": result.to_dict() if result is not None else None,
+                    "error": error,
+                },
+            )
+        status = (
+            "unknown"
+            if result is None
+            else ("rejected" if result.needs_fix(profile.threshold) else "accepted")
+        )
+        # Final-video evidence cannot reliably attribute a rewrite to one scene.
+        return reference, status
+
+    def _automatic_evaluation(self, inputs, video, context):
+        settings = inputs.config.resolve()
+        result = EvalResult(run_id=inputs.run_id)
+        scene_results, error = {}, ""
+        with inputs.config.activate():
+            try:
+                evaluator = self.visual.evaluator(inputs, context, visual=False)
+                for scene in inputs.scenes:
+                    if not scene.code_file:
+                        continue
+                    self.visual._checkpoint(context)
+                    evaluated = evaluator.evaluate_code(
+                        _source(inputs, scene), renderer=inputs.render_profile.renderer
+                    )
+                    scene_results[scene.plan.scene_id] = evaluated
+                    for score in evaluated.scores:
+                        result.add_score(score)
+                # Supply only the immutable stage snapshot: never reload a manifest
+                # or discover videos from shared directories during evaluation.
+                snapshot = SimpleNamespace(scenes={s.plan.scene_id: s for s in inputs.scenes})
+                for score in evaluator._evaluate_efficiency(inputs.root, manifest=snapshot):
+                    result.add_score(score)
+            except _PROPAGATE:
+                raise
+            except Exception as exc:
+                error = sanitize_record(str(exc) or type(exc).__name__, _secrets())
+                result.add_error("evaluation", error)
+            self.visual._checkpoint(context)
+            self._validate_video(inputs, video)
+            low = tuple(
+                sorted(
+                    scene_id
+                    for scene_id, evaluated in scene_results.items()
+                    if evaluated.overall_score is not None
+                    and evaluated.overall_score < settings.EVAL_THRESHOLD
+                )
+            )
+            improve = (
+                not error
+                and inputs.auto_fix
+                and inputs.eval_round < settings.MAX_EVAL_ROUNDS
+                and result.overall_score is not None
+                and result.overall_score < settings.EVAL_THRESHOLD
+                and bool(low)
+            )
+            targets = low if improve else ()
+            next_round = inputs.eval_round + 1 if improve else inputs.eval_round
+            reference = store_report(
+                inputs,
+                {
+                    "schema_version": 1,
+                    "scope": "run_evaluation",
+                    "video_sha256": video.video.sha256,
+                    "scene_bindings": [scene_binding(s) for s in inputs.scenes],
+                    "config_sha256": sha256_text(inputs.config.values_json),
+                    "eval_round": next_round,
+                    "scenes_to_improve": targets,
+                    "result": result.to_dict(),
+                    "error": error,
+                },
+            )
+        return reference, targets, next_round

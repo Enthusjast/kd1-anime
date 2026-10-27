@@ -67,6 +67,12 @@
   diff 一次性批准后仍重新检查和 Review。批准查询使用逻辑工作身份，不受 transport checkpoint 干扰。
 - 保留有界重规划、无进展检测和 strict/relaxed 策略；SceneProgram v2 不支持时显式回退 LLM，
   不降低数学、AST、生命周期和提交前只读复检要求。
+- v11 迁入显式 Smoke、私有直接渲染、有限 Render Fix、基础设施重试、最佳回滚与安全教学
+  提案；原始派发身份在后续 checkpoint 中保持可验证，改码失效旧收据并重新检查/Review。
+- v11 迁入 scene/boundary/final 视觉门、视觉候选修复、精确合并和有界全片评价；视觉
+  `unknown` 保留有效视频，过期 frame/video/report 拒绝，partial output 仍默认拒绝。
+- 修复通用脱敏误删合法 submission attempt ID 的问题；仅精确验证的 SubmissionAttempt
+  结构保留公开身份，普通 token、伪造结构、已知凭据和隐藏分析仍被脱敏或拒绝。
 - 将默认代码 Review 轮数和渲染失败自动修复次数从 5 次提高到 8 次。
 - 删除持久化 LLM 响应缓存及其 CLI/配置入口；每次 Agent 调用都会重新请求模型，
   避免复用历史错误结果阻碍代码修复。

@@ -61,6 +61,7 @@ class AgentRunState(ValidatedModel):
     step_count: int = Field(default=0, ge=0)
     planning_review: bool = True
     planning_preflight: bool = True
+    smoke_requested: bool = False
     plan_sha256: Sha256 | None = None
     approved_plan_sha256: Sha256 | None = None
     approved_plan_identity: WorkIdentity | None = None
@@ -70,9 +71,15 @@ class AgentRunState(ValidatedModel):
     scene_action_versions: dict[int, int] = Field(default_factory=dict)
     plan_review_complete: bool = False
     plan_repair_feedback: str = ""
+    plan_repair_proposals: dict[int, ObjectRef] = Field(default_factory=dict)
     continuity_published: bool = False
     pending_candidates: dict[int, AgentPendingCandidate] = Field(default_factory=dict)
     scene_review_counters: dict[int, AgentReviewState] = Field(default_factory=dict)
+    visual_repairs: dict[int, ObjectRef] = Field(default_factory=dict)
+    boundary_input_sha256: Sha256 | None = None
+    final_visual_report: ObjectRef | None = None
+    final_evaluation_report: ObjectRef | None = None
+    final_visual_status: Literal["skipped", "accepted", "rejected", "unknown"] = "skipped"
     pending_approval: AgentAction | None = None
     stop_reason: str = ""
     intents: tuple[ExecutionIntent, ...] = ()

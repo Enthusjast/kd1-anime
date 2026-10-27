@@ -172,7 +172,7 @@ class Application:
         wait: bool = False,
         backend: RenderBackendName | None = None,
     ) -> tuple[RenderJob, Path | None, str]:
-        return self._runtime(agent=False).submit_existing_scene(
+        return self._runtime().submit_existing_scene(
             source_code, class_name, scene_id=scene_id, wait=wait, backend=backend
         )
 
