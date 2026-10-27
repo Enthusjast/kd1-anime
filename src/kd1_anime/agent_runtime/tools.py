@@ -18,6 +18,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Literal, get_args
 
@@ -33,6 +34,8 @@ from kd1_anime.agent_runtime.policy import PolicyDecision, ToolPolicySpec
 from kd1_anime.commits import RunPatch, ScenePatch
 from kd1_anime.domain.diagnostics import Diagnostic
 from kd1_anime.services.results import StageResult
+
+current_invocation: ContextVar[ToolInvocation | None] = ContextVar("agent_invocation", default=None)
 
 
 def action_signature(action: AgentAction) -> str:
@@ -75,6 +78,12 @@ class ToolRegistry:
         if tool.policy.action in self._tools:
             raise ValueError("Domain tool already registered")
         self._tools[tool.policy.action] = tool
+
+    def configure(self, action: str, **updates) -> None:
+        """Replace only a registered tool's closed policy, never its implementation."""
+        tool = self.get(action)
+        policy = ToolPolicySpec.model_validate({**tool.policy.model_dump(), **updates})
+        self._tools[action] = replace(tool, policy=policy)
 
     def get(self, action: str) -> ToolDefinition:
         try:
@@ -162,7 +171,10 @@ class ToolExecutor:
             raise ValueError("Tool requires its exact identity-bound action")
         if decision.allowed_tools and action.kind not in decision.allowed_tools:
             raise PermissionError("Policy did not authorize this tool")
-        if tool.policy.requires_approval and decision.grant_id is None:
+        if (
+            tool.policy.requires_approval
+            or (action.kind == "inspect_candidate" and action.proposal is not None)
+        ) and decision.grant_id is None:
             raise PermissionError("Tool requires an exact approval grant")
         end = time.monotonic() + tool.policy.timeout_seconds
         if deadline is not None:
@@ -229,7 +241,11 @@ class ToolExecutor:
             self.adapters.persist_invocation(invocation)
             try:
                 context.checkpoint()
-                result = tool.execute(action, context)
+                token = current_invocation.set(invocation)
+                try:
+                    result = tool.execute(action, context)
+                finally:
+                    current_invocation.reset(token)
                 context.checkpoint()
                 if not isinstance(result, ToolResult) or not isinstance(result.stage, StageResult):
                     raise TypeError("Tool must return a typed StageResult and patch")
@@ -259,6 +275,13 @@ class ToolExecutor:
                     raise ValueError(
                         "Run patch contains a scene result for a different action revision"
                     )
+                if (
+                    isinstance(result.patch, RunPatch)
+                    and action.scene_id is not None
+                    and result.patch.scenes
+                    and not any(patch.scene_id == action.scene_id for patch in result.patch.scenes)
+                ):
+                    raise ValueError("Scene worker returned only unrelated scene publications")
                 if action.kind == "submit_render" and invocation.external_job_id is None:
                     raise ValueError(
                         "Submission must durably record its external ID before returning"

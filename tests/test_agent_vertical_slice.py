@@ -75,6 +75,7 @@ def test_noninteractive_plan_approval_wait_is_durable_and_never_submits(agent_bo
 @pytest.mark.parametrize(
     "next_action",
     [
+        "detail_scene",
         "review_plan",
         "propose_technical_spec",
         "propose_code_candidate",
@@ -94,7 +95,8 @@ def test_each_committed_single_scene_stage_can_resume_without_repeating_render(
     interrupted = []
 
     def stop_after_commit(manifest):
-        if manifest.agent.next_action == next_action and not interrupted:
+        pending = {manifest.agent.next_action, *manifest.agent.scene_next_actions.values()}
+        if next_action in pending and not interrupted:
             interrupted.append(True)
             raise OSError("isolated stage interruption")
 
@@ -175,9 +177,7 @@ def test_cli_output_option_publishes_requested_path_on_agent_runtime(agent_bound
     assert manifest.final_video == str(requested)
 
 
-def test_cli_unsupported_agent_mode_fails_without_silent_legacy_execution(
-    agent_boundary, monkeypatch
-):
+def test_cli_compiler_fallback_is_explicit_and_keeps_agent_execution(agent_boundary, monkeypatch):
     from typer.testing import CliRunner
 
     from kd1_anime.cli import app
@@ -189,9 +189,13 @@ def test_cli_unsupported_agent_mode_fails_without_silent_legacy_execution(
         "kd1_anime.application._agent_runtime", lambda: AgentRuntime(dependencies=dependencies)
     )
     result = CliRunner().invoke(app, ["generate", "Show a one-second pause", "--approve-plan"])
-    assert result.exit_code == 1
+    assert result.exit_code == 0, result.output
     root = next((boundary.workspace / "runs").iterdir())
     manifest = RunRepository(boundary.workspace).load(root.name)
-    assert manifest.schema_version == 11 and manifest.status == "failed"
-    assert not manifest.request_budget.reservations
-    assert not boundary.backend.sources
+    assert manifest.schema_version == 11 and manifest.status == "completed"
+    generated = next(
+        item for item in manifest.agent.invocations if item.action == "propose_code_candidate"
+    )
+    report = json.loads((root / generated.result_ref.path).read_text())
+    assert any(item["code"] == "scene_program_unsupported" for item in report["diagnostics"])
+    assert "code" in boundary.calls and len(boundary.backend.sources) == 1

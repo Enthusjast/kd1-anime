@@ -65,6 +65,19 @@ class GenerationService:
             item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
         )
 
+    @staticmethod
+    def validate_technical_contract(plan, technical_spec, *, renderer=None) -> None:
+        """Apply the same technical compiler before any source-producing branch."""
+        if technical_spec is None:
+            return
+        result = compile_technical_spec(plan, technical_spec, renderer=renderer)
+        if not result.is_valid:
+            raise ValidationError(
+                "TechnicalSpec 未通过确定性编译：\n"
+                + "\n".join(f"- {error}" for error in result.errors),
+                hint="请重新生成 TechnicalSpec，不要直接修改代码绕过技术合同",
+            )
+
     def generate(
         self,
         plan: ScenePlan,
@@ -111,18 +124,7 @@ class GenerationService:
         relaxed_stagnation_threshold = max(
             4, self.limits.get("MAX_STAGNANT_ATTEMPTS", self.config.MAX_STAGNANT_ATTEMPTS) + 2
         )
-        if technical_spec is not None:
-            technical_result = compile_technical_spec(
-                plan,
-                technical_spec,
-                renderer=renderer,
-            )
-            if not technical_result.is_valid:
-                raise ValidationError(
-                    "TechnicalSpec 未通过确定性编译：\n"
-                    + "\n".join(f"- {error}" for error in technical_result.errors),
-                    hint="请重新生成 TechnicalSpec，不要直接修改代码绕过技术合同",
-                )
+        self.validate_technical_contract(plan, technical_spec, renderer=renderer)
         attempt = attempts_used
         if attempt >= max_validation_attempts:
             raise ValidationError("生成代码未通过确定性校验：当前输入的验证尝试预算已耗尽")
@@ -175,9 +177,11 @@ class GenerationService:
             ):
                 code_kwargs["teaching_graph"] = teaching_graph
             code = agent.generate_code(
-                plan,
-                **code_kwargs,
+                snapshot_value(plan),
+                **snapshot_value(code_kwargs),
             )
+            if not isinstance(code, str):
+                raise TypeError("Coder did not return source text")
             inspection = self.candidate_acceptor.inspect_candidate(
                 code,
                 plan,

@@ -152,6 +152,7 @@ class DependencyService:
                     if manifest.continuity_bible is not None
                     else None,
                     "renderer": manifest.render_profile.digest(),
+                    "rag": manifest.rag_profile.model_dump(mode="json"),
                 }
             )
 
@@ -160,6 +161,7 @@ class DependencyService:
             or before.teaching_graph != after.teaching_graph
             or before.continuity_bible != after.continuity_bible
             or before.render_profile != after.render_profile
+            or before.rag_profile != after.rag_profile
         ):
             global_consumers = graph.changed_globals(global_inputs(after))
             affected.update(global_consumers)

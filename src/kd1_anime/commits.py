@@ -23,7 +23,7 @@ from kd1_anime.domain.planning import (
 )
 from kd1_anime.domain.state_ledger import StateLedger
 from kd1_anime.models import ValidatedModel
-from kd1_anime.rag.models import RagReceipt
+from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.request_budget import RequestReservation
 from kd1_anime.run_store import (
     MANIFEST_NAME,
@@ -101,6 +101,7 @@ class RunPatch(ValidatedModel):
     eval_round: int | None = Field(default=None, ge=0)
     continuity_rebuild_required: bool | None = None
     rag_receipts: dict[str, RagReceipt] | None = Field(default=None, max_length=256)
+    rag_profile: RagRuntimeProfile | None = None
     rag_warnings: list[str] | None = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
@@ -191,13 +192,36 @@ class RunCommitter:
             raise ValueError("Command scene_id has no scene patch")
         for scene in patch.scenes:
             stored = current.scenes.get(scene.scene_id)
+            if stored is None and current.schema_version == 11:
+                known = current.agent.outline_identities if current.agent is not None else {}
+                importing = (
+                    patch.outlines is not None
+                    and patch.agent is not None
+                    and scene.scene_id in patch.agent.outline_identities
+                    and any(outline.scene_id == scene.scene_id for outline in patch.outlines)
+                )
+                if scene.scene_id not in known and not importing:
+                    raise StaleWorkError("New scene has no durable outline identity")
             identity = (
                 WorkIdentity(stored.revision, stored.input_sha256)
                 if stored is not None
-                else WorkIdentity(0, "")
+                else (
+                    current.agent.outline_identities.get(scene.scene_id, WorkIdentity(0, ""))
+                    if current.schema_version == 11 and current.agent is not None
+                    else WorkIdentity(0, "")
+                )
             )
             if scene.identity != identity:
                 raise StaleWorkError("Commit was built from superseded scene inputs")
+            if stored is None and current.schema_version == 11:
+                for source, revision in scene.dependency_revisions.items():
+                    dependency = current.scenes.get(source)
+                    if dependency is None or dependency.revision != revision:
+                        raise StaleWorkError(
+                            "Detail result was built from superseded dependency inputs"
+                        )
+                # Detail is bound to the durable outline, not sibling Detail results.
+                continue
             required_dependencies = {
                 binding.source_scene_id
                 for binding in current.dependency_graph.bindings
@@ -246,7 +270,7 @@ class RunCommitter:
                 or scene.code_sha256
                 or scene.class_name
                 or scene.reviewed
-                or scene.plan_reviewed
+                or (scene.plan_reviewed and candidate.schema_version != 11)
                 or scene.local_smoke_status not in {"pending", "skipped"}
                 or scene.technical_spec is not None
                 or scene.technical_status != "pending"

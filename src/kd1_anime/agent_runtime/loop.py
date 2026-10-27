@@ -14,7 +14,7 @@ from kd1_anime.agent_runtime.tools import ToolExecutor, action_signature
 
 
 class LoopResult(RuntimeRecord):
-    status: Literal["DONE", "NEED_USER", "FAILED", "BUDGET_EXHAUSTED"]
+    status: Literal["DONE", "NEED_USER", "FAILED", "BUDGET_EXHAUSTED", "CONTINUE"]
     reason: str
     steps: int = Field(ge=0)
     action: AgentAction | None = None
@@ -64,12 +64,17 @@ class AgentLoop:
         self.propose_action = propose_action
         self.after_step = after_step
 
+    def step(self, *, cancelled: Callable[[], bool] = lambda: False) -> LoopResult:
+        """Authorize and dispatch at most one action without fabricating exhaustion."""
+        return self.run(cancelled=cancelled, stop_after_step=True)
+
     def run(
         self,
         *,
         max_steps: int = 100,
         cancelled: Callable[[], bool] = lambda: False,
         deadline: float | None = None,
+        stop_after_step: bool = False,
     ) -> LoopResult:
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
             raise ValueError("max_steps must be a nonnegative integer")
@@ -182,3 +187,7 @@ class AgentLoop:
                 )
             if _progress(self.snapshot()) == _progress(current):
                 return LoopResult(status="FAILED", reason="no_progress", steps=steps, action=action)
+            if stop_after_step:
+                return LoopResult(
+                    status="CONTINUE", reason="step_completed", steps=steps, action=action
+                )

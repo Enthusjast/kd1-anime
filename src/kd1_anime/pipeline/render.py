@@ -184,6 +184,7 @@ class RenderPipeline:
             manim_version=inputs.render_profile.manim_version,
             expected_class_name=scene.class_name,
             allow_repair=False,
+            continuity_mode="none" if inputs.direct_render else "contract",
         )
         if not inspection.accepted or inspection.code_sha256 != scene.code_sha256:
             raise ValueError("Read-only render source inspection rejected: " + inspection.feedback)

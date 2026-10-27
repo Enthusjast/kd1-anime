@@ -48,7 +48,7 @@
 
 CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
 `plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
-`run_incremental`。单场景生成、规划和计划文件继续执行默认使用 v11 Agent Runtime；
+`run_incremental`。生成、规划和计划文件继续执行默认使用 v11 Agent Runtime；
 直接渲染、增量、TUI 和 batch 暂留 legacy v10，恢复严格按清单版本选择运行时。
 计划导出只读取已提交 manifest，不把 worker Context 暴露给 CLI。
 
@@ -64,7 +64,7 @@ Context 不持有基础运行 manifest。FSM 状态和转移规则集中到 `dom
 该路径只复制被修改的场景及 run 字段；新的 v11 路径不复制全量 Context。旧 Orchestrator
 暂时仍使用 legacy StageTransaction，v10/v11 同时可执行，但同一 run 从不切换实现或双写。
 
-### 2.1 专用 Runtime 协议与单场景执行
+### 2.1 专用 Runtime 协议与多场景执行
 
 `agent_runtime/contracts.py` 用闭合 union 定义领域动作、消息、intent、invocation、
 grant、usage 和 v3 事件。模型不能提出 shell、任意文件/Python 执行或自我批准动作。
@@ -84,13 +84,18 @@ v2 只读，中间损坏或身份冲突拒绝，尾部半行作为中断处理�
 `prompt_identity.py` 分别计算稳定 generation identity 和单次最终消息 hash；schema、
 prompt pack、generator、validator 或策略变化使旧身份不兼容，旧 v10 缺失身份不会伪造。
 v11 必须包含 `agent` 元数据、Session、完整 generation identity、intent/invocation 和 usage；
-不写入 `plan_approved`/`approve_plan` 布尔字段。单场景已覆盖规划/审查/批准、TechnicalSpec、
-编码/检查/Review、local/Slurm 提交/轮询、精确视频合并、评价和完成恢复。
-`--approve-plan` 只在计划 hash 可用后代表本地用户签发精确 grant，非 TTY 等待不读 stdin。
+不写入 `plan_approved`/`approve_plan` 布尔字段。默认路径覆盖概要、并行 Detail、RAG、
+数学和连续性编译、完整 Plan Review、TechnicalSpec 屏障、并行 Coding/Review、继承上下文、
+ElementManifest 和 StateLedger 发布，再进行 local/Slurm 提交、精确合并和评价。
+独立 worker 使用不可变输入、独立 Agent 和 `stream=False`，只通过 typed commit 发布结果。
+`--approve-plan` 只在全部计划屏障完成后代表本地用户签发精确 grant，非 TTY 等待不读 stdin。
+需要确认的代码修改先保存不可变 diff：base/candidate/inspection/WorkIdentity 精确绑定；
+计划 grant 不授权 diff，diff 批准后仍重新 CandidateInspection 和 Review。批准查询以逻辑
+WorkIdentity 判断有效性，不因无关请求预占或 transport revision 增加而过期。
 CLI 从已提交查询区分等待、失败和完成，不把 `None` 输出伪报为视频成功。
 
-当前单场景阶段对多场景、RAG、compiler/IR、显式 smoke、自动视觉/渲染修复明确保存停止状态，
-不静默降级到另一实现。后续领域迁移按独立阶段解除这些限制；旧 v10 不补造新身份。
+当前未迁移的显式 smoke、自动视觉/渲染修复保存明确停止状态，不静默降级到另一实现。
+直接渲染、完整 retry/incremental 和展示层在后续独立阶段迁移；旧 v10 不补造新身份。
 
 ```text
 kd1_anime.cli / kd1_anime.tui

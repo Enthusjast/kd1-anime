@@ -558,3 +558,25 @@ def test_incremental_reuses_verified_artifact_without_mutating_base_or_request_b
     assert base_requests.isdisjoint(
         item.request_id for item in incremental.request_budget.reservations
     )
+
+
+def test_direct_render_does_not_require_cross_scene_export_definitions(
+    application_boundary, monkeypatch
+):
+    boundary = application_boundary
+    source = (
+        "from manim import *\nclass RadiusScene(Scene):\n"
+        "    def construct(self):\n"
+        "        radius = 1\n"
+        "        circle = Circle(radius=radius)\n"
+        "        self.add(circle)\n"
+        "        self.wait(1)\n"
+    )
+    monkeypatch.setattr("test_application.SOURCE", source)
+    job, video, run_id = boundary.app.submit_existing_scene(source, "RadiusScene", wait=True)
+    assert video.read_bytes() == b"merged:" + VIDEO
+    manifest = RunRepository(boundary.workspace).load_for_resume(run_id)
+    assert manifest.direct_render and manifest.status == "completed"
+    assert manifest.scenes[1].code_sha256 == sha256_text(source)
+    assert job.job_id == "1" and len(boundary.backend.sources) == 1
+    assert not manifest.request_budget.reservations

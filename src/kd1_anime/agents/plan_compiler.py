@@ -374,6 +374,13 @@ def _simple_equations(text: str) -> list[tuple[str, str]]:
     for match in pattern.finditer(str(text or "")):
         left, right = match.groups()
         if (
+            "=" in match.group(0)
+            and _safe_numeric(left) is not None
+            and _safe_numeric(right) is not None
+        ):
+            pairs.append((left, right))
+            continue
+        if (
             any(char in left + right for char in "+-*/^²³")
             and re.search(r"[A-Za-z]", left + right)
             and not re.fullmatch(r"[A-Za-z]", left)

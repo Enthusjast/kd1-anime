@@ -61,6 +61,12 @@
   CLI 不再把缺少视频的暂停报告为成功。直接渲染和增量入口暂留 v10，按清单版本选择恢复。
 - 增加单场景全部已提交阶段的中断恢复与过期 worker 回归；修复新运行时输出路径优先级，
   保持 `--output`/配置行为，并隔离显示回调失败与配置凭据。
+- v11 默认路径完成多场景规划、独立 Detail/Coding worker、RAG、数学/连续性/技术合同屏障和
+  全片 StateLedger 发布；上游输入变化按教学、handoff 和源码依赖失效下游证据。
+- precise fix 先生成不可变 base/candidate/inspection diff；计划批准不授权代码修改，
+  diff 一次性批准后仍重新检查和 Review。批准查询使用逻辑工作身份，不受 transport checkpoint 干扰。
+- 保留有界重规划、无进展检测和 strict/relaxed 策略；SceneProgram v2 不支持时显式回退 LLM，
+  不降低数学、AST、生命周期和提交前只读复检要求。
 - 将默认代码 Review 轮数和渲染失败自动修复次数从 5 次提高到 8 次。
 - 删除持久化 LLM 响应缓存及其 CLI/配置入口；每次 Agent 调用都会重新请求模型，
   避免复用历史错误结果阻碍代码修复。

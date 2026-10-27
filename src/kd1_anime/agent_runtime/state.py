@@ -10,6 +10,7 @@ from kd1_anime.agent_runtime.contracts import (
     ActionName,
     AgentAction,
     ExecutionIntent,
+    ObjectRef,
     RuntimeRecord,
     Sha256,
     ToolInvocation,
@@ -35,6 +36,18 @@ class AgentSubmission(ValidatedModel):
     attempt: SubmissionAttempt
 
 
+class AgentReviewState(RuntimeRecord):
+    review_round: int = Field(default=0, ge=0)
+    review_signature: str = ""
+    identical_review_count: int = Field(default=0, ge=0)
+    feedback: str = ""
+
+
+class AgentPendingCandidate(RuntimeRecord):
+    proposal: ObjectRef
+    diff_sha256: Sha256
+
+
 class AgentRunState(ValidatedModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -52,6 +65,14 @@ class AgentRunState(ValidatedModel):
     approved_plan_sha256: Sha256 | None = None
     approved_plan_identity: WorkIdentity | None = None
     reviewed_identities: dict[int, WorkIdentity] = Field(default_factory=dict)
+    outline_identities: dict[int, WorkIdentity] = Field(default_factory=dict)
+    scene_next_actions: dict[int, ActionName] = Field(default_factory=dict)
+    scene_action_versions: dict[int, int] = Field(default_factory=dict)
+    plan_review_complete: bool = False
+    plan_repair_feedback: str = ""
+    continuity_published: bool = False
+    pending_candidates: dict[int, AgentPendingCandidate] = Field(default_factory=dict)
+    scene_review_counters: dict[int, AgentReviewState] = Field(default_factory=dict)
     pending_approval: AgentAction | None = None
     stop_reason: str = ""
     intents: tuple[ExecutionIntent, ...] = ()
@@ -61,7 +82,7 @@ class AgentRunState(ValidatedModel):
     submissions: tuple[AgentSubmission, ...] = ()
     committed_invocations: tuple[str, ...] = ()
 
-    @field_validator("stop_reason")
+    @field_validator("stop_reason", "plan_repair_feedback")
     @classmethod
     def visible_stop_reason(cls, value):
         from kd1_anime.agent_runtime.contracts import sanitize_record
@@ -76,6 +97,23 @@ class AgentRunState(ValidatedModel):
             errors.append("Duplicate agent intent or invocation identity")
         for intent in self.intents:
             action = intent.action
+            if action.kind == "inspect_candidate" and action.proposal is not None:
+                valid_input = (
+                    action.proposal.work_identity == action.work_identity
+                    and action.proposal.digest() == action.input_sha256
+                    and action.candidate == action.proposal.candidate_source
+                )
+            elif action.kind == "publish_continuity":
+                valid_input = (
+                    action.scene_id is None
+                    and action.publication.plan_identity == action.work_identity
+                    and action.publication.digest() == action.input_sha256
+                )
+            else:
+                valid_input = (
+                    action.work_identity is not None
+                    and action.input_sha256 == action.work_identity.input_sha256
+                )
             resource = f"run:{run_id}" + (
                 f"/scene:{action.scene_id}" if action.scene_id is not None else ""
             )
@@ -84,7 +122,7 @@ class AgentRunState(ValidatedModel):
                 or action.run_id != run_id
                 or action.resource_id != resource
                 or action.work_identity is None
-                or action.input_sha256 != action.work_identity.input_sha256
+                or not valid_input
             ):
                 errors.append("Agent intent input/session/resource binding mismatch")
         for invocation in self.invocations:
@@ -191,8 +229,28 @@ def merge_transport_state(current: AgentRunState, proposed: AgentRunState) -> Ag
             if submission_ranks[old.attempt.status] > submission_ranks[item.attempt.status]:
                 continue
         submissions[item.attempt.token] = item
+    scene_next_actions = dict(current.scene_next_actions)
+    scene_action_versions = dict(current.scene_action_versions)
+    scene_maps = {
+        name: dict(getattr(current, name))
+        for name in ("reviewed_identities", "pending_candidates", "scene_review_counters")
+    }
+    for scene_id, action in proposed.scene_next_actions.items():
+        version = proposed.scene_action_versions.get(scene_id, 0)
+        if version >= scene_action_versions.get(scene_id, 0):
+            scene_next_actions[scene_id] = action
+            scene_action_versions[scene_id] = version
+            for name, values in scene_maps.items():
+                incoming = getattr(proposed, name)
+                if scene_id in incoming:
+                    values[scene_id] = incoming[scene_id]
+                else:
+                    values.pop(scene_id, None)
     return proposed.model_copy(
         update={
+            "scene_next_actions": scene_next_actions,
+            "scene_action_versions": scene_action_versions,
+            **scene_maps,
             "intents": intents,
             "invocations": invocations,
             "usage": usage,

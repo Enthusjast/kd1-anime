@@ -489,3 +489,51 @@ def test_empty_and_syntax_invalid_sources_return_bound_rejection_evidence(origin
     assert inspection.original_code_sha256 == inspection.code_sha256 == sha256_text(original)
     assert not inspection.ast_result.is_valid
     assert inspection.diagnostics
+
+
+def test_independent_direct_inspection_does_not_require_handoff_exports():
+    code = (
+        "from manim import *\nclass RadiusScene(Scene):\n"
+        "    def construct(self):\n"
+        "        radius = 1\n"
+        "        circle = Circle(radius=radius)\n"
+        "        self.add(circle)\n"
+    )
+    acceptor = CandidateAcceptor()
+    assert not acceptor.inspect_candidate(code, make_plan(), allow_repair=False).accepted
+    direct = acceptor.inspect_candidate(
+        code, make_plan(), allow_repair=False, continuity_mode="none", manim_version="0.20.1"
+    )
+    assert direct.accepted and direct.code == code
+    assert direct.ast_result.is_valid and direct.api_result.is_valid
+    assert direct.continuity_result.applicability == "not_applicable"
+    assert direct.exported_elements == ()
+
+
+@pytest.mark.parametrize(
+    "invalid", ["        open('/tmp/unsafe', 'w')\n", "        self.add(InventedShape())\n"]
+)
+def test_direct_inspection_preserves_ast_and_api_boundaries(invalid):
+    inspection = CandidateAcceptor().inspect_candidate(
+        CODE + invalid,
+        make_plan(),
+        allow_repair=False,
+        continuity_mode="none",
+        manim_version="0.20.1",
+    )
+    assert not inspection.accepted
+    assert not inspection.ast_result.is_valid or not inspection.api_result.is_valid
+
+
+def test_direct_inspection_cannot_disable_explicit_handoff_or_unknown_modes():
+    declared = make_plan().model_copy(
+        update={
+            "new_elements": [
+                VisualElementState(element_id="circle", variable_name="circle", required=True)
+            ]
+        }
+    )
+    with pytest.raises(ValueError):
+        CandidateAcceptor().inspect_candidate(CODE, declared, continuity_mode="none")
+    with pytest.raises(ValueError):
+        CandidateAcceptor().inspect_candidate(CODE, make_plan(), continuity_mode="unknown")

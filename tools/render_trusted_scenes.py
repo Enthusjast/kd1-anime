@@ -53,7 +53,7 @@ def main() -> None:
         task = tasks[task_id]
         plan = task_plan(task)
         program = SceneProgram.model_validate(task.program)
-        accepted = CandidateAcceptor().inspect(
+        accepted = CandidateAcceptor().accept_candidate(
             compile_program(program, plan),
             plan,
             renderer="cairo",

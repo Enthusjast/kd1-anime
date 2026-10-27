@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from kd1_anime.agents.api_linter import (
     ApiLintResult,
@@ -42,6 +43,7 @@ from kd1_anime.run_store import atomic_write_text, sha256_text
 class ContinuityValidationResult:
     is_valid: bool
     errors: tuple[str, ...] = ()
+    applicability: Literal["contract", "not_applicable"] = "contract"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +117,19 @@ class CandidateAcceptor:
         expected_class_name: str | None = None,
         validator: Callable[..., CodeValidationResult] | None = None,
         allow_repair: bool = True,
+        continuity_mode: Literal["contract", "none"] = "contract",
     ) -> CandidateInspection:
         """检查并可选地修复内存中的源码；普通候选错误作为结果返回，不写文件。"""
+
+        if continuity_mode not in {"contract", "none"}:
+            raise ValueError("Unknown candidate continuity inspection mode")
+        if continuity_mode == "none" and (
+            plan.inherited_elements
+            or plan.handoff
+            or any(element.required for element in plan.new_elements)
+            or (technical_spec is not None and technical_spec.export_element_ids)
+        ):
+            raise ValueError("Direct inspection cannot discard an explicit handoff contract")
 
         original_code = code
         original_hash = sha256_text(code)
@@ -133,10 +146,11 @@ class CandidateAcceptor:
                 ):
                     code, notes = repair(code, technical_spec)
                     repairs.extend(notes)
-            stripped = strip_redundant_optional_export_block(code, plan)
-            if stripped != code:
-                code = stripped
-                repairs.append("移除重复的可选连续性导出定义块")
+            if continuity_mode == "contract":
+                stripped = strip_redundant_optional_export_block(code, plan)
+                if stripped != code:
+                    code = stripped
+                    repairs.append("移除重复的可选连续性导出定义块")
 
         def inspect_source(source: str) -> CandidateInspection:
             # 自定义 validator 只能补充约束，不能替代安全边界或其它检查。
@@ -161,12 +175,15 @@ class CandidateAcceptor:
             )
             exported_code = ""
             exported_elements: tuple[ExtractedElement, ...] = ()
-            try:
-                exported_code, elements = extract_scene_continuity_elements(source, plan)
-                exported_elements = tuple(elements)
-                continuity = ContinuityValidationResult(True)
-            except ValueError as exc:
-                continuity = ContinuityValidationResult(False, (str(exc),))
+            if continuity_mode == "none":
+                continuity = ContinuityValidationResult(True, applicability="not_applicable")
+            else:
+                try:
+                    exported_code, elements = extract_scene_continuity_elements(source, plan)
+                    exported_elements = tuple(elements)
+                    continuity = ContinuityValidationResult(True)
+                except ValueError as exc:
+                    continuity = ContinuityValidationResult(False, (str(exc),))
             lifecycle = (
                 validate_animation_lifecycle(source, technical_spec, renderer=renderer)
                 if technical_spec is not None
@@ -248,6 +265,7 @@ class CandidateAcceptor:
         destination: Path | None = None,
         validator: Callable[..., CodeValidationResult] | None = None,
         allow_repair: bool = True,
+        continuity_mode: Literal["contract", "none"] = "contract",
     ) -> AcceptedCandidate:
         """接纳检查成功的源码，并可选地原子写入权限为 0600 的目标文件。"""
 
@@ -260,6 +278,7 @@ class CandidateAcceptor:
             expected_class_name=expected_class_name,
             validator=validator,
             allow_repair=allow_repair,
+            continuity_mode=continuity_mode,
         )
         if not inspection.accepted:
             raise CandidateRejected(inspection)

@@ -12,6 +12,7 @@ from kd1_anime.agent_runtime.contracts import (
     ActionName,
     AgentAction,
     ApprovalGrant,
+    ObjectRef,
     Permission,
     PermissionScope,
     RunId,
@@ -58,6 +59,7 @@ class ScenePolicyState(RuntimeRecord):
     approved_diff_identity: WorkIdentity | None = None
     external_job_id: str | None = None
     static_verified: bool = False
+    source_ref: ObjectRef | None = None
 
 
 class PolicySnapshot(RuntimeRecord):
@@ -130,6 +132,8 @@ class PolicySession(Protocol):
 
 _PHASES: dict[str, frozenset[str]] = {
     "propose_plan": frozenset({"INIT", "PLANNING"}),
+    "detail_scene": frozenset({"DETAILING"}),
+    "publish_continuity": frozenset({"CODING", "REVIEWING"}),
     "revise_plan": frozenset(
         {
             "PLANNING",
@@ -161,6 +165,7 @@ _PHASES: dict[str, frozenset[str]] = {
     "fail": frozenset(set()),
 }
 _SCENE_PHASES: dict[str, frozenset[str]] = {
+    "detail_scene": frozenset({"pending"}),
     "propose_technical_spec": frozenset({"detailed", "plan_reviewed", "technical_planning"}),
     "propose_code_candidate": frozenset(
         {"plan_reviewed", "technical_planning", "coded", "reviewed"}
@@ -175,7 +180,7 @@ _SCENE_PHASES: dict[str, frozenset[str]] = {
     "retry_scene": frozenset({"failed"}),
     "reuse_scene": frozenset({"pending", "detailed", "plan_reviewed", "reviewed"}),
 }
-_READ_ACTIONS = frozenset({"inspect_candidate", "poll_render"})
+_READ_ACTIONS = frozenset({"poll_render"})
 
 
 def required_permission(action: AgentAction) -> Permission:
@@ -188,7 +193,7 @@ def required_permission(action: AgentAction) -> Permission:
     return "read" if action.kind in _READ_ACTIONS else "write"
 
 
-def _grant_is_current(grant: ApprovalGrant, session: PolicySession) -> bool:
+def grant_is_current(grant: ApprovalGrant, session: PolicySession) -> bool:
     commands = getattr(session, "commands", None)
     if commands is None:
         return True
@@ -261,6 +266,11 @@ class Policy:
             root: snapshot.work_identity,
             **{f"{root}/scene:{scene.scene_id}": scene.work_identity for scene in snapshot.scenes},
         }
+        diff_inputs = {
+            f"{root}/scene:{scene.scene_id}": scene.diff_sha256
+            for scene in snapshot.scenes
+            if scene.diff_sha256 is not None
+        }
         resources = set(identities)
         available = []
         for tool in tools:
@@ -279,12 +289,17 @@ class Policy:
                 and grant.run_id == snapshot.run_id
                 and grant.session_id == session.session_id
                 and grant.work_identity == identities[grant.resource_id]
-                and grant.input_sha256 == identities[grant.resource_id].input_sha256
+                and grant.input_sha256
+                == (
+                    diff_inputs.get(grant.resource_id, identities[grant.resource_id].input_sha256)
+                    if tool.action == "inspect_candidate"
+                    else identities[grant.resource_id].input_sha256
+                )
                 and grant.issued_by == "local_user"
                 and grant.consumed_by_intent is None
                 and grant.issued_at <= snapshot.now
                 and (grant.expires_at is None or snapshot.now < grant.expires_at)
-                and _grant_is_current(grant, session)
+                and grant_is_current(grant, session)
                 for grant in session.grants
             ):
                 continue
@@ -349,22 +364,69 @@ class Policy:
         if action.scene_id is not None and scene is None:
             return deny("unknown_scene")
         identity = scene.work_identity if scene else snapshot.work_identity
-        if action.work_identity != identity or action.input_sha256 != identity.input_sha256:
+        diff = action.kind == "inspect_candidate" and action.proposal is not None
+        if action.work_identity != identity:
+            return deny("stale_work")
+        if diff:
+            if (
+                action.proposal.work_identity != identity
+                or action.proposal.digest() != action.input_sha256
+                or action.input_sha256 != scene.diff_sha256
+                or action.candidate != action.proposal.candidate_source
+                or action.proposal.base_source.sha256 != scene.code_sha256
+                or action.proposal.base_source.kind != "code"
+                or action.proposal.candidate_source.kind != "code"
+                or action.proposal.inspection_report.kind != "report"
+                or action.proposal.review_report.kind != "report"
+            ):
+                return deny("diff_identity_mismatch")
+        elif action.kind == "publish_continuity":
+            sources = action.publication.scenes
+            ordered = tuple(sorted(snapshot.scenes, key=lambda item: item.scene_id))
+            if (
+                action.scene_id is not None
+                or action.publication.plan_identity != snapshot.work_identity
+                or snapshot.plan_sha256 is None
+                or snapshot.approved_plan_sha256 != snapshot.plan_sha256
+                or snapshot.approved_plan_identity != snapshot.work_identity
+                or action.input_sha256 != action.publication.digest()
+                or len(sources) != len(ordered)
+                or any(
+                    bound.scene_id != committed.scene_id
+                    or bound.work_identity != committed.work_identity
+                    or bound.source != committed.source_ref
+                    or bound.source.kind != "code"
+                    or committed.phase != "reviewed"
+                    or not committed.static_verified
+                    or committed.approved_code_identity != committed.work_identity
+                    or committed.approved_code_sha256 != committed.code_sha256
+                    for bound, committed in zip(sources, ordered, strict=True)
+                )
+            ):
+                return deny("continuity_inputs_not_reviewed")
+        elif action.input_sha256 != identity.input_sha256:
             return deny("stale_work")
         if scene:
             if action.kind in _SCENE_PHASES and scene.phase not in _SCENE_PHASES[action.kind]:
                 return deny("invalid_scene_phase")
-            for dependency in scene.dependencies:
-                source = next(
-                    (item for item in snapshot.scenes if item.scene_id == dependency.scene_id), None
-                )
-                if (
-                    source is None
-                    or source.scene_id >= scene.scene_id
-                    or source.work_identity != dependency.work_identity
-                    or source.phase not in {"reviewed", "rendered", "visual_accepted"}
-                ):
-                    return deny("stale_dependency")
+            if action.kind in {
+                "propose_code_candidate",
+                "inspect_candidate",
+                "review_code",
+                "submit_render",
+            }:
+                for dependency in scene.dependencies:
+                    source = next(
+                        (item for item in snapshot.scenes if item.scene_id == dependency.scene_id),
+                        None,
+                    )
+                    if (
+                        source is None
+                        or source.scene_id >= scene.scene_id
+                        or source.work_identity != dependency.work_identity
+                        or source.phase not in {"reviewed", "rendered", "visual_accepted"}
+                    ):
+                        return deny("stale_dependency")
             if (
                 action.kind in {"poll_render", "cancel_render"}
                 and action.job_id != scene.external_job_id
@@ -430,7 +492,7 @@ class Policy:
                 or any(item.phase != "visual_accepted" for item in snapshot.scenes)
             ):
                 return deny("unfinished_scenes")
-        needs_grant = tool.requires_approval
+        needs_grant = tool.requires_approval or diff
         grant = (
             next(
                 (
@@ -447,7 +509,7 @@ class Policy:
                         and grant.consumed_by_intent is None
                         and grant.issued_at <= snapshot.now
                         and (grant.expires_at is None or snapshot.now < grant.expires_at)
-                        and _grant_is_current(grant, session)
+                        and grant_is_current(grant, session)
                     )
                 ),
                 None,

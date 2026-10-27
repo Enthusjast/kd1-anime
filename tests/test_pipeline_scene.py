@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from kd1_anime.domain.planning import LessonSpec, ScenePlan, TeachingGraph
-from kd1_anime.domain.review import ReviewResult
+from kd1_anime.domain.review import ReviewFinding, ReviewResult
 from kd1_anime.domain.runtime import ExecutionSpec, RunConfig
 from kd1_anime.pipeline.contracts import SceneInputs
 from kd1_anime.pipeline.scene import ScenePipeline
@@ -59,7 +59,19 @@ def pipeline(reject=False):
     class Reviewer:
         def review(self, code, plan, **kwargs):
             return ReviewResult(
-                is_valid=not reject, feedback="The requested scene is missing" if reject else ""
+                is_valid=not reject,
+                feedback="The requested scene is missing" if reject else "",
+                findings=[
+                    ReviewFinding(
+                        category="runtime",
+                        severity="major",
+                        evidence_type="source_code",
+                        evidence="self.wait(1)",
+                        why="The requested scene is missing",
+                    )
+                ]
+                if reject
+                else [],
             )
 
     return ScenePipeline(

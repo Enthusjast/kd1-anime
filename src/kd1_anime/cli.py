@@ -524,13 +524,13 @@ def generate(
             waiting = view.status not in {"completed", "dry_run_complete"}
         if waiting:
             console.print(
-                f"\n[yellow]运行已暂停，等待计划批准；尚未生成视频。Run ID: {observed_run_id}[/]"
+                f"\n[yellow]运行已暂停，等待计划或代码修复批准；尚未生成视频。Run ID: {observed_run_id}[/]"
             )
         elif dry_run:
             console.print("\n[bold green]Dry-run 完成[/]")
         elif final_video is None:
             console.print(
-                "\n[yellow]运行已暂停，等待计划批准；尚未生成视频。使用 status 查看运行。[/]"
+                "\n[yellow]运行已暂停，等待计划或代码修复批准；尚未生成视频。使用 status 查看运行。[/]"
             )
         else:
             console.print(f"\n[bold green]成功![/] 输出文件: {final_video}")
@@ -913,7 +913,9 @@ def resume(
             console.print(f"[bold red]恢复已停止:[/] {view.stop_reason}", markup=False)
             raise typer.Exit(1)
         if view.status not in {"completed", "dry_run_complete"}:
-            console.print(f"[yellow]运行已暂停，等待计划批准或安全恢复决定。Run ID: {run_id}[/]")
+            console.print(
+                f"[yellow]运行已暂停，等待计划、代码修复批准或安全恢复决定。Run ID: {run_id}[/]"
+            )
             return
     if manifest.dry_run:
         console.print(f"[bold green]Dry-run 已完成[/] 运行目录: {repository.run_root(run_id)}")

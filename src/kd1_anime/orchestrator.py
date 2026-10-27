@@ -7799,6 +7799,7 @@ class Orchestrator:
             expected_class_name=state.class_name,
             validator=self._validate,
             allow_repair=False,
+            continuity_mode="none" if ctx.direct_render else "contract",
         )
         if not inspection.accepted:
             with self._state_lock:
@@ -8273,6 +8274,7 @@ class Orchestrator:
                     renderer=ctx.render_profile.renderer,
                     manim_version=ctx.render_profile.manim_version,
                     expected_class_name=candidate.class_name,
+                    allow_repair=False,
                 )
                 if candidate.artifact is not None:
                     self._artifact_video_path(ctx, candidate.artifact)
@@ -8306,6 +8308,7 @@ class Orchestrator:
                 expected_class_name=candidate.class_name,
                 validator=self._validate,
                 destination=None,
+                allow_repair=False,
             )
         except CandidateRejected:
             return False

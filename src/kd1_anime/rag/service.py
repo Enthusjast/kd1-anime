@@ -33,6 +33,7 @@ from kd1_anime.rag.models import (
     RagChunkRef,
     RagIndexInfo,
     RagReceipt,
+    RagRuntimeProfile,
     RagSearchResult,
     RagStatus,
     RetrievedChunk,
@@ -316,6 +317,34 @@ class RagService:
         self.require_index()
         self.embedding.require()
         self.reranker.require()
+
+    def runtime_profile(self) -> RagRuntimeProfile:
+        """Return the existing verified index/config identity without credentials."""
+        if not self.enabled:
+            return RagRuntimeProfile()
+        runtime = self.runtime_status()
+        index = runtime.get("index") or {}
+        return RagRuntimeProfile(
+            enabled=bool(runtime["enabled"]),
+            status=runtime["status"],
+            index_sha256=index.get("index_sha256", ""),
+            embedding_model=str(runtime.get("embedding_model", "")),
+            reranker_model=str(runtime.get("reranker_model", "")),
+            top_k=self.config.RAG_TOP_K,
+            rerank_top_n=self.config.RAG_RERANK_TOP_N,
+            max_context_chars=self.config.RAG_MAX_CONTEXT_CHARS,
+            chunker_version=str(index.get("chunker_version", "")),
+            chunk_size=int(index.get("chunk_size", 0) or 0),
+            chunk_overlap=int(index.get("chunk_overlap", 0) or 0),
+        )
+
+    def require_profile(self, expected: RagRuntimeProfile) -> RagRuntimeProfile:
+        """Reject index/model/chunker drift; transient status is not a new identity."""
+        self.require_ready()
+        current = self.runtime_profile()
+        if current.model_dump(exclude={"status"}) != expected.model_dump(exclude={"status"}):
+            raise RagClientError("RAG runtime profile differs from the fixed run profile")
+        return current
 
     def _empty_result(
         self,

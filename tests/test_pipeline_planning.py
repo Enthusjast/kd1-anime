@@ -29,11 +29,10 @@ from kd1_anime.domain.planning import (
 )
 from kd1_anime.domain.runtime import ExecutionSpec, RunConfig
 from kd1_anime.domain.technical import TechnicalAnimation, TechnicalSpec
-from kd1_anime.pipeline.contracts import PlanningOutput, SceneInputs
+from kd1_anime.pipeline.contracts import DetailInputs, PlanningOutput, SceneInputs
 from kd1_anime.pipeline.planning import (
     PlanningPipeline,
     PlanningStageError,
-    UnsupportedPlanningError,
 )
 from kd1_anime.rendering import RenderProfile
 from kd1_anime.run_store import StoredSceneState
@@ -144,31 +143,26 @@ def inputs(tmp_path, planned=None, *, renderer="cairo"):
     )
 
 
-def test_propose_builds_real_lesson_bible_detail_and_owned_snapshots(boundary):
+def test_propose_builds_outline_bible_without_detail_or_placeholder(boundary):
     responses, calls, contexts, factory = boundary
     result = factory().propose("Show time", "cairo")
     assert result.lesson_spec.topic == "Time"
     assert result.teaching_graph == TeachingGraph()
-    assert result.plans[0].global_visual_state == result.continuity_bible.global_visual_state
-    assert [entry[1]["response_model"] for entry in calls] == [
-        PlanningDraft,
-        ContinuityBible,
-        SceneDetail,
-    ]
-    assert contexts == [(None, "planning_draft"), (None, "planning_bible"), (1, "planning_detail")]
+    assert result.plans == ()
+    assert [entry[1]["response_model"] for entry in calls] == [PlanningDraft, ContinuityBible]
+    assert contexts == [(None, "planning_draft"), (None, "planning_bible")]
     responses[PlanningDraft].lesson_spec.topic = "Changed outside worker"
     assert result.lesson_spec.topic == "Time"
     assert not hasattr(result, "context")
 
 
-def test_multiple_scene_draft_stops_before_bible_or_detail(boundary):
+def test_multiple_scene_draft_returns_all_outlines_before_detail(boundary):
     responses, calls, _, factory = boundary
     responses[PlanningDraft] = PlanningDraft(items=[outline(), outline(2)])
-    with pytest.raises(UnsupportedPlanningError) as caught:
-        factory().propose("Two separate chapters", "cairo")
-    assert len(calls) == 1
-    assert caught.value.diagnostics[0].code == "planning.unsupported_multiple_scenes"
-    assert caught.value.diagnostics[0].evidence["scene_ids"] == [1, 2]
+    result = factory().propose("Two separate chapters", "cairo")
+    assert [item.scene_id for item in result.outlines] == [1, 2]
+    assert result.plans == ()
+    assert [item[1]["response_model"] for item in calls] == [PlanningDraft, ContinuityBible]
 
 
 def test_review_preserves_full_independent_review_evidence(boundary):
@@ -207,7 +201,8 @@ def test_deterministic_math_failure_cannot_be_approved_by_model(boundary, monkey
     with pytest.raises(PlanningStageError) as caught:
         factory().review(planned, "cairo")
     assert not calls
-    assert caught.value.output.plans == planned.plans
+    assert caught.value.output.plans[0].math_claims == planned.plans[0].math_claims
+    assert planned.plans[0].math_claims[0].expression_after == "2"
     assert any(
         item.category == "math" and item.severity == "major" for item in caught.value.diagnostics
     )
@@ -236,7 +231,7 @@ def test_independent_continuity_failure_retains_plan_review_evidence(boundary):
     )
     with pytest.raises(PlanningStageError) as caught:
         factory().review(output(), "cairo")
-    assert len(calls) == 2
+    assert 2 <= len(calls) <= 12
     evidence = {item.code: item.evidence for item in caught.value.diagnostics}
     assert evidence["planning.plan_review"]["summary"] == "Independent plan evidence"
     assert evidence["planning.continuity_review"]["issues"] == [issue.model_dump(mode="json")]
@@ -257,7 +252,7 @@ def test_model_plan_failure_remains_bounded_and_evidence_complete(boundary):
     )
     with pytest.raises(PlanningStageError) as caught:
         factory().review(output(), "cairo")
-    assert sum(kind is PlanReviewerAgent for kind, _ in calls) == 1
+    assert 1 <= sum(kind is PlanReviewerAgent for kind, _ in calls) <= 4
     assert any(
         item.evidence.get("issues") == [issue.model_dump(mode="json")]
         for item in caught.value.diagnostics
@@ -294,7 +289,8 @@ def test_invalid_technical_spec_raises_before_any_codegen(boundary, tmp_path):
     )
     with pytest.raises(PlanningStageError) as caught:
         factory().technical(inputs(tmp_path))
-    assert len(calls) == 1 and calls[0][0] is TechnicalPlannerAgent
+    assert 1 <= len(calls) <= settings.MAX_TECHNICAL_SPEC_ATTEMPTS
+    assert all(kind is TechnicalPlannerAgent for kind, _ in calls)
     evidence = next(
         item.evidence
         for item in caught.value.diagnostics
@@ -350,3 +346,62 @@ def test_mutating_first_reviewer_cannot_change_second_reviewer_or_output(boundar
     continuity_prompt = calls[-1][1]["user_message"]
     assert "Mutated plan" not in continuity_prompt
     assert "Mutated lesson" not in continuity_prompt
+
+
+def test_detail_is_independent_and_never_mutates_closed_inputs(boundary, tmp_path):
+    responses, calls, contexts, factory = boundary
+    planned = output()
+    source = DetailInputs(
+        run_id="detail-test",
+        root=tmp_path,
+        config=RunConfig.capture(),
+        outline=planned.outlines[0],
+        outlines=planned.outlines,
+        lesson_spec=planned.lesson_spec,
+        teaching_graph=planned.teaching_graph,
+        continuity_bible=planned.continuity_bible,
+        user_prompt="Show time",
+        renderer="cairo",
+    )
+    before = source.outline.model_dump(mode="json")
+    result = factory().detail(source)
+    assert result.plan.scene_id == 1
+    assert source.outline.model_dump(mode="json") == before
+    assert result.plan.global_visual_state == planned.continuity_bible.global_visual_state
+    assert contexts == [(1, "planning_detail")]
+    assert [item[1]["response_model"] for item in calls] == [SceneDetail]
+    responses[SceneDetail].visual_design = "Changed outside worker"
+    assert result.plan.visual_design == "Empty frame"
+
+
+def test_review_rejects_missing_scene_detail_before_any_model(boundary):
+    _, calls, _, factory = boundary
+    planned = output().model_copy(update={"outlines": (outline(), outline(2))})
+    with pytest.raises(PlanningStageError) as caught:
+        factory().review(planned, "cairo")
+    assert not calls
+    assert any(item.code == "planning.incomplete_detail" for item in caught.value.diagnostics)
+
+
+@pytest.mark.parametrize("mode", ["strict", "relaxed"])
+def test_identical_replan_stops_without_dropping_original_evidence(boundary, monkeypatch, mode):
+    responses, calls, _, factory = boundary
+    monkeypatch.setattr(settings, "GENERATION_MODE", mode)
+    responses[PlanReviewResult] = PlanReviewResult(
+        is_valid=False,
+        issues=[
+            PlanReviewIssue(
+                category="math",
+                confidence="high",
+                evidence_type="calculation",
+                evidence="2+2=4, not 5",
+                message="Incorrect arithmetic",
+                fix_instruction="Fix arithmetic",
+            )
+        ],
+    )
+    with pytest.raises(PlanningStageError) as caught:
+        factory().review(output(), "cairo")
+    assert sum(kind is PlannerAgent for kind, _ in calls) <= settings.MAX_PLAN_REPLAN_ATTEMPTS
+    assert any(item.code == "planning.stagnation" for item in caught.value.diagnostics)
+    assert any(item.evidence.get("issues") for item in caught.value.diagnostics)

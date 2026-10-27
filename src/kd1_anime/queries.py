@@ -15,6 +15,7 @@ from kd1_anime.agent_runtime.contracts import (
     ActionName,
     AgentMessage,
     ApprovalGrant,
+    DiffBinding,
     PermissionScope,
     RunId,
     RuntimeRecord,
@@ -22,6 +23,7 @@ from kd1_anime.agent_runtime.contracts import (
     sanitize_record,
     utc_now,
 )
+from kd1_anime.agent_runtime.policy import grant_is_current
 from kd1_anime.agent_runtime.session import SessionStore, UserCommand
 from kd1_anime.domain.dependencies import WorkIdentity
 from kd1_anime.domain.execution import FSMState, RunPhase
@@ -83,6 +85,7 @@ class ApprovalRequestView(RuntimeRecord):
     work_identity: WorkIdentity | None = None
     status: Literal["pending", "approved", "consumed", "expired", "stale"]
     grant_id: str | None = None
+    proposal: DiffBinding | None = None
 
 
 _IDENTITY = TypeAdapter(WorkIdentity)
@@ -208,6 +211,15 @@ class QueryService:
                     if metadata.get("work_identity") is not None
                     else None
                 )
+                proposal = (
+                    DiffBinding.model_validate(metadata["proposal"])
+                    if metadata.get("proposal") is not None
+                    else None
+                )
+                if proposal is not None and (
+                    proposal.work_identity != identity or proposal.digest() != input_hash
+                ):
+                    raise ValueError("Approval notification diff binding is inconsistent")
                 if requested_session not in sessions and self.sessions is not None:
                     sessions[requested_session] = self.sessions.load(requested_session)
                 session = sessions.get(requested_session)
@@ -236,6 +248,10 @@ class QueryService:
                     if scene_id is not None
                     else event.manifest_revision != manifest.revision
                 )
+                if scene_id is None and manifest.agent is not None:
+                    stale = identity != WorkIdentity(
+                        manifest.agent.run_revision, manifest.agent.run_input_sha256
+                    )
                 if scene_id is not None and identity is None:
                     stale = True
                 grant = next(
@@ -253,6 +269,12 @@ class QueryService:
                     )
                 if grant is None and matches:
                     grant = matches[-1]
+                if (
+                    grant is not None
+                    and grant.consumed_by_intent is None
+                    and not grant_is_current(grant, session)
+                ):
+                    stale = True
                 status = "stale" if stale else "pending"
                 if not stale and grant is not None:
                     if grant.consumed_by_intent is not None:
@@ -275,6 +297,7 @@ class QueryService:
                         work_identity=identity,
                         status=status,
                         grant_id=grant.grant_id if grant is not None else None,
+                        proposal=proposal,
                     )
                 )
             return tuple(views)

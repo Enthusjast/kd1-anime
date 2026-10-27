@@ -21,6 +21,8 @@ RunId = Annotated[str, Field(pattern=r"^\d{8}-\d{6}-[0-9a-f]{8}$")]
 Permission = Literal["read", "write", "exec", "cluster"]
 ActionName = Literal[
     "propose_plan",
+    "detail_scene",
+    "publish_continuity",
     "revise_plan",
     "propose_technical_spec",
     "propose_code_candidate",
@@ -126,6 +128,11 @@ class RevisePlan(ActionBase):
     feedback: str
 
 
+class DetailScene(ActionBase):
+    kind: Literal["detail_scene"] = "detail_scene"
+    scene_id: int = Field(ge=1)
+
+
 class ProposeTechnicalSpec(ActionBase):
     kind: Literal["propose_technical_spec"] = "propose_technical_spec"
     scene_id: int = Field(ge=1)
@@ -145,10 +152,48 @@ class ReviewCode(ActionBase):
     scene_id: int = Field(ge=1)
 
 
+class DiffBinding(RuntimeRecord):
+    """Exact proposed bytes and evidence, bound to the unchanged base scene."""
+
+    work_identity: WorkIdentity
+    base_source: ObjectRef
+    candidate_source: ObjectRef
+    inspection_report: ObjectRef
+    review_report: ObjectRef
+    context_sha256: Sha256
+
+    def digest(self) -> str:
+        from kd1_anime.domain.dependencies import digest
+
+        return digest(self.model_dump(mode="json"))
+
+
+class ContinuitySource(RuntimeRecord):
+    scene_id: int = Field(ge=1)
+    work_identity: WorkIdentity
+    source: ObjectRef
+
+
+class ContinuityBinding(RuntimeRecord):
+    plan_identity: WorkIdentity
+    scenes: tuple[ContinuitySource, ...] = Field(min_length=1)
+
+    def digest(self) -> str:
+        from kd1_anime.domain.dependencies import digest
+
+        return digest(self.model_dump(mode="json"))
+
+
+class PublishContinuity(ActionBase):
+    kind: Literal["publish_continuity"] = "publish_continuity"
+    publication: ContinuityBinding
+
+
 class InspectCandidate(ActionBase):
     kind: Literal["inspect_candidate"] = "inspect_candidate"
     scene_id: int = Field(ge=1)
     candidate: ObjectRef
+    proposal: DiffBinding | None = None
 
 
 class SubmitRender(ActionBase):
@@ -222,6 +267,8 @@ class Fail(ActionBase):
 
 AgentAction = Annotated[
     ProposePlan
+    | PublishContinuity
+    | DetailScene
     | RevisePlan
     | ProposeTechnicalSpec
     | ProposeCodeCandidate
