@@ -1,8 +1,12 @@
-from pathlib import Path
+import pytest
 
+from kd1_anime.agents.validator import validate_manim_code
+from kd1_anime.candidate_acceptor import CandidateAcceptor
+from kd1_anime.domain.planning import ScenePlan
+from kd1_anime.exceptions import ValidationError
+from kd1_anime.services.generation import GenerationService
 from kd1_anime.services.planning import PlanningService
 from kd1_anime.services.recovery import RecoveryInput, RecoveryService
-from kd1_anime.services.visual_evaluation import VisualEvaluationService
 
 
 def test_planning_service_signature_is_stable_and_duration_is_bounded():
@@ -23,16 +27,69 @@ def test_recovery_service_returns_decisions_without_mutating_inputs():
     assert scenes[0].job_id == "local-abcdef123456"
 
 
-def test_visual_service_forwards_only_explicit_evaluation_inputs():
-    class Evaluator:
-        def evaluate_video_frames(self, samples, description, *, scene_context, scope):
-            return samples, description, scene_context, scope
-
-    result = VisualEvaluationService.evaluate_frames(
-        Evaluator(),
-        [Path("frame.jpg")],
-        "description",
-        scene_context="context",
-        scope="scene",
+def generation_plan():
+    return ScenePlan(
+        scene_id=1,
+        title="Circle",
+        duration_seconds=1,
+        purpose="Show one circle",
+        math_concept="Circle",
+        visual_design="A circle",
+        camera_movement="Fixed",
+        visual_flow=["Create a circle"],
+        key_moments=["Circle appears"],
+        computation="radius=1",
     )
-    assert result == ([Path("frame.jpg")], "description", "context", "scene")
+
+
+def test_generation_rejects_deprecated_api_before_accepting_revised_candidate():
+    invalid = (
+        "from manim import *\nclass Demo(Scene):\n"
+        "    def construct(self): self.play(ShowCreation(Circle()))\n"
+    )
+    valid = invalid.replace("ShowCreation", "Create")
+
+    class Coder:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_code(self, plan, **kwargs):
+            self.calls += 1
+            return invalid if self.calls == 1 else valid
+
+    coder = Coder()
+    result = GenerationService(
+        agent=coder,
+        validator=validate_manim_code,
+        candidate_acceptor=CandidateAcceptor(),
+        generation_mode="strict",
+        manim_version="0.20.1",
+        limits={"CODE_VALIDATION_ATTEMPTS": 3},
+    ).generate(generation_plan())
+
+    assert result.code == valid
+    assert result.class_name == "Demo"
+    assert result.attempts == coder.calls == 2
+
+
+def test_generation_exhausts_validation_budget_without_accepting_unsafe_source():
+    class Coder:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_code(self, plan, **kwargs):
+            self.calls += 1
+            return "import os\nos.system('unsafe')\n"
+
+    coder = Coder()
+    service = GenerationService(
+        agent=coder,
+        validator=validate_manim_code,
+        candidate_acceptor=CandidateAcceptor(),
+        generation_mode="strict",
+        limits={"CODE_VALIDATION_ATTEMPTS": 3},
+    )
+
+    with pytest.raises(ValidationError):
+        service.generate(generation_plan())
+    assert coder.calls == 3

@@ -921,15 +921,15 @@ def test_precise_patch_rejects_a_replaced_input_before_writing(monkeypatch, tmp_
     from kd1_anime.domain.review import FixSuggestion, ReviewResult
 
     orchestrator, ctx, state = prepare_submission(tmp_path)
-    inspect_candidate = orchestrator.candidate_acceptor.inspect
+    accept_candidate = orchestrator.candidate_acceptor.accept_candidate
     before = (ctx.paths.scenes / "scene_1.py").read_bytes()
 
-    def inspect_then_replace(*args, **kwargs):
-        accepted = inspect_candidate(*args, **kwargs)
+    def accept_then_replace(*args, **kwargs):
+        accepted = accept_candidate(*args, **kwargs)
         state.revision += 1
         return accepted
 
-    monkeypatch.setattr(orchestrator.candidate_acceptor, "inspect", inspect_then_replace)
+    monkeypatch.setattr(orchestrator.candidate_acceptor, "accept_candidate", accept_then_replace)
     review = ReviewResult(
         is_valid=False,
         feedback="correct duration",
@@ -1022,8 +1022,8 @@ def test_candidate_catalog_uses_target_version_and_keeps_unknown_as_warning():
 
     code = CODE.replace("self.wait()", "self.add(InventedShape())")
     with pytest.raises(CandidateRejected, match="不提供公开 API"):
-        CandidateAcceptor().inspect(code, plan(), manim_version="0.20.1")
-    accepted = CandidateAcceptor().inspect(code, plan(), manim_version="99.0")
+        CandidateAcceptor().accept_candidate(code, plan(), manim_version="0.20.1")
+    accepted = CandidateAcceptor().accept_candidate(code, plan(), manim_version="99.0")
     assert accepted.api_warnings
 
 

@@ -257,7 +257,7 @@ def offline_baseline() -> dict:
                 raise ValueError("Capability uses the free-code path")
             plan = task_plan(task)
             code = compile_program(SceneProgram.model_validate(task.program), plan)
-            CandidateAcceptor().inspect(code, plan, manim_version="0.20.1")
+            CandidateAcceptor().accept_candidate(code, plan, manim_version="0.20.1")
             accepted = True
         except ValueError as exc:
             error = str(exc)

@@ -46,6 +46,11 @@
 
 ## 2. 组件
 
+CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
+`plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
+`run_incremental`。该组合根目前委托 legacy Orchestrator；计划导出只读取已提交
+manifest，不把 worker Context 暴露给 CLI。TUI 在后续独立阶段迁移。
+
 ```text
 kd1_anime.cli / kd1_anime.tui
        │
@@ -307,11 +312,21 @@ Slurm Job；任一 Job 取消失败都会保留运行目录。
 
 ### 3.6 MERGING 与增量复用
 
-`CandidateAcceptor` 是所有候选代码的唯一静态接纳入口：Coder、AutoFix、精确替换、回滚、
-结构化编译和视觉候选恢复都要重新通过 AST、安全、Manim API、连续性和生命周期检查，再由
-Orchestrator 原子写入状态。`SceneState`/manifest 分别记录 `static_verification`、
-`execution_verification` 和 `visual_verification`；三者的 `unknown`、`warning` 和
-`failed` 语义不互相替代。VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个
+`CandidateAcceptor.inspect_candidate()` 是所有候选代码的唯一静态检查链：Coder、
+AutoFix、精确替换、回滚、结构化编译和视觉候选恢复共享 AST、安全、Manim API、
+连续性和生命周期检查。`CandidateInspection` 同时保留原始/最终源码与 hash、全部
+检查结果、修复记录和结构化诊断；`accept_candidate()` 仅接纳检查通过的结果。
+候选生成允许明确的确定性修复，源码变化后丢弃旧证据并重新检查；Review 和提交前
+使用 `allow_repair=False`，不得暗改已审查代码。自定义 validator 只能增加约束，
+不能替代内置 AST/安全检查。
+
+`domain.diagnostics.Diagnostic` 是闭合的展示、反馈与路由合同，适配计划、代码、视觉、
+AST/API/生命周期和渲染错误；保留脱敏原始证据及源码/视频 hash、revision、行号和帧 ID，
+不改变原始 LLM 输出 schema，也不授权代码修改。
+
+`SceneState`/manifest 分别记录 `static_verification`、`execution_verification` 和
+`visual_verification`；三者的 `unknown`、`warning` 和 `failed` 语义不互相替代。
+VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个
 `SceneArtifact` 解析精确路径，再核对 scene ID、类名、代码哈希、渲染配置（含
 Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
 

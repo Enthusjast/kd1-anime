@@ -6,23 +6,8 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from kd1_anime.agents.api_linter import lint_manim_api, repair_manim_api_compatibility
-from kd1_anime.agents.continuity import (
-    extract_scene_continuity_elements,
-    strip_redundant_optional_export_block,
-)
-from kd1_anime.agents.lifecycle import (
-    repair_initial_active_alias_lifecycle,
-    repair_missing_animation_markers,
-    repair_removed_active_lifecycle,
-    repair_required_export_alias_lifecycle,
-    repair_required_export_replacement_lifecycle,
-    repair_required_export_transform_alias_lifecycle,
-    validate_animation_lifecycle,
-)
 from kd1_anime.agents.risk import assess_scene_risk
 from kd1_anime.agents.technical_planner import TechnicalSpec, compile_technical_spec
-from kd1_anime.agents.validator import CodeValidationResult
 from kd1_anime.config import settings
 from kd1_anime.domain.planning import (
     ContinuityBible,
@@ -112,10 +97,7 @@ class GenerationService:
         candidate_budget = self.limits.get(candidate_key, getattr(self.config, candidate_key))
         current_feedback = feedback
         current_previous = previous_code
-        last_validation: CodeValidationResult | None = None
-        last_continuity_error = ""
-        last_lifecycle_error = ""
-        last_api_errors: tuple[str, ...] = ()
+        last_feedback = ""
         repeated_candidate_count = 0
         strategy_hint = ""
         temperature_override: float | None = None
@@ -196,149 +178,42 @@ class GenerationService:
                 plan,
                 **code_kwargs,
             )
-            if technical_spec is not None:
-                code, api_repairs = repair_manim_api_compatibility(code)
-                code, lifecycle_repairs = repair_required_export_alias_lifecycle(
-                    code,
-                    technical_spec,
-                )
-                if api_repairs:
-                    log = getattr(agent, "_log", None)
-                    if callable(log):
-                        log(
-                            "已应用确定性 Manim API 兼容修复: " + "；".join(api_repairs),
-                            style="yellow",
-                        )
-                transform_alias_code, transform_alias_repairs = (
-                    repair_required_export_transform_alias_lifecycle(code, technical_spec)
-                )
-                if transform_alias_repairs:
-                    code = transform_alias_code
-                    lifecycle_repairs = (*lifecycle_repairs, *transform_alias_repairs)
-                replacement_code, replacement_repairs = (
-                    repair_required_export_replacement_lifecycle(code, technical_spec)
-                )
-                if replacement_repairs:
-                    code = replacement_code
-                    lifecycle_repairs = (*lifecycle_repairs, *replacement_repairs)
-                alias_code, alias_repairs = repair_initial_active_alias_lifecycle(
-                    code,
-                    technical_spec,
-                )
-                if alias_repairs:
-                    code = alias_code
-                    lifecycle_repairs = (*lifecycle_repairs, *alias_repairs)
-                if lifecycle_repairs:
-                    log = getattr(agent, "_log", None)
-                    if callable(log):
-                        log(
-                            "已应用确定性生命周期兼容修复: " + "；".join(lifecycle_repairs),
-                            style="yellow",
-                        )
-            code = strip_redundant_optional_export_block(code, plan)
-
-            validation = self._validate(code, renderer=renderer)
-            api_result = lint_manim_api(
-                code, renderer=renderer, scene_plan=plan, manim_version=self.manim_version
+            inspection = self.candidate_acceptor.inspect_candidate(
+                code,
+                plan,
+                technical_spec=technical_spec,
+                renderer=renderer,
+                manim_version=self.manim_version,
+                validator=self._validate,
+                allow_repair=True,
             )
-            continuity_error = ""
-            try:
-                extract_scene_continuity_elements(code, plan)
-            except ValueError as exc:
-                continuity_error = str(exc)
-            lifecycle_error = ""
-            if technical_spec is not None and validation.is_valid and not continuity_error:
-                lifecycle_result = validate_animation_lifecycle(
-                    code,
-                    technical_spec,
-                    renderer=renderer,
-                )
-                if not lifecycle_result.is_valid:
-                    repaired_code, removed_repairs = repair_removed_active_lifecycle(
-                        code,
-                        technical_spec,
-                        lifecycle_result.errors,
+            code = inspection.code
+            if inspection.repairs:
+                log = getattr(agent, "_log", None)
+                if callable(log):
+                    log("已应用确定性候选修复: " + "；".join(inspection.repairs), style="yellow")
+            if inspection.accepted:
+                return GeneratedCode(code, inspection.class_name, attempt)
+            errors_by_stage: dict[str, list[str]] = {}
+            for diagnostic in inspection.diagnostics:
+                if diagnostic.severity == "major":
+                    errors_by_stage.setdefault(diagnostic.stage, []).append(
+                        diagnostic.detail or diagnostic.summary
                     )
-                    if removed_repairs:
-                        code = repaired_code
-                        # 末尾补丁虽是一个很窄的 AST 修复，也改变了候选
-                        # 源码；不能沿用修复前的校验结果作为通过依据。
-                        validation = self._validate(code, renderer=renderer)
-                        api_result = lint_manim_api(
-                            code,
-                            renderer=renderer,
-                            scene_plan=plan,
-                            manim_version=self.manim_version,
-                        )
-                        continuity_error = ""
-                        try:
-                            extract_scene_continuity_elements(code, plan)
-                        except ValueError as exc:
-                            continuity_error = str(exc)
-                        lifecycle_result = validate_animation_lifecycle(
-                            code,
-                            technical_spec,
-                            renderer=renderer,
-                        )
-                    lifecycle_error = "\n".join(lifecycle_result.errors)
-                    if "缺少语义事件标记" in lifecycle_error:
-                        repaired_code, marker_repairs = repair_missing_animation_markers(
-                            code,
-                            technical_spec,
-                        )
-                        if marker_repairs:
-                            code = repaired_code
-                            log = getattr(agent, "_log", None)
-                            if callable(log):
-                                log(
-                                    "已应用确定性事件标记修复: " + "；".join(marker_repairs),
-                                    style="yellow",
-                                )
-                            validation = self._validate(code, renderer=renderer)
-                            api_result = lint_manim_api(
-                                code,
-                                renderer=renderer,
-                                scene_plan=plan,
-                                manim_version=self.manim_version,
-                            )
-                            continuity_error = ""
-                            try:
-                                extract_scene_continuity_elements(code, plan)
-                            except ValueError as exc:
-                                continuity_error = str(exc)
-                            if (
-                                technical_spec is not None
-                                and validation.is_valid
-                                and not continuity_error
-                            ):
-                                lifecycle_result = validate_animation_lifecycle(
-                                    code,
-                                    technical_spec,
-                                    renderer=renderer,
-                                )
-                                lifecycle_error = "\n".join(lifecycle_result.errors)
-                            else:
-                                lifecycle_error = ""
-            if (
-                validation.is_valid
-                and api_result.is_valid
-                and not continuity_error
-                and not lifecycle_error
-            ):
-                return GeneratedCode(code, validation.scene_classes[0], attempt)
-            last_validation = validation
-            last_api_errors = api_result.errors
-            last_continuity_error = continuity_error
-            last_lifecycle_error = lifecycle_error
+            validation_feedback = "\n".join(errors_by_stage.get("ast", ()))
+            api_errors = errors_by_stage.get("api", ())
+            continuity_error = "\n".join(errors_by_stage.get("continuity", ()))
+            lifecycle_error = "\n".join(errors_by_stage.get("lifecycle", ()))
+            last_feedback = inspection.feedback
             validation_failure_attempts += 1
             if generation_mode == "relaxed":
                 failure_signature = sha256_text(
                     "\n".join(
                         (
-                            validation.feedback,
+                            validation_feedback,
                             continuity_error,
                             lifecycle_error,
-                            "\n".join(api_result.errors),
+                            "\n".join(api_errors),
                         )
                     )
                 )
@@ -356,11 +231,11 @@ class GenerationService:
                 f"上一候选是第 {attempt}/{attempt_limit_text} 次尝试，未通过确定性校验；"
                 f"现在进行第 {attempt + 1}/{attempt_limit_text} "
                 "次修复。不得原样返回上一候选代码，必须针对下面的确定性错误做最小修改：\n"
-                f"{validation.feedback}"
+                f"{validation_feedback}"
             ]
-            if api_result.errors:
+            if api_errors:
                 feedback_parts.append(
-                    "\nManim API 静态检查未通过，必须先修复：\n- " + "\n- ".join(api_result.errors)
+                    "\nManim API 静态检查未通过，必须先修复：\n- " + "\n- ".join(api_errors)
                 )
             if current_previous and code == current_previous:
                 feedback_parts.append(
@@ -478,7 +353,7 @@ class GenerationService:
                 )
 
             # 如果是 TexTemplate 相关错误，提供正确示例
-            if any("TexTemplate" in err or "tex_template" in err for err in validation.errors):
+            if "TexTemplate" in validation_feedback or "tex_template" in validation_feedback:
                 feedback_parts.append("""
 \n=== 正确的 TexTemplate 配置示例 ===
 你必须在 construct() 方法开头添加以下代码：
@@ -500,23 +375,6 @@ class GenerationService:
                 "" if generation_mode == "relaxed" and repeated_candidate_count >= 2 else code
             )
         raise ValidationError(
-            "生成代码未通过确定性校验：\n"
-            + (
-                "\n".join(
-                    part
-                    for part in (
-                        last_validation.feedback if last_validation else "",
-                        f"连续性导出合同错误: {last_continuity_error}"
-                        if last_continuity_error
-                        else "",
-                        f"动画生命周期错误: {last_lifecycle_error}" if last_lifecycle_error else "",
-                        "Manim API 静态检查错误: " + "; ".join(last_api_errors)
-                        if last_api_errors
-                        else "",
-                    )
-                    if part
-                )
-                or "未知错误"
-            ),
+            "生成代码未通过确定性校验：\n" + (last_feedback or "未知错误"),
             hint="尝试简化场景或调整 prompt",
         )

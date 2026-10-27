@@ -2700,8 +2700,10 @@ def test_removing_reexported_scene_keeps_ids_used_by_older_boundaries(tmp_path):
     assert ctx.state_ledger.current_scene_id == 1
 
 
-def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports(monkeypatch):
-    from kd1_anime.agents.validator import CodeValidationResult
+def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports():
+    from kd1_anime.agents.validator import validate_manim_code
+    from kd1_anime.candidate_acceptor import CandidateAcceptor
+    from kd1_anime.services.generation import GenerationService
 
     scene_plan = plan().model_copy(
         update={
@@ -2717,9 +2719,8 @@ def test_code_generation_does_not_treat_unmarked_internal_objects_as_exports(mon
     code = """from manim import *
 class Demo(Scene):
     def construct(self):
-        tex_template = TexTemplate(tex_compiler="xelatex", output_format=".xdv")
-        temporary_formula = MathTex(r"x^2", tex_template=tex_template)
-        self.play(Write(temporary_formula))
+        temporary_formula = Circle()
+        self.play(Create(temporary_formula))
 """
 
     class FakeCoder:
@@ -2730,17 +2731,15 @@ class Demo(Scene):
             return code
 
     coder = FakeCoder()
-    monkeypatch.setattr(module, "CoderAgent", lambda: coder)
-    monkeypatch.setattr(
-        Orchestrator,
-        "_validate",
-        staticmethod(lambda value, **kwargs: CodeValidationResult(True, scene_classes=["Demo"])),
-    )
+    generated = GenerationService(
+        agent=coder,
+        validator=validate_manim_code,
+        candidate_acceptor=CandidateAcceptor(),
+        generation_mode="strict",
+    ).generate(scene_plan)
 
-    generated, class_name = Orchestrator()._generate_validated_code(scene_plan, stream=False)
-
-    assert generated == code
-    assert class_name == "Demo"
+    assert generated.code == code
+    assert generated.class_name == "Demo"
     assert coder.calls == 1
 
 
@@ -3807,7 +3806,7 @@ def test_visual_restore_rejects_revised_inputs_before_writing(monkeypatch, tmp_p
     ctx, state = _make_visual_eval_context(tmp_path)
     orchestrator = Orchestrator()
     before = (ctx.paths.scenes / "scene_1.py").read_bytes()
-    inspect_candidate = orchestrator.candidate_acceptor.inspect
+    accept_candidate = orchestrator.candidate_acceptor.accept_candidate
     candidate = VisualCandidate(
         score=4,
         has_major_issue=False,
@@ -3823,12 +3822,12 @@ def test_visual_restore_rejects_revised_inputs_before_writing(monkeypatch, tmp_p
         report_sha256="a" * 64,
     )
 
-    def inspect_then_change(*args, **kwargs):
-        result = inspect_candidate(*args, **kwargs)
+    def accept_then_change(*args, **kwargs):
+        result = accept_candidate(*args, **kwargs)
         state.revision += 1
         return result
 
-    monkeypatch.setattr(orchestrator.candidate_acceptor, "inspect", inspect_then_change)
+    monkeypatch.setattr(orchestrator.candidate_acceptor, "accept_candidate", accept_then_change)
     with pytest.raises(StaleWorkError):
         orchestrator._restore_visual_candidate_into_state(ctx, 1, state, candidate)
     assert (ctx.paths.scenes / "scene_1.py").read_bytes() == before

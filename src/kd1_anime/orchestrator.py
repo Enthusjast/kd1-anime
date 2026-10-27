@@ -24,7 +24,6 @@ from uuid import uuid4
 from rich.console import Console
 from rich.prompt import Confirm
 
-from kd1_anime.agents.api_linter import lint_manim_api
 from kd1_anime.agents.auto_fixer import AutoFixerAgent
 from kd1_anime.agents.base import BaseAgent
 from kd1_anime.agents.capability import (
@@ -42,10 +41,6 @@ from kd1_anime.agents.continuity import (
 )
 from kd1_anime.agents.failure_corpus import FailureCase, FailureCaseStore
 from kd1_anime.agents.failure_router import classify_failure
-from kd1_anime.agents.lifecycle import (
-    detect_unknown_animations,
-    validate_animation_lifecycle,
-)
 from kd1_anime.agents.plan_compiler import PlanCompiler, normalize_scene_timeline_contract
 from kd1_anime.agents.plan_reviewer import (
     PlanReviewerAgent,
@@ -112,6 +107,7 @@ from kd1_anime.config import GenerationMode, settings
 from kd1_anime.control import RunControl
 from kd1_anime.domain.dependencies import StaleWorkError, WorkIdentity
 from kd1_anime.domain.dependencies import digest as dependency_digest
+from kd1_anime.domain.diagnostics import diagnostic_from_plan_issue
 from kd1_anime.domain.execution import (
     RETRY_LIMIT_NAMES,
     StageAttempts,
@@ -2950,24 +2946,6 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _unknown_animation_details(
-        ctx: PipelineContext,
-        state: SceneState,
-        code: str,
-    ) -> list[str]:
-        """提取候选中的未知动画诊断；未知调用本身不是阻断错误。"""
-
-        if state.technical_spec is None:
-            return []
-        return list(
-            detect_unknown_animations(
-                code,
-                state.technical_spec,
-                renderer=ctx.render_profile.renderer,
-            )
-        )
-
-    @staticmethod
     def _local_smoke_enabled(
         ctx: PipelineContext,
         state: SceneState | None = None,
@@ -5350,11 +5328,15 @@ class Orchestrator:
 
     @staticmethod
     def _plan_review_feedback(issues: list[PlanReviewIssue]) -> str:
-        return "\n\n".join(
-            f"[{issue.category}] 字段 {issue.field or '未指定'}: {issue.message}\n"
-            + (f"证据: {issue.evidence}\n" if issue.evidence else "")
-            + f"修正要求: {issue.fix_instruction}"
+        diagnostics = [
+            diagnostic_from_plan_issue(issue, secrets=Orchestrator._event_secrets())
             for issue in issues
+        ]
+        return "\n\n".join(
+            f"[{item.category}] 字段 {item.evidence.get('field') or '未指定'}: {item.summary}\n"
+            + (f"证据: {item.detail}\n" if item.detail else "")
+            + f"修正要求: {item.hint}"
+            for item in diagnostics
         )
 
     def _repair_plan_handoff_issues(
@@ -7432,27 +7414,23 @@ class Orchestrator:
         def compile_ir_candidate() -> tuple[str, str]:
             program = build_scene_program_from_contract(state.plan, state.technical_spec)
             candidate = compile_scene_program(program, state.plan)
-            validation = self._validate(candidate, renderer=ctx.render_profile.renderer)
-            if not validation.is_valid:
-                raise SceneProgramCompileError(validation.feedback)
             try:
-                extract_scene_continuity_elements(candidate, state.plan)
-            except ValueError as exc:
-                raise SceneProgramCompileError(str(exc)) from exc
-            if state.technical_spec is not None:
-                lifecycle_result = validate_animation_lifecycle(
+                accepted = self.candidate_acceptor.accept_candidate(
                     candidate,
-                    state.technical_spec,
+                    state.plan,
+                    technical_spec=state.technical_spec,
                     renderer=ctx.render_profile.renderer,
+                    manim_version=ctx.render_profile.manim_version,
+                    validator=self._validate,
                 )
-                if not lifecycle_result.is_valid:
-                    raise SceneProgramCompileError("；".join(lifecycle_result.errors))
+            except CandidateRejected as exc:
+                raise SceneProgramCompileError(str(exc)) from exc
             self._write_stage_artifact(
                 ctx,
                 f"scene_{scene_id}_program.json",
                 {"schema_version": 1, "program": program.model_dump(mode="json")},
             )
-            return candidate, validation.scene_classes[0]
+            return accepted.code, accepted.class_name
 
         faithful_candidate = None
         if (
@@ -7462,7 +7440,7 @@ class Orchestrator:
         ):
             try:
                 compiled = compile_program(state.plan.program, state.plan)
-                faithful_candidate = self.candidate_acceptor.inspect(
+                faithful_candidate = self.candidate_acceptor.accept_candidate(
                     compiled,
                     state.plan,
                     technical_spec=state.technical_spec,
@@ -7550,47 +7528,21 @@ class Orchestrator:
                     # Plan/TechnicalSpec 的场景判死。使用不依赖 LLM 的最小代码
                     # 作为最后保险；它仍必须通过与正常候选完全相同的校验链。
                     fallback_code = build_safe_scene_code(state.plan, state.technical_spec)
-                    fallback_validation = self._validate(
-                        fallback_code,
-                        renderer=ctx.render_profile.renderer,
-                    )
-                    fallback_continuity_error = ""
                     try:
-                        extract_scene_continuity_elements(fallback_code, state.plan)
-                    except ValueError as fallback_exc:
-                        fallback_continuity_error = str(fallback_exc)
-                    fallback_lifecycle_error = ""
-                    if (
-                        state.technical_spec is not None
-                        and fallback_validation.is_valid
-                        and not fallback_continuity_error
-                    ):
-                        lifecycle_result = validate_animation_lifecycle(
+                        fallback = self.candidate_acceptor.accept_candidate(
                             fallback_code,
-                            state.technical_spec,
+                            state.plan,
+                            technical_spec=state.technical_spec,
                             renderer=ctx.render_profile.renderer,
+                            manim_version=ctx.render_profile.manim_version,
+                            validator=self._validate,
                         )
-                        if not lifecycle_result.is_valid:
-                            fallback_lifecycle_error = "; ".join(lifecycle_result.errors)
-                    if (
-                        not fallback_validation.is_valid
-                        or fallback_continuity_error
-                        or fallback_lifecycle_error
-                    ):
+                    except CandidateRejected as fallback_exc:
                         raise RuntimeError(
-                            "Coder 生成失败，且安全代码降级未通过确定性校验："
-                            + "；".join(
-                                part
-                                for part in (
-                                    "; ".join(fallback_validation.errors),
-                                    fallback_continuity_error,
-                                    fallback_lifecycle_error,
-                                )
-                                if part
-                            )
+                            "Coder 生成失败，且安全代码降级未通过确定性校验：" + str(fallback_exc)
                         ) from exc
-                    code = fallback_code
-                    class_name = fallback_validation.scene_classes[0]
+                    code = fallback.code
+                    class_name = fallback.class_name
                     code_fallback_used = True
                     code_fallback_reason = str(exc)[:5_000]
                     self._emit(
@@ -7606,7 +7558,7 @@ class Orchestrator:
                     raise
         path = ctx.paths.scenes / f"scene_{scene_id}.py"
         try:
-            accepted = self.candidate_acceptor.accept(
+            accepted = self.candidate_acceptor.accept_candidate(
                 code,
                 state.plan,
                 technical_spec=state.technical_spec,
@@ -7623,13 +7575,7 @@ class Orchestrator:
             ) from exc
         code = accepted.code
         class_name = accepted.class_name
-        unknown_animation_details = list(
-            self.candidate_acceptor.unknown_animation_details(
-                code,
-                state.technical_spec,
-                renderer=ctx.render_profile.renderer,
-            )
-        )
+        unknown_animation_details = list(accepted.unknown_animations)
         with self._state_lock:
             self._accept_work(ctx, state, identity)
             self._write_private(path, code)
@@ -7678,14 +7624,8 @@ class Orchestrator:
             code_sha256=state.static_verification.code_sha256,
         )
         self._local_smoke_render(ctx, state)
-        api_result = lint_manim_api(
-            code,
-            renderer=ctx.render_profile.renderer,
-            scene_plan=state.plan,
-            manim_version=ctx.render_profile.manim_version,
-        )
-        if api_result.warnings:
-            self._emit("scene_api_warning", scene_id=scene_id, warnings=list(api_result.warnings))
+        if accepted.api_warnings:
+            self._emit("scene_api_warning", scene_id=scene_id, warnings=list(accepted.api_warnings))
         self._emit("scene_coded", scene_id=scene_id, file_path=str(path))
 
     @scene_span("reviewing")
@@ -7701,6 +7641,16 @@ class Orchestrator:
             identity = self._work_identity(ctx, state)
         if settings.SKIP_REVIEW:
             try:
+                self.candidate_acceptor.accept_candidate(
+                    state.code,
+                    state.plan,
+                    technical_spec=state.technical_spec,
+                    renderer=ctx.render_profile.renderer,
+                    manim_version=ctx.render_profile.manim_version,
+                    expected_class_name=state.class_name,
+                    validator=self._validate,
+                    allow_repair=False,
+                )
                 if not defer_continuity_commit:
                     self._refresh_scene_export(state)
                     self._commit_scene_review_continuity(ctx, state)
@@ -7729,18 +7679,17 @@ class Orchestrator:
         self._emit("scene_reviewing", scene_id=scene_id)
         deterministic_review_error = False
         try:
-            # 导出区是确定性的交接合同。先校验再调用 Reviewer，避免把重复
-            # 导出标记、缺失元素等可直接修复的问题交给 LLM，尤其避免长上下文
-            # 让 Reviewer 输出被截断。
-            extract_scene_continuity_elements(state.code, state.plan)
-            if state.technical_spec is not None:
-                lifecycle_result = validate_animation_lifecycle(
-                    state.code,
-                    state.technical_spec,
-                    renderer=ctx.render_profile.renderer,
-                )
-                if not lifecycle_result.is_valid:
-                    raise ValueError("动画生命周期错误：" + "；".join(lifecycle_result.errors))
+            # Review evidence must describe the exact accepted immutable source.
+            self.candidate_acceptor.accept_candidate(
+                state.code,
+                state.plan,
+                technical_spec=state.technical_spec,
+                renderer=ctx.render_profile.renderer,
+                manim_version=ctx.render_profile.manim_version,
+                expected_class_name=state.class_name,
+                validator=self._validate,
+                allow_repair=False,
+            )
         except ValueError as exc:
             deterministic_review_error = True
             result = ReviewResult(
@@ -7845,48 +7794,28 @@ class Orchestrator:
                 self._checkpoint(ctx, State.DISPATCHING)
             self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
             return
-        validation = self._validate(on_disk_code, renderer=ctx.render_profile.renderer)
-        if not validation.is_valid:
-            with self._state_lock:
-                self._mark_failed(state, "提交前校验失败:\n" + validation.feedback, "coding")
-                self._checkpoint(ctx, State.DISPATCHING)
-            self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
-            return
-        api_result = lint_manim_api(
+        inspection = self.candidate_acceptor.inspect_candidate(
             on_disk_code,
+            state.plan,
+            technical_spec=state.technical_spec,
             renderer=ctx.render_profile.renderer,
-            scene_plan=state.plan,
             manim_version=ctx.render_profile.manim_version,
+            expected_class_name=state.class_name,
+            validator=self._validate,
+            allow_repair=False,
         )
-        if not api_result.is_valid:
+        if not inspection.accepted:
             with self._state_lock:
-                self._mark_failed(
-                    state,
-                    "提交前 Manim API 静态检查失败:\n" + "\n".join(api_result.errors),
-                    "coding",
-                )
+                self._mark_failed(state, "提交前校验失败:\n" + inspection.feedback, "coding")
                 self._checkpoint(ctx, State.DISPATCHING)
             self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
             return
-        if api_result.warnings:
-            self._emit("scene_api_warning", scene_id=scene_id, warnings=list(api_result.warnings))
-        if state.technical_spec is not None:
-            lifecycle_result = validate_animation_lifecycle(
-                on_disk_code,
-                state.technical_spec,
-                renderer=ctx.render_profile.renderer,
+        if inspection.api_result.warnings:
+            self._emit(
+                "scene_api_warning",
+                scene_id=scene_id,
+                warnings=list(inspection.api_result.warnings),
             )
-            if not lifecycle_result.is_valid:
-                with self._state_lock:
-                    self._mark_failed(
-                        state,
-                        "提交前动画生命周期校验失败:\n"
-                        + "\n".join(f"- {error}" for error in lifecycle_result.errors),
-                        "coding",
-                    )
-                    self._checkpoint(ctx, State.DISPATCHING)
-                self._emit("scene_failed", scene_id=scene_id, reason=state.failure_reason)
-                return
         capability = state.capability_contract or build_capability_contract(
             state.plan,
             state.technical_spec,
@@ -7922,7 +7851,7 @@ class Orchestrator:
             )
         with self._state_lock:
             self._mark_static_verification(state, status="passed")
-        state.class_name = validation.scene_classes[0]
+        state.class_name = inspection.class_name
         job: SlurmJob | None = None
         try:
             resource_profile = estimate_render_resources(
@@ -8341,7 +8270,7 @@ class Orchestrator:
                 code = path.read_text(encoding="utf-8")
                 if sha256_text(code) != candidate.code_sha256:
                     continue
-                self.candidate_acceptor.inspect(
+                self.candidate_acceptor.accept_candidate(
                     code,
                     state.plan,
                     technical_spec=state.technical_spec,
@@ -8372,7 +8301,7 @@ class Orchestrator:
         path = restore_run_path(ctx.paths.root, candidate.code_file)
         code = path.read_text(encoding="utf-8")
         try:
-            accepted = self.candidate_acceptor.accept(
+            accepted = self.candidate_acceptor.accept_candidate(
                 code,
                 state.plan,
                 technical_spec=state.technical_spec,
@@ -8456,7 +8385,7 @@ class Orchestrator:
         candidates.append(build_safe_scene_code(state.plan, state.technical_spec))
         for candidate in candidates:
             try:
-                accepted = self.candidate_acceptor.inspect(
+                accepted = self.candidate_acceptor.accept_candidate(
                     candidate,
                     state.plan,
                     technical_spec=state.technical_spec,
@@ -8488,7 +8417,7 @@ class Orchestrator:
         with self._state_lock:
             identity = identity or self._work_identity(ctx, state)
         try:
-            accepted = self.candidate_acceptor.accept(
+            accepted = self.candidate_acceptor.accept_candidate(
                 candidate,
                 state.plan,
                 technical_spec=state.technical_spec,
@@ -8505,13 +8434,7 @@ class Orchestrator:
         candidate = accepted.code
         class_name = accepted.class_name
         code_changed = candidate != state.code
-        unknown_animation_details = list(
-            self.candidate_acceptor.unknown_animation_details(
-                candidate,
-                state.technical_spec,
-                renderer=ctx.render_profile.renderer,
-            )
-        )
+        unknown_animation_details = list(accepted.unknown_animations)
         with self._state_lock:
             if identity is not None:
                 self._accept_work(ctx, state, identity)
@@ -9194,7 +9117,7 @@ class Orchestrator:
             return False
 
         try:
-            accepted = self.candidate_acceptor.inspect(
+            accepted = self.candidate_acceptor.accept_candidate(
                 candidate,
                 state.plan,
                 technical_spec=state.technical_spec,
@@ -9207,13 +9130,7 @@ class Orchestrator:
             return False
         candidate = accepted.code
         validation = accepted.validation
-        unknown_animation_details = list(
-            self.candidate_acceptor.unknown_animation_details(
-                candidate,
-                state.technical_spec,
-                renderer=ctx.render_profile.renderer,
-            )
-        )
+        unknown_animation_details = list(accepted.unknown_animations)
 
         with self._state_lock:
             self._accept_work(ctx, state, identity)
@@ -9839,7 +9756,7 @@ class Orchestrator:
         # manifest，直到合并阶段才暴露问题。
         self._artifact_video_path(ctx, candidate.artifact)
         try:
-            accepted = self.candidate_acceptor.inspect(
+            accepted = self.candidate_acceptor.accept_candidate(
                 candidate.code,
                 state.plan,
                 technical_spec=state.technical_spec,
@@ -9859,13 +9776,7 @@ class Orchestrator:
             if candidate.artifact.scene_class_name != candidate.class_name:
                 raise RuntimeError(f"Scene {scene_id} 的视觉候选类名与视频产物不一致")
             code_changed = accepted.code != state.code
-        unknown_animation_details = list(
-            self.candidate_acceptor.unknown_animation_details(
-                accepted.code,
-                state.technical_spec,
-                renderer=ctx.render_profile.renderer,
-            )
-        )
+        unknown_animation_details = list(accepted.unknown_animations)
         with self._state_lock:
             self._accept_work(ctx, state, identity)
             self._write_private(ctx.paths.scenes / f"scene_{scene_id}.py", accepted.code)

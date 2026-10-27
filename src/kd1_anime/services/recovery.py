@@ -74,7 +74,7 @@ class RecoveryService:
         technical = validated_copy(inputs.technical_spec) if inputs.technical_spec else None
         candidate = agent.fix(inputs.code, inputs.error_log, **snapshot_value(dict(options)))
         try:
-            accepted = acceptor.inspect(
+            accepted = acceptor.accept_candidate(
                 candidate,
                 plan,
                 technical_spec=technical,
