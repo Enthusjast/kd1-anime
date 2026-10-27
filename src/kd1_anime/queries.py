@@ -56,6 +56,7 @@ class RunView(RuntimeRecord):
     created_at: datetime
     updated_at: datetime
     scenes: tuple[SceneView, ...]
+    stop_reason: str = ""
 
 
 class SessionView(RuntimeRecord):
@@ -141,6 +142,9 @@ class QueryService:
                         status=manifest.status,
                         run_phase=manifest.run_phase,
                         goal=manifest.user_prompt,
+                        stop_reason=manifest.agent.stop_reason
+                        if manifest.agent is not None
+                        else manifest.error,
                         created_at=manifest.created_at,
                         updated_at=manifest.updated_at,
                         scenes=scenes,

@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from pydantic import ConfigDict, Field, PrivateAttr, create_model, field_validator, model_validator
 
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import GenerationMode, resolve_runtime_path, settings
@@ -56,7 +57,9 @@ from kd1_anime.verification import ExecutionVerification, StaticVerification, Vi
 
 MANIFEST_NAME = "manifest.json"
 MANIFEST_SCHEMA_VERSION = 10
-READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10})
+AGENT_MANIFEST_SCHEMA_VERSION = 11
+WRITABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({10, 11})
+READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10, 11})
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
     {
@@ -321,7 +324,8 @@ class RunManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    schema_version: Literal[4, 5, 6, 7, 8, 9, 10] = MANIFEST_SCHEMA_VERSION
+    schema_version: Literal[4, 5, 6, 7, 8, 9, 10, 11] = MANIFEST_SCHEMA_VERSION
+    agent: AgentRunState | None = None
     run_config: RunConfig = Field(default_factory=RunConfig.capture)
     execution_spec: ExecutionSpec = Field(default_factory=ExecutionSpec.capture)
     artifact_refs: dict[str, str] = Field(default_factory=dict)
@@ -390,17 +394,42 @@ class RunManifest(BaseModel):
     rag_receipts: dict[str, RagReceipt] = Field(default_factory=dict, max_length=256)
     rag_warnings: list[str] = Field(default_factory=list, max_length=100)
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_runtime_ownership(cls, value):
+        if not isinstance(value, dict):
+            return value
+        version = value.get("schema_version", MANIFEST_SCHEMA_VERSION)
+        if version == AGENT_MANIFEST_SCHEMA_VERSION:
+            if value.get("agent") is None:
+                raise ValueError("v11 requires complete agent runtime identity and session state")
+            if value.get("plan_approved") or value.get("approve_plan"):
+                raise ValueError("v11 approvals are Session grants, never manifest booleans")
+        elif value.get("agent") is not None:
+            raise ValueError("Legacy manifests cannot contain fabricated agent runtime state")
+        return value
+
+    def _dump_options(self, options):
+        hidden = {"plan_approved", "approve_plan"} if self.schema_version == 11 else {"agent"}
+        excluded = options.get("exclude")
+        options["exclude"] = (
+            {**excluded, **{name: True for name in hidden}}
+            if isinstance(excluded, dict)
+            else set(excluded or ()) | hidden
+        )
+        return options
+
     def model_dump(self, **kwargs):
         if self._legacy_raw is not None:
             from copy import deepcopy
 
             return deepcopy(self._legacy_raw)
-        return super().model_dump(**kwargs)
+        return super().model_dump(**self._dump_options(kwargs))
 
     def model_dump_json(self, **kwargs):
         if self._legacy_raw is not None:
             return json.dumps(self._legacy_raw, ensure_ascii=False, indent=kwargs.get("indent"))
-        return super().model_dump_json(**kwargs)
+        return super().model_dump_json(**self._dump_options(kwargs))
 
     @field_validator("retry_limits", mode="before")
     @classmethod
@@ -443,7 +472,18 @@ class RunManifest(BaseModel):
         """
 
         errors: list[str] = []
-        if self.schema_version == MANIFEST_SCHEMA_VERSION:
+        if self.schema_version == AGENT_MANIFEST_SCHEMA_VERSION:
+            if self.agent is None:
+                errors.append("v11 is missing its agent runtime identity")
+            else:
+                errors.extend(
+                    self.agent.integrity_errors(
+                        self.run_id, {item.request_id for item in self.request_budget.reservations}
+                    )
+                )
+        elif self.agent is not None:
+            errors.append("Legacy manifests cannot authorize agent execution")
+        if self.schema_version in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
             if json.loads(self.execution_spec.render_json) != self.render_profile.model_dump(
                 mode="json"
             ):
@@ -464,7 +504,7 @@ class RunManifest(BaseModel):
         if self.schema_version not in READABLE_MANIFEST_SCHEMA_VERSIONS:
             errors.append(f"不支持的 manifest schema_version: {self.schema_version}")
         for scene_id, scene in self.scenes.items():
-            if self.schema_version == MANIFEST_SCHEMA_VERSION:
+            if self.schema_version in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
                 if scene.snapshot is not None and scene.snapshot != scene_snapshot(scene):
                     errors.append(f"Scene {scene_id} 嵌套状态与兼容投影不一致")
                 attempt_keys = set()
@@ -722,17 +762,18 @@ class RunManifest(BaseModel):
             errors.append(f"运行状态 {self.status} 不能与 FSM 终态 DONE 同时出现")
         return errors
 
-    def validate_for_resume(self) -> None:
+    def validate_for_resume(self, *, runtime: Literal["legacy", "agent"] = "legacy") -> None:
         """在恢复/增量复用前拒绝语义损坏的清单。
 
         ``status`` 命令仍允许读取并展示损坏清单，便于诊断；真正复用其中
         的代码、Job 或元素交接时必须 fail-closed，不能只依赖字段类型校验。
         """
 
-        if self.schema_version != MANIFEST_SCHEMA_VERSION:
+        expected = AGENT_MANIFEST_SCHEMA_VERSION if runtime == "agent" else MANIFEST_SCHEMA_VERSION
+        if self.schema_version != expected:
             raise ValueError(
                 f"manifest schema_version={self.schema_version} 仅支持只读查看；"
-                f"恢复需要 v{MANIFEST_SCHEMA_VERSION}，请重新生成运行。"
+                f"{runtime} 恢复需要 v{expected}，不能自动切换运行时。"
             )
         errors = self.integrity_errors()
         if errors:
@@ -896,11 +937,8 @@ def atomic_write_json(path: Path, payload: Any, *, mode: int = 0o600) -> None:
 def write_manifest(path: Path, manifest: RunManifest) -> None:
     """以同目录临时文件 + os.replace 原子更新清单。"""
 
-    if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
-        raise ValueError(
-            f"只允许写入 v{MANIFEST_SCHEMA_VERSION} manifest，"
-            f"不能修改 v{manifest.schema_version} 旧清单"
-        )
+    if manifest.schema_version not in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
+        raise ValueError(f"不能修改只读 v{manifest.schema_version} 清单")
     for scene in manifest.scenes.values():
         scene.snapshot = scene_snapshot(scene)
     manifest.updated_at = utc_now()
@@ -936,7 +974,7 @@ class RunRepository:
             raise ValueError("运行清单顶层必须是 JSON 对象")
         migrated = migrate_manifest_data(raw, self.run_root(run_id))
         manifest = RunManifest.model_validate(migrated)
-        if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+        if manifest.schema_version not in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
             manifest._legacy_raw = raw
         if manifest.run_id != run_id:
             raise ValueError("运行目录与 manifest.run_id 不一致")
@@ -947,6 +985,11 @@ class RunRepository:
 
         manifest = self.load(run_id)
         manifest.validate_for_resume()
+        return manifest
+
+    def load_for_agent_resume(self, run_id: str) -> RunManifest:
+        manifest = self.load(run_id)
+        manifest.validate_for_resume(runtime="agent")
         return manifest
 
     def list(self) -> list[RunManifest]:
@@ -1074,9 +1117,15 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
     if version in READABLE_MANIFEST_SCHEMA_VERSIONS:
+        if version == AGENT_MANIFEST_SCHEMA_VERSION and (
+            "agent" not in raw or "plan_approved" in raw or "approve_plan" in raw
+        ):
+            raise ValueError(
+                "v11 requires agent identity and Session grants, not boolean approvals"
+            )
         if version >= 5:
             required_fields = {"lesson_spec", "teaching_graph", "state_ledger"}
-            if version == MANIFEST_SCHEMA_VERSION:
+            if version in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
                 required_fields.update(
                     {
                         "run_config",
@@ -1093,7 +1142,7 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
             missing_fields = sorted(required_fields - raw.keys())
             if missing_fields:
                 raise ValueError(f"v{version} manifest 缺少必需字段: " + ", ".join(missing_fields))
-        if version == MANIFEST_SCHEMA_VERSION and isinstance(raw.get("scenes"), dict):
+        if version in WRITABLE_MANIFEST_SCHEMA_VERSIONS and isinstance(raw.get("scenes"), dict):
             scene_fields = {
                 "snapshot",
                 "revision",
@@ -1110,22 +1159,24 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
             }
             for scene_id, scene in raw["scenes"].items():
                 if isinstance(scene, dict) and (missing := sorted(scene_fields - scene.keys())):
-                    raise ValueError(f"v10 Scene {scene_id} 缺少必需字段: " + ", ".join(missing))
-        if version == MANIFEST_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"v{version} Scene {scene_id} 缺少必需字段: " + ", ".join(missing)
+                    )
+        if version in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
             if not isinstance(raw.get("run_config"), dict) or not isinstance(
                 raw.get("execution_spec"), dict
             ):
-                raise ValueError("v10 requires complete run and execution contracts")
+                raise ValueError(f"v{version} requires complete run and execution contracts")
             if not set(ExecutionSpec.model_fields) <= set(raw["execution_spec"]):
-                raise ValueError("v10 requires a complete execution contract")
+                raise ValueError(f"v{version} requires a complete execution contract")
             if "values_json" not in raw["run_config"]:
-                raise ValueError("v10 requires a complete run configuration")
+                raise ValueError(f"v{version} requires a complete run configuration")
             for scene_id, data in raw.get("scenes", {}).items():
                 if not isinstance(data.get("snapshot"), dict):
-                    raise ValueError(f"v10 Scene {scene_id} requires a nested snapshot")
+                    raise ValueError(f"v{version} Scene {scene_id} requires a nested snapshot")
                 parsed = StoredSceneState.model_validate(data)
                 if parsed.snapshot != scene_snapshot(parsed):
-                    raise ValueError(f"v10 Scene {scene_id} 嵌套状态与兼容投影不一致")
+                    raise ValueError(f"v{version} Scene {scene_id} 嵌套状态与兼容投影不一致")
         return raw
     if version < MANIFEST_SCHEMA_VERSION:
         raise ValueError(

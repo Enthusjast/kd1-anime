@@ -585,7 +585,7 @@ def test_v4_manifest_is_readable_but_read_only(tmp_path):
     assert loaded.schema_version == 4
     with pytest.raises(ValueError, match="仅支持只读查看"):
         loaded.validate_for_resume()
-    with pytest.raises(ValueError, match="只允许写入 v10"):
+    with pytest.raises(ValueError):
         write_manifest(path, loaded)
 
 

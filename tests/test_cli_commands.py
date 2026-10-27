@@ -146,7 +146,7 @@ def test_global_dry_run_reports_completion_without_video(monkeypatch):
     calls = []
 
     class FakeApplication:
-        def generate(self, prompt, *, dry_run=False):
+        def generate(self, prompt, *, dry_run=False, callback=None):
             calls.append((prompt, dry_run))
             return None
 
@@ -168,7 +168,7 @@ def test_generate_strict_flag_overrides_configured_generation_mode(monkeypatch):
     calls = []
 
     class FakeApplication:
-        def generate(self, prompt, *, dry_run=False):
+        def generate(self, prompt, *, dry_run=False, callback=None):
             calls.append((prompt, dry_run, settings.GENERATION_MODE))
             return None
 
@@ -305,7 +305,7 @@ def test_generate_does_not_clear_configured_overwrite_setting(monkeypatch):
     monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
 
     class FakeApplication:
-        def generate(self, prompt, *, dry_run=False):
+        def generate(self, prompt, *, dry_run=False, callback=None):
             return None
 
     monkeypatch.setattr(application_module, "Application", FakeApplication)
@@ -401,8 +401,6 @@ def test_resume_preflight_includes_auto_fix_after_monitoring():
 
 
 def test_generate_resume_uses_manifest_dry_run_for_completion_message(monkeypatch, tmp_path):
-    import kd1_anime.application as application_module
-
     run_id = "20260728-120000-1234abcd"
     root = tmp_path / "runs" / run_id
     root.mkdir(parents=True)
@@ -436,20 +434,13 @@ def test_generate_resume_uses_manifest_dry_run_for_completion_message(monkeypatc
     from kd1_anime.run_store import sha256_text
 
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    (root / "scenes").mkdir()
-    (root / "scenes" / "scene_1.py").write_text(code)
-    manifest.scenes[1].code_file = "scenes/scene_1.py"
+    from kd1_anime.objects import ObjectStore
+
+    manifest.scenes[1].code_file = ObjectStore(root).source(1, code)
     manifest.scenes[1].code_sha256 = sha256_text(code)
     manifest.scenes[1].class_name = "Demo"
     write_manifest(root / "manifest.json", manifest)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
-
-    class FakeApplication:
-        def resume(self, requested_run_id, *, interactive=False):
-            assert requested_run_id == run_id
-            return None
-
-    monkeypatch.setattr(application_module, "Application", FakeApplication)
 
     result = CliRunner().invoke(app, ["generate", "--resume", run_id])
 
@@ -681,6 +672,9 @@ def test_plan_command_reviews_generated_plans(monkeypatch):
     monkeypatch.setattr("kd1_anime.orchestrator.PlannerAgent", FakePlanner)
     monkeypatch.setattr("kd1_anime.orchestrator.PlanReviewerAgent", FakePlanReviewer)
     monkeypatch.setattr("kd1_anime.orchestrator.ContinuityReviewerAgent", FakeContinuityReviewer)
+    from kd1_anime.orchestrator import Orchestrator
+
+    monkeypatch.setattr("kd1_anime.application._agent_runtime", Orchestrator)
     result = CliRunner().invoke(app, ["plan", "解释圆"])
 
     assert result.exit_code == 0, result.output
@@ -724,6 +718,9 @@ def test_plan_command_exports_structured_plan(monkeypatch, tmp_path):
 
     monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", lambda **kwargs: None)
     monkeypatch.setattr("kd1_anime.orchestrator.PlannerAgent", FakePlanner)
+    from kd1_anime.orchestrator import Orchestrator
+
+    monkeypatch.setattr("kd1_anime.application._agent_runtime", Orchestrator)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path / "workspace")
     output = tmp_path / "plan.json"
 

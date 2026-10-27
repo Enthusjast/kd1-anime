@@ -48,8 +48,9 @@
 
 CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
 `plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
-`run_incremental`。该组合根目前委托 legacy Orchestrator；计划导出只读取已提交
-manifest，不把 worker Context 暴露给 CLI。TUI 在后续独立阶段迁移。
+`run_incremental`。单场景生成、规划和计划文件继续执行默认使用 v11 Agent Runtime；
+直接渲染、增量、TUI 和 batch 暂留 legacy v10，恢复严格按清单版本选择运行时。
+计划导出只读取已提交 manifest，不把 worker Context 暴露给 CLI。
 
 `domain/scene_fields.py` 是运行态字段所有权和 v10 存储投影的唯一元数据；领域
 `code_revision` 单向映射为原有 snapshot `code` 键。`CodeCandidate` 与
@@ -60,10 +61,10 @@ Context 不持有基础运行 manifest。FSM 状态和转移规则集中到 `dom
 和依赖 revision 验证工作身份；无关场景结果可显式 rebase，不重新执行工具。副作用由
 应用/工具层执行，依赖失效由纯服务计算并要求显式 consumer patch。请求预占按
 `request_id` 追加、尝试计数取已提交最大值；原子 manifest 写入成功后才发布状态。
-该路径只复制被修改的场景及 run 字段；旧 Orchestrator 暂时仍使用 legacy
-StageTransaction，不在此阶段切换可执行 manifest 版本。
+该路径只复制被修改的场景及 run 字段；新的 v11 路径不复制全量 Context。旧 Orchestrator
+暂时仍使用 legacy StageTransaction，v10/v11 同时可执行，但同一 run 从不切换实现或双写。
 
-### 2.1 专用 Runtime 协议（尚未切换执行路径）
+### 2.1 专用 Runtime 协议与单场景执行
 
 `agent_runtime/contracts.py` 用闭合 union 定义领域动作、消息、intent、invocation、
 grant、usage 和 v3 事件。模型不能提出 shell、任意文件/Python 执行或自我批准动作。
@@ -82,7 +83,14 @@ v2 只读，中间损坏或身份冲突拒绝，尾部半行作为中断处理�
 
 `prompt_identity.py` 分别计算稳定 generation identity 和单次最终消息 hash；schema、
 prompt pack、generator、validator 或策略变化使旧身份不兼容，旧 v10 缺失身份不会伪造。
-现有运行仍由 legacy v10 路径执行，v11 垂直切片在下一独立阶段启用。
+v11 必须包含 `agent` 元数据、Session、完整 generation identity、intent/invocation 和 usage；
+不写入 `plan_approved`/`approve_plan` 布尔字段。单场景已覆盖规划/审查/批准、TechnicalSpec、
+编码/检查/Review、local/Slurm 提交/轮询、精确视频合并、评价和完成恢复。
+`--approve-plan` 只在计划 hash 可用后代表本地用户签发精确 grant，非 TTY 等待不读 stdin。
+CLI 从已提交查询区分等待、失败和完成，不把 `None` 输出伪报为视频成功。
+
+当前单场景阶段对多场景、RAG、compiler/IR、显式 smoke、自动视觉/渲染修复明确保存停止状态，
+不静默降级到另一实现。后续领域迁移按独立阶段解除这些限制；旧 v10 不补造新身份。
 
 ```text
 kd1_anime.cli / kd1_anime.tui

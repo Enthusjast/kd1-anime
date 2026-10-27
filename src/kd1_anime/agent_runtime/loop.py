@@ -53,6 +53,7 @@ class AgentLoop:
         budget: Callable[[], PolicyBudget],
         next_action: Callable[[PolicySnapshot], AgentAction | None],
         propose_action: Callable[[PolicySnapshot, tuple[str, ...]], AgentAction] | None = None,
+        after_step: Callable[[], None] | None = None,
     ):
         self.policy = policy
         self.executor = executor
@@ -61,6 +62,7 @@ class AgentLoop:
         self.budget = budget
         self.next_action = next_action
         self.propose_action = propose_action
+        self.after_step = after_step
 
     def run(
         self,
@@ -159,6 +161,10 @@ class AgentLoop:
                     action=action,
                 )
             steps += 1
+            if outcome.status == "completed" and outcome.result is not None and self.after_step:
+                # The observer is deliberately outside execution/persistence error
+                # handling: an interrupted client cannot undo a committed stage.
+                self.after_step()
             if outcome.status in {"unknown", "pending", "cancelled"}:
                 return LoopResult(
                     status="NEED_USER",

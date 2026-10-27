@@ -12,7 +12,14 @@ from pydantic import ConfigDict, Field
 
 from kd1_anime.agent_runtime.contracts import ACTION_ADAPTER
 from kd1_anime.domain.dependencies import digest
-from kd1_anime.domain.planning import ContinuityBible, LessonSpec, ScenePlan, TeachingGraph
+from kd1_anime.domain.plan_review import ContinuityReviewResult, PlanReviewResult
+from kd1_anime.domain.planning import (
+    ContinuityBible,
+    LessonSpec,
+    PlanningDraft,
+    ScenePlan,
+    TeachingGraph,
+)
 from kd1_anime.domain.review import ReviewResult
 from kd1_anime.domain.runtime import file_digest
 from kd1_anime.domain.technical import TechnicalSpec
@@ -60,6 +67,9 @@ def capture_generation_identity() -> GenerationIdentity:
             TeachingGraph,
             TechnicalSpec,
             ReviewResult,
+            PlanningDraft,
+            PlanReviewResult,
+            ContinuityReviewResult,
         )
     }
     schemas["AgentAction"] = ACTION_ADAPTER.json_schema()
@@ -69,8 +79,12 @@ def capture_generation_identity() -> GenerationIdentity:
         context_builder_sha256=file_digest(root / "agents" / "prompt_context.py"),
         generator_sha256=files_hash(
             [
-                root / "services" / "generation.py",
-                root / "services" / "program_compiler.py",
+                *root.joinpath("services").glob("*.py"),
+                *root.joinpath("pipeline").glob("*.py"),
+                *root.joinpath("domain").glob("*.py"),
+                root / "agent_runtime" / "runtime.py",
+                root / "agent_runtime" / "state.py",
+                root / "eval" / "visual_eval.py",
                 root / "agents" / "coder.py",
                 root / "prompt_identity.py",
             ]

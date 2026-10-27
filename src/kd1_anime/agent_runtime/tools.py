@@ -248,6 +248,17 @@ class ToolExecutor:
                     or result.patch.identity != action.work_identity
                 ):
                     raise ValueError("Scene patch belongs to another action identity")
+                if (
+                    isinstance(result.patch, RunPatch)
+                    and action.scene_id is not None
+                    and any(
+                        patch.scene_id == action.scene_id and patch.identity != action.work_identity
+                        for patch in result.patch.scenes
+                    )
+                ):
+                    raise ValueError(
+                        "Run patch contains a scene result for a different action revision"
+                    )
                 if action.kind == "submit_render" and invocation.external_job_id is None:
                     raise ValueError(
                         "Submission must durably record its external ID before returning"

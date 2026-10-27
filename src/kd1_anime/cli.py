@@ -202,6 +202,12 @@ def _ensure_rag_apis_available() -> None:
         raise typer.Exit(1) from exc
 
 
+def _load_execution_manifest(run_id: str) -> RunManifest:
+    from kd1_anime.application import Application
+
+    return Application.load_for_resume(run_id)
+
+
 def _manifest_requires_generation_apis(manifest: RunManifest) -> bool:
     """判断恢复是否还会进入需要主 LLM/RAG 的阶段。"""
 
@@ -439,7 +445,7 @@ def generate(
             RunRepository(settings.WORKSPACE_DIR).load_for_resume(incremental)
         requires_llm = not resume
         if resume:
-            manifest = RunRepository(settings.WORKSPACE_DIR).load_for_resume(resume)
+            manifest = _load_execution_manifest(resume)
             # 恢复任务的 dry-run 属性以 manifest 为准；不能因为用户省略
             # --dry-run 就把 dry-run 运行误报为普通视频生成成功。
             dry_run = manifest.dry_run
@@ -466,14 +472,22 @@ def generate(
     from kd1_anime.application import Application
 
     application = Application()
+    observed_run_id = None
+
+    def observe_run(name, data):
+        nonlocal observed_run_id
+        if name == "run_started":
+            observed_run_id = data.get("run_id")
+
     try:
         if resume:
             console.print(f"[cyan]恢复运行[/] {resume}")
-            final_video = application.resume(resume, interactive=True)
+            final_video = application.resume(resume, interactive=True, callback=observe_run)
         elif plan_file:
             console.print(f"[cyan]从计划文件继续[/] {plan_file}")
             final_video = application.run_from_plan(
                 plan_file,
+                callback=observe_run,
                 dry_run=dry_run,
                 output_path=output,
                 approve_plan=approve_plan,
@@ -485,12 +499,13 @@ def generate(
             final_video = application.run_incremental(
                 prompt,
                 incremental,
+                callback=observe_run,
                 dry_run=dry_run,
                 smoke=smoke,
                 backend=backend,
             )
         else:
-            run_kwargs = {"dry_run": dry_run}
+            run_kwargs = {"dry_run": dry_run, "callback": observe_run}
             if approve_plan:
                 run_kwargs["approve_plan"] = True
             if smoke:
@@ -499,8 +514,24 @@ def generate(
                 run_kwargs["backend"] = backend
             final_video = application.generate(prompt, **run_kwargs)
 
-        if dry_run:
+        waiting = False
+        if final_video is None and observed_run_id is not None:
+            from kd1_anime.queries import QueryService
+
+            view = QueryService(RunRepository(settings.WORKSPACE_DIR)).run(observed_run_id)
+            if view.status == "failed":
+                raise RuntimeError(view.stop_reason or "运行失败，已保存恢复状态")
+            waiting = view.status not in {"completed", "dry_run_complete"}
+        if waiting:
+            console.print(
+                f"\n[yellow]运行已暂停，等待计划批准；尚未生成视频。Run ID: {observed_run_id}[/]"
+            )
+        elif dry_run:
             console.print("\n[bold green]Dry-run 完成[/]")
+        elif final_video is None:
+            console.print(
+                "\n[yellow]运行已暂停，等待计划批准；尚未生成视频。使用 status 查看运行。[/]"
+            )
         else:
             console.print(f"\n[bold green]成功![/] 输出文件: {final_video}")
     except KeyboardInterrupt as e:
@@ -847,7 +878,7 @@ def resume(
 
     repository = RunRepository(settings.WORKSPACE_DIR)
     try:
-        manifest = repository.load_for_resume(run_id)
+        manifest = _load_execution_manifest(run_id)
         if _manifest_requires_generation_apis(manifest):
             _ensure_llm_api_available()
             _ensure_rag_apis_available()
@@ -874,6 +905,16 @@ def resume(
             f"[bold red]恢复失败:[/] {exc}\n使用 kd1-anime status 查看可用运行", markup=False
         )
         raise typer.Exit(1) from exc
+    if final_video is None and manifest.agent is not None:
+        from kd1_anime.queries import QueryService
+
+        view = QueryService(repository).run(run_id)
+        if view.status == "failed":
+            console.print(f"[bold red]恢复已停止:[/] {view.stop_reason}", markup=False)
+            raise typer.Exit(1)
+        if view.status not in {"completed", "dry_run_complete"}:
+            console.print(f"[yellow]运行已暂停，等待计划批准或安全恢复决定。Run ID: {run_id}[/]")
+            return
     if manifest.dry_run:
         console.print(f"[bold green]Dry-run 已完成[/] 运行目录: {repository.run_root(run_id)}")
     else:
@@ -888,9 +929,8 @@ def retry(
 ):
     """只重试一个场景，保留同一运行中其它已完成场景。"""
 
-    repository = RunRepository(settings.WORKSPACE_DIR)
     try:
-        manifest = repository.load_for_resume(run_id)
+        manifest = _load_execution_manifest(run_id)
         if manifest.dry_run:
             raise ValueError("dry-run 运行请使用 resume，而不是 retry")
         if _manifest_requires_generation_apis(manifest):

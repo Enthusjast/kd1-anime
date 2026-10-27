@@ -11,6 +11,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field, model_validator
 
+from kd1_anime.agent_runtime.state import AgentRunState, merge_transport_state
 from kd1_anime.domain.dependencies import DependencyGraph, StaleWorkError, WorkIdentity
 from kd1_anime.domain.execution import FSMState, RunPhase
 from kd1_anime.domain.planning import (
@@ -26,7 +27,7 @@ from kd1_anime.rag.models import RagReceipt
 from kd1_anime.request_budget import RequestReservation
 from kd1_anime.run_store import (
     MANIFEST_NAME,
-    MANIFEST_SCHEMA_VERSION,
+    WRITABLE_MANIFEST_SCHEMA_VERSIONS,
     RunManifest,
     RunStatus,
     StoredSceneState,
@@ -72,6 +73,7 @@ class RunPatch(ValidatedModel):
 
     scenes: tuple[ScenePatch, ...] = ()
     reservation_additions: tuple[RequestReservation, ...] = ()
+    agent: AgentRunState | None = None
     state: FSMState | None = None
     status: RunStatus | None = None
     run_phase: RunPhase | None = None
@@ -153,8 +155,9 @@ class RunCommitter:
     """
 
     def __init__(self, run_root: Path, manifest: RunManifest):
-        if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
-            raise ValueError("Typed commits require a v10 manifest")
+        if manifest.schema_version not in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
+            raise ValueError("Typed commits require an executable manifest")
+        manifest.validate_for_resume(runtime="agent" if manifest.schema_version == 11 else "legacy")
         self._run_root = Path(run_root)
         self._current = manifest
         self._lock = RLock()
@@ -292,8 +295,14 @@ class RunCommitter:
             self._check_inputs(command, patch)
             current = self._current
             candidate = current.model_copy()
-            for name in patch.model_fields_set - {"scenes", "reservation_additions"}:
+            if candidate.schema_version == 11 and "plan_approved" in patch.model_fields_set:
+                raise ValueError("Agent approvals belong to Session grants")
+            for name in patch.model_fields_set - {"scenes", "reservation_additions", "agent"}:
                 setattr(candidate, name, getattr(patch, name))
+            if patch.agent is not None:
+                if current.agent is None:
+                    raise ValueError("Legacy runs cannot acquire agent identity")
+                candidate.agent = merge_transport_state(current.agent, patch.agent)
             if patch.scenes:
                 scenes = dict(current.scenes)
                 for scene in patch.scenes:

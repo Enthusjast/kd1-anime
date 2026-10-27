@@ -293,7 +293,8 @@ def test_cancellation_needs_exact_current_job_permission_but_not_an_extra_grant(
 
 
 def test_merge_requires_exec_scope_not_write_scope():
-    snap = snapshot().model_copy(update={"state": "MERGING"})
+    ready = ScenePolicyState(scene_id=1, phase="visual_accepted", work_identity=IDENTITY)
+    snap = snapshot(scenes=(ready,)).model_copy(update={"state": "MERGING"})
     action = MergeVideo(
         run_id=RUN,
         resource_id=f"run:{RUN}",

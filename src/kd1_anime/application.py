@@ -1,4 +1,4 @@
-"""Public animation use cases and the transitional legacy composition root.
+"""Public animation use cases and version-aware runtime composition.
 
 Callers provide goals, commands and callbacks, never a mutable pipeline context.
 The runtime factory is the injection boundary for isolated execution backends.
@@ -17,6 +17,7 @@ from kd1_anime.events import CallbackAdapter, PipelineEvent
 from kd1_anime.run_store import RunRepository, atomic_write_json
 
 if TYPE_CHECKING:
+    from kd1_anime.agent_runtime.runtime import AgentRuntime
     from kd1_anime.cluster.jobs import RenderJob
     from kd1_anime.orchestrator import Orchestrator
 
@@ -29,11 +30,33 @@ def _legacy_runtime() -> Orchestrator:
     return Orchestrator()
 
 
+def _agent_runtime() -> AgentRuntime:
+    from kd1_anime.agent_runtime.runtime import AgentRuntime
+
+    return AgentRuntime()
+
+
 class Application:
     """Stable use-case boundary; legacy state remains owned by its runtime."""
 
-    def __init__(self, runtime_factory: Callable[[], Orchestrator] | None = None):
-        self._runtime_factory = runtime_factory or _legacy_runtime
+    def __init__(self, runtime_factory: Callable[[], Orchestrator | AgentRuntime] | None = None):
+        self._runtime_factory = runtime_factory
+
+    def _runtime(self, *, agent: bool = True):
+        if self._runtime_factory is not None:
+            return self._runtime_factory()
+        return _agent_runtime() if agent else _legacy_runtime()
+
+    @staticmethod
+    def load_for_resume(run_id: str):
+        manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
+        selected = "agent" if manifest.schema_version == 11 else "legacy"
+        manifest.validate_for_resume(runtime=selected)
+        if manifest.agent is not None:
+            from kd1_anime.prompt_identity import verify_generation_identity
+
+            verify_generation_identity(manifest.agent.generation_identity)
+        return manifest
 
     def generate(
         self,
@@ -59,7 +82,9 @@ class Application:
             options["smoke"] = True
         if backend is not None:
             options["backend"] = backend
-        return self._runtime_factory().run(user_prompt, **options)
+        runtime = self._runtime()
+        generate = getattr(runtime, "generate", None) or runtime.run
+        return generate(user_prompt, **options)
 
     def plan_only(
         self,
@@ -83,7 +108,7 @@ class Application:
                 run_id = data["run_id"]
             adapter.publish(PipelineEvent(name, data))
 
-        scenes = self._runtime_factory().plan_only(
+        scenes = self._runtime().plan_only(
             user_prompt,
             callback=observe if export_path is not None else callback,
             interactive=interactive,
@@ -127,7 +152,7 @@ class Application:
         smoke: bool = False,
         backend: RenderBackendName | None = None,
     ) -> Path | None:
-        return self._runtime_factory().run_from_plan(
+        return self._runtime().run_from_plan(
             plan_file,
             callback=callback,
             dry_run=dry_run,
@@ -147,7 +172,7 @@ class Application:
         wait: bool = False,
         backend: RenderBackendName | None = None,
     ) -> tuple[RenderJob, Path | None, str]:
-        return self._runtime_factory().submit_existing_scene(
+        return self._runtime(agent=False).submit_existing_scene(
             source_code, class_name, scene_id=scene_id, wait=wait, backend=backend
         )
 
@@ -158,11 +183,11 @@ class Application:
         interactive: bool = False,
     ) -> Path | None:
         repository = RunRepository(settings.WORKSPACE_DIR)
-        manifest = repository.load_for_resume(run_id)
+        manifest = self.load_for_resume(run_id)
         options = {"callback": callback, "interactive": interactive}
         if manifest.incremental and manifest.base_run_id:
             options["base_manifest"] = repository.load_for_resume(manifest.base_run_id)
-        return self._runtime_factory().resume(run_id, **options)
+        return self._runtime(agent=manifest.schema_version == 11).resume(run_id, **options)
 
     def retry(
         self,
@@ -173,7 +198,7 @@ class Application:
         interactive: bool = False,
     ) -> Path | None:
         repository = RunRepository(settings.WORKSPACE_DIR)
-        manifest = repository.load_for_resume(run_id)
+        manifest = self.load_for_resume(run_id)
         options = {
             "callback": callback,
             "interactive": interactive,
@@ -181,7 +206,7 @@ class Application:
         }
         if manifest.incremental and manifest.base_run_id:
             options["base_manifest"] = repository.load_for_resume(manifest.base_run_id)
-        return self._runtime_factory().resume(run_id, **options)
+        return self._runtime(agent=manifest.schema_version == 11).resume(run_id, **options)
 
     def run_incremental(
         self,
@@ -196,7 +221,7 @@ class Application:
         backend: RenderBackendName | None = None,
     ) -> Path | None:
         base = RunRepository(settings.WORKSPACE_DIR).load_for_resume(base_run_id)
-        return self._runtime_factory().run_incremental(
+        return self._runtime(agent=False).run_incremental(
             user_prompt,
             base_run_id,
             base_manifest=base,

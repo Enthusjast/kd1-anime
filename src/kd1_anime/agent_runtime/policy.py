@@ -57,6 +57,7 @@ class ScenePolicyState(RuntimeRecord):
     approved_diff_sha256: Sha256 | None = None
     approved_diff_identity: WorkIdentity | None = None
     external_job_id: str | None = None
+    static_verified: bool = False
 
 
 class PolicySnapshot(RuntimeRecord):
@@ -70,6 +71,8 @@ class PolicySnapshot(RuntimeRecord):
     approved_plan_identity: WorkIdentity | None = None
     waiting_for_approval: bool = False
     waiting_for_job: bool = False
+    plan_only: bool = False
+    dry_run: bool = False
     now: datetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
@@ -399,10 +402,34 @@ class Policy:
             for scope in session.permissions
         ):
             return deny("permission_denied")
-        if action.kind in {"merge_video", "finish"} and any(
-            item.phase != "visual_accepted" for item in snapshot.scenes
-        ):
-            return deny("unfinished_scenes")
+        if action.kind in {"merge_video", "finish"}:
+            valid_early_finish = (
+                action.kind == "finish"
+                and bool(snapshot.scenes)
+                and (
+                    (
+                        snapshot.plan_only
+                        and snapshot.plan_sha256 is not None
+                        and all(item.phase == "plan_reviewed" for item in snapshot.scenes)
+                    )
+                    or (
+                        snapshot.dry_run
+                        and all(
+                            item.phase == "reviewed"
+                            and item.static_verified
+                            and item.code_sha256 is not None
+                            and item.approved_code_sha256 == item.code_sha256
+                            and item.approved_code_identity == item.work_identity
+                            for item in snapshot.scenes
+                        )
+                    )
+                )
+            )
+            if not valid_early_finish and (
+                not snapshot.scenes
+                or any(item.phase != "visual_accepted" for item in snapshot.scenes)
+            ):
+                return deny("unfinished_scenes")
         needs_grant = tool.requires_approval
         grant = (
             next(
