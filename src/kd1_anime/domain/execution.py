@@ -3,12 +3,163 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum, auto
 from typing import Literal
 from uuid import uuid4
 
 from pydantic import ConfigDict, Field
 
 from kd1_anime.models import ValidatedModel as BaseModel
+
+FSMState = Literal[
+    "INIT",
+    "PLANNING",
+    "DETAILING",
+    "PLAN_REVIEWING",
+    "CODING",
+    "REVIEWING",
+    "DISPATCHING",
+    "MONITORING",
+    "FIXING",
+    "VISUAL_EVALUATING",
+    "MERGING",
+    "EVALUATING",
+    "DONE",
+    "ERROR",
+]
+
+# 顶层状态机的可观察转移表。场景线程可以在同一检查点附近并发完成，
+# 因此它只用于诊断和恢复校验，不作为拒绝并发检查点的硬闸门；真正的
+# 终态一致性仍由 RunManifest.integrity_errors() 负责。
+FSM_TRANSITIONS: dict[str, frozenset[str]] = {
+    "INIT": frozenset({"PLANNING", "ERROR"}),
+    "PLANNING": frozenset({"PLANNING", "DETAILING", "PLAN_REVIEWING", "CODING", "ERROR"}),
+    "DETAILING": frozenset({"DETAILING", "PLAN_REVIEWING", "CODING", "REVIEWING", "ERROR"}),
+    "PLAN_REVIEWING": frozenset({"PLAN_REVIEWING", "DETAILING", "CODING", "REVIEWING", "ERROR"}),
+    "CODING": frozenset({"CODING", "REVIEWING", "DISPATCHING", "PLAN_REVIEWING", "ERROR"}),
+    "REVIEWING": frozenset(
+        {
+            "REVIEWING",
+            "CODING",
+            "DISPATCHING",
+            "FIXING",
+            "DETAILING",
+            "PLAN_REVIEWING",
+            "ERROR",
+        }
+    ),
+    "DISPATCHING": frozenset(
+        {
+            "DISPATCHING",
+            "MONITORING",
+            "MERGING",
+            "DETAILING",
+            "PLAN_REVIEWING",
+            "CODING",
+            "REVIEWING",
+            "ERROR",
+        }
+    ),
+    "MONITORING": frozenset(
+        {
+            "MONITORING",
+            "FIXING",
+            "DISPATCHING",
+            "MERGING",
+            "DETAILING",
+            "PLAN_REVIEWING",
+            "CODING",
+            "REVIEWING",
+            "ERROR",
+        }
+    ),
+    "FIXING": frozenset(
+        {
+            "FIXING",
+            "REVIEWING",
+            "CODING",
+            "MONITORING",
+            "DISPATCHING",
+            "DETAILING",
+            "PLAN_REVIEWING",
+            "ERROR",
+        }
+    ),
+    "VISUAL_EVALUATING": frozenset(
+        {
+            "VISUAL_EVALUATING",
+            "CODING",
+            "DETAILING",
+            "PLAN_REVIEWING",
+            "REVIEWING",
+            "MERGING",
+            "ERROR",
+        }
+    ),
+    "MERGING": frozenset(
+        {"MERGING", "EVALUATING", "DETAILING", "PLAN_REVIEWING", "CODING", "ERROR"}
+    ),
+    "EVALUATING": frozenset(
+        {"EVALUATING", "CODING", "DETAILING", "PLAN_REVIEWING", "MERGING", "DONE", "ERROR"}
+    ),
+    # DONE -> coding/reviewing 等是为“dry-run 失败后显式 resume”保留的恢复边，
+    # 已完成正式运行仍会在 resume 入口先校验并直接返回，不会走这条边。
+    "DONE": frozenset(
+        {
+            "DONE",
+            "DETAILING",
+            "CODING",
+            "PLAN_REVIEWING",
+            "REVIEWING",
+            "DISPATCHING",
+            "ERROR",
+        }
+    ),
+    "ERROR": frozenset(
+        {
+            "ERROR",
+            "INIT",
+            "PLANNING",
+            "DETAILING",
+            "PLAN_REVIEWING",
+            "CODING",
+            "REVIEWING",
+            "DISPATCHING",
+            "MONITORING",
+            "FIXING",
+            "VISUAL_EVALUATING",
+            "MERGING",
+            "EVALUATING",
+            "DONE",
+        }
+    ),
+}
+
+
+def is_valid_fsm_transition(previous_state: str, current_state: str) -> bool:
+    """判断两个顶层检查点状态是否存在已知转移。"""
+
+    if previous_state == current_state:
+        return True
+    return current_state in FSM_TRANSITIONS.get(previous_state, frozenset())
+
+
+class State(Enum):
+    INIT = auto()
+    PLANNING = auto()
+    DETAILING = auto()
+    PLAN_REVIEWING = auto()
+    CODING = auto()
+    REVIEWING = auto()
+    DISPATCHING = auto()
+    MONITORING = auto()
+    FIXING = auto()
+    VISUAL_EVALUATING = auto()
+    MERGING = auto()
+    EVALUATING = auto()
+    DONE = auto()
+    ERROR = auto()
+
 
 RunPhase = Literal[
     "initializing", "planning", "executing", "merging", "evaluating", "finished", "failed"
@@ -32,8 +183,12 @@ def transition_run(previous: RunPhase, target: RunPhase, *, reopening: bool = Fa
     return target
 
 
-def validate_scene_transition(previous: str, target: str, *, revised: bool) -> None:
+def validate_scene_transition(
+    previous: str, target: str, *, revised: bool, reused: bool = False
+) -> None:
     if revised or previous == target or target == "failed":
+        return
+    if previous == "reviewed" and target == "rendered" and reused:
         return
     allowed = {
         "pending": {

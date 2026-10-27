@@ -472,7 +472,7 @@ def test_direct_render_needs_no_llm_and_owns_private_source(application_boundary
 @pytest.mark.parametrize("entry", ["retry", "incremental"])
 def test_unsafe_run_identifier_is_rejected_before_external_work(application_boundary, entry):
     boundary = application_boundary
-    with pytest.raises((ValueError, FileNotFoundError, workflow.RunNotFoundError)):
+    with pytest.raises((ValueError, FileNotFoundError)):
         if entry == "retry":
             boundary.app.retry("../outside", 1)
         else:
@@ -532,3 +532,29 @@ def test_legacy_manifest_is_read_only_at_execution_entries(application_boundary,
     assert boundary.calls == calls
     assert not boundary.backend.sources
     assert len(list((boundary.workspace / "runs").glob("*/manifest.json"))) == 1
+
+
+def test_incremental_reuses_verified_artifact_without_mutating_base_or_request_budget(
+    application_boundary,
+):
+    boundary = application_boundary
+    boundary.app.generate("Show a one-second pause")
+    base_root, base = saved_run(boundary)
+    base_bytes = (base_root / "manifest.json").read_bytes()
+    base_requests = {item.request_id for item in base.request_budget.reservations}
+
+    video = boundary.app.run_incremental("Show a one-second pause", base.run_id)
+
+    assert video is not None and video.read_bytes() == b"merged:" + VIDEO
+    roots = [path for path in (boundary.workspace / "runs").iterdir() if path != base_root]
+    assert len(roots) == 1
+    incremental = RunRepository(boundary.workspace).load_for_resume(roots[0].name)
+    assert incremental.status == "completed" and incremental.base_run_id == base.run_id
+    assert incremental.scenes[1].artifact.origin == "reused"
+    assert incremental.scenes[1].artifact.video_sha256 == base.scenes[1].artifact.video_sha256
+    assert len(boundary.backend.sources) == 1
+    assert (base_root / "manifest.json").read_bytes() == base_bytes
+    assert incremental.request_budget.reservations
+    assert base_requests.isdisjoint(
+        item.request_id for item in incremental.request_budget.reservations
+    )

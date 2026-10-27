@@ -5,13 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar
 from uuid import uuid4
 
 from kd1_anime.cluster.jobs import RenderJob as SlurmJob
 from kd1_anime.cluster.render_backend import RenderBackendName
 from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.config import GenerationMode, resolve_runtime_path, settings
+from kd1_anime.domain.candidates import CodeCandidate
 from kd1_anime.domain.capability import CapabilityContract
 from kd1_anime.domain.dependencies import DependencyGraph
 from kd1_anime.domain.execution import RunPhase, StageAttempts, SubmissionAttempt
@@ -25,13 +25,13 @@ from kd1_anime.domain.planning import (
     ScenePlan,
     TeachingGraph,
 )
-from kd1_anime.domain.runtime import ExecutionSpec, RunConfig
+from kd1_anime.domain.runtime import ExecutionSpec, RunConfig, VisualEvalProfile
+from kd1_anime.domain.scene_fields import SCENE_FIELDS, SCENE_GROUPS
 from kd1_anime.domain.state_ledger import StateLedger
 from kd1_anime.domain.technical import TechnicalSpec
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.rendering import MergeProfile, RenderProfile, SceneArtifact
 from kd1_anime.request_budget import RequestBudget
-from kd1_anime.run_store import RunManifest, StoredCodeCandidate, VisualEvalProfile
 from kd1_anime.verification import ExecutionVerification, StaticVerification, VisualVerification
 
 
@@ -116,7 +116,7 @@ class CodeRevisionState:
     inherited_elements_code: str = ""
     exported_elements_code: str = ""
     exported_elements: list[ExtractedElement] = field(default_factory=list)
-    candidates: list[StoredCodeCandidate] = field(default_factory=list)
+    candidates: list[CodeCandidate] = field(default_factory=list)
 
 
 @dataclass
@@ -172,73 +172,6 @@ class SceneState:
     verification: VerificationState
     lifecycle: LifecycleState
 
-    _field_groups: ClassVar[dict[str, str]] = {
-        "plan": "planning",
-        "plan_ready": "planning",
-        "plan_replan_attempts": "planning",
-        "plan_review_round": "planning",
-        "plan_reviewed": "planning",
-        "plan_review_feedback": "planning",
-        "plan_review_signature": "planning",
-        "technical_spec": "planning",
-        "technical_contract_stale": "planning",
-        "technical_spec_sha256": "planning",
-        "technical_input_sha256": "planning",
-        "technical_status": "planning",
-        "technical_error": "planning",
-        "capability_contract": "planning",
-        "capability_status": "planning",
-        "code": "code_revision",
-        "class_name": "code_revision",
-        "review_round": "code_revision",
-        "safe_fallback_used": "code_revision",
-        "safe_fallback_reason": "code_revision",
-        "identical_plan_review_count": "code_revision",
-        "unknown_animation_detected": "code_revision",
-        "unknown_animation_details": "code_revision",
-        "rewrite_feedback": "code_revision",
-        "review_signature": "code_revision",
-        "identical_review_count": "code_revision",
-        "reviewed": "code_revision",
-        "inherited_elements_code": "code_revision",
-        "exported_elements_code": "code_revision",
-        "exported_elements": "code_revision",
-        "candidates": "code_revision",
-        "submission": "execution",
-        "submission_attempts": "execution",
-        "stage_attempts": "execution",
-        "fix_attempts": "execution",
-        "infra_retries": "execution",
-        "slurm_job": "execution",
-        "artifact": "execution",
-        "rendered": "execution",
-        "resource_profile": "execution",
-        "last_error_fp": "execution",
-        "identical_error_count": "execution",
-        "last_repair_code_sha256": "execution",
-        "last_repair_error_fp": "execution",
-        "stagnant_repair_count": "execution",
-        "static_verification": "verification",
-        "execution_verification": "verification",
-        "visual_verification": "verification",
-        "local_smoke_status": "verification",
-        "visual_status": "verification",
-        "visual_fix_attempts": "verification",
-        "visual_score": "verification",
-        "visual_report_file": "verification",
-        "visual_report_sha256": "verification",
-        "visual_artifact_sha256": "verification",
-        "visual_feedback": "verification",
-        "visual_best_candidate": "verification",
-        "revision": "lifecycle",
-        "input_sha256": "lifecycle",
-        "give_up": "lifecycle",
-        "failed": "lifecycle",
-        "failure_reason": "lifecycle",
-        "failure_category": "lifecycle",
-        "phase": "lifecycle",
-    }
-
     def __init__(self, plan, **values):
         object.__setattr__(self, "planning", PlanningState(plan))
         object.__setattr__(self, "code_revision", CodeRevisionState())
@@ -246,22 +179,24 @@ class SceneState:
         object.__setattr__(self, "verification", VerificationState())
         object.__setattr__(self, "lifecycle", LifecycleState())
         for name, value in values.items():
-            if name not in self._field_groups:
+            if name not in SCENE_FIELDS:
                 raise TypeError(f"Unknown scene state field {name}")
             setattr(self, name, value)
 
     def __getattr__(self, name):
-        group = type(self)._field_groups.get(name)
-        if group is None:
+        metadata = SCENE_FIELDS.get(name)
+        if metadata is None:
             raise AttributeError(name)
-        return getattr(object.__getattribute__(self, group), name)
+        return getattr(object.__getattribute__(self, metadata.domain_group), name)
 
     def __setattr__(self, name, value):
-        group = type(self)._field_groups.get(name)
-        if group is None:
+        metadata = SCENE_FIELDS.get(name)
+        if metadata is not None:
+            setattr(object.__getattribute__(self, metadata.domain_group), name, value)
+        elif name in SCENE_GROUPS:
             object.__setattr__(self, name, value)
         else:
-            setattr(object.__getattribute__(self, group), name, value)
+            raise AttributeError(name)
 
 
 @dataclass
@@ -331,7 +266,6 @@ class PipelineContext:
     # 增量渲染支持
     incremental: bool = False
     base_run_id: str | None = None
-    base_manifest: RunManifest | None = None
     scenes_to_render: list[int] = field(default_factory=list)
     scenes_to_reuse: list[int] = field(default_factory=list)
 

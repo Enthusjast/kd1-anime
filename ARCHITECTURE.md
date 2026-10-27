@@ -51,6 +51,18 @@ CLI 的执行命令统一调用 `application.Application` 的公开用例：`gen
 `run_incremental`。该组合根目前委托 legacy Orchestrator；计划导出只读取已提交
 manifest，不把 worker Context 暴露给 CLI。TUI 在后续独立阶段迁移。
 
+`domain/scene_fields.py` 是运行态字段所有权和 v10 存储投影的唯一元数据；领域
+`code_revision` 单向映射为原有 snapshot `code` 键。`CodeCandidate` 与
+`VisualEvalProfile` 分别由 `domain/candidates.py`、`domain/runtime.py` 定义，领域
+Context 不持有基础运行 manifest。FSM 状态和转移规则集中到 `domain/execution.py`。
+
+新 `RunCommitter` 仅接受闭合 `RunPatch` / `ScenePatch`，按场景 revision、完整输入摘要
+和依赖 revision 验证工作身份；无关场景结果可显式 rebase，不重新执行工具。副作用由
+应用/工具层执行，依赖失效由纯服务计算并要求显式 consumer patch。请求预占按
+`request_id` 追加、尝试计数取已提交最大值；原子 manifest 写入成功后才发布状态。
+该路径只复制被修改的场景及 run 字段；旧 Orchestrator 暂时仍使用 legacy
+StageTransaction，不在此阶段切换可执行 manifest 版本。
+
 ```text
 kd1_anime.cli / kd1_anime.tui
        │

@@ -7,10 +7,31 @@ import json
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
 from pydantic import ConfigDict, Field, field_validator
 
 from kd1_anime.models import ValidatedModel
+
+
+class VisualEvalProfile(ValidatedModel):
+    """持久化的非敏感视觉评估策略；API Key 和端点不写入运行清单。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    model: str = Field(default="", max_length=300)
+    frame_count: int = Field(default=6, ge=1, le=8)
+    threshold: float = Field(default=3.5, ge=1.0, le=5.0)
+    max_fix_attempts: int = Field(default=2, ge=0, le=5)
+    # 本次运行是否允许视觉评估驱动 Planner/Coder 修复；旧清单默认保持
+    # strict 兼容，由 Orchestrator 再结合 generation_mode 和配置判定。
+    repair_enabled: bool = True
+    evaluator_version: Literal["1"] = "1"
+
+    def digest(self) -> str:
+        payload = self.model_dump_json(exclude_none=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def file_digest(path: Path) -> str:

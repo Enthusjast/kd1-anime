@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from kd1_anime.domain.candidates import CodeCandidate
 from kd1_anime.domain.review import ReviewFinding, ReviewResult
-from kd1_anime.run_store import StoredCodeCandidate
 
 
 def accepts_review(result: ReviewResult, *, relaxed: bool, allow_soft_pass: bool) -> bool:
@@ -45,7 +45,7 @@ def review_finding_requires_plan_repair(finding: ReviewFinding) -> bool:
     return any(marker.lower() in text for marker in plan_markers)
 
 
-def candidate_rank(candidate: StoredCodeCandidate) -> tuple[int, float]:
+def candidate_rank(candidate: CodeCandidate) -> tuple[int, float]:
     verification_rank = {"validated": 1, "smoke": 2, "rendered": 3}.get(
         candidate.verification,
         0,

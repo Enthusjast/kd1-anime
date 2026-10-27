@@ -3719,7 +3719,7 @@ def test_auto_eval_does_not_repeat_visual_calls_or_depend_on_visual_endpoint(mon
 
 
 def _make_visual_eval_context(tmp_path):
-    from kd1_anime.run_store import VisualEvalProfile
+    from kd1_anime.domain.runtime import VisualEvalProfile
 
     run_paths = paths(tmp_path)
     for directory in (run_paths.root, run_paths.scenes, run_paths.logs, run_paths.videos):

@@ -157,7 +157,12 @@ class Application:
         callback: Callback | None = None,
         interactive: bool = False,
     ) -> Path | None:
-        return self._runtime_factory().resume(run_id, callback=callback, interactive=interactive)
+        repository = RunRepository(settings.WORKSPACE_DIR)
+        manifest = repository.load_for_resume(run_id)
+        options = {"callback": callback, "interactive": interactive}
+        if manifest.incremental and manifest.base_run_id:
+            options["base_manifest"] = repository.load_for_resume(manifest.base_run_id)
+        return self._runtime_factory().resume(run_id, **options)
 
     def retry(
         self,
@@ -167,9 +172,16 @@ class Application:
         callback: Callback | None = None,
         interactive: bool = False,
     ) -> Path | None:
-        return self._runtime_factory().resume(
-            run_id, callback=callback, interactive=interactive, retry_scene_id=scene_id
-        )
+        repository = RunRepository(settings.WORKSPACE_DIR)
+        manifest = repository.load_for_resume(run_id)
+        options = {
+            "callback": callback,
+            "interactive": interactive,
+            "retry_scene_id": scene_id,
+        }
+        if manifest.incremental and manifest.base_run_id:
+            options["base_manifest"] = repository.load_for_resume(manifest.base_run_id)
+        return self._runtime_factory().resume(run_id, **options)
 
     def run_incremental(
         self,
@@ -183,9 +195,11 @@ class Application:
         smoke: bool = False,
         backend: RenderBackendName | None = None,
     ) -> Path | None:
+        base = RunRepository(settings.WORKSPACE_DIR).load_for_resume(base_run_id)
         return self._runtime_factory().run_incremental(
             user_prompt,
             base_run_id,
+            base_manifest=base,
             callback=callback,
             dry_run=dry_run,
             interactive=interactive,

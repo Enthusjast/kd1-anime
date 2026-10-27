@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 from kd1_anime.domain.dependencies import DependencyBinding, SceneDependency, digest
 from kd1_anime.domain.planning import ScenePlan
 from kd1_anime.domain.technical import TechnicalSpec
+
+if TYPE_CHECKING:
+    from kd1_anime.run_store import RunManifest
 
 
 class DependencyService:
@@ -101,3 +105,72 @@ class DependencyService:
                     )
                 )
         return result
+
+    @staticmethod
+    def affected_manifest(
+        before: RunManifest, after: RunManifest, changed_scene_ids: Sequence[int]
+    ) -> set[int]:
+        """Compute invalidations from stored values, without mutating either run.
+
+        A revision-only update is not an output change. Once a producer changes,
+        the graph's conservative transitive rule also covers consumers whose
+        future output contracts cannot yet be known. No job cancellation or file
+        operation belongs in this calculation.
+        """
+
+        def node(scene):
+            return {
+                "revision": scene.revision,
+                "code": scene.code_sha256,
+                "contract": DependencyService.contract(scene.plan, scene.technical_spec),
+                "teaching": DependencyService.teaching(scene.plan),
+            }
+
+        plans = [scene.plan for scene in before.scenes.values()]
+        graph = before.dependency_graph
+        bound = {binding.consumer_scene_id for binding in graph.bindings}
+        fallback = DependencyService.fallback_edges(plans, bound, {})
+        if after.dependency_graph.bindings != graph.bindings:
+            fallback.extend(after.dependency_graph.bindings)
+        affected = set()
+        for scene_id in changed_scene_ids:
+            previous = before.scenes.get(scene_id)
+            proposed = after.scenes.get(scene_id)
+            if previous is None or proposed is None:
+                continue
+            old_node = node(previous)
+            new_node = node(proposed)
+            if any(old_node[key] != new_node[key] for key in ("code", "contract", "teaching")):
+                affected.update(graph.affected(scene_id, {scene_id: new_node}, fallback))
+
+        def global_inputs(manifest):
+            return digest(
+                {
+                    "lesson": manifest.lesson_spec.model_dump(mode="json"),
+                    "teaching": manifest.teaching_graph.model_dump(mode="json"),
+                    "bible": manifest.continuity_bible.model_dump(mode="json")
+                    if manifest.continuity_bible is not None
+                    else None,
+                    "renderer": manifest.render_profile.digest(),
+                }
+            )
+
+        if (
+            before.lesson_spec != after.lesson_spec
+            or before.teaching_graph != after.teaching_graph
+            or before.continuity_bible != after.continuity_bible
+            or before.render_profile != after.render_profile
+        ):
+            global_consumers = graph.changed_globals(global_inputs(after))
+            affected.update(global_consumers)
+            # Their future outputs are unknown, so every downstream dependency
+            # must be invalidated, even if its producer's old digest still fits.
+            frontier = set(global_consumers)
+            edges = (*graph.bindings, *fallback)
+            while frontier:
+                source = frontier.pop()
+                for edge in edges:
+                    if edge.source_scene_id == source and edge.consumer_scene_id not in affected:
+                        affected.add(edge.consumer_scene_id)
+                        frontier.add(edge.consumer_scene_id)
+        return affected

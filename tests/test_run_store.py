@@ -12,6 +12,10 @@ from kd1_anime.agents.planner import ContinuityBible, ScenePlan
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 from kd1_anime.cli import app
 from kd1_anime.config import settings
+from kd1_anime.domain.candidates import CodeCandidate
+from kd1_anime.domain.execution import is_valid_fsm_transition
+from kd1_anime.domain.runtime import VisualEvalProfile
+from kd1_anime.domain.scene_fields import SCENE_FIELDS, SCENE_STORAGE_FIELDS
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import sha256_file
 from kd1_anime.run_store import (
@@ -19,9 +23,10 @@ from kd1_anime.run_store import (
     RunRepository,
     StoredSceneState,
     StoredSlurmJob,
-    is_valid_fsm_transition,
     lock_run,
     restore_run_path,
+    scene_field_group,
+    scene_snapshot,
     sha256_text,
     write_manifest,
 )
@@ -724,3 +729,94 @@ def test_manifest_rejects_unknown_fsm_state_and_scene_phase():
     scene = StoredSceneState(plan=make_plan())
     with pytest.raises(ValueError):
         scene.phase = "not-a-phase"
+
+
+def test_scene_storage_metadata_is_complete_and_explicit():
+    stored_fields = set(StoredSceneState.model_fields) - {"snapshot"}
+    assert set(SCENE_STORAGE_FIELDS) == stored_fields
+    assert sum(len(metadata.stored_names) for metadata in SCENE_FIELDS.values()) == len(
+        stored_fields
+    )
+    assert SCENE_FIELDS["code"].stored_names == ("code_file", "code_sha256")
+    for alias in ("code_file", "code_sha256"):
+        assert SCENE_STORAGE_FIELDS[alias] is SCENE_FIELDS["code"]
+        assert SCENE_STORAGE_FIELDS[alias].domain_group == "code_revision"
+        assert scene_field_group(alias) == "code"
+    for unknown in ("invented", "plan_invented", "visual_invented", "last_invented"):
+        with pytest.raises(KeyError):
+            scene_field_group(unknown)
+
+
+def test_scene_snapshot_preserves_v10_groups_and_exact_flat_projection():
+    scene = StoredSceneState(
+        plan=make_plan(),
+        code_file="objects/source.py",
+        code_sha256="a" * 64,
+        class_name="Demo",
+        plan_review_feedback="plan feedback",
+        identical_plan_review_count=2,
+        last_error_fp="render failure",
+        visual_feedback="visual feedback",
+        failure_reason="failure",
+    )
+    snapshot = scene_snapshot(scene).model_dump(mode="json")
+    assert tuple(snapshot) == ("planning", "code", "execution", "verification", "lifecycle")
+    assert snapshot["planning"]["plan_review_feedback"] == "plan feedback"
+    assert snapshot["code"]["identical_plan_review_count"] == 2
+    assert snapshot["execution"]["last_error_fp"] == "render failure"
+    assert snapshot["verification"]["visual_feedback"] == "visual feedback"
+    assert snapshot["lifecycle"]["failure_reason"] == "failure"
+    flattened = {name: value for group in snapshot.values() for name, value in group.items()}
+    assert len(flattened) == sum(len(group) for group in snapshot.values())
+    assert flattened == scene.model_dump(mode="json", exclude={"snapshot"})
+    assert StoredSceneState.model_validate(flattened) == scene
+
+
+def test_extracted_domain_schemas_round_trip_v10_without_shape_changes(tmp_path):
+    candidate_payload = {
+        "code_file": "objects/source.py",
+        "code_sha256": "a" * 64,
+        "class_name": "Demo",
+        "verification": "validated",
+        "inherited_elements_sha256": "",
+        "exported_elements_code": "",
+        "exported_elements": [],
+        "artifact": None,
+        "visual_score": None,
+    }
+    profile_payload = {
+        "enabled": True,
+        "model": "vision-model",
+        "frame_count": 6,
+        "threshold": 3.5,
+        "max_fix_attempts": 2,
+        "repair_enabled": True,
+        "evaluator_version": "1",
+    }
+    candidate = CodeCandidate.model_validate(candidate_payload)
+    profile = VisualEvalProfile.model_validate(profile_payload)
+    assert candidate.model_dump(mode="json") == candidate_payload
+    assert profile.model_dump(mode="json") == profile_payload
+    assert profile.digest() == sha256_text(json.dumps(profile_payload, separators=(",", ":")))
+    paths = make_paths(tmp_path / "workspace")
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(paths.output),
+        visual_eval_profile=profile,
+        scenes={1: StoredSceneState(plan=make_plan(), candidates=[candidate])},
+    )
+    manifest_path = paths.root / "manifest.json"
+    write_manifest(manifest_path, manifest)
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 10
+    assert raw["visual_eval_profile"] == profile_payload
+    assert raw["scenes"]["1"]["candidates"] == [candidate_payload]
+    assert raw["scenes"]["1"]["snapshot"]["code"]["candidates"] == [candidate_payload]
+    assert "code_revision" not in raw["scenes"]["1"]["snapshot"]
+    restored = RunRepository(tmp_path / "workspace").load(RUN_ID)
+    assert restored.model_dump(mode="json") == raw
+    assert restored.integrity_errors() == []
+    assert isinstance(restored.scenes[1].candidates[0], CodeCandidate)
+    assert isinstance(restored.visual_eval_profile, VisualEvalProfile)
+    assert scene_snapshot(restored.scenes[1]) == restored.scenes[1].snapshot

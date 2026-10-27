@@ -224,7 +224,9 @@ def test_all_legacy_execution_entries_reject_before_side_effects(
     )
     with pytest.raises(ValueError, match="只读"):
         if entry == "incremental":
-            orchestrator.run_incremental("new", ctx.paths.run_id)
+            from kd1_anime.application import Application
+
+            Application().run_incremental("new", ctx.paths.run_id)
         else:
             orchestrator.resume(ctx.paths.run_id, retry_scene_id=1 if entry == "retry" else None)
     assert path.read_text() == before
@@ -770,9 +772,8 @@ def test_incomplete_or_different_environment_refuses_reuse_and_preserves_video(
         execution_spec=spec,
         incremental=True,
         base_run_id=RUN_ID,
-        base_manifest=base,
     )
-    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
     assert not state.rendered and state.artifact is None
     assert ctx.scenes_to_render == [1]
     assert video.read_bytes() == original

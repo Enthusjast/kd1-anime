@@ -115,7 +115,6 @@ def test_incremental_reuses_verified_matching_artifact(monkeypatch, tmp_path):
         execution_spec=ExecutionSpec.capture(profile),
         incremental=True,
         base_run_id=RUN_ID,
-        base_manifest=base,
         render_profile=profile,
     )
 
@@ -132,7 +131,7 @@ def test_incremental_reuses_verified_matching_artifact(monkeypatch, tmp_path):
         staticmethod(assert_artifact_is_published_first),
     )
 
-    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
 
     assert state.rendered is True
     assert state.slurm_job is None
@@ -159,11 +158,10 @@ def test_incremental_reuse_is_self_contained_after_base_cleanup(monkeypatch, tmp
         execution_spec=ExecutionSpec.capture(profile),
         incremental=True,
         base_run_id=RUN_ID,
-        base_manifest=base,
         render_profile=profile,
     )
 
-    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
     assert state.artifact is not None
     reused_path = paths.root / state.artifact.video_path
 
@@ -190,11 +188,10 @@ def test_incremental_rejects_render_profile_change(monkeypatch, tmp_path):
         execution_spec=ExecutionSpec.capture(changed_profile),
         incremental=True,
         base_run_id=RUN_ID,
-        base_manifest=base,
         render_profile=changed_profile,
     )
 
-    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
 
     assert state.rendered is False
     assert state.artifact is None
@@ -216,11 +213,10 @@ def test_incremental_rejects_code_change(monkeypatch, tmp_path):
         execution_spec=ExecutionSpec.capture(profile),
         incremental=True,
         base_run_id=RUN_ID,
-        base_manifest=base,
         render_profile=profile,
     )
 
-    Orchestrator()._apply_incremental_for_scene(ctx, 1, state)
+    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
 
     assert state.rendered is False
     assert ctx.scenes_to_render == [1]

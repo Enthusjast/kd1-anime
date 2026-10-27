@@ -183,9 +183,13 @@ class BatchProcessor:
             if self.config.incremental and task.task_id in self.config.base_run_ids:
                 # 增量渲染模式
                 base_run_id = self.config.base_run_ids[task.task_id]
+                from kd1_anime.run_store import RunRepository
+
+                base_manifest = RunRepository(settings.WORKSPACE_DIR).load_for_resume(base_run_id)
                 run_kwargs = {
                     "dry_run": self.config.dry_run,
                     "output_path": output_path,
+                    "base_manifest": base_manifest,
                 }
                 if self.config.backend is not None:
                     run_kwargs["backend"] = self.config.backend

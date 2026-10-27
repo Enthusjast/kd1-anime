@@ -272,6 +272,11 @@ def test_execution_fsm_rejects_unapproved_stage_changes():
     with pytest.raises(ValueError):
         validate_scene_transition("coded", "monitoring", revised=False)
     validate_scene_transition("visual_accepted", "coded", revised=True)
+    with pytest.raises(ValueError):
+        validate_scene_transition("reviewed", "rendered", revised=False)
+    validate_scene_transition("reviewed", "rendered", revised=False, reused=True)
+    with pytest.raises(ValueError):
+        validate_scene_transition("coded", "rendered", revised=False, reused=True)
 
 
 def test_pending_submission_cannot_be_automatically_resubmitted(tmp_path):

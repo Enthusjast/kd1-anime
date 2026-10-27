@@ -20,9 +20,16 @@ from pydantic import ConfigDict, Field, PrivateAttr, create_model, field_validat
 from kd1_anime.cluster.resource_estimator import RenderResourceProfile
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import GenerationMode, resolve_runtime_path, settings
+from kd1_anime.domain.candidates import CodeCandidate
 from kd1_anime.domain.capability import CapabilityContract
 from kd1_anime.domain.dependencies import DependencyGraph
-from kd1_anime.domain.execution import RETRY_LIMIT_NAMES, RunPhase, StageAttempts, SubmissionAttempt
+from kd1_anime.domain.execution import (
+    RETRY_LIMIT_NAMES,
+    FSMState,
+    RunPhase,
+    StageAttempts,
+    SubmissionAttempt,
+)
 from kd1_anime.domain.planning import (
     ContinuityBible,
     ElementManifest,
@@ -32,7 +39,8 @@ from kd1_anime.domain.planning import (
     ScenePlan,
     TeachingGraph,
 )
-from kd1_anime.domain.runtime import ExecutionSpec, RunConfig
+from kd1_anime.domain.runtime import ExecutionSpec, RunConfig, VisualEvalProfile
+from kd1_anime.domain.scene_fields import SCENE_STORAGE_FIELDS
 from kd1_anime.domain.state_ledger import StateLedger
 from kd1_anime.domain.technical import TechnicalSpec
 from kd1_anime.models import ValidatedModel as BaseModel
@@ -65,137 +73,6 @@ RESUME_LLM_STATES = frozenset(
     }
 )
 RunStatus = Literal["running", "interrupted", "failed", "completed", "dry_run_complete"]
-FSMState = Literal[
-    "INIT",
-    "PLANNING",
-    "DETAILING",
-    "PLAN_REVIEWING",
-    "CODING",
-    "REVIEWING",
-    "DISPATCHING",
-    "MONITORING",
-    "FIXING",
-    "VISUAL_EVALUATING",
-    "MERGING",
-    "EVALUATING",
-    "DONE",
-    "ERROR",
-]
-
-# 顶层状态机的可观察转移表。场景线程可以在同一检查点附近并发完成，
-# 因此它只用于诊断和恢复校验，不作为拒绝并发检查点的硬闸门；真正的
-# 终态一致性仍由 RunManifest.integrity_errors() 负责。
-FSM_TRANSITIONS: dict[str, frozenset[str]] = {
-    "INIT": frozenset({"PLANNING", "ERROR"}),
-    "PLANNING": frozenset({"PLANNING", "DETAILING", "PLAN_REVIEWING", "CODING", "ERROR"}),
-    "DETAILING": frozenset({"DETAILING", "PLAN_REVIEWING", "CODING", "REVIEWING", "ERROR"}),
-    "PLAN_REVIEWING": frozenset({"PLAN_REVIEWING", "DETAILING", "CODING", "REVIEWING", "ERROR"}),
-    "CODING": frozenset({"CODING", "REVIEWING", "DISPATCHING", "PLAN_REVIEWING", "ERROR"}),
-    "REVIEWING": frozenset(
-        {
-            "REVIEWING",
-            "CODING",
-            "DISPATCHING",
-            "FIXING",
-            "DETAILING",
-            "PLAN_REVIEWING",
-            "ERROR",
-        }
-    ),
-    "DISPATCHING": frozenset(
-        {
-            "DISPATCHING",
-            "MONITORING",
-            "MERGING",
-            "DETAILING",
-            "PLAN_REVIEWING",
-            "CODING",
-            "REVIEWING",
-            "ERROR",
-        }
-    ),
-    "MONITORING": frozenset(
-        {
-            "MONITORING",
-            "FIXING",
-            "DISPATCHING",
-            "MERGING",
-            "DETAILING",
-            "PLAN_REVIEWING",
-            "CODING",
-            "REVIEWING",
-            "ERROR",
-        }
-    ),
-    "FIXING": frozenset(
-        {
-            "FIXING",
-            "REVIEWING",
-            "CODING",
-            "MONITORING",
-            "DISPATCHING",
-            "DETAILING",
-            "PLAN_REVIEWING",
-            "ERROR",
-        }
-    ),
-    "VISUAL_EVALUATING": frozenset(
-        {
-            "VISUAL_EVALUATING",
-            "CODING",
-            "DETAILING",
-            "PLAN_REVIEWING",
-            "REVIEWING",
-            "MERGING",
-            "ERROR",
-        }
-    ),
-    "MERGING": frozenset(
-        {"MERGING", "EVALUATING", "DETAILING", "PLAN_REVIEWING", "CODING", "ERROR"}
-    ),
-    "EVALUATING": frozenset(
-        {"EVALUATING", "CODING", "DETAILING", "PLAN_REVIEWING", "MERGING", "DONE", "ERROR"}
-    ),
-    # DONE -> coding/reviewing 等是为“dry-run 失败后显式 resume”保留的恢复边，
-    # 已完成正式运行仍会在 resume 入口先校验并直接返回，不会走这条边。
-    "DONE": frozenset(
-        {
-            "DONE",
-            "DETAILING",
-            "CODING",
-            "PLAN_REVIEWING",
-            "REVIEWING",
-            "DISPATCHING",
-            "ERROR",
-        }
-    ),
-    "ERROR": frozenset(
-        {
-            "ERROR",
-            "INIT",
-            "PLANNING",
-            "DETAILING",
-            "PLAN_REVIEWING",
-            "CODING",
-            "REVIEWING",
-            "DISPATCHING",
-            "MONITORING",
-            "FIXING",
-            "VISUAL_EVALUATING",
-            "MERGING",
-            "EVALUATING",
-            "DONE",
-        }
-    ),
-}
-
-
-def is_valid_fsm_transition(previous_state: str, current_state: str) -> bool:
-    """判断两个顶层检查点状态是否存在已知转移。"""
-
-    if previous_state == current_state:
-        return True
-    return current_state in FSM_TRANSITIONS.get(previous_state, frozenset())
 
 
 ScenePhase = Literal[
@@ -224,7 +101,6 @@ VisualStatus = Literal[
 ]
 TechnicalStatus = Literal["pending", "generating", "passed", "failed"]
 LocalSmokeStatus = Literal["pending", "running", "passed", "failed", "skipped"]
-CandidateVerification = Literal["validated", "smoke", "rendered"]
 
 
 def utc_now() -> datetime:
@@ -265,26 +141,6 @@ class StoredSlurmJob(BaseModel):
     environment_warning: str = Field(default="", max_length=2_000)
 
 
-class VisualEvalProfile(BaseModel):
-    """持久化的非敏感视觉评估策略；API Key 和端点不写入运行清单。"""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    enabled: bool = False
-    model: str = Field(default="", max_length=300)
-    frame_count: int = Field(default=6, ge=1, le=8)
-    threshold: float = Field(default=3.5, ge=1.0, le=5.0)
-    max_fix_attempts: int = Field(default=2, ge=0, le=5)
-    # 本次运行是否允许视觉评估驱动 Planner/Coder 修复；旧清单默认保持
-    # strict 兼容，由 Orchestrator 再结合 generation_mode 和配置判定。
-    repair_enabled: bool = True
-    evaluator_version: Literal["1"] = "1"
-
-    def digest(self) -> str:
-        payload = self.model_dump_json(exclude_none=False)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 class StoredVisualCandidate(BaseModel):
     """可在视觉修复失败时恢复的、完整且经过验证的场景候选。"""
 
@@ -305,22 +161,6 @@ class StoredVisualCandidate(BaseModel):
     exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
     report_file: str
     report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-
-class StoredCodeCandidate(BaseModel):
-    """场景可回滚的代码候选；代码本体保存在 run 内私有文件。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    code_file: str
-    code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    class_name: str = Field(min_length=1, max_length=200)
-    verification: CandidateVerification = "validated"
-    inherited_elements_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
-    exported_elements_code: str = Field(default="", max_length=30_000)
-    exported_elements: list[ExtractedElement] = Field(default_factory=list, max_length=100)
-    artifact: SceneArtifact | None = None
-    visual_score: float | None = Field(default=None, ge=1.0, le=5.0)
 
 
 class StoredSceneState(BaseModel):
@@ -439,37 +279,13 @@ class StoredSceneState(BaseModel):
     visual_artifact_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     visual_feedback: str = Field(default="", max_length=20_000)
     visual_best_candidate: StoredVisualCandidate | None = None
-    candidates: list[StoredCodeCandidate] = Field(default_factory=list, max_length=3)
+    candidates: list[CodeCandidate] = Field(default_factory=list, max_length=3)
 
 
 def scene_field_group(name: str) -> str:
-    if name == "plan" or name.startswith(("plan_", "technical_", "capability_")):
-        return "planning"
-    if "verification" in name or name.startswith(("visual_", "local_smoke")):
-        return "verification"
-    if name in {
-        "submission",
-        "submission_attempts",
-        "slurm_job",
-        "artifact",
-        "rendered",
-        "fix_attempts",
-        "infra_retries",
-        "stage_attempts",
-        "resource_profile",
-    } or name.startswith(("last_", "identical_error", "stagnant_")):
-        return "execution"
-    if name in {
-        "revision",
-        "input_sha256",
-        "phase",
-        "failed",
-        "give_up",
-        "failure_reason",
-        "failure_category",
-    }:
-        return "lifecycle"
-    return "code"
+    """Return the explicit v10 group; unknown storage fields fail closed."""
+
+    return SCENE_STORAGE_FIELDS[name].snapshot_group
 
 
 # Each nested group uses the exact validated field schemas of the compatibility

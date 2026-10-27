@@ -17,7 +17,6 @@ from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from copy import deepcopy
 from datetime import datetime
-from enum import Enum, auto
 from pathlib import Path
 from uuid import uuid4
 
@@ -105,18 +104,20 @@ from kd1_anime.cluster.slurm import (
 from kd1_anime.commits import CommitCommand, restore_snapshot
 from kd1_anime.config import GenerationMode, settings
 from kd1_anime.control import RunControl
+from kd1_anime.domain.candidates import CodeCandidate
 from kd1_anime.domain.dependencies import StaleWorkError, WorkIdentity
 from kd1_anime.domain.dependencies import digest as dependency_digest
 from kd1_anime.domain.diagnostics import diagnostic_from_plan_issue
 from kd1_anime.domain.execution import (
     RETRY_LIMIT_NAMES,
     StageAttempts,
+    State,
     SubmissionAttempt,
     transition_run,
     validate_scene_transition,
 )
 from kd1_anime.domain.plan_review import ContinuityIssue, PlanReviewIssue, PlanReviewResult
-from kd1_anime.domain.runtime import ExecutionSpec
+from kd1_anime.domain.runtime import ExecutionSpec, VisualEvalProfile
 from kd1_anime.domain.state import PipelineContext, RunPaths, SceneState, VisualCandidate
 from kd1_anime.domain.state_ledger import LedgerElement, StateLedger, validate_boundary_handoff
 from kd1_anime.events import CallbackAdapter, PipelineEvent
@@ -125,7 +126,6 @@ from kd1_anime.exceptions import (
     LLMResponseError,
     PipelineError,
     RunError,
-    RunNotFoundError,
     ValidationError,
 )
 from kd1_anime.logging import get_logger
@@ -153,10 +153,8 @@ from kd1_anime.run_store import (
     MANIFEST_SCHEMA_VERSION,
     RunManifest,
     RunRepository,
-    StoredCodeCandidate,
     StoredSceneState,
     StoredVisualCandidate,
-    VisualEvalProfile,
     atomic_write_json,
     atomic_write_text,
     get_reusable_video_path,
@@ -263,25 +261,14 @@ RETRYABLE_INFRA_STATES = {
 FIXABLE_RENDER_STATES = {"FAILED", "TIMEOUT", "OUT_OF_MEMORY", "RUN_TIMEOUT"}
 
 
-class State(Enum):
-    INIT = auto()
-    PLANNING = auto()
-    DETAILING = auto()
-    PLAN_REVIEWING = auto()
-    CODING = auto()
-    REVIEWING = auto()
-    DISPATCHING = auto()
-    MONITORING = auto()
-    FIXING = auto()
-    VISUAL_EVALUATING = auto()
-    MERGING = auto()
-    EVALUATING = auto()  # 新增：评估状态
-    DONE = auto()
-    ERROR = auto()
-
-
 class Orchestrator:
-    def __init__(self, resource_coordinator: ResourceCoordinator | None = None) -> None:
+    def __init__(
+        self,
+        resource_coordinator: ResourceCoordinator | None = None,
+        *,
+        base_manifest: RunManifest | None = None,
+    ) -> None:
+        self._base_manifest = base_manifest
         self.planner = PlannerAgent()
         self.slurm = create_render_backend()
         self._backend_name: RenderBackendName = settings.RENDER_BACKEND
@@ -1367,7 +1354,10 @@ class Orchestrator:
                 phase = self._scene_phase(scene)
                 if previous is not None:
                     validate_scene_transition(
-                        previous.phase, phase, revised=revision > previous.revision
+                        previous.phase,
+                        phase,
+                        revised=revision > previous.revision,
+                        reused=scene.artifact is not None and scene.artifact.origin == "reused",
                     )
                 if scene.slurm_job is not None and not scene.slurm_job.execution_sha256:
                     scene.slurm_job.execution_sha256 = ctx.execution_spec.digest()
@@ -1626,12 +1616,12 @@ class Orchestrator:
 
     @staticmethod
     def _restore_code_candidates(
-        candidates: list[StoredCodeCandidate],
+        candidates: list[CodeCandidate],
         root: Path,
-    ) -> list[StoredCodeCandidate]:
+    ) -> list[CodeCandidate]:
         """只恢复代码文件和哈希均匹配的回滚候选。"""
 
-        restored: list[StoredCodeCandidate] = []
+        restored: list[CodeCandidate] = []
         for candidate in candidates[-3:]:
             try:
                 path = restore_run_path(root, candidate.code_file)
@@ -1937,9 +1927,6 @@ class Orchestrator:
             rag_receipts=dict(getattr(manifest, "rag_receipts", {})),
             rag_warnings=list(getattr(manifest, "rag_warnings", [])),
         )
-        if manifest.incremental and manifest.base_run_id:
-            context.base_manifest = RunRepository(settings.WORKSPACE_DIR).load(manifest.base_run_id)
-            context.base_manifest.validate_for_resume()
         if context.expected_final_duration is None and context.outlines:
             transition = effective_transition_duration(
                 (item.duration_seconds for item in context.outlines), context.merge_profile
@@ -2035,15 +2022,14 @@ class Orchestrator:
         approve_plan: bool = False,
         smoke: bool = False,
         backend: RenderBackendName | None = None,
+        *,
+        base_manifest: RunManifest,
     ) -> Path | None:
         """增量渲染：只重新渲染受 prompt 变化影响的场景。"""
-        # 加载基础运行的 manifest
-        repository = RunRepository(settings.WORKSPACE_DIR)
-        try:
-            base_manifest = repository.load(base_run_id)
-        except (OSError, ValueError) as exc:
-            raise RunNotFoundError(f"无法加载基础运行 {base_run_id}: {exc}") from exc
         base_manifest.validate_for_resume()
+        if base_manifest.run_id != base_run_id:
+            raise ValueError("基础运行标识与应用层加载的清单不一致")
+        self._base_manifest = base_manifest
 
         # 入口先校验配置；真实模型探测在建立请求账本后进行并计入预算。
         settings.require_llm_key()
@@ -2084,7 +2070,6 @@ class Orchestrator:
             incremental=True,
             approve_plan=approve_plan,
             base_run_id=base_run_id,
-            base_manifest=base_manifest,
             paths=RunPaths.create(output_path),
             visual_eval_profile=self._configured_visual_profile(
                 enabled=settings.ENABLE_VISUAL_EVAL and not dry_run,
@@ -2275,6 +2260,8 @@ class Orchestrator:
         callback: Callback | None = None,
         interactive: bool = False,
         retry_scene_id: int | None = None,
+        *,
+        base_manifest: RunManifest | None = None,
     ) -> Path | None:
         """从原子清单恢复，不重新提交仍有 Job ID 的场景。"""
 
@@ -2285,6 +2272,11 @@ class Orchestrator:
         if not repository.manifest_path(run_id).is_file():
             raise FileNotFoundError(f"找不到运行清单: {run_id}")
         initial_manifest = repository.load_for_resume(run_id)
+        if initial_manifest.incremental and initial_manifest.base_run_id:
+            if base_manifest is None or base_manifest.run_id != initial_manifest.base_run_id:
+                raise ValueError("恢复增量运行需要应用层加载匹配的基础清单")
+            base_manifest.validate_for_resume()
+        self._base_manifest = base_manifest
         with lock_run(root), initial_manifest.run_config.activate():
             manifest = repository.load_for_resume(run_id)
             self._set_backend(getattr(manifest, "backend", "slurm"))
@@ -7667,10 +7659,9 @@ class Orchestrator:
             with self._state_lock:
                 state.reviewed = True
                 self._mark_static_verification(state, status="passed")
-                if not defer_continuity_commit:
-                    self._apply_incremental_for_scene(ctx, scene_id, state)
-                    if state.rendered:
-                        self._update_state_ledger(ctx, state)
+                self._apply_incremental_for_scene(ctx, scene_id, state)
+                if not defer_continuity_commit and state.rendered:
+                    self._update_state_ledger(ctx, state)
                 self._checkpoint(ctx, State.REVIEWING)
             self._emit("scene_review_skipped", scene_id=scene_id)
             if state.rendered and state.artifact and state.artifact.origin == "reused":
@@ -7760,6 +7751,11 @@ class Orchestrator:
                 allow_relaxed_soft_pass=not deterministic_review_error,
                 defer_continuity_commit=defer_continuity_commit,
             )
+            if defer_continuity_commit and state.reviewed:
+                # Artifact reuse is a per-scene decision and must precede submit;
+                # shared continuity ledgers still publish at the ordered barrier.
+                self._apply_incremental_for_scene(ctx, scene_id, state)
+                self._checkpoint(ctx, State.REVIEWING)
 
     @scene_span("dispatching")
     def _scene_submit(self, ctx: PipelineContext, scene_id: int, state: SceneState) -> None:
@@ -8180,7 +8176,7 @@ class Orchestrator:
         state.stagnant_repair_count = 0
 
     @staticmethod
-    def _candidate_rank(candidate: StoredCodeCandidate) -> tuple[int, float]:
+    def _candidate_rank(candidate: CodeCandidate) -> tuple[int, float]:
         from kd1_anime.services.policies import candidate_rank
 
         return candidate_rank(candidate)
@@ -8208,7 +8204,7 @@ class Orchestrator:
         )
         if existing is None:
             state.candidates.append(
-                StoredCodeCandidate(
+                CodeCandidate(
                     code_file=candidate_path.relative_to(ctx.paths.root).as_posix(),
                     code_sha256=code_hash,
                     class_name=state.class_name,
@@ -8222,7 +8218,7 @@ class Orchestrator:
             )
         else:
             if self._candidate_rank(
-                StoredCodeCandidate(
+                CodeCandidate(
                     code_file=existing.code_file,
                     code_sha256=existing.code_sha256,
                     class_name=existing.class_name,
@@ -8251,7 +8247,7 @@ class Orchestrator:
         self,
         ctx: PipelineContext,
         state: SceneState,
-    ) -> StoredCodeCandidate | None:
+    ) -> CodeCandidate | None:
         """返回当前代码之外的、可验证的最高等级成功候选。"""
 
         current_hash = sha256_text(state.code) if state.code else ""
@@ -9386,9 +9382,12 @@ class Orchestrator:
         self, ctx: PipelineContext, scene_id: int, state: SceneState
     ) -> None:
         """Review 通过后，按代码与渲染配置身份安全复用旧产物。"""
-        if not ctx.incremental or not ctx.base_manifest or not ctx.base_run_id:
+        base_manifest = self._base_manifest
+        if state.rendered or not ctx.incremental or base_manifest is None or not ctx.base_run_id:
             return
-        base_scene = ctx.base_manifest.scenes.get(scene_id)
+        if base_manifest.run_id != ctx.base_run_id:
+            raise ValueError("增量输入的基础运行身份不一致")
+        base_scene = base_manifest.scenes.get(scene_id)
         if base_scene is None:
             ctx.scenes_to_render.append(scene_id)
             return
@@ -9406,7 +9405,7 @@ class Orchestrator:
             and ctx.execution_spec.matches_environment(artifact.environment_fingerprint)
         ):
             base_root = RunRepository(settings.WORKSPACE_DIR).run_root(ctx.base_run_id)
-            old_video = get_reusable_video_path(ctx.base_manifest, scene_id, base_root)
+            old_video = get_reusable_video_path(base_manifest, scene_id, base_root)
             if old_video:
                 try:
                     if (

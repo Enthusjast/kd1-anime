@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import time
+from dataclasses import fields
 from pathlib import Path
 
 from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.cluster.slurm import SlurmJob
 from kd1_anime.config import settings
+from kd1_anime.domain import state as state_module
+from kd1_anime.domain.scene_fields import SCENE_FIELDS, SCENE_GROUPS
+from kd1_anime.domain.state import (
+    CodeRevisionState,
+    ExecutionState,
+    LifecycleState,
+    PlanningState,
+    VerificationState,
+)
 from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
 from kd1_anime.rendering import RenderProfile
 from kd1_anime.run_store import RunManifest, RunRepository, StoredSceneState, write_manifest
@@ -152,3 +163,47 @@ def test_local_resume_preserves_unconfirmed_job_and_blocks_resubmission(
     assert restored.failed and restored.give_up
     assert "禁止自动重提" in restored.failure_reason
     assert captured["state"] is State.MONITORING
+
+
+def test_scene_metadata_covers_each_runtime_field_once():
+    groups = {
+        "planning": PlanningState,
+        "code_revision": CodeRevisionState,
+        "execution": ExecutionState,
+        "verification": VerificationState,
+        "lifecycle": LifecycleState,
+    }
+    assert tuple(groups) == SCENE_GROUPS
+    expected = {item.name: group for group, model in groups.items() for item in fields(model)}
+    assert len(expected) == sum(len(fields(model)) for model in groups.values())
+    assert {name: metadata.domain_group for name, metadata in SCENE_FIELDS.items()} == expected
+    scene = SceneState(plan=make_plan())
+    for name, metadata in SCENE_FIELDS.items():
+        assert getattr(scene, name) is getattr(getattr(scene, metadata.domain_group), name)
+    scene.review_round = 2
+    assert scene.code_revision.review_round == 2
+
+
+def test_scene_state_rejects_unknown_compatibility_fields():
+    import pytest
+
+    with pytest.raises(TypeError, match="Unknown scene state field"):
+        SceneState(plan=make_plan(), invented_field=True)
+    scene = SceneState(plan=make_plan())
+    with pytest.raises(AttributeError, match="invented_field"):
+        scene.invented_field = True
+    with pytest.raises(AttributeError, match="invented_field"):
+        _ = scene.invented_field
+
+
+def test_domain_has_no_storage_imports_or_incremental_manifest():
+    domain_root = Path(state_module.__file__).parent
+    forbidden = {"run_store", "kd1_anime.run_store"}
+    for source in domain_root.rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert node.module not in forbidden, source
+            elif isinstance(node, ast.Import):
+                assert not any(alias.name in forbidden for alias in node.names), source
+    assert "base_manifest" not in {item.name for item in fields(PipelineContext)}
