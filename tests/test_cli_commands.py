@@ -4,7 +4,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from kd1_anime.agents.planner import LessonSpec, ScenePlan, TeachingGraph
+from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.cli import _manifest_requires_generation_apis, _print_comparison, app
 from kd1_anime.config import settings
 from kd1_anime.eval.metrics import ComparisonResult, EvalResult
@@ -139,21 +139,18 @@ def test_generate_resume_does_not_require_a_dummy_prompt(monkeypatch, tmp_path):
     assert "output_final.mp4" in result.output
 
 
-def test_global_dry_run_is_forwarded_to_generate(monkeypatch, tmp_path):
-    import kd1_anime.orchestrator as orchestrator_module
+def test_global_dry_run_reports_completion_without_video(monkeypatch):
+    import kd1_anime.application as application_module
 
     monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
     calls = []
 
-    class FakeOrchestrator:
-        def __init__(self):
-            pass
-
-        def run(self, prompt, *, dry_run=False):
+    class FakeApplication:
+        def generate(self, prompt, *, dry_run=False):
             calls.append((prompt, dry_run))
             return None
 
-    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(application_module, "Application", FakeApplication)
     monkeypatch.setattr(settings, "LLM_API_KEY", "key")
     monkeypatch.setattr(settings, "LLM_MODEL", "model")
 
@@ -161,19 +158,21 @@ def test_global_dry_run_is_forwarded_to_generate(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert calls == [("demo", True)]
+    assert "Dry-run 完成" in result.output
+    assert "输出文件" not in result.output
 
 
 def test_generate_strict_flag_overrides_configured_generation_mode(monkeypatch):
-    import kd1_anime.orchestrator as orchestrator_module
+    import kd1_anime.application as application_module
 
     calls = []
 
-    class FakeOrchestrator:
-        def run(self, prompt, *, dry_run=False):
+    class FakeApplication:
+        def generate(self, prompt, *, dry_run=False):
             calls.append((prompt, dry_run, settings.GENERATION_MODE))
             return None
 
-    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(application_module, "Application", FakeApplication)
     monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
     monkeypatch.setattr(settings, "LLM_API_KEY", "key")
     monkeypatch.setattr(settings, "LLM_MODEL", "model")
@@ -183,27 +182,6 @@ def test_generate_strict_flag_overrides_configured_generation_mode(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert calls == [("demo", True, "strict")]
-
-
-def test_generate_smoke_is_forwarded_to_orchestrator(monkeypatch):
-    import kd1_anime.orchestrator as orchestrator_module
-
-    calls = []
-
-    class FakeOrchestrator:
-        def run(self, prompt, *, dry_run=False, smoke=False):
-            calls.append((prompt, dry_run, smoke))
-            return None
-
-    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
-    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
-    monkeypatch.setattr(settings, "LLM_API_KEY", "key")
-    monkeypatch.setattr(settings, "LLM_MODEL", "model")
-
-    result = CliRunner().invoke(app, ["generate", "demo", "--dry-run", "--smoke"])
-
-    assert result.exit_code == 0, result.output
-    assert calls == [("demo", True, True)]
 
 
 def test_generate_exits_before_pipeline_when_healthcheck_fails(monkeypatch):
@@ -218,6 +196,36 @@ def test_generate_exits_before_pipeline_when_healthcheck_fails(monkeypatch):
     result = CliRunner().invoke(app, ["generate", "demo", "--dry-run"])
 
     assert result.exit_code == 1
+
+
+@pytest.mark.parametrize("command", ["generate", "plan"])
+@pytest.mark.parametrize(
+    ("failure", "exit_code", "message"),
+    [
+        (RuntimeError("endpoint [offline]"), 1, "endpoint [offline]"),
+        (KeyboardInterrupt(), 130, "用户中断"),
+    ],
+)
+def test_generation_commands_report_failure_and_cancellation(
+    monkeypatch, command, failure, exit_code, message
+):
+    class FailingApplication:
+        def generate(self, prompt, **kwargs):
+            raise failure
+
+        def plan_only(self, prompt, **kwargs):
+            raise failure
+
+    monkeypatch.setattr("kd1_anime.application.Application", FailingApplication)
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
+    monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", lambda **kwargs: None)
+
+    result = CliRunner().invoke(app, [command, "demo"])
+
+    assert result.exit_code == exit_code, result.output
+    assert message in result.output
+    assert "成功" not in result.output
+    assert "场景规划结果" not in result.output
 
 
 def test_evaluate_image_enables_visual_evaluation_by_default(monkeypatch, tmp_path):
@@ -292,18 +300,15 @@ def test_evaluate_scene_id_uses_visual_scene_artifact_path(monkeypatch):
 
 
 def test_generate_does_not_clear_configured_overwrite_setting(monkeypatch):
-    import kd1_anime.orchestrator as orchestrator_module
+    import kd1_anime.application as application_module
 
     monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", lambda: None)
 
-    class FakeOrchestrator:
-        def __init__(self):
-            pass
-
-        def run(self, prompt, *, dry_run=False):
+    class FakeApplication:
+        def generate(self, prompt, *, dry_run=False):
             return None
 
-    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(application_module, "Application", FakeApplication)
     monkeypatch.setattr(settings, "LLM_API_KEY", "key")
     monkeypatch.setattr(settings, "LLM_MODEL", "model")
     monkeypatch.setattr(settings, "OVERWRITE_OUTPUT", True)
@@ -396,7 +401,7 @@ def test_resume_preflight_includes_auto_fix_after_monitoring():
 
 
 def test_generate_resume_uses_manifest_dry_run_for_completion_message(monkeypatch, tmp_path):
-    import kd1_anime.orchestrator as orchestrator_module
+    import kd1_anime.application as application_module
 
     run_id = "20260728-120000-1234abcd"
     root = tmp_path / "runs" / run_id
@@ -439,12 +444,12 @@ def test_generate_resume_uses_manifest_dry_run_for_completion_message(monkeypatc
     write_manifest(root / "manifest.json", manifest)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
 
-    class FakeOrchestrator:
+    class FakeApplication:
         def resume(self, requested_run_id, *, interactive=False):
             assert requested_run_id == run_id
             return None
 
-    monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(application_module, "Application", FakeApplication)
 
     result = CliRunner().invoke(app, ["generate", "--resume", run_id])
 
@@ -684,6 +689,16 @@ def test_plan_command_reviews_generated_plans(monkeypatch):
 
 
 def test_plan_command_exports_structured_plan(monkeypatch, tmp_path):
+    from kd1_anime.agents.planner import ContinuityBible, SceneOutline
+    from kd1_anime.run_store import RunRepository
+
+    outline = SceneOutline(
+        scene_id=1,
+        title="圆",
+        duration_seconds=10,
+        purpose="展示圆",
+        math_concept="圆的面积",
+    )
     plan = ScenePlan(
         scene_id=1,
         title="圆",
@@ -697,28 +712,36 @@ def test_plan_command_exports_structured_plan(monkeypatch, tmp_path):
         computation="半径=1",
     )
 
-    class FakeContext:
-        user_prompt = "解释圆"
-        lesson_spec = LessonSpec(topic="圆")
-        teaching_graph = TeachingGraph()
-        continuity_bible = None
-        paths = type("FakePaths", (), {"run_id": "20260829-120000-1234abcd"})()
+    class FakePlanner:
+        def plan_outline(self, prompt, **kwargs):
+            return [outline]
 
-    class FakeOrchestrator:
-        def __init__(self):
-            self._ctx = FakeContext()
+        def plan_continuity_bible(self, prompt, outlines, **kwargs):
+            return ContinuityBible()
 
-        def plan_only(self, prompt, **kwargs):
-            return [plan]
+        def plan_detail(self, outline, outlines, prompt, **kwargs):
+            return plan
 
     monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", lambda **kwargs: None)
-    # cli 在命令函数内部导入 Orchestrator，因此替换其模块绑定。
-    monkeypatch.setattr("kd1_anime.orchestrator.Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr("kd1_anime.orchestrator.PlannerAgent", FakePlanner)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path / "workspace")
     output = tmp_path / "plan.json"
 
-    result = CliRunner().invoke(app, ["plan", "解释圆", "--output", str(output)])
+    result = CliRunner().invoke(
+        app,
+        ["plan", "解释圆", "--no-review", "--output", str(output)],
+    )
 
     assert result.exit_code == 0, result.output
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
     assert payload["items"][0]["title"] == "圆"
+    assert payload["user_prompt"] == "解释圆"
+    manifest = RunRepository(settings.WORKSPACE_DIR).load(payload["run_id"])
+    assert payload["lesson_spec"] == manifest.lesson_spec.model_dump(mode="json")
+    assert payload["teaching_graph"] == manifest.teaching_graph.model_dump(mode="json")
+    assert payload["continuity_bible"] == manifest.continuity_bible.model_dump(mode="json")
+    assert payload["items"] == [
+        scene.plan.model_dump(mode="json") for scene in manifest.scenes.values()
+    ]
+    assert "预览模式，未执行计划审查" in result.output

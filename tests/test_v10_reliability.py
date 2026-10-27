@@ -747,7 +747,8 @@ def test_incomplete_or_different_environment_refuses_reuse_and_preserves_video(
     from kd1_anime.rendering import RenderProfile
 
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
-    profile = RenderProfile.current()
+    # Exercise a known version mismatch even when Manim is not installed on the test host.
+    profile = RenderProfile.current().model_copy(update={"manim_version": "0.20.1"})
     base, video = make_base(tmp_path, profile)
     original = video.read_bytes()
     artifact = base.scenes[1].artifact

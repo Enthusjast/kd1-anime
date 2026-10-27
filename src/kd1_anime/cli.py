@@ -463,16 +463,16 @@ def generate(
         console.print(f"[bold red]错误:[/] {e}", markup=False)
         raise typer.Exit(1) from e
 
-    from kd1_anime.orchestrator import Orchestrator
+    from kd1_anime.application import Application
 
-    orchestrator = Orchestrator()
+    application = Application()
     try:
         if resume:
             console.print(f"[cyan]恢复运行[/] {resume}")
-            final_video = orchestrator.resume(resume, interactive=True)
+            final_video = application.resume(resume, interactive=True)
         elif plan_file:
             console.print(f"[cyan]从计划文件继续[/] {plan_file}")
-            final_video = orchestrator.run_from_plan(
+            final_video = application.run_from_plan(
                 plan_file,
                 dry_run=dry_run,
                 output_path=output,
@@ -482,7 +482,7 @@ def generate(
             )
         elif incremental:
             console.print(f"[cyan]增量渲染模式[/] 基于运行: {incremental}")
-            final_video = orchestrator.run_incremental(
+            final_video = application.run_incremental(
                 prompt,
                 incremental,
                 dry_run=dry_run,
@@ -497,7 +497,7 @@ def generate(
                 run_kwargs["smoke"] = True
             if backend:
                 run_kwargs["backend"] = backend
-            final_video = orchestrator.run(prompt, **run_kwargs)
+            final_video = application.generate(prompt, **run_kwargs)
 
         if dry_run:
             console.print("\n[bold green]Dry-run 完成[/]")
@@ -554,33 +554,16 @@ def plan(
     _ensure_generation_apis(dry_run=True)
 
     try:
-        from kd1_anime.orchestrator import Orchestrator
+        from kd1_anime.application import Application
 
-        orchestrator = Orchestrator()
-        scenes = orchestrator.plan_only(
+        scenes = Application().plan_only(
             prompt,
             interactive=False,
             review=review,
             preflight=False,
+            export_path=output,
         )
-        context = orchestrator._ctx
-        if output is not None and context is not None:
-            from kd1_anime.run_store import atomic_write_json
-
-            payload = {
-                "schema_version": 1,
-                "run_id": context.paths.run_id,
-                "user_prompt": context.user_prompt,
-                "lesson_spec": context.lesson_spec.model_dump(mode="json"),
-                "teaching_graph": context.teaching_graph.model_dump(mode="json"),
-                "continuity_bible": (
-                    context.continuity_bible.model_dump(mode="json")
-                    if context.continuity_bible is not None
-                    else None
-                ),
-                "items": [scene.model_dump(mode="json") for scene in scenes],
-            }
-            atomic_write_json(output.expanduser().resolve(), payload)
+        if output is not None:
             console.print(f"结构化计划已导出: {output.expanduser().resolve()}", markup=False)
     except KeyboardInterrupt as e:
         console.print("\n[yellow]用户中断[/]")
@@ -623,7 +606,7 @@ def render(
 ):
     """直接提交单个 .py 文件到 Slurm 渲染 (跳过 pipeline)"""
     from kd1_anime.agents.validator import validate_manim_code
-    from kd1_anime.orchestrator import Orchestrator
+    from kd1_anime.application import Application
 
     sid = scene_id
     if backend and backend not in {"slurm", "local"}:
@@ -653,7 +636,7 @@ def render(
         )
         return
     try:
-        job, final_video, run_id = Orchestrator().submit_existing_scene(
+        job, final_video, run_id = Application().submit_existing_scene(
             source_code,
             selected_class,
             scene_id=sid,
@@ -878,9 +861,9 @@ def resume(
             )
         if force:
             settings.OVERWRITE_OUTPUT = True
-        from kd1_anime.orchestrator import Orchestrator
+        from kd1_anime.application import Application
 
-        final_video = Orchestrator().resume(run_id, interactive=interactive)
+        final_video = Application().resume(run_id, interactive=interactive)
     except typer.Exit:
         raise
     except KeyboardInterrupt as exc:
@@ -918,12 +901,12 @@ def retry(
                 model_override=manifest.visual_eval_profile.model,
                 endpoint_required=False,
             )
-        from kd1_anime.orchestrator import Orchestrator
+        from kd1_anime.application import Application
 
-        final_video = Orchestrator().resume(
+        final_video = Application().retry(
             run_id,
+            scene_id,
             interactive=interactive,
-            retry_scene_id=scene_id,
         )
     except typer.Exit:
         raise
