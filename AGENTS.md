@@ -77,7 +77,7 @@ Key invariants:
 19. A visual endpoint failure is `unknown`, never a fabricated low score or a reason to delete a valid render.
 20. Main/visual requests, probes, retries and compatibility fallbacks reserve and checkpoint their budget before dispatch; unknown outcomes still count.
 21. Resume/retry preserve request limits, reservations and retry counters. Incremental runs have independent budgets.
-22. Manifest v10 is executable; v4-v9 are read-only and must be rejected before probes, job access, run locking or file changes.
+22. Manifests v10 and v11 are executable by their respective runtimes; v4-v9 are read-only and must be rejected before probes, job access, run locking or file changes. Never switch runtimes for a run.
 23. Commit worker results only when their scene revision and complete input digest match; invalidate consumers by teaching, handoff or source dependencies.
 24. Persist a unique submission attempt before external submission and the returned Job ID immediately afterward. Uncertain submission or failed cancellation prohibits automatic resubmission.
 25. Slurm, local rendering and smoke use the same environment whitelist and container policy. Never adopt a local process by historical PID.
@@ -90,10 +90,14 @@ Key invariants:
 
 - `src/kd1_anime/cli.py`: Typer commands and installed package entry point.
 - `main.py`: thin source-tree compatibility launcher.
-- `src/kd1_anime/tui.py`: Rich + prompt_toolkit clarification UI and callback rendering.
+- `src/kd1_anime/tui.py`: Rich + prompt_toolkit clarification UI using public application and query APIs.
 - `src/kd1_anime/config.py`: validated pydantic-settings configuration.
-- `src/kd1_anime/orchestrator.py`: FSM, per-run paths, scene state, parallel LLM stages.
-- `src/kd1_anime/run_store.py`: v10 manifests, read-only legacy formats, atomic checkpoints, code hashes and run locks.
+- `src/kd1_anime/application.py`, `queries.py`: public execution, user decisions and read-only run/session projections.
+- `src/kd1_anime/agent_runtime/`: v11 action contracts, deterministic Policy, bounded loop, Session and durable tool lifecycle.
+- `src/kd1_anime/pipeline/`: immutable planning, scene, render, repair, recovery, incremental and finalization stages.
+- `src/kd1_anime/event_store.py`: v3 committed/ephemeral event sequences and replay.
+- `src/kd1_anime/orchestrator.py`: legacy v10 FSM, per-run paths and parallel stages.
+- `src/kd1_anime/run_store.py`: v10/v11 manifests, read-only older formats, atomic checkpoints, code hashes and run locks.
 - `src/kd1_anime/domain/`: planning, technical, review, execution, dependency, boundary and program contracts; old Agent paths re-export them.
 - `src/kd1_anime/commits.py`, `stage_transactions.py`, `objects.py`: isolated stage proposals, durable state commit and immutable objects.
 - `src/kd1_anime/control.py`, `scheduling.py`, `clients.py`: cancellation/deadlines, bounded workers and run-owned clients.
