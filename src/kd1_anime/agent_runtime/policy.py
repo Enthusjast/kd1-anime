@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Literal, Protocol, get_args
 
 from pydantic import Field, model_validator
 
@@ -76,6 +76,7 @@ class PolicySnapshot(RuntimeRecord):
     waiting_for_job: bool = False
     plan_only: bool = False
     dry_run: bool = False
+    recovery_epoch: int = Field(default=0, ge=0)
     allow_partial: bool = False
     now: datetime = Field(default_factory=utc_now)
 
@@ -132,6 +133,18 @@ class PolicySession(Protocol):
     grants: tuple[ApprovalGrant, ...]
 
 
+RECOVERY_ACTIONS = frozenset(
+    {
+        "retry_scene",
+        "cancel_render",
+        "reconcile_submission",
+        "reconcile_render",
+        "resume_run",
+        "reconcile_merge",
+    }
+)
+_RECOVERY_PHASES = frozenset(get_args(FSMState)) - {"DONE"}
+
 _PHASES: dict[str, frozenset[str]] = {
     "propose_plan": frozenset({"INIT", "PLANNING"}),
     "detail_scene": frozenset({"DETAILING"}),
@@ -156,7 +169,11 @@ _PHASES: dict[str, frozenset[str]] = {
     "smoke_scene": frozenset({"CODING", "REVIEWING", "FIXING"}),
     "submit_render": frozenset({"DISPATCHING"}),
     "poll_render": frozenset({"MONITORING"}),
-    "cancel_render": frozenset({"DISPATCHING", "MONITORING", "ERROR"}),
+    "cancel_render": _RECOVERY_PHASES,
+    "reconcile_submission": _RECOVERY_PHASES,
+    "reconcile_render": _RECOVERY_PHASES,
+    "resume_run": _RECOVERY_PHASES,
+    "reconcile_merge": _RECOVERY_PHASES,
     "propose_render_fix": frozenset({"FIXING"}),
     "propose_visual_fix": frozenset({"VISUAL_EVALUATING", "FIXING"}),
     "evaluate_visual": frozenset({"VISUAL_EVALUATING", "MONITORING"}),
@@ -164,7 +181,7 @@ _PHASES: dict[str, frozenset[str]] = {
     "merge_video": frozenset({"MERGING"}),
     "evaluate_run": frozenset({"EVALUATING"}),
     "reuse_scene": frozenset({"CODING", "REVIEWING", "DISPATCHING"}),
-    "retry_scene": frozenset({"ERROR", "FIXING"}),
+    "retry_scene": _RECOVERY_PHASES,
     "finish": frozenset({"EVALUATING"}),
     "fail": frozenset(set()),
 }
@@ -179,16 +196,19 @@ _SCENE_PHASES: dict[str, frozenset[str]] = {
     "smoke_scene": frozenset({"coded", "reviewed"}),
     "submit_render": frozenset({"reviewed"}),
     "poll_render": frozenset({"monitoring"}),
-    "cancel_render": frozenset({"monitoring"}),
+    "cancel_render": frozenset(
+        {"monitoring", "failed", "rendered", "visual_evaluating", "visual_accepted"}
+    ),
     "propose_render_fix": frozenset({"failed", "monitoring", "coded", "reviewed"}),
     "propose_visual_fix": frozenset({"visual_evaluating", "rendered", "visual_accepted"}),
-    "retry_scene": frozenset({"failed"}),
     "reuse_scene": frozenset({"pending", "detailed", "plan_reviewed", "reviewed"}),
 }
-_READ_ACTIONS = frozenset({"poll_render"})
+_READ_ACTIONS = frozenset({"poll_render", "reconcile_submission", "reconcile_render"})
 
 
 def required_permission(action: AgentAction) -> Permission:
+    if action.kind == "reconcile_merge":
+        return "exec"
     if action.kind == "submit_render":
         return "cluster" if action.backend == "slurm" else "exec"
     if action.kind == "cancel_render":
@@ -342,6 +362,8 @@ class Policy:
         resource = f"run:{action.run_id}"
         if action.scene_id is not None:
             resource += f"/scene:{action.scene_id}"
+        if action.recovery_epoch != snapshot.recovery_epoch:
+            return deny("stale_recovery_epoch")
         if action.run_id != snapshot.run_id or action.resource_id != resource:
             return deny("invalid_resource")
         if snapshot.run_id not in session.run_ids:
@@ -353,10 +375,9 @@ class Policy:
             and tool.side_effect != "external"
         ):
             return deny("tool_declaration_mismatch")
-        if snapshot.state in {"DONE", "ERROR"} and action.kind not in {
-            "retry_scene",
-            "cancel_render",
-        }:
+        if snapshot.state == "DONE" or (
+            snapshot.state == "ERROR" and action.kind not in RECOVERY_ACTIONS
+        ):
             return deny("terminal_state")
         if action.kind != "fail" and snapshot.state not in _PHASES[action.kind]:
             return deny("invalid_phase")

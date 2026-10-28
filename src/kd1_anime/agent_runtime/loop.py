@@ -9,7 +9,13 @@ from typing import Literal
 from pydantic import Field
 
 from kd1_anime.agent_runtime.contracts import ACTION_ADAPTER, AgentAction, RuntimeRecord
-from kd1_anime.agent_runtime.policy import Policy, PolicyBudget, PolicySession, PolicySnapshot
+from kd1_anime.agent_runtime.policy import (
+    RECOVERY_ACTIONS,
+    Policy,
+    PolicyBudget,
+    PolicySession,
+    PolicySnapshot,
+)
 from kd1_anime.agent_runtime.tools import ToolExecutor, action_signature
 
 
@@ -88,8 +94,16 @@ class AgentLoop:
             snapshot = self.snapshot()
             if snapshot.state == "DONE":
                 return LoopResult(status="DONE", reason="done", steps=steps)
+            recovery_action = None
             if snapshot.state == "ERROR":
-                return LoopResult(status="FAILED", reason="error_state", steps=steps)
+                try:
+                    recovery_action = self.next_action(snapshot)
+                except Exception:
+                    return LoopResult(
+                        status="FAILED", reason="invalid_action_proposal", steps=steps
+                    )
+                if recovery_action is None or recovery_action.kind not in RECOVERY_ACTIONS:
+                    return LoopResult(status="FAILED", reason="error_state", steps=steps)
             if snapshot.waiting_for_approval or snapshot.waiting_for_job:
                 reason = (
                     "waiting_for_approval" if snapshot.waiting_for_approval else "waiting_for_job"
@@ -104,7 +118,7 @@ class AgentLoop:
                 return LoopResult(status="BUDGET_EXHAUSTED", reason="budget_exhausted", steps=steps)
             session = self.session()
             try:
-                action = self.next_action(snapshot)
+                action = recovery_action or self.next_action(snapshot)
                 if action is None:
                     available = self.policy.available_tools(
                         snapshot, session, budget, self.executor.registry.policies

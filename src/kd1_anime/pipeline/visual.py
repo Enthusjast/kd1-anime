@@ -34,6 +34,7 @@ from kd1_anime.run_store import (
     restore_run_path,
     sha256_text,
 )
+from kd1_anime.services.dependencies import scene_work_digest
 from kd1_anime.services.policies import visual_repair_target
 from kd1_anime.services.visual_evaluation import (
     SceneVisualInput,
@@ -54,7 +55,10 @@ _PROPAGATE = (
 
 
 class VisualSceneOutput(RuntimeRecord):
+    """Return historical reuse authority only when restoring a verified best candidate."""
+
     scene: StoredSceneState
+    reuse_provenance: ObjectRef | None = None
     report: ObjectRef | None = None
     repair_route: VisualRoute = "none"
     feedback: str = ""
@@ -333,6 +337,8 @@ class VisualPipeline:
         scene.failure_reason = scene.failure_category = scene.rewrite_feedback = ""
         scene.exported_elements_code = candidate.exported_elements_code
         scene.exported_elements = list(candidate.exported_elements)
+        if inputs.context_sha256:
+            scene.input_sha256 = scene_work_digest(scene, inputs.context_sha256)
         code = _source(inputs, scene)
         inspection = self.acceptor.inspect_candidate(
             code,
@@ -349,11 +355,20 @@ class VisualPipeline:
         scene.exported_elements = list(inspection.exported_elements)
         scene.unknown_animation_detected = bool(inspection.unknown_animations)
         scene.unknown_animation_details = list(inspection.unknown_animations)[-30:]
-        validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
         reference = ObjectRef(
             path=candidate.report_file, sha256=candidate.report_sha256, kind="report"
         )
         report = verify_report(inputs, scene, reference)
+        # Only the candidate's immutable report can authorize historical reuse;
+        # the current typed receipt may already belong to a later code attempt.
+        reuse_provenance = None
+        if scene.artifact.origin == "reused":
+            try:
+                reuse_provenance = ObjectRef.model_validate(report.get("reuse_provenance"))
+            except (TypeError, ValueError) as exc:
+                raise VisualIdentityError(
+                    "Visual rollback lacks exact typed reuse provenance"
+                ) from exc
         result = report.get("result")
         if (
             not result
@@ -382,10 +397,18 @@ class VisualPipeline:
             artifact_sha256=scene.artifact.video_sha256,
             duration_seconds=scene.artifact.metadata.duration_seconds,
         )
+        validate_artifact(
+            inputs.root,
+            inputs.run_id,
+            scene,
+            inputs.render_profile,
+            provenance=reuse_provenance,
+        )
         self._checkpoint(context)
         return VisualSceneOutput(
             scene=scene,
             report=reference,
+            reuse_provenance=reuse_provenance,
             restored=True,
             feedback=feedback,
             visual_fix_attempts=scene.visual_fix_attempts,
@@ -425,7 +448,13 @@ class VisualPipeline:
         if not scene.rendered and scene.visual_best_candidate and (scene.failed or scene.give_up):
             return self._restore_best(inputs, context)
         _source(inputs)
-        video = validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+        video = validate_artifact(
+            inputs.root,
+            inputs.run_id,
+            scene,
+            inputs.render_profile,
+            provenance=inputs.reuse_provenance,
+        )
         if scene.visual_status == "needs_fix":
             reference = ObjectRef(
                 path=scene.visual_report_file, sha256=scene.visual_report_sha256, kind="report"
@@ -484,7 +513,13 @@ class VisualPipeline:
                 error = sanitize_record(str(exc) or type(exc).__name__, _secrets())
             self._checkpoint(context)
             _source(inputs)
-            validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+            validate_artifact(
+                inputs.root,
+                inputs.run_id,
+                scene,
+                inputs.render_profile,
+                provenance=inputs.reuse_provenance,
+            )
             samples = _preserve_frames(inputs, samples)
             reference = store_report(
                 inputs,
@@ -492,6 +527,9 @@ class VisualPipeline:
                     "schema_version": 1,
                     "scope": "scene",
                     "binding": scene_binding(scene),
+                    "reuse_provenance": inputs.reuse_provenance.model_dump(mode="json")
+                    if scene.artifact.origin == "reused" and inputs.reuse_provenance is not None
+                    else None,
                     "visual_profile_sha256": profile.digest(),
                     "model": profile.model,
                     "attempt": scene.visual_fix_attempts,
@@ -621,7 +659,13 @@ class VisualPipeline:
                 "Visual evidence must be routed to plan repair, not a code fixer"
             )
         original = _source(inputs)
-        validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+        validate_artifact(
+            inputs.root,
+            inputs.run_id,
+            scene,
+            inputs.render_profile,
+            provenance=inputs.reuse_provenance,
+        )
         with inputs.config.activate():
             fixer = self.fixer_factory()
             fixer.request_context = self.request_context(scene.plan.scene_id, "visual_fixing")
@@ -637,7 +681,13 @@ class VisualPipeline:
             )
             self._checkpoint(context)
             _source(inputs)
-            validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+            validate_artifact(
+                inputs.root,
+                inputs.run_id,
+                scene,
+                inputs.render_profile,
+                provenance=inputs.reuse_provenance,
+            )
             _read_report(inputs, reference)
             for frame in report.get("frames", []):
                 path = restore_run_path(inputs.root, frame["path"])
@@ -696,7 +746,13 @@ class VisualPipeline:
         rendered = [
             (
                 scene.plan.scene_id,
-                validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile),
+                validate_artifact(
+                    inputs.root,
+                    inputs.run_id,
+                    scene,
+                    inputs.render_profile,
+                    provenance=inputs.reuse_receipts.get(scene.plan.scene_id),
+                ),
             )
             for scene in scenes
             if scene.rendered
@@ -754,7 +810,13 @@ class VisualPipeline:
             for scene in scenes:
                 if scene.rendered:
                     _source(inputs, scene)
-                    validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+                    validate_artifact(
+                        inputs.root,
+                        inputs.run_id,
+                        scene,
+                        inputs.render_profile,
+                        provenance=inputs.reuse_receipts.get(scene.plan.scene_id),
+                    )
             verify_samples(samples)
             reference = store_report(
                 inputs,

@@ -41,6 +41,10 @@ ActionName = Literal[
     "submit_render",
     "poll_render",
     "cancel_render",
+    "reconcile_submission",
+    "reconcile_render",
+    "resume_run",
+    "reconcile_merge",
     "propose_render_fix",
     "propose_visual_fix",
     "evaluate_visual",
@@ -151,6 +155,7 @@ class ActionBase(RuntimeRecord):
     input_sha256: Sha256
     work_identity: WorkIdentity | None = None
     scene_id: int | None = Field(default=None, ge=1)
+    recovery_epoch: int = Field(default=0, ge=0, strict=True)
 
 
 class ProposePlan(ActionBase):
@@ -256,6 +261,32 @@ class CancelRender(ActionBase):
     job_id: str = Field(pattern=r"^(?:\d+|local-[0-9a-f]{12})$")
 
 
+class ReconcileSubmission(ActionBase):
+    kind: Literal["reconcile_submission"] = "reconcile_submission"
+    scene_id: int = Field(ge=1)
+    attempt_token: str = Field(pattern=r"^[0-9a-f]{12}$")
+
+
+class ReconcileRender(ActionBase):
+    kind: Literal["reconcile_render"] = "reconcile_render"
+    scene_id: int = Field(ge=1)
+    job_id: str | None = Field(default=None, pattern=r"^(?:\d+|local-[0-9a-f]{12})$")
+    artifact: ObjectRef | None = None
+
+
+class ResumeRun(ActionBase):
+    kind: Literal["resume_run"] = "resume_run"
+    scene_id: None = None
+    scenes: dict[int, WorkIdentity] = Field(default_factory=dict)
+    rag_profile_sha256: Sha256 | None = None
+
+
+class ReconcileMerge(ActionBase):
+    kind: Literal["reconcile_merge"] = "reconcile_merge"
+    scene_id: None = None
+    artifacts: tuple[ObjectRef, ...] = Field(min_length=1)
+
+
 class ProposeRenderFix(ActionBase):
     kind: Literal["propose_render_fix"] = "propose_render_fix"
     scene_id: int = Field(ge=1)
@@ -326,6 +357,10 @@ AgentAction = Annotated[
     | SubmitRender
     | PollRender
     | CancelRender
+    | ReconcileSubmission
+    | ReconcileRender
+    | ResumeRun
+    | ReconcileMerge
     | ProposeRenderFix
     | ProposeVisualFix
     | EvaluateVisual

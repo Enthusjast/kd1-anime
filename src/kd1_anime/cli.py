@@ -442,7 +442,7 @@ def generate(
         # 纯渲染监控、合并或已完成运行不需要重新调用 LLM；恢复命令应能在
         # 用户暂时未配置 API Key 时继续处理已有代码和远端 Job。
         if incremental:
-            RunRepository(settings.WORKSPACE_DIR).load_for_resume(incremental)
+            _load_execution_manifest(incremental)
         requires_llm = not resume
         if resume:
             manifest = _load_execution_manifest(resume)
@@ -501,6 +501,8 @@ def generate(
                 incremental,
                 callback=observe_run,
                 dry_run=dry_run,
+                output_path=output,
+                approve_plan=approve_plan,
                 smoke=smoke,
                 backend=backend,
             )

@@ -60,7 +60,9 @@ def _binding(value) -> tuple:
 class UserCommand(RuntimeRecord):
     command_id: str = Field(default_factory=lambda: uuid4().hex, min_length=1)
     session_id: str = Field(min_length=1)
-    kind: Literal["goal", "clarification", "ready", "approve", "reject", "cancel"]
+    kind: Literal[
+        "goal", "clarification", "ready", "approve", "reject", "cancel", "resume", "retry"
+    ]
     role: Literal["user"] = "user"
     content: str = ""
     action: AgentAction | None = None
@@ -69,10 +71,12 @@ class UserCommand(RuntimeRecord):
     @model_validator(mode="after")
     def validate_command(self):
         _session_id(self.session_id)
-        if self.kind in {"approve", "reject"} and self.action is None:
-            raise ValueError("Approval and rejection require an exact action")
-        if self.kind not in {"approve", "reject"} and self.action is not None:
-            raise ValueError("Only approval and rejection commands bind actions")
+        if self.kind in {"approve", "reject", "retry"} and self.action is None:
+            raise ValueError("Approval, rejection and retry require an exact action")
+        if self.kind not in {"approve", "reject", "retry"} and self.action is not None:
+            raise ValueError("This command cannot bind an action")
+        if self.kind == "retry" and self.action.kind != "retry_scene":
+            raise ValueError("Retry command must bind a RetryScene action")
         if self.kind in {"goal", "clarification"} and not self.content:
             raise ValueError("Goals and clarifications require visible content")
         return self

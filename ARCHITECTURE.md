@@ -48,8 +48,8 @@
 
 CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
 `plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
-`run_incremental`。生成、规划、计划文件继续执行和直接渲染默认使用 v11 Agent Runtime；
-增量、TUI 和 batch 暂留 legacy v10，恢复严格按清单版本选择运行时。
+`run_incremental`。生成、规划、直接渲染、恢复、重试及增量执行使用 v11 Agent Runtime；
+TUI 和 batch 暂留 legacy v10，旧运行仍按清单版本选择对应运行时。
 计划导出只读取已提交 manifest，不把 worker Context 暴露给 CLI。
 
 `domain/scene_fields.py` 是运行态字段所有权和 v10 存储投影的唯一元数据；领域
@@ -109,7 +109,13 @@ Scene、boundary 和 final visual gate 保持独立端点，报告/帧/视频按
 合并只有旧输出 hash 完全匹配时才能原子替换。完成恢复也核验成片和报告身份。
 
 直接渲染将外部源码复制进私有内容对象，只做只读静态验收，不调用生成/Review LLM，且
-持久化禁用自动改码。完整 retry/incremental 和展示层在后续独立阶段迁移；旧 v10 不补造身份。
+持久化禁用自动改码。恢复先只读检查版本及生成身份，再持运行锁重新验证配置、源码和执行身份。
+未知提交通过单独的 reconciliation intent 核实；历史 local 进程不按 PID 认领，取消未确认禁止重提。
+显式 retry 保留请求预占、轮次和失败计数，完成运行不能原地重试。
+
+增量运行验证基础运行及执行身份，创建独立 Session 和预算；已审查场景通过教学、handoff、
+源码上下文和全局输入判断复用资格。复用视频复制到当前私有目录，typed provenance 绑定完整
+来源和内容身份，不凭展示别名授权；基础目录删除后已完成运行仍可验证和恢复。
 
 ```text
 kd1_anime.cli / kd1_anime.tui

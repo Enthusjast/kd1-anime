@@ -37,6 +37,7 @@ from kd1_anime.agent_runtime.state import (
     AgentRunState,
     AgentStageAttempt,
     AgentSubmission,
+    merge_transport_state,
 )
 from kd1_anime.agent_runtime.tools import (
     ExecutionAdapters,
@@ -58,14 +59,16 @@ from kd1_anime.agents.reviewer import ReviewerAgent
 from kd1_anime.agents.technical_planner import TechnicalPlannerAgent
 from kd1_anime.cluster.render_backend import create_render_backend
 from kd1_anime.cluster.resource_estimator import estimate_render_resources
+from kd1_anime.cluster.status import TERMINAL_STATES
 from kd1_anime.commits import CommitCommand, RunCommitter, RunPatch, ScenePatch
 from kd1_anime.config import resolve_runtime_path, settings
 from kd1_anime.control import RunControl
-from kd1_anime.domain.dependencies import WorkIdentity, digest
+from kd1_anime.domain.dependencies import DependencyGraph, WorkIdentity, digest
 from kd1_anime.domain.diagnostics import Diagnostic
 from kd1_anime.domain.execution import SubmissionAttempt
 from kd1_anime.domain.planning import (
     ContinuityBible,
+    ElementManifest,
     LessonSpec,
     SceneOutline,
     ScenePlan,
@@ -73,6 +76,7 @@ from kd1_anime.domain.planning import (
 )
 from kd1_anime.domain.runtime import ExecutionSpec, RunConfig, VisualEvalProfile
 from kd1_anime.domain.state import RunPaths
+from kd1_anime.domain.state_ledger import StateLedger
 from kd1_anime.event_store import EventStore
 from kd1_anime.events import CallbackAdapter, PipelineEvent
 from kd1_anime.media.merger import VideoMerger
@@ -89,8 +93,16 @@ from kd1_anime.pipeline.contracts import (
     TechnicalOutput,
 )
 from kd1_anime.pipeline.finalization import FinalizationPipeline
+from kd1_anime.pipeline.incremental import IncrementalInputs, IncrementalOutput, IncrementalPipeline
 from kd1_anime.pipeline.planning import PlanningPipeline, PlanningStageError
-from kd1_anime.pipeline.render import RenderPipeline
+from kd1_anime.pipeline.recovery import (
+    RecoveryOutput,
+    RecoveryPipeline,
+    RecoveryPlan,
+    plan_resume,
+    plan_retry,
+)
+from kd1_anime.pipeline.render import RenderPipeline, validate_artifact
 from kd1_anime.pipeline.repair import RenderRepairOutput, RenderRepairPipeline
 from kd1_anime.pipeline.scene import CodeReviewOutput, InspectionOutput, ScenePipeline
 from kd1_anime.pipeline.smoke import SmokePipeline
@@ -121,7 +133,7 @@ from kd1_anime.services.continuity_state import (
     build_continuity_publication,
     prepare_inherited_inputs,
 )
-from kd1_anime.services.dependencies import DependencyService
+from kd1_anime.services.dependencies import DependencyService, scene_work_digest
 from kd1_anime.services.rendering import RenderingService
 from kd1_anime.services.results import StageResult
 from kd1_anime.verification import ExecutionVerification
@@ -274,6 +286,111 @@ class AgentRuntime:
             raise RuntimeError(self.manifest.agent.stop_reason or "Direct render submission failed")
         return restore_render_job(scene.slurm_job, self.root), output, self.manifest.run_id
 
+    def run_incremental(
+        self,
+        user_prompt,
+        base_run_id,
+        *,
+        base_manifest,
+        callback=None,
+        dry_run=False,
+        interactive=False,
+        output_path=None,
+        approve_plan=False,
+        smoke=False,
+        backend=None,
+    ):
+        if base_manifest.run_id != base_run_id or base_manifest.schema_version != 11:
+            raise ValueError("Incremental execution requires the exact v11 base manifest")
+        verify_generation_identity(base_manifest.agent.generation_identity)
+        return self._start(
+            user_prompt,
+            callback=callback,
+            dry_run=dry_run,
+            interactive=interactive,
+            output_path=output_path,
+            approve_plan=approve_plan,
+            smoke=smoke,
+            backend=backend,
+            operation="incremental",
+            base_manifest=base_manifest,
+        )
+
+    @staticmethod
+    def _verify_resume_inputs(root, manifest):
+        manifest.execution_spec.verify_image()
+        actual = ExecutionSpec.capture(RenderProfile.current())
+        if actual != manifest.execution_spec:
+            raise ValueError("Actual execution environment differs from the pinned run identity")
+        for identifier, scene in manifest.scenes.items():
+            if not scene.code_file:
+                continue
+            expected = f"scenes/revisions/scene_{identifier}/{scene.code_sha256}.py"
+            if scene.code_file != expected:
+                raise ValueError("Resume source is not an immutable content object")
+            source = restore_run_path(root, scene.code_file)
+            if not source.is_file() or sha256_file(source) != scene.code_sha256:
+                raise ValueError("Resume source hash mismatch")
+
+    def _pending_submission(self, scene_id, *, manifest=None):
+        manifest = manifest or self.manifest
+        scene = manifest.scenes[scene_id]
+        return next(
+            (
+                item.attempt
+                for item in reversed(manifest.agent.submissions)
+                if item.scene_id == scene_id
+                and item.attempt.code_sha256 == scene.code_sha256
+                and item.attempt.token not in manifest.agent.retired_submissions
+            ),
+            None,
+        )
+
+    def _recovery_action(self, name, scene_id=None):
+        action = self._make_action(name, self._snapshot(), scene_id)
+        result = self._run_action(action)
+        if result.status != "CONTINUE":
+            self._stop("Recovery requires an explicit safe decision: " + result.reason)
+            return False
+        return True
+
+    def _reconcile_before_resume(self):
+        for identifier in sorted(self.manifest.scenes):
+            scene = self.manifest.scenes[identifier]
+            if (
+                not scene.rendered
+                and scene.slurm_job is None
+                and self._pending_submission(identifier) is not None
+                and not self._recovery_action("reconcile_submission", identifier)
+            ):
+                return False
+            scene = self.manifest.scenes[identifier]
+            if (
+                scene.slurm_job is not None or scene.artifact is not None
+            ) and not self._recovery_action("reconcile_render", identifier):
+                return False
+        return True
+
+    def _current_rag_profile(self):
+        if self._rag is None:
+            return self.manifest.rag_profile
+        current = self._rag.runtime_profile()
+        if current.model_dump(exclude={"status"}) == self.manifest.rag_profile.model_dump(
+            exclude={"status"}
+        ):
+            return self.manifest.rag_profile
+        return current
+
+    def _cancel_recovery_prerequisites(self, plan):
+        for cancellation in plan.cancellations:
+            if not self._recovery_action("cancel_render", cancellation.scene_id):
+                return False
+            job = self.manifest.scenes[cancellation.scene_id].slurm_job
+            if job is None or not job.cancelled or job.status != "CANCELLED":
+                self._stop("Recovery cancellation failed; automatic resubmission forbidden")
+                return False
+        return True
+
     def resume(
         self,
         run_id: str,
@@ -281,25 +398,111 @@ class AgentRuntime:
         interactive=False,
         approve_plan=False,
         retry_scene_id=None,
-        **unsupported,
+        *,
+        base_manifest=None,
     ):
         repository = RunRepository(settings.WORKSPACE_DIR)
         before = repository.load_for_agent_resume(run_id)
         verify_generation_identity(before.agent.generation_identity)
+        if retry_scene_id is not None and (before.state == "DONE" or before.status == "completed"):
+            raise RuntimeError("Completed runs cannot retry in place; create a new incremental run")
         root = repository.run_root(run_id)
-        with lock_run(root), before.run_config.activate():
+        with lock_run(root):
             manifest = repository.load_for_agent_resume(run_id)
             verify_generation_identity(manifest.agent.generation_identity)
-            self._bind(root, manifest, callback)
-            self._notify("run_started", {"run_id": run_id})
-            if retry_scene_id is not None or unsupported:
-                self._stop("P4 does not support scene retry or incremental resume")
-                return None
-            if manifest.state == "DONE":
-                return self._completed_video()
-            if manifest.agent.stop_reason or manifest.state == "ERROR":
-                return None
-            return self._drive(approve_plan=approve_plan, interactive=interactive)
+            with manifest.run_config.activate():
+                self._verify_resume_inputs(root, manifest)
+                self._base_manifest = base_manifest
+                self._bind(root, manifest, callback)
+                if manifest.state == "DONE":
+                    return self._completed_video()
+                epoch = manifest.agent.recovery_epoch + 1
+                pending = manifest.agent.pending_approval
+                self._patch(
+                    RunPatch(
+                        agent=self._agent_update(
+                            recovery_epoch=epoch,
+                            pending_approval=pending.model_copy(update={"recovery_epoch": epoch})
+                            if pending
+                            else None,
+                        )
+                    )
+                )
+                self.sessions.command(
+                    manifest.agent.session_id,
+                    UserCommand(
+                        session_id=manifest.agent.session_id,
+                        kind="resume",
+                        content=f"Resume run {run_id}",
+                    ),
+                )
+                self._notify("run_started", {"run_id": run_id})
+                if retry_scene_id is not None and self.manifest.agent.pending_approval is not None:
+                    pending = self.manifest.agent.pending_approval
+                    self.sessions.command(
+                        manifest.agent.session_id,
+                        UserCommand(
+                            session_id=manifest.agent.session_id,
+                            kind="reject",
+                            action=pending,
+                            content="Explicit scene retry supersedes this pending proposal",
+                        ),
+                    )
+                    self._patch(RunPatch(agent=self._agent_update(pending_approval=None)))
+                if not self._reconcile_before_resume():
+                    return None
+                plan = (
+                    plan_retry(self.manifest, retry_scene_id)
+                    if retry_scene_id is not None
+                    else plan_resume(self.manifest, current_rag_profile=self._current_rag_profile())
+                )
+                if not self._cancel_recovery_prerequisites(plan):
+                    return None
+                plan = (
+                    plan_retry(self.manifest, retry_scene_id)
+                    if retry_scene_id is not None
+                    else plan_resume(self.manifest, current_rag_profile=self._current_rag_profile())
+                )
+                if plan.blocked:
+                    self._stop(
+                        "Unconfirmed execution prevents recovery: "
+                        + ",".join(map(str, plan.blocked))
+                    )
+                    return None
+                if retry_scene_id is not None:
+                    action = self._make_action("retry_scene", self._snapshot(), retry_scene_id)
+                    self.sessions.command(
+                        manifest.agent.session_id,
+                        UserCommand(
+                            session_id=manifest.agent.session_id,
+                            kind="retry",
+                            action=action,
+                            content=f"Retry scene {retry_scene_id} without resetting budgets",
+                        ),
+                    )
+                    result = self._run_action(action)
+                    if result.status != "CONTINUE":
+                        self._stop("Scene retry could not commit: " + result.reason)
+                        return None
+                elif (
+                    self.manifest.state == "ERROR"
+                    or self.manifest.agent.stop_reason
+                    or plan.scenes
+                    or plan.rag_profile is not None
+                ):
+                    if not self._recovery_action("resume_run"):
+                        return None
+                if (
+                    self.manifest.state == "MERGING"
+                    and any(
+                        intent.action.kind in {"merge_video", "reconcile_merge"}
+                        and intent.status != "completed"
+                        for intent in self.manifest.agent.intents
+                    )
+                    and not self._recovery_action("reconcile_merge")
+                ):
+                    return None
+                return self._drive(approve_plan=approve_plan, interactive=interactive)
 
     @staticmethod
     def _parse_export(payload):
@@ -360,15 +563,26 @@ class AgentRuntime:
         imported=None,
         direct_source=None,
         no_wait=False,
+        base_manifest=None,
     ):
         prompt = actions.sanitize_record(prompt, self._secrets())
         config = RunConfig.capture()
         with config.activate():
             profile = RenderProfile.current()
             execution = ExecutionSpec.capture(profile)
+            identity = capture_generation_identity()
+            self._base_manifest = base_manifest
+            if base_manifest is not None:
+                verify_generation_identity(base_manifest.agent.generation_identity)
+                IncrementalPipeline.validate_base(
+                    base_manifest,
+                    RunRepository(settings.WORKSPACE_DIR).run_root(base_manifest.run_id),
+                    generation_identity=identity,
+                    execution_spec=execution,
+                    backend=backend or settings.RENDER_BACKEND,
+                )
             paths = RunPaths.create(output_path)
             run_id, root = paths.run_id, paths.root
-            identity = capture_generation_identity()
             sessions = SessionStore(
                 resolve_runtime_path(settings.WORKSPACE_DIR) / "sessions", secrets=self._secrets()
             )
@@ -396,6 +610,8 @@ class AgentRuntime:
                 state="PLANNING",
                 run_phase="planning",
                 scene_codegen_mode=settings.SCENE_CODEGEN_MODE,
+                incremental=base_manifest is not None,
+                base_run_id=base_manifest.run_id if base_manifest is not None else None,
                 visual_eval_profile=VisualEvalProfile(
                     enabled=settings.ENABLE_VISUAL_EVAL and operation != "render",
                     model=(settings.VISUAL_LLM_MODEL or settings.EVAL_VISUAL_MODEL or "")
@@ -577,6 +793,12 @@ class AgentRuntime:
                 False,
             ),
             (actions.PollRender, RenderingOutput, "read", "none", False),
+            (actions.ReconcileSubmission, RecoveryOutput, "read", "none", False),
+            (actions.ReconcileRender, RecoveryOutput, "read", "none", False),
+            (actions.ResumeRun, RecoveryPlan, "write", "commit", False),
+            (actions.RetryScene, RecoveryPlan, "write", "commit", False),
+            (actions.ReuseScene, IncrementalOutput, "write", "commit", False),
+            (actions.ReconcileMerge, FinalizationOutput, "exec", "external", False),
             (actions.ProposeRenderFix, RenderRepairOutput, "write", "commit", True),
             (
                 actions.CancelRender,
@@ -692,7 +914,15 @@ class AgentRuntime:
         if previous == invocation or (previous is not None and previous.status == "completed"):
             return
         submissions = self.manifest.agent.submissions
-        if invocation.action == "submit_render" and invocation.external_job_id is not None:
+        if (
+            invocation.action in {"submit_render", "reconcile_submission"}
+            and invocation.external_job_id is not None
+        ):
+            bound_action = next(
+                item.action
+                for item in self.manifest.agent.intents
+                if item.intent_id == invocation.intent_id
+            )
             submissions = tuple(
                 item.model_copy(
                     update={
@@ -704,7 +934,17 @@ class AgentRuntime:
                         )
                     }
                 )
-                if item.attempt.scene_revision == invocation.work_identity.revision
+                if (
+                    (
+                        invocation.action == "submit_render"
+                        and item.intent_id in {None, invocation.intent_id}
+                        and item.attempt.scene_revision == invocation.work_identity.revision
+                    )
+                    or (
+                        invocation.action == "reconcile_submission"
+                        and item.attempt.token == bound_action.attempt_token
+                    )
+                )
                 and item.attempt.code_sha256 == self.manifest.scenes[item.scene_id].code_sha256
                 and invocation.resource_id == f"run:{self.manifest.run_id}/scene:{item.scene_id}"
                 else item
@@ -723,6 +963,10 @@ class AgentRuntime:
 
     @_serialized
     def _commit_result(self, intent, invocation, result):
+        if intent.action.recovery_epoch != self.manifest.agent.recovery_epoch:
+            from kd1_anime.domain.dependencies import StaleWorkError
+
+            raise StaleWorkError("Result belongs to a superseded recovery invocation epoch")
         updates = {name: getattr(result.patch, name) for name in result.patch.model_fields_set}
         proposed = updates.get("agent") or self.manifest.agent
         if intent.action.scene_id is not None and updates.get("scenes"):
@@ -787,6 +1031,8 @@ class AgentRuntime:
                 "scene_review_counters",
                 "plan_repair_proposals",
                 "visual_repairs",
+                "incremental_checked",
+                "reuse_receipts",
             ):
                 values = dict(getattr(latest, name))
                 incoming = getattr(proposed, name)
@@ -796,7 +1042,7 @@ class AgentRuntime:
                     else:
                         values.pop(scene_id, None)
                 semantic[name] = values
-            if proposed.stop_reason:
+            if proposed.stop_reason or intent.action.kind in {"retry_scene", "resume_run"}:
                 semantic["stop_reason"] = proposed.stop_reason
         reviewed = dict(semantic.get("reviewed_identities", latest.reviewed_identities))
         for patch in updates.get("scenes", ()):
@@ -814,16 +1060,45 @@ class AgentRuntime:
             elif previous is not None and previous.input_sha256 != replacement.input_sha256:
                 semantic["continuity_published"] = False
         semantic["reviewed_identities"] = reviewed
+        retired = list(dict.fromkeys((*latest.retired_submissions, *proposed.retired_submissions)))
+        clearing = {
+            patch.scene_id
+            for patch in updates.get("scenes", ())
+            if patch.replacement.submission is None
+        } | set(updates.get("scene_removals", {}))
+        for identifier in clearing:
+            previous = self.manifest.scenes.get(identifier)
+            if (
+                previous
+                and previous.submission
+                and previous.slurm_job
+                and (previous.slurm_job.cancelled or previous.slurm_job.status in TERMINAL_STATES)
+                and previous.submission.token not in retired
+            ):
+                retired.append(previous.submission.token)
+        semantic["retired_submissions"] = tuple(retired)
         if "artifact_refs" in updates:
             updates["artifact_refs"] = {**self.manifest.artifact_refs, **updates["artifact_refs"]}
         if "rag_receipts" in updates:
-            updates["rag_receipts"] = {**self.manifest.rag_receipts, **updates["rag_receipts"]}
+            dropped = (
+                set(result.stage.value.drop_rag_receipt_keys)
+                if intent.action.kind in {"resume_run", "retry_scene"}
+                else set()
+            )
+            updates["rag_receipts"] = {
+                **{
+                    key: value
+                    for key, value in self.manifest.rag_receipts.items()
+                    if key not in dropped
+                },
+                **updates["rag_receipts"],
+            }
         complete_intent = intent.model_copy(update={"status": "completed"})
         report = self._store_output(result.stage.value)
         complete_invocation = invocation.model_copy(
             update={"status": "completed", "finished_at": utc_now(), "result_ref": report}
         )
-        latest = self.manifest.agent
+        latest = merge_transport_state(self.manifest.agent, proposed)
         updates["agent"] = latest.model_copy(
             update={
                 **semantic,
@@ -832,15 +1107,37 @@ class AgentRuntime:
                 "invocations": self._replace(
                     latest.invocations, complete_invocation, "invocation_id"
                 ),
-                "committed_invocations": (*latest.committed_invocations, invocation.invocation_id),
+                "committed_invocations": tuple(
+                    dict.fromkeys((*latest.committed_invocations, invocation.invocation_id))
+                ),
             }
         )
         try:
             manifest = self._patch(RunPatch(**updates), phase=intent.action.kind)
         except Exception:
             if intent.action.kind == "submit_render" and invocation.external_job_id is not None:
+
+                def record_cancellation(status):
+                    self._patch(
+                        RunPatch(
+                            agent=self._agent_update(
+                                submissions=tuple(
+                                    item.model_copy(update={"cancellation_status": status})
+                                    if item.intent_id == intent.intent_id
+                                    else item
+                                    for item in self.manifest.agent.submissions
+                                )
+                            )
+                        )
+                    )
+
                 with suppress(Exception):
-                    self._render().backend.cancel_job(invocation.external_job_id)
+                    record_cancellation("unknown")
+                cancelled = False
+                with suppress(Exception):
+                    cancelled = bool(self._render().backend.cancel_job(invocation.external_job_id))
+                with suppress(Exception):
+                    record_cancellation("succeeded" if cancelled else "failed")
                 # The durable attempt and returned ID remain reserved even when
                 # cancellation fails; recovery must reconcile, never resubmit.
             raise
@@ -1098,9 +1395,9 @@ class AgentRuntime:
         )
 
     @staticmethod
-    def _dispatch_identity(manifest, scene_id):
+    def _dispatch_identity(manifest, scene_id, attempt=None):
         scene = manifest.scenes[scene_id]
-        attempt = scene.submission
+        attempt = attempt or scene.submission
         if attempt is None:
             return None
         if not any(
@@ -1108,10 +1405,14 @@ class AgentRuntime:
             for item in manifest.agent.submissions
         ):
             raise ValueError("Current submission differs from its durable attempt")
+        reservation = next(
+            item for item in manifest.agent.submissions if item.attempt.token == attempt.token
+        )
         matches = [
             intent.action.work_identity
             for intent in manifest.agent.intents
             if intent.action.kind == "submit_render"
+            and (reservation.intent_id is None or intent.intent_id == reservation.intent_id)
             and intent.action.scene_id == scene_id
             and intent.action.work_identity.revision == attempt.scene_revision
             and intent.action.source.sha256 == scene.code_sha256
@@ -1121,7 +1422,7 @@ class AgentRuntime:
             raise ValueError("Current submission has no unique durable dispatch identity")
         return matches[0]
 
-    def _scene_inputs(self, scene_id, *, manifest=None, inherit=False):
+    def _scene_inputs(self, scene_id, *, manifest=None, inherit=False, submission_attempt=None):
         manifest = manifest or self.manifest
         previous = manifest.scenes.get(scene_id - 1)
         inputs = SceneInputs(
@@ -1148,7 +1449,9 @@ class AgentRuntime:
             direct_render=manifest.direct_render,
             auto_fix=manifest.auto_fix,
             visual_eval_profile=manifest.visual_eval_profile,
-            submission_identity=self._dispatch_identity(manifest, scene_id),
+            submission_identity=self._dispatch_identity(manifest, scene_id, submission_attempt),
+            context_sha256=self._scene_context_digest(manifest.scenes[scene_id], manifest=manifest),
+            reuse_provenance=manifest.agent.reuse_receipts.get(scene_id),
         )
         if inherit:
             prior = tuple(
@@ -1156,7 +1459,13 @@ class AgentRuntime:
                 for identifier in sorted(manifest.scenes)
                 if identifier < scene_id
             )
-            return prepare_inherited_inputs(inputs, prior)
+            from dataclasses import replace
+
+            prepared = prepare_inherited_inputs(inputs, prior)
+            return replace(
+                prepared,
+                context_sha256=self._scene_context_digest(prepared.scene, manifest=manifest),
+            )
         return inputs
 
     def _final_inputs(self):
@@ -1178,7 +1487,10 @@ class AgentRuntime:
             visual_eval_profile=manifest.visual_eval_profile,
             auto_fix=manifest.auto_fix,
             eval_round=manifest.eval_round,
-            existing_output_sha256=manifest.final_video_sha256,
+            existing_output_sha256=manifest.final_video_sha256
+            or manifest.agent.previous_output_sha256
+            or "",
+            reuse_receipts=dict(manifest.agent.reuse_receipts),
         )
 
     def _render(self):
@@ -1204,6 +1516,11 @@ class AgentRuntime:
         )
 
     def _scene_digest(self, scene, *, planning=None, manifest=None):
+        return scene_work_digest(
+            scene, self._scene_context_digest(scene, planning=planning, manifest=manifest)
+        )
+
+    def _scene_context_digest(self, scene, *, planning=None, manifest=None):
         manifest = manifest or self.manifest
         plans = (
             planning.plans
@@ -1221,12 +1538,6 @@ class AgentRuntime:
         shared = planning
         return digest(
             {
-                "plan": scene.plan.model_dump(mode="json"),
-                "technical": scene.technical_spec.model_dump(mode="json")
-                if scene.technical_spec
-                else None,
-                "source": scene.code_sha256,
-                "inherited": scene.inherited_elements_code,
                 "lesson": (shared.lesson_spec if shared else manifest.lesson_spec).model_dump(
                     mode="json"
                 ),
@@ -1338,6 +1649,210 @@ class AgentRuntime:
             },
         )
 
+    @staticmethod
+    def _resume_phase(manifest, agent):
+        if not manifest.outlines:
+            return "PLANNING", "propose_plan"
+        if len(manifest.scenes) != len(manifest.outlines):
+            return "DETAILING", "detail_scene"
+        if not agent.plan_review_complete or any(
+            not scene.plan_reviewed for scene in manifest.scenes.values()
+        ):
+            return "PLAN_REVIEWING", "review_plan"
+        if (
+            agent.operation != "render"
+            and agent.approved_plan_sha256 is None
+            and agent.operation != "plan"
+        ):
+            return "PLAN_REVIEWING", "review_plan"
+        if agent.operation == "plan":
+            return "EVALUATING", "finish"
+        if (
+            any(not scene.reviewed for scene in manifest.scenes.values())
+            or not agent.continuity_published
+        ):
+            return "CODING", "publish_continuity"
+        if manifest.dry_run:
+            return "EVALUATING", "finish"
+        if any(not scene.rendered and not scene.give_up for scene in manifest.scenes.values()):
+            return "MONITORING", "poll_render"
+        if manifest.final_video:
+            return "EVALUATING", "finish" if agent.next_action == "finish" else "evaluate_run"
+        return (
+            ("VISUAL_EVALUATING", "evaluate_boundary")
+            if manifest.visual_eval_profile.enabled
+            else ("MERGING", "merge_video")
+        )
+
+    def _restore_retry_counters(self, scene, agent):
+        reference = agent.retired_scenes.get(scene.plan.scene_id)
+        if reference is None:
+            return scene
+        path = restore_run_path(self.root, reference.path)
+        if reference.kind != "report" or sha256_file(path) != reference.sha256:
+            raise ValueError("Retired scene counter snapshot hash mismatch")
+        previous = StoredSceneState.model_validate_json(path.read_text())
+        if previous.plan.scene_id != scene.plan.scene_id:
+            raise ValueError("Retired scene counter snapshot identity mismatch")
+        for name in (
+            "review_round",
+            "fix_attempts",
+            "infra_retries",
+            "plan_replan_attempts",
+            "plan_review_round",
+            "identical_plan_review_count",
+            "identical_review_count",
+            "visual_fix_attempts",
+            "identical_error_count",
+            "stagnant_repair_count",
+        ):
+            setattr(scene, name, max(getattr(scene, name), getattr(previous, name)))
+        scene.stage_attempts = [item.model_copy(deep=True) for item in previous.stage_attempts]
+        scene.submission_attempts = [
+            item.model_copy(deep=True) for item in previous.submission_attempts
+        ]
+        for name in (
+            "review_signature",
+            "plan_review_signature",
+            "last_error_fp",
+            "last_repair_code_sha256",
+            "last_repair_error_fp",
+        ):
+            setattr(scene, name, getattr(previous, name))
+        return scene
+
+    def _recovery_updates(self, plan, manifest, *, retry=False):
+        if plan.blocked or plan.cancellations:
+            raise RuntimeError("Recovery prerequisites must be confirmed before state publication")
+        agent = manifest.agent
+        updates = {"status": "running", "error": "", "run_phase": "executing"}
+        future = manifest.model_copy()
+        if plan.rag_profile is not None:
+            future.rag_profile = plan.rag_profile
+            updates["rag_profile"] = plan.rag_profile
+            updates["rag_receipts"] = {}
+            agent = agent.model_copy(
+                update={
+                    "plan_sha256": None,
+                    "approved_plan_sha256": None,
+                    "approved_plan_identity": None,
+                    "plan_review_complete": False,
+                    "pending_approval": None,
+                    "run_revision": agent.run_revision + 1,
+                    "run_input_sha256": digest(
+                        {
+                            "prior": agent.run_input_sha256,
+                            "rag": plan.rag_profile.model_dump(mode="json"),
+                            "revision": agent.run_revision + 1,
+                        }
+                    ),
+                }
+            )
+        if plan.invalidate_planning:
+            retired = dict(agent.retired_scenes)
+            retired.update(
+                (identifier, self._store_output(scene))
+                for identifier, scene in manifest.scenes.items()
+            )
+            updates.update(
+                scene_removals={
+                    identifier: WorkIdentity(scene.revision, scene.input_sha256)
+                    for identifier, scene in manifest.scenes.items()
+                },
+                outlines=[],
+                dependency_graph=DependencyGraph(),
+                state_ledger=StateLedger(),
+                element_manifest=ElementManifest(),
+                plan_review_status="pending",
+            )
+            future.scenes, future.outlines = {}, []
+            agent = agent.model_copy(
+                update={
+                    "retired_scenes": retired,
+                    "outline_identities": {},
+                    "scene_next_actions": {},
+                    "scene_action_versions": {},
+                    "reviewed_identities": {},
+                    "pending_candidates": {},
+                    "visual_repairs": {},
+                    "reuse_receipts": {},
+                    "incremental_checked": {},
+                    "continuity_published": False,
+                }
+            )
+            patches = ()
+        else:
+            future.scenes = {
+                **manifest.scenes,
+                **{item.scene_id: item.replacement for item in plan.scenes},
+            }
+            patches = tuple(
+                self._scene_patch(item.replacement, manifest=future, identity=item.identity)
+                for item in plan.scenes
+            )
+            names, versions = dict(agent.scene_next_actions), dict(agent.scene_action_versions)
+            candidates, visual, reuse = (
+                dict(agent.pending_candidates),
+                dict(agent.visual_repairs),
+                dict(agent.reuse_receipts),
+            )
+            reviewed = dict(agent.reviewed_identities)
+            for item, patch in zip(plan.scenes, patches, strict=True):
+                identifier = item.scene_id
+                names[identifier] = item.next_action
+                versions[identifier] = versions.get(identifier, 0) + 1
+                candidates.pop(identifier, None)
+                visual.pop(identifier, None)
+                if retry or patch.replacement.artifact is None:
+                    reuse.pop(identifier, None)
+                if patch.replacement.reviewed:
+                    reviewed[identifier] = WorkIdentity(
+                        item.identity.revision + 1, patch.replacement.input_sha256
+                    )
+                else:
+                    reviewed.pop(identifier, None)
+            agent = agent.model_copy(
+                update={
+                    "scene_next_actions": names,
+                    "scene_action_versions": versions,
+                    "pending_candidates": candidates,
+                    "visual_repairs": visual,
+                    "reuse_receipts": reuse,
+                    "reviewed_identities": reviewed,
+                    "pending_approval": None
+                    if retry or plan.rag_profile is not None
+                    else agent.pending_approval,
+                    "continuity_published": False if plan.scenes else agent.continuity_published,
+                }
+            )
+        if plan.clear_final or plan.invalidate_planning:
+            updates.update(final_video=None, final_video_sha256="")
+            future.final_video, future.final_video_sha256 = None, ""
+            agent = agent.model_copy(
+                update={
+                    "previous_output_sha256": manifest.final_video_sha256
+                    or agent.previous_output_sha256,
+                    "final_visual_report": None,
+                    "final_evaluation_report": None,
+                    "final_visual_status": "skipped",
+                }
+            )
+        agent = agent.model_copy(update={"stop_reason": ""})
+        future.agent = agent
+        state, next_action = self._resume_phase(future, agent)
+        if manifest.direct_render:
+            state = (
+                "MONITORING"
+                if any(scene.slurm_job for scene in future.scenes.values())
+                else "DISPATCHING"
+            )
+            next_action = "poll_render" if state == "MONITORING" else "submit_render"
+            agent = agent.model_copy(update={"continuity_published": True})
+        updates.update(
+            state=state, scenes=patches, agent=agent.model_copy(update={"next_action": next_action})
+        )
+        return updates
+
     def _execute(self, action, context):
         # Reservations are transport-only; they never change a scene identity.
         with self._runtime_lock:
@@ -1381,7 +1896,227 @@ class AgentRuntime:
         patches = ()
         updates = {}
         kind = action.kind
-        if kind == "propose_plan":
+        if kind in {"resume_run", "retry_scene"}:
+            if kind == "resume_run":
+                expected = {item.scene_id: item.work_identity for item in self._snapshot().scenes}
+                profile = self._current_rag_profile()
+                if action.scenes != expected or action.rag_profile_sha256 != digest(
+                    profile.model_dump(mode="json")
+                ):
+                    raise ValueError("Resume decision snapshot changed before dispatch")
+                output = plan_resume(manifest, current_rag_profile=profile)
+            else:
+                output = plan_retry(manifest, action.scene_id)
+            delta = self._recovery_updates(output, manifest, retry=kind == "retry_scene")
+            patches = delta.pop("scenes")
+            agent = delta.pop("agent")
+            updates.update(delta)
+            next_action = (
+                agent.scene_next_actions[action.scene_id]
+                if action.scene_id is not None
+                else agent.next_action
+            )
+        elif kind == "reconcile_submission":
+            attempt = self._pending_submission(action.scene_id, manifest=manifest)
+            if attempt is None or attempt.token != action.attempt_token:
+                raise ValueError("Outstanding submission changed before reconciliation")
+            inputs = self._scene_inputs(
+                action.scene_id, manifest=manifest, submission_attempt=attempt
+            )
+            output = RecoveryPipeline(
+                self._render().backend, control=self.control
+            ).reconcile_submission(inputs, attempt, context)
+            if output.status != "adopted":
+                raise RuntimeError(
+                    output.reason
+                    or "Submission remains uncertain; automatic resubmission forbidden"
+                )
+            scene = inputs.scene
+            scene.slurm_job, scene.submission = output.job, output.submission
+            scene.submission_attempts = [
+                *{
+                    item.token: item for item in (*scene.submission_attempts, output.submission)
+                }.values()
+            ]
+            scene.failed = scene.give_up = False
+            scene.phase = "monitoring"
+            submissions = tuple(
+                item.model_copy(update={"attempt": output.submission})
+                if item.attempt.token == attempt.token
+                else item
+                for item in agent.submissions
+            )
+            reservation = next(
+                item for item in agent.submissions if item.attempt.token == attempt.token
+            )
+            original = next(
+                item
+                for item in agent.intents
+                if item.action.kind == "submit_render"
+                and item.action.scene_id == action.scene_id
+                and item.action.work_identity == inputs.submission_identity
+                and (reservation.intent_id is None or item.intent_id == reservation.intent_id)
+            )
+            intents = self._replace(
+                agent.intents, original.model_copy(update={"status": "completed"}), "intent_id"
+            )
+            invocations = agent.invocations
+            committed = list(agent.committed_invocations)
+            reference = self._store_output(RenderingOutput(status="pending", job=output.job))
+            for item in agent.invocations:
+                if item.intent_id == original.intent_id:
+                    value = item.model_copy(
+                        update={
+                            "status": "completed",
+                            "external_job_id": output.job.job_id,
+                            "finished_at": utc_now(),
+                            "result_ref": reference,
+                        }
+                    )
+                    invocations = self._replace(invocations, value, "invocation_id")
+                    if item.invocation_id not in committed:
+                        committed.append(item.invocation_id)
+            agent = agent.model_copy(
+                update={
+                    "submissions": submissions,
+                    "intents": intents,
+                    "invocations": invocations,
+                    "committed_invocations": tuple(committed),
+                }
+            )
+            patches = (self._scene_patch(scene),)
+            next_action = "poll_render"
+        elif kind == "reconcile_render":
+            inputs = self._scene_inputs(action.scene_id, manifest=manifest)
+            scene = inputs.scene
+            expected_job = scene.slurm_job.job_id if scene.slurm_job else None
+            expected_artifact = (
+                ObjectRef(
+                    path=scene.artifact.video_path, sha256=scene.artifact.video_sha256, kind="video"
+                )
+                if scene.artifact
+                else None
+            )
+            if action.job_id != expected_job or action.artifact != expected_artifact:
+                raise ValueError("Restored render identity changed before reconciliation")
+            if scene.artifact is not None and scene.artifact.origin == "reused":
+                try:
+                    validate_artifact(
+                        self.root,
+                        manifest.run_id,
+                        scene,
+                        manifest.render_profile,
+                        provenance=inputs.reuse_provenance,
+                    )
+                except (OSError, ValueError) as exc:
+                    output = RecoveryOutput(
+                        status="restart", invalidate_artifact=True, reason=str(exc)
+                    )
+                else:
+                    output = RecoveryOutput(status="rendered", artifact=scene.artifact)
+            else:
+                output = RecoveryPipeline(
+                    self._render().backend, control=self.control
+                ).reconcile_scene(inputs, context)
+            if output.status == "blocked":
+                raise RuntimeError(output.reason or "Render state remains uncertain")
+            if output.job is not None:
+                scene.slurm_job = output.job
+            if output.status == "rendered":
+                was_rendered = scene.rendered
+                scene.artifact, scene.rendered = output.artifact, True
+                scene.failed = scene.give_up = False
+                scene.execution_verification = ExecutionVerification(
+                    status="passed",
+                    scope="formal_video",
+                    code_sha256=scene.code_sha256,
+                    artifact_sha256=output.artifact.video_sha256,
+                    duration_seconds=output.artifact.metadata.duration_seconds,
+                    checked_at=utc_now().isoformat(),
+                )
+                if not was_rendered:
+                    scene.visual_status = (
+                        "pending" if manifest.visual_eval_profile.enabled else "skipped"
+                    )
+                scene.phase = (
+                    "visual_evaluating"
+                    if scene.visual_status == "pending" and manifest.visual_eval_profile.enabled
+                    else "visual_accepted"
+                )
+                next_action = (
+                    "evaluate_visual" if manifest.visual_eval_profile.enabled else "merge_video"
+                )
+            elif output.status == "restart":
+                retired = list(agent.retired_submissions)
+                if scene.submission is not None and scene.submission.token not in retired:
+                    retired.append(scene.submission.token)
+                scene.slurm_job = scene.submission = scene.artifact = None
+                scene.rendered = scene.failed = scene.give_up = False
+                scene.phase = "reviewed" if scene.reviewed else "coded"
+                agent = agent.model_copy(
+                    update={
+                        "retired_submissions": tuple(retired),
+                        "previous_output_sha256": manifest.final_video_sha256
+                        or agent.previous_output_sha256,
+                    }
+                )
+                updates.update(
+                    state="DISPATCHING" if scene.reviewed else "CODING",
+                    final_video=None,
+                    final_video_sha256="",
+                )
+                next_action = "submit_render" if scene.reviewed else "review_code"
+            else:
+                scene.phase = "monitoring"
+                next_action = "poll_render"
+            patches = (self._scene_patch(scene),)
+        elif kind == "reuse_scene":
+            if (
+                self._base_manifest is None
+                or action.base_run_id != manifest.base_run_id
+                or self._base_manifest.run_id != action.base_run_id
+            ):
+                raise ValueError(
+                    "Pending incremental reuse requires an explicit verified base manifest"
+                )
+            output = IncrementalPipeline().reuse(
+                IncrementalInputs(
+                    base=self._base_manifest,
+                    base_root=RunRepository(settings.WORKSPACE_DIR).run_root(action.base_run_id),
+                    current=self._scene_inputs(action.scene_id, manifest=manifest),
+                    generation_identity=agent.generation_identity,
+                    current_scenes=tuple(
+                        item.model_copy(deep=True) for item in manifest.scenes.values()
+                    ),
+                    rag_profile=manifest.rag_profile,
+                    continuity_ready=agent.continuity_published,
+                    backend=manifest.backend,
+                ),
+                context,
+            )
+            checked, receipts = dict(agent.incremental_checked), dict(agent.reuse_receipts)
+            checked[action.scene_id] = manifest.scenes[action.scene_id].input_sha256
+            if output.eligible:
+                receipts[action.scene_id] = output.provenance
+                scene = output.scene
+                scene.phase = (
+                    "visual_evaluating"
+                    if manifest.visual_eval_profile.enabled
+                    else "visual_accepted"
+                )
+                patches = (self._scene_patch(scene),)
+                updates["artifact_refs"] = {
+                    f"reuse_scene_{action.scene_id}": output.provenance.path
+                }
+                next_action = (
+                    "evaluate_visual" if manifest.visual_eval_profile.enabled else "merge_video"
+                )
+            else:
+                next_action = "submit_render"
+            agent = agent.model_copy(
+                update={"incremental_checked": checked, "reuse_receipts": receipts}
+            )
+        elif kind == "propose_plan":
             if "imported_plan" in manifest.artifact_refs:
                 output = self._parse_export(
                     json.loads(
@@ -1475,7 +2210,9 @@ class AgentRuntime:
             )
             patches = (
                 self._scene_patch(
-                    StoredSceneState(plan=output.plan, phase="detailed", plan_ready=True)
+                    self._restore_retry_counters(
+                        StoredSceneState(plan=output.plan, phase="detailed", plan_ready=True), agent
+                    )
                 ),
             )
             next_action = "review_plan"
@@ -1896,6 +2633,8 @@ class AgentRuntime:
             next_action = "finish" if manifest.dry_run else "submit_render"
         elif kind == "submit_render":
             scene = manifest.scenes[action.scene_id]
+            if self._pending_submission(action.scene_id, manifest=manifest) is not None:
+                raise RuntimeError("Outstanding submission must be reconciled before resubmission")
             attempt = SubmissionAttempt(
                 backend=manifest.backend,
                 scene_revision=scene.revision,
@@ -1906,7 +2645,11 @@ class AgentRuntime:
                     agent=self._agent_update(
                         submissions=(
                             *self.manifest.agent.submissions,
-                            AgentSubmission(scene_id=action.scene_id, attempt=attempt),
+                            AgentSubmission(
+                                scene_id=action.scene_id,
+                                attempt=attempt,
+                                intent_id=current_invocation.get().intent_id,
+                            ),
                         )
                     )
                 )
@@ -2055,6 +2798,19 @@ class AgentRuntime:
                 scenes, target_id = output.scenes, output.scene_id
                 updates["state_ledger"] = output.state_ledger
             route = output.repair_route
+            receipts = dict(agent.reuse_receipts)
+            for scene in scenes:
+                if scene.artifact is not None and scene.artifact.origin == "rendered":
+                    receipts.pop(scene.plan.scene_id, None)
+            if (
+                kind == "evaluate_visual"
+                and output.restored
+                and output.scene.artifact.origin == "reused"
+            ):
+                if output.reuse_provenance is None:
+                    raise ValueError("Restored reused scene has no exact typed provenance")
+                receipts[action.scene_id] = output.reuse_provenance
+            agent = agent.model_copy(update={"reuse_receipts": receipts})
             next_action = "merge_video"
             if route in {"planner", "continuity"}:
                 agent = agent.model_copy(
@@ -2128,6 +2884,14 @@ class AgentRuntime:
             else:
                 restored = self.visual.reject_proposal(inputs, context)
                 scene = restored.scene
+                receipts = dict(agent.reuse_receipts)
+                if scene.artifact.origin == "reused":
+                    if restored.reuse_provenance is None:
+                        raise ValueError("Visual rollback requires exact typed reuse provenance")
+                    receipts[action.scene_id] = restored.reuse_provenance
+                else:
+                    receipts.pop(action.scene_id, None)
+                agent = agent.model_copy(update={"reuse_receipts": receipts})
                 scene.phase = "visual_accepted"
                 next_action = "merge_video"
                 updates.update(state="MONITORING")
@@ -2140,12 +2904,15 @@ class AgentRuntime:
             pending.pop(action.scene_id, None)
             agent = agent.model_copy(update={"visual_repairs": pending})
             patches = (self._scene_patch(scene),)
-        elif kind in {"merge_video", "evaluate_run"}:
-            output = (
-                self.finalization.merge(self._final_inputs(), context)
-                if kind == "merge_video"
-                else self.finalization.evaluate(self._final_inputs(), self._final_output(), context)
-            )
+        elif kind in {"merge_video", "reconcile_merge", "evaluate_run"}:
+            if kind == "merge_video":
+                output = self.finalization.merge(self._final_inputs(), context)
+            elif kind == "reconcile_merge":
+                output = self.finalization.reconcile_merge(self._final_inputs(), context)
+            else:
+                output = self.finalization.evaluate(
+                    self._final_inputs(), self._final_output(), context
+                )
             updates.update(
                 final_video=output.output_path,
                 final_video_sha256=output.video.sha256,
@@ -2153,7 +2920,7 @@ class AgentRuntime:
                 state="EVALUATING",
                 run_phase="evaluating",
             )
-            next_action = "evaluate_run" if kind == "merge_video" else "finish"
+            next_action = "finish" if kind == "evaluate_run" else "evaluate_run"
             if kind == "evaluate_run":
                 updates["eval_round"] = output.eval_round
             agent = agent.model_copy(
@@ -2204,7 +2971,8 @@ class AgentRuntime:
             scene_actions = dict(agent.scene_next_actions)
             scene_actions[action.scene_id] = next_action
             versions = dict(agent.scene_action_versions)
-            versions[action.scene_id] = versions.get(action.scene_id, 0) + 1
+            if kind != "retry_scene":
+                versions[action.scene_id] = versions.get(action.scene_id, 0) + 1
             agent = agent.model_copy(
                 update={"scene_next_actions": scene_actions, "scene_action_versions": versions}
             )
@@ -2315,6 +3083,7 @@ class AgentRuntime:
             plan_only=agent.operation == "plan",
             dry_run=manifest.dry_run,
             allow_partial=manifest.run_config.resolve().ALLOW_PARTIAL_OUTPUT,
+            recovery_epoch=agent.recovery_epoch,
         )
 
     def _budget(self):
@@ -2416,6 +3185,7 @@ class AgentRuntime:
         )
         values = dict(
             kind=name,
+            recovery_epoch=manifest.agent.recovery_epoch,
             run_id=manifest.run_id,
             resource_id=f"run:{manifest.run_id}" + (f"/scene:{scene_id}" if scene_id else ""),
             input_sha256=identity.input_sha256,
@@ -2459,7 +3229,29 @@ class AgentRuntime:
             values["snapshot_sha256"] = self._visual_input_digest(manifest)
         elif name == "propose_visual_fix":
             values["report"] = manifest.agent.visual_repairs[scene_id]
-        elif name == "poll_render":
+        elif name == "resume_run":
+            values.update(
+                scenes={item.scene_id: item.work_identity for item in snapshot.scenes},
+                rag_profile_sha256=digest(self._current_rag_profile().model_dump(mode="json")),
+            )
+        elif name == "reconcile_submission":
+            attempt = self._pending_submission(scene_id)
+            if attempt is None:
+                raise ValueError("No outstanding submission to reconcile")
+            values["attempt_token"] = attempt.token
+        elif name == "reconcile_render":
+            scene = manifest.scenes[scene_id]
+            values.update(
+                job_id=scene.slurm_job.job_id if scene.slurm_job else None,
+                artifact=ObjectRef(
+                    path=scene.artifact.video_path, sha256=scene.artifact.video_sha256, kind="video"
+                )
+                if scene.artifact
+                else None,
+            )
+        elif name == "reuse_scene":
+            values["base_run_id"] = manifest.base_run_id
+        elif name in {"poll_render", "cancel_render"}:
             values["job_id"] = manifest.scenes[scene_id].slurm_job.job_id
         elif name == "propose_render_fix":
             scene = manifest.scenes[scene_id]
@@ -2472,7 +3264,7 @@ class AgentRuntime:
                 scene_id=scene_id,
                 revision=scene.revision,
             )
-        elif name == "merge_video":
+        elif name in {"merge_video", "reconcile_merge"}:
             values["artifacts"] = tuple(
                 ObjectRef(
                     path=scene.artifact.video_path, sha256=scene.artifact.video_sha256, kind="video"
@@ -2557,6 +3349,14 @@ class AgentRuntime:
         if manifest.state in {"DISPATCHING", "MONITORING"}:
             for identifier, scene in sorted(manifest.scenes.items()):
                 if not scene.rendered and not scene.give_up:
+                    if scene.slurm_job is None and self._pending_submission(identifier) is not None:
+                        return (self._make_action("reconcile_submission", snapshot, identifier),)
+                    if (
+                        scene.slurm_job is None
+                        and manifest.incremental
+                        and agent.incremental_checked.get(identifier) != scene.input_sha256
+                    ):
+                        return (self._make_action("reuse_scene", snapshot, identifier),)
                     name = "poll_render" if scene.slurm_job is not None else "submit_render"
                     return (self._make_action(name, snapshot, identifier),)
         return (self._make_action(agent.next_action, snapshot),)

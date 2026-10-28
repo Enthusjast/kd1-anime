@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from kd1_anime.agent_runtime.contracts import ObjectRef, sanitize_record
 from kd1_anime.agent_runtime.tools import ToolContext
 from kd1_anime.eval.metrics import EvalResult
+from kd1_anime.media.merger import VideoMerger
 from kd1_anime.pipeline.contracts import FinalizationInputs, FinalizationOutput
 from kd1_anime.pipeline.render import validate_artifact
 from kd1_anime.pipeline.visual import (
@@ -96,8 +97,8 @@ class FinalizationPipeline:
             control=control,
         )
 
-    def merge(self, inputs: FinalizationInputs, context: ToolContext) -> FinalizationOutput:
-        context.checkpoint()
+    @staticmethod
+    def _merge_inputs(inputs: FinalizationInputs) -> tuple[list[Path], Path]:
         if not inputs.scenes:
             raise ValueError("Finalization requires verified scene artifacts")
         scene_ids = [scene.plan.scene_id for scene in inputs.scenes]
@@ -117,7 +118,13 @@ class FinalizationPipeline:
         for scene in rendered:
             _source(inputs, scene)
             videos.append(
-                validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+                validate_artifact(
+                    inputs.root,
+                    inputs.run_id,
+                    scene,
+                    inputs.render_profile,
+                    provenance=inputs.reuse_receipts.get(scene.plan.scene_id),
+                )
             )
             if visual_profile(inputs).enabled:
                 if scene.visual_status not in {"passed", "warning", "unknown"}:
@@ -126,6 +133,11 @@ class FinalizationPipeline:
         requested = inputs.output_path.expanduser().absolute()
         if requested.is_symlink() or requested.resolve() in videos:
             raise ValueError("Final output must not alias an input artifact")
+        return videos, requested
+
+    def merge(self, inputs: FinalizationInputs, context: ToolContext) -> FinalizationOutput:
+        context.checkpoint()
+        videos, requested = self._merge_inputs(inputs)
         with inputs.config.activate():
             # VideoMerger owns the output lock, ffprobe verification and atomic replace.
             merged = Path(
@@ -151,6 +163,101 @@ class FinalizationPipeline:
             raise ValueError("Merger returned an invalid final output identity")
         reference = _immutable_video(inputs.root, merged)
         return FinalizationOutput(video=reference, output_path=str(requested.resolve()))
+
+    def reconcile_merge(
+        self, inputs: FinalizationInputs, context: ToolContext
+    ) -> FinalizationOutput:
+        """Recompute an unknown merge result, then publish only byte-authorized output.
+
+        A valid-looking public video is not evidence of this merge. Only the exact
+        candidate hash or the caller's previously authorized same-run hash permits
+        adoption/replacement. No media discovery or generic retry is performed.
+        """
+        context.checkpoint()
+        videos, requested = self._merge_inputs(inputs)
+        with tempfile.TemporaryDirectory(prefix=".merge-recovery-", dir=inputs.root) as name:
+            candidate = Path(name) / "candidate.mp4"
+            with inputs.config.activate():
+                merged = Path(
+                    self.merger.merge(
+                        videos,
+                        candidate,
+                        render_profile=inputs.render_profile,
+                        merge_profile=inputs.merge_profile,
+                        replace_existing=False,
+                    )
+                )
+            if (
+                merged.is_symlink()
+                or merged.resolve() != candidate.resolve()
+                or not merged.is_file()
+                or merged.stat().st_size <= 0
+            ):
+                raise ValueError("Merger returned an invalid recovery candidate identity")
+            # Reject source/artifact mutations during the recomputation as well.
+            self._merge_inputs(inputs)
+            reference = _immutable_video(inputs.root, merged)
+            private = restore_run_path(inputs.root, reference.path)
+            context.checkpoint()
+            requested.parent.mkdir(parents=True, exist_ok=True)
+            # Use precisely the lock used by normal VideoMerger publication.
+            with VideoMerger._output_lock(requested.resolve()):
+                self._publish_reconciled(inputs, private, requested, reference.sha256)
+            return FinalizationOutput(video=reference, output_path=str(requested.resolve()))
+
+    @staticmethod
+    def _output_digest(requested: Path) -> str | None:
+        if requested.is_symlink():
+            raise ValueError("Final output must not be a symbolic link")
+        if not requested.exists():
+            return None
+        if not requested.is_file():
+            raise ValueError("Final output must be a regular file")
+        return sha256_file(requested)
+
+    @classmethod
+    def _publish_reconciled(cls, inputs, private, requested, digest):
+        """Publish under VideoMerger's lock; an absent target uses no-clobber link."""
+        existing = cls._output_digest(requested)
+        if existing != digest:
+            if existing is not None and existing != inputs.existing_output_sha256:
+                raise ValueError("Existing final output differs from the verified merge candidate")
+            descriptor, name = tempfile.mkstemp(prefix=".merge-recovery-", dir=requested.parent)
+            temporary = Path(name)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as output, private.open("rb") as source:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if sha256_file(temporary) != digest:
+                    raise ValueError("Immutable recovery candidate hash mismatch")
+                if existing is None:
+                    try:
+                        # Atomic even against a writer that does not honor our lock.
+                        os.link(temporary, requested)
+                    except FileExistsError:
+                        if cls._output_digest(requested) != digest:
+                            raise ValueError("Final output appeared with unrelated bytes") from None
+                else:
+                    # Authorization is hash-bound, not merely path- or run-bound.
+                    current = cls._output_digest(requested)
+                    if current != digest:
+                        if current != inputs.existing_output_sha256:
+                            raise ValueError("Previously authorized final output changed")
+                        os.replace(temporary, requested)
+            finally:
+                temporary.unlink(missing_ok=True)
+        if cls._output_digest(requested) != digest:
+            raise ValueError("Final output changed during merge reconciliation")
+        requested.chmod(0o600)
+        with requested.open("rb") as output:
+            os.fsync(output.fileno())
+        directory_fd = os.open(requested.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def evaluate(
         self, inputs: FinalizationInputs, video: FinalizationOutput, context: ToolContext
@@ -189,7 +296,13 @@ class FinalizationPipeline:
         for scene in inputs.scenes:
             if scene.rendered:
                 _source(inputs, scene)
-                validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile)
+                validate_artifact(
+                    inputs.root,
+                    inputs.run_id,
+                    scene,
+                    inputs.render_profile,
+                    provenance=inputs.reuse_receipts.get(scene.plan.scene_id),
+                )
         for reference, scope in (
             (video.visual_report, "complete_video"),
             (video.evaluation_report, "run_evaluation"),
@@ -232,7 +345,13 @@ class FinalizationPipeline:
         rendered = [
             (
                 scene.plan.scene_id,
-                validate_artifact(inputs.root, inputs.run_id, scene, inputs.render_profile),
+                validate_artifact(
+                    inputs.root,
+                    inputs.run_id,
+                    scene,
+                    inputs.render_profile,
+                    provenance=inputs.reuse_receipts.get(scene.plan.scene_id),
+                ),
             )
             for scene in sorted(inputs.scenes, key=lambda item: item.plan.scene_id)
             if scene.rendered

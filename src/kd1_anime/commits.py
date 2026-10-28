@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import ConfigDict, Field, model_validator
 
 from kd1_anime.agent_runtime.state import AgentRunState, merge_transport_state
+from kd1_anime.cluster.status import TERMINAL_STATES
 from kd1_anime.domain.dependencies import DependencyGraph, StaleWorkError, WorkIdentity
 from kd1_anime.domain.execution import FSMState, RunPhase
 from kd1_anime.domain.planning import (
@@ -72,6 +73,7 @@ class RunPatch(ValidatedModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     scenes: tuple[ScenePatch, ...] = ()
+    scene_removals: dict[int, WorkIdentity] = Field(default_factory=dict)
     reservation_additions: tuple[RequestReservation, ...] = ()
     agent: AgentRunState | None = None
     state: FSMState | None = None
@@ -109,6 +111,10 @@ class RunPatch(ValidatedModel):
         scene_ids = [scene.scene_id for scene in self.scenes]
         if len(scene_ids) != len(set(scene_ids)):
             raise ValueError("A run patch cannot replace one scene twice")
+        if set(scene_ids) & self.scene_removals.keys() or any(
+            isinstance(key, bool) or key < 1 for key in self.scene_removals
+        ):
+            raise ValueError("Scene retirement must name distinct positive scene identities")
         nullable = {"expected_final_duration", "continuity_bible", "final_video"}
         for name in self.model_fields_set - nullable:
             if getattr(self, name) is None:
@@ -190,6 +196,23 @@ class RunCommitter:
                 raise StaleWorkError("Command identity does not match its scene patch")
         elif command.scene_id is not None and command.scene_id not in proposed:
             raise ValueError("Command scene_id has no scene patch")
+        if patch.scene_removals and current.schema_version != 11:
+            raise ValueError("Scene retirement requires agent runtime ownership")
+        for scene_id, identity in patch.scene_removals.items():
+            stored = current.scenes.get(scene_id)
+            if stored is None or identity != WorkIdentity(stored.revision, stored.input_sha256):
+                raise StaleWorkError("Scene retirement was built from superseded inputs")
+            if (
+                stored.slurm_job is not None
+                and not stored.slurm_job.cancelled
+                and stored.slurm_job.status not in TERMINAL_STATES
+            ):
+                raise ValueError("Scene retirement requires confirmed job termination")
+            if any(
+                item.scene_id == scene_id and item.attempt.status in {"pending", "unknown"}
+                for item in current.agent.submissions
+            ):
+                raise ValueError("Uncertain submission forbids scene retirement")
         for scene in patch.scenes:
             stored = current.scenes.get(scene.scene_id)
             if stored is None and current.schema_version == 11:
@@ -259,11 +282,13 @@ class RunCommitter:
                     raise StaleWorkError("Commit was built from superseded dependency inputs")
 
     def _check_invalidations(self, candidate: RunManifest, patch: RunPatch) -> None:
-        changed = {scene.scene_id for scene in patch.scenes}
+        changed = {scene.scene_id for scene in patch.scenes} | patch.scene_removals.keys()
         affected = DependencyService.affected_manifest(self._current, candidate, tuple(changed))
         if not affected.issubset(changed):
             raise ValueError("Changed dependencies require explicit consumer invalidation patches")
         for scene_id in affected:
+            if scene_id in patch.scene_removals:
+                continue
             scene = candidate.scenes[scene_id]
             if (
                 scene.code_file
@@ -321,14 +346,23 @@ class RunCommitter:
             candidate = current.model_copy()
             if candidate.schema_version == 11 and "plan_approved" in patch.model_fields_set:
                 raise ValueError("Agent approvals belong to Session grants")
-            for name in patch.model_fields_set - {"scenes", "reservation_additions", "agent"}:
+            for name in patch.model_fields_set - {
+                "scenes",
+                "scene_removals",
+                "reservation_additions",
+                "agent",
+            }:
                 setattr(candidate, name, getattr(patch, name))
             if patch.agent is not None:
                 if current.agent is None:
                     raise ValueError("Legacy runs cannot acquire agent identity")
                 candidate.agent = merge_transport_state(current.agent, patch.agent)
-            if patch.scenes:
-                scenes = dict(current.scenes)
+            if patch.scenes or patch.scene_removals:
+                scenes = {
+                    scene_id: scene
+                    for scene_id, scene in current.scenes.items()
+                    if scene_id not in patch.scene_removals
+                }
                 for scene in patch.scenes:
                     replacement = scene.replacement
                     # The proposal was reconstructed above, so all nested values

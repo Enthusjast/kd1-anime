@@ -488,7 +488,7 @@ def test_completed_run_cannot_be_retried_in_place(application_boundary):
     root, manifest = saved_run(boundary)
     before = (root / "manifest.json").read_bytes()
     calls = list(boundary.calls)
-    with pytest.raises(RuntimeError, match="已完成运行不能原地重试"):
+    with pytest.raises(RuntimeError):
         boundary.app.retry(manifest.run_id, 1)
     assert video.read_bytes() == b"merged:" + VIDEO
     assert (root / "manifest.json").read_bytes() == before

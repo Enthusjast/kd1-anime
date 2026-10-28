@@ -73,6 +73,10 @@
   `unknown` 保留有效视频，过期 frame/video/report 拒绝，partial output 仍默认拒绝。
 - 修复通用脱敏误删合法 submission attempt ID 的问题；仅精确验证的 SubmissionAttempt
   结构保留公开身份，普通 token、伪造结构、已知凭据和隐藏分析仍被脱敏或拒绝。
+- v11 恢复、显式重试和增量复用使用独立领域动作及 typed commit；提交、取消和合并的未知
+  结果先核实身份，不自动重复派发；保留原有请求预算和各类重试计数。
+- 增量运行校验基础运行、执行环境、依赖及媒体身份，在独立私有目录复制复用产物；
+  CLI 的 `--incremental` 同时保留 `--approve-plan` 和 `--output` 语义。
 - 将默认代码 Review 轮数和渲染失败自动修复次数从 5 次提高到 8 次。
 - 删除持久化 LLM 响应缓存及其 CLI/配置入口；每次 Agent 调用都会重新请求模型，
   避免复用历史错误结果阻碍代码修复。

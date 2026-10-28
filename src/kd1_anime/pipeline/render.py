@@ -25,9 +25,13 @@ def _private_path(root: Path, path: Path) -> str:
     return relative
 
 
-def validate_artifact(root, run_id, scene, profile) -> Path:
+def validate_artifact(root, run_id, scene, profile, *, provenance=None) -> Path:
     """Bind an exact artifact to the current job; never discover a different video."""
     artifact, stored = scene.artifact, scene.slurm_job
+    if artifact is not None and artifact.origin == "reused":
+        from kd1_anime.pipeline.incremental import validate_reused_artifact
+
+        return validate_reused_artifact(root, run_id, scene, profile, provenance=provenance)
     if artifact is None or stored is None or not scene.rendered or not artifact.verified:
         raise ValueError("Scene has no verified current-job artifact identity")
     if (

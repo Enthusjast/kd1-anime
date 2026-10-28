@@ -49,9 +49,15 @@ class Application:
 
     @staticmethod
     def load_for_resume(run_id: str):
-        manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
-        selected = "agent" if manifest.schema_version == 11 else "legacy"
-        manifest.validate_for_resume(runtime=selected)
+        repository = RunRepository(settings.WORKSPACE_DIR)
+        version = repository.schema_version(run_id)
+        if version not in {10, 11}:
+            raise ValueError(f"manifest schema_version={version} 仅支持只读查看")
+        manifest = (
+            repository.load_for_agent_resume(run_id)
+            if version == 11
+            else repository.load_for_resume(run_id)
+        )
         if manifest.agent is not None:
             from kd1_anime.prompt_identity import verify_generation_identity
 
@@ -182,11 +188,23 @@ class Application:
         callback: Callback | None = None,
         interactive: bool = False,
     ) -> Path | None:
-        repository = RunRepository(settings.WORKSPACE_DIR)
         manifest = self.load_for_resume(run_id)
         options = {"callback": callback, "interactive": interactive}
-        if manifest.incremental and manifest.base_run_id:
-            options["base_manifest"] = repository.load_for_resume(manifest.base_run_id)
+        if (
+            manifest.incremental
+            and manifest.base_run_id
+            and manifest.state != "DONE"
+            and (
+                manifest.agent is None
+                or not manifest.scenes
+                or any(
+                    not scene.rendered
+                    and manifest.agent.incremental_checked.get(identifier) != scene.input_sha256
+                    for identifier, scene in manifest.scenes.items()
+                )
+            )
+        ):
+            options["base_manifest"] = self.load_for_resume(manifest.base_run_id)
         return self._runtime(agent=manifest.schema_version == 11).resume(run_id, **options)
 
     def retry(
@@ -197,15 +215,21 @@ class Application:
         callback: Callback | None = None,
         interactive: bool = False,
     ) -> Path | None:
-        repository = RunRepository(settings.WORKSPACE_DIR)
         manifest = self.load_for_resume(run_id)
-        options = {
-            "callback": callback,
-            "interactive": interactive,
-            "retry_scene_id": scene_id,
-        }
-        if manifest.incremental and manifest.base_run_id:
-            options["base_manifest"] = repository.load_for_resume(manifest.base_run_id)
+        if manifest.state == "DONE" or manifest.status == "completed":
+            raise RuntimeError("Completed runs cannot retry in place; create a new incremental run")
+        options = {"callback": callback, "interactive": interactive, "retry_scene_id": scene_id}
+        if (
+            manifest.incremental
+            and manifest.base_run_id
+            and (
+                manifest.agent is None
+                or scene_id not in manifest.scenes
+                or manifest.agent.incremental_checked.get(scene_id)
+                != manifest.scenes[scene_id].input_sha256
+            )
+        ):
+            options["base_manifest"] = self.load_for_resume(manifest.base_run_id)
         return self._runtime(agent=manifest.schema_version == 11).resume(run_id, **options)
 
     def run_incremental(
@@ -220,8 +244,8 @@ class Application:
         smoke: bool = False,
         backend: RenderBackendName | None = None,
     ) -> Path | None:
-        base = RunRepository(settings.WORKSPACE_DIR).load_for_resume(base_run_id)
-        return self._runtime(agent=False).run_incremental(
+        base = self.load_for_resume(base_run_id)
+        return self._runtime().run_incremental(
             user_prompt,
             base_run_id,
             base_manifest=base,

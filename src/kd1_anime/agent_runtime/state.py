@@ -34,6 +34,10 @@ class AgentSubmission(ValidatedModel):
 
     scene_id: int = Field(ge=1)
     attempt: SubmissionAttempt
+    intent_id: str | None = Field(default=None, min_length=1)
+    cancellation_status: Literal["not_requested", "unknown", "succeeded", "failed"] = (
+        "not_requested"
+    )
 
 
 class AgentReviewState(RuntimeRecord):
@@ -59,6 +63,8 @@ class AgentRunState(ValidatedModel):
     run_revision: int = Field(default=0, ge=0)
     run_input_sha256: Sha256
     step_count: int = Field(default=0, ge=0)
+    recovery_epoch: int = Field(default=0, ge=0)
+    previous_output_sha256: Sha256 | None = None
     planning_review: bool = True
     planning_preflight: bool = True
     smoke_requested: bool = False
@@ -80,6 +86,10 @@ class AgentRunState(ValidatedModel):
     final_visual_report: ObjectRef | None = None
     final_evaluation_report: ObjectRef | None = None
     final_visual_status: Literal["skipped", "accepted", "rejected", "unknown"] = "skipped"
+    incremental_checked: dict[int, Sha256] = Field(default_factory=dict)
+    reuse_receipts: dict[int, ObjectRef] = Field(default_factory=dict)
+    retired_scenes: dict[int, ObjectRef] = Field(default_factory=dict)
+    retired_submissions: tuple[str, ...] = ()
     pending_approval: AgentAction | None = None
     stop_reason: str = ""
     intents: tuple[ExecutionIntent, ...] = ()
@@ -158,6 +168,23 @@ class AgentRunState(ValidatedModel):
             errors.append("Duplicate agent stage attempt identity")
         if len({item.attempt.token for item in self.submissions}) != len(self.submissions):
             errors.append("Duplicate agent submission identity")
+        tokens = {item.attempt.token: item.attempt for item in self.submissions}
+        if len(set(self.retired_submissions)) != len(self.retired_submissions) or any(
+            token not in tokens or tokens[token].status in {"pending", "unknown"}
+            for token in self.retired_submissions
+        ):
+            errors.append("Retired submissions must be unique confirmed attempt identities")
+        for submission in self.submissions:
+            if submission.intent_id is not None:
+                intent = intents.get(submission.intent_id)
+                if (
+                    intent is None
+                    or intent.action.kind != "submit_render"
+                    or intent.action.scene_id != submission.scene_id
+                    or intent.action.work_identity.revision != submission.attempt.scene_revision
+                    or intent.action.source.sha256 != submission.attempt.code_sha256
+                ):
+                    errors.append("Submission reservation differs from its exact dispatch intent")
         return errors
 
 
@@ -168,6 +195,7 @@ def merge_transport_state(current: AgentRunState, proposed: AgentRunState) -> Ag
         or current.generation_identity != proposed.generation_identity
         or current.operation != proposed.operation
         or proposed.run_revision < current.run_revision
+        or proposed.recovery_epoch < current.recovery_epoch
     ):
         raise ValueError("A runtime patch cannot replace its pinned identity")
 
@@ -223,24 +251,44 @@ def merge_transport_state(current: AgentRunState, proposed: AgentRunState) -> Ag
             attempts[key] = item
     submissions = {item.attempt.token: item for item in current.submissions}
     submission_ranks = {"pending": 0, "unknown": 1, "submitted": 2, "cancelled": 3}
-    for item in proposed.submissions:
+    for incoming in proposed.submissions:
+        item = incoming
         old = submissions.get(item.attempt.token)
         if old is not None:
-            if old.scene_id != item.scene_id or any(
-                getattr(old.attempt, name) != getattr(item.attempt, name)
-                for name in ("backend", "scene_revision", "code_sha256", "created_at")
+            if (
+                old.scene_id != item.scene_id
+                or (old.intent_id is not None and old.intent_id != item.intent_id)
+                or any(
+                    getattr(old.attempt, name) != getattr(item.attempt, name)
+                    for name in ("backend", "scene_revision", "code_sha256", "created_at")
+                )
             ):
                 raise ValueError("Submission attempt cannot change its bound inputs")
+            cancellation_ranks = {"not_requested": 0, "unknown": 1, "failed": 2, "succeeded": 3}
+            if (
+                cancellation_ranks[old.cancellation_status]
+                > cancellation_ranks[item.cancellation_status]
+            ):
+                item = item.model_copy(update={"cancellation_status": old.cancellation_status})
             if old.attempt.job_id and item.attempt.job_id not in {"", old.attempt.job_id}:
                 raise ValueError("Submission attempt cannot change its external job")
             if submission_ranks[old.attempt.status] > submission_ranks[item.attempt.status]:
                 continue
         submissions[item.attempt.token] = item
-    scene_next_actions = dict(current.scene_next_actions)
-    scene_action_versions = dict(current.scene_action_versions)
+    scene_owner = proposed if proposed.run_revision > current.run_revision else current
+    scene_next_actions = dict(scene_owner.scene_next_actions)
+    scene_action_versions = dict(scene_owner.scene_action_versions)
     scene_maps = {
-        name: dict(getattr(current, name))
-        for name in ("reviewed_identities", "pending_candidates", "scene_review_counters")
+        name: dict(getattr(scene_owner, name))
+        for name in (
+            "reviewed_identities",
+            "pending_candidates",
+            "scene_review_counters",
+            "visual_repairs",
+            "plan_repair_proposals",
+            "incremental_checked",
+            "reuse_receipts",
+        )
     }
     for scene_id, action in proposed.scene_next_actions.items():
         version = proposed.scene_action_versions.get(scene_id, 0)
@@ -264,6 +312,9 @@ def merge_transport_state(current: AgentRunState, proposed: AgentRunState) -> Ag
             "attempts": tuple(attempts.values()),
             "submissions": tuple(submissions.values()),
             "step_count": max(current.step_count, proposed.step_count),
+            "retired_submissions": tuple(
+                dict.fromkeys((*current.retired_submissions, *proposed.retired_submissions))
+            ),
             "committed_invocations": tuple(
                 dict.fromkeys((*current.committed_invocations, *proposed.committed_invocations))
             ),

@@ -46,6 +46,8 @@ class SceneInputs:
     auto_fix: bool = True
     visual_eval_profile: VisualEvalProfile | None = None
     submission_identity: WorkIdentity | None = None
+    reuse_provenance: ObjectRef | None = None
+    context_sha256: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +85,7 @@ class FinalizationInputs:
     eval_round: int = 0
     visual_eval_profile: VisualEvalProfile | None = None
     existing_output_sha256: str = ""
+    reuse_receipts: dict[int, ObjectRef] = field(default_factory=dict)
 
 
 class PlanningOutput(RuntimeRecord):

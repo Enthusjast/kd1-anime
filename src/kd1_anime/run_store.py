@@ -965,13 +965,28 @@ class RunRepository:
     def manifest_path(self, run_id: str) -> Path:
         return self.run_root(run_id) / MANIFEST_NAME
 
-    def load(self, run_id: str) -> RunManifest:
+    def schema_version(self, run_id: str) -> int:
+        path = self.manifest_path(run_id)
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(f"找不到运行清单: {run_id}")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or type(raw.get("schema_version")) is not int:
+            raise ValueError("manifest schema_version 必须是整数")
+        return raw["schema_version"]
+
+    def _load(self, run_id: str, expected_version: int | None = None) -> RunManifest:
         path = self.manifest_path(run_id)
         if not path.is_file() or path.is_symlink():
             raise FileNotFoundError(f"找不到运行清单: {run_id}")
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("运行清单顶层必须是 JSON 对象")
+        if type(raw.get("schema_version")) is not int:
+            raise ValueError("manifest schema_version 必须是整数")
+        if expected_version is not None and raw["schema_version"] != expected_version:
+            raise ValueError(
+                f"manifest schema_version={raw.get('schema_version')} 仅支持只读查看；恢复需要 v{expected_version}"
+            )
         migrated = migrate_manifest_data(raw, self.run_root(run_id))
         manifest = RunManifest.model_validate(migrated)
         if manifest.schema_version not in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
@@ -980,15 +995,18 @@ class RunRepository:
             raise ValueError("运行目录与 manifest.run_id 不一致")
         return manifest
 
+    def load(self, run_id: str) -> RunManifest:
+        return self._load(run_id)
+
     def load_for_resume(self, run_id: str) -> RunManifest:
         """读取并验证可修改恢复的当前版本清单。"""
 
-        manifest = self.load(run_id)
+        manifest = self._load(run_id, MANIFEST_SCHEMA_VERSION)
         manifest.validate_for_resume()
         return manifest
 
     def load_for_agent_resume(self, run_id: str) -> RunManifest:
-        manifest = self.load(run_id)
+        manifest = self._load(run_id, AGENT_MANIFEST_SCHEMA_VERSION)
         manifest.validate_for_resume(runtime="agent")
         return manifest
 

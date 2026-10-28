@@ -13,6 +13,21 @@ if TYPE_CHECKING:
     from kd1_anime.run_store import RunManifest
 
 
+def scene_work_digest(scene, context_sha256: str) -> str:
+    """Bind exact scene semantics to the coordinator's immutable shared inputs."""
+    return digest(
+        {
+            "plan": scene.plan.model_dump(mode="json"),
+            "technical": scene.technical_spec.model_dump(mode="json")
+            if scene.technical_spec
+            else None,
+            "source": scene.code_sha256,
+            "inherited": scene.inherited_elements_code,
+            "context": context_sha256,
+        }
+    )
+
+
 class DependencyService:
     @staticmethod
     def contract(plan: ScenePlan, technical: TechnicalSpec | None) -> str:
