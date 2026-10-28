@@ -611,7 +611,7 @@ cat > prompts.txt <<'EOF'
 可视化特征值和特征向量
 EOF
 
-kd1-anime batch prompts.txt --max-parallel 3
+kd1-anime batch prompts.txt --max-parallel 3 --approve-plan
 
 cat > prompts.json <<'EOF'
 {
@@ -622,10 +622,13 @@ cat > prompts.json <<'EOF'
 }
 EOF
 
-kd1-anime batch prompts.json --dry-run
+kd1-anime batch prompts.json --dry-run --approve-plan
 ```
 
 `--max-parallel` 限制项目级并行数；所有项目还共享进程级 `LLM_PARALLEL_WORKERS`、`RAG_PARALLEL_WORKERS`、`VISUAL_LLM_PARALLEL_WORKERS`、`SLURM_MAX_IN_FLIGHT` 和本地渲染配额。使用 `--backend local` 时，批量任务仍以前台子进程运行；使用 `--output-dir` 时，输出文件会按任务编号写入该目录；重复目标和不允许覆盖的文件会在执行前被拒绝。
+
+批处理默认不会替用户批准计划：未提供 `--approve-plan` 的任务会保存为等待状态并显示 run ID；
+显式参数只批准完整计划，不批准代码 diff。用户可检查运行并作出决定后再恢复。
 
 ## 渲染器、转场与视频合并
 

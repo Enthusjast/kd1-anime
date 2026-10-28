@@ -1,4 +1,4 @@
-"""跨 Orchestrator 共享的进程级资源配额。"""
+"""Process-wide model/RAG pools and live render-attempt capacity shared by runtimes."""
 
 from __future__ import annotations
 
@@ -30,6 +30,40 @@ class ResourceCoordinator:
         self._local_limit = max(1, local_limit if local_limit is not None else 1)
         self._local_active = 0
         self._local_lock = threading.Lock()
+        self._render_claims: dict[tuple[str, str], str] = {}
+        self._render_claims_lock = threading.Lock()
+
+    def claim_render(self, key: tuple[str, str], backend: str, *, existing=False) -> bool:
+        """Reserve an attempt across runtimes; uncertain dispatches keep their claim.
+
+        Restored identities are counted once, even when they exceed today's limit.
+        This only accounts for capacity: it never adopts or operates a process.
+        """
+        if backend not in {"slurm", "local"}:
+            raise ValueError("Unknown render capacity backend")
+        with self._render_claims_lock:
+            previous = self._render_claims.get(key)
+            if previous is not None:
+                if previous != backend:
+                    raise ValueError("Render capacity identity changed backend")
+                return True
+            acquire = self.try_acquire_slurm if backend == "slurm" else self.try_acquire_local
+            register = (
+                self.register_existing_slurm if backend == "slurm" else self.register_existing_local
+            )
+            if existing:
+                register()
+            elif not acquire():
+                return False
+            self._render_claims[key] = backend
+            return True
+
+    def release_render(self, key: tuple[str, str]) -> None:
+        """Release only after the owning runtime durably confirms terminal state."""
+        with self._render_claims_lock:
+            backend = self._render_claims.pop(key, None)
+            if backend is not None:
+                (self.release_slurm if backend == "slurm" else self.release_local)()
 
     def try_acquire_slurm(self) -> bool:
         with self._slurm_lock:

@@ -1,17 +1,14 @@
 """批量并行处理模块测试。"""
 
 import json
-import threading
-from types import SimpleNamespace
 
 import pytest
 
-import kd1_anime.batch as batch_module
-import kd1_anime.orchestrator as orchestrator_module
 from kd1_anime.batch import (
     BatchConfig,
     BatchProcessor,
     BatchTask,
+    load_batch_config,
     load_prompts_from_file,
 )
 
@@ -89,6 +86,7 @@ class TestBatchConfig:
         assert config.dry_run is False
         assert config.output_dir is None
         assert config.incremental is False
+        assert config.approve_plan is False
 
     def test_custom_config(self, tmp_path):
         """测试自定义配置。"""
@@ -115,6 +113,26 @@ class TestBatchConfig:
     def test_rejects_invalid_base_run_id(self):
         with pytest.raises(ValueError, match="无效 run-id"):
             BatchConfig(base_run_ids={1: "not-a-run"})
+
+    @pytest.mark.parametrize("value", ["true", "false", 0, 1, None])
+    def test_rejects_non_boolean_plan_approval(self, value, tmp_path):
+        with pytest.raises(ValueError, match="approve_plan"):
+            BatchConfig(approve_plan=value)
+        path = tmp_path / "batch.json"
+        path.write_text(json.dumps({"approve_plan": value}), encoding="utf-8")
+        with pytest.raises(ValueError, match="approve_plan"):
+            load_batch_config(path)
+
+    @pytest.mark.parametrize("value", [False, True])
+    def test_loads_explicit_boolean_plan_approval(self, value, tmp_path):
+        path = tmp_path / "batch.json"
+        path.write_text(json.dumps({"approve_plan": value}), encoding="utf-8")
+        assert load_batch_config(path).approve_plan is value
+
+    def test_json_config_does_not_implicitly_approve_plans(self, tmp_path):
+        path = tmp_path / "batch.json"
+        path.write_text("{}", encoding="utf-8")
+        assert load_batch_config(path).approve_plan is False
 
 
 class TestBatchProcessor:
@@ -176,98 +194,6 @@ class TestBatchProcessor:
         processor._validate_output_targets()
 
         assert output_dir.stat().st_mode & 0o777 == 0o755
-
-    def test_dry_run_does_not_report_nonexistent_output(self, monkeypatch, tmp_path):
-        class FakeOrchestrator:
-            def __init__(self, resource_coordinator=None):
-                self._ctx = None
-
-            def run(self, *args, **kwargs):
-                return None
-
-        monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
-        processor = BatchProcessor(BatchConfig(dry_run=True))
-        task = processor.add_task("demo", tmp_path / "not-created.mp4")
-
-        processor._execute_single_task(task)
-
-        assert task.status == "completed"
-        assert task.output is None
-
-    def test_failed_task_keeps_run_id_for_diagnostics(self, monkeypatch, tmp_path):
-        class FakeOrchestrator:
-            def __init__(self, resource_coordinator=None):
-                self._ctx = SimpleNamespace(
-                    paths=SimpleNamespace(run_id="20260728-120000-1234abcd")
-                )
-
-            def run(self, *args, **kwargs):
-                raise RuntimeError("render failed")
-
-        monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
-        processor = BatchProcessor(BatchConfig(dry_run=True))
-        task = processor.add_task("demo", tmp_path / "not-created.mp4")
-
-        processor._execute_single_task(task)
-
-        assert task.status == "failed"
-        assert task.run_id == "20260728-120000-1234abcd"
-
-    def test_keyboard_interrupt_cancels_active_orchestrators(self, monkeypatch):
-        started = threading.Event()
-        cancelled = threading.Event()
-
-        class FakeOrchestrator:
-            def __init__(self, resource_coordinator=None):
-                self._ctx = SimpleNamespace(
-                    paths=SimpleNamespace(run_id="20260728-120000-1234abcd")
-                )
-
-            def run(self, *args, **kwargs):
-                started.set()
-                cancelled.wait(timeout=2)
-                return None
-
-            def cancel_all(self):
-                cancelled.set()
-
-        monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
-        processor = BatchProcessor(BatchConfig(max_parallel=1, dry_run=True))
-        processor.add_task("demo")
-
-        def interrupt_after_worker(futures):
-            assert started.wait(timeout=2)
-            raise KeyboardInterrupt
-
-        monkeypatch.setattr(batch_module, "as_completed", interrupt_after_worker)
-
-        tasks = processor.execute_all()
-
-        assert tasks[0].status == "interrupted"
-        assert cancelled.is_set()
-
-    def test_error_after_interrupt_is_recorded_as_interrupted(self, monkeypatch):
-        class FakeOrchestrator:
-            def __init__(self, resource_coordinator=None):
-                self._ctx = SimpleNamespace(
-                    paths=SimpleNamespace(run_id="20260728-120000-1234abcd")
-                )
-
-            def run(self, *args, **kwargs):
-                processor._interrupted.set()
-                raise RuntimeError("cancelled while waiting")
-
-            def cancel_all(self):
-                pass
-
-        monkeypatch.setattr(orchestrator_module, "Orchestrator", FakeOrchestrator)
-        processor = BatchProcessor(BatchConfig(max_parallel=1, dry_run=True))
-        processor.add_task("demo")
-
-        task = processor._execute_single_task(processor.tasks[0])
-
-        assert task.status == "interrupted"
-        assert task.error == "用户中断，任务已停止"
 
 
 class TestBatchTask:

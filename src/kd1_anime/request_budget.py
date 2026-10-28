@@ -262,7 +262,12 @@ class ObservedStream:
                     self.visible_bytes += len(text.encode("utf-8"))
                 yield chunk
         except BaseException as exc:
-            self._finish(exc)
+            try:
+                close = getattr(self.stream, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                self._finish(exc)
             raise
         else:
             self._finish()

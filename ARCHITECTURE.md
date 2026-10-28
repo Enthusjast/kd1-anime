@@ -48,8 +48,8 @@
 
 CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
 `plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
-`run_incremental`。生成、规划、直接渲染、恢复、重试、增量及 TUI 使用 v11 Agent Runtime；
-batch 暂留 legacy v10，旧运行仍按清单版本选择对应运行时。
+`run_incremental`。生成、规划、直接渲染、恢复、重试、增量、TUI 与新批处理使用 v11 Agent Runtime；
+既有 v10 运行仍由 legacy 路径执行，不在同一运行中切换。
 计划导出只读取已提交 manifest，不把 worker Context 暴露给 CLI。
 
 `domain/scene_fields.py` 是运行态字段所有权和 v10 存储投影的唯一元数据；领域
@@ -219,8 +219,8 @@ CODING → Code REVIEWING，彼此并行；共享 ElementManifest/StateLedger �
 
 运行生命周期和场景生命周期分别记录，原有 FSM 枚举保留为兼容检查点与 TUI 投影。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜和初始计划审查使用有界工作池；Technical Planner 按依赖链生成结构化 TechnicalSpec。每份合同的 `handoff_out` 只包含当前场景最终导出的对象状态，下一场景以 `handoff_in` 接收相同的 element ID、变量名、对象类型和最终状态，不必等待前一场景的生成代码。FIFO 就绪队列按依赖派发技术规划、编码、审查、提交及结果处理任务，每场景最多一个改变状态的在途任务，远端等待不占用工作线程。具备完整结构化交接的场景可并行生成和渲染；需要源码上下文或全片审查的路径保留必要屏障。代码审查结果提交后，Orchestrator 按 Scene ID 顺序更新 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。v4–v9 清单仅供查看和导出。默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则使用受控本地进程（默认一个在途任务）。每个任务使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。后端边界统一执行产物定位、ffprobe 和哈希验证。
 
-LLM 调用受 `LLM_PARALLEL_WORKERS` 信号量限制；RAG 请求受独立的 `RAG_PARALLEL_WORKERS` 信号量限制；Slurm 提交受 `SLURM_MAX_IN_FLIGHT` 限制。批量模式中的多个 Orchestrator 共享同一个 `ResourceCoordinator`，不会把每项目配额相乘。
-CLI 先检查模型配置；运行建立并保存预算后，以短超时探测主模型，探测同样占用持久化请求计数。启用 RAG 时确认索引存在且未过期，并探测 Embedding 和 Reranker。探测失败直接退出。视觉评估使用完全独立的 Key、URL、模型、超时和并发配置；批处理中的多个 Orchestrator 共享进程级视觉并发配额。配置缺失会在启动前失败，网络探测暂时失败时生成流水线降级为 `unknown`；显式 `evaluate --visual` 则失败退出。`status`、`render`、`clean`、已完成运行恢复和纯代码评估不依赖这些探测。
+主模型、视觉模型和 RAG 使用独立并发配额；批处理中的 v11 运行共享 `ResourceCoordinator`，Slurm/local 名额在外部作业确认终态前持续占用。不确定提交和取消失败保留名额，不能借释放配额触发重复提交。
+CLI 先检查模型配置；运行建立并保存预算后探测主模型，探测同样占用持久化请求计数。视觉评估使用独立 Key、URL、模型、超时和并发配置；视觉端点故障可记为 `unknown`。批处理默认等待计划批准，`--approve-plan` 仅代表本地用户批准完整计划。
 
 `ERROR` 是失败检查点。任何未处理异常或不允许的部分输出都会触发失败；用户中断时会尝试取消仍在运行的 Job，并持久化取消成功或失败的观测。运行和场景使用独立转移规则；非法生命周期转移被拒绝。场景修订变化和显式恢复只能沿允许的重新执行路径推进。
 

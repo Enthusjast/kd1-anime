@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event
 from typing import TYPE_CHECKING
 
 from kd1_anime.cluster.render_backend import RenderBackendName
@@ -31,22 +32,43 @@ def _legacy_runtime() -> Orchestrator:
     return Orchestrator()
 
 
-def _agent_runtime() -> AgentRuntime:
+def _agent_runtime(*, resource_coordinator=None) -> AgentRuntime:
     from kd1_anime.agent_runtime.runtime import AgentRuntime
 
-    return AgentRuntime()
+    return AgentRuntime(resource_coordinator=resource_coordinator)
 
 
 class Application:
     """Stable use-case boundary; legacy state remains owned by its runtime."""
 
-    def __init__(self, runtime_factory: Callable[[], Orchestrator | AgentRuntime] | None = None):
+    def __init__(
+        self,
+        runtime_factory: Callable[[], Orchestrator | AgentRuntime] | None = None,
+        *,
+        resource_coordinator=None,
+    ):
         self._runtime_factory = runtime_factory
+        self._resource_coordinator = resource_coordinator
+        self._active_runtime = None
+        self._cancel_requested = Event()
 
     def _runtime(self, *, agent: bool = True):
         if self._runtime_factory is not None:
-            return self._runtime_factory()
-        return _agent_runtime() if agent else _legacy_runtime()
+            runtime = self._runtime_factory()
+        elif agent and self._resource_coordinator is not None:
+            runtime = _agent_runtime(resource_coordinator=self._resource_coordinator)
+        else:
+            runtime = _agent_runtime() if agent else _legacy_runtime()
+        self._active_runtime = runtime
+        if self._cancel_requested.is_set():
+            runtime.cancel_all()
+        return runtime
+
+    def cancel_all(self) -> None:
+        self._cancel_requested.set()
+        runtime = self._active_runtime
+        if runtime is not None:
+            runtime.cancel_all()
 
     @staticmethod
     def _sessions():

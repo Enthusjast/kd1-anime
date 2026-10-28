@@ -104,6 +104,9 @@ class ExecutionAdapters:
     consume_grant: Callable[[str, ExecutionIntent], object]
     commit: Callable[[ExecutionIntent, ToolInvocation, ToolResult], int]
     emit_committed: Callable[[ExecutionIntent, ToolInvocation, int], None]
+    compensate_submission: Callable[[ExecutionIntent, ToolInvocation, ToolResult], None] | None = (
+        None
+    )
 
 
 class ToolCancelled(RuntimeError):
@@ -246,7 +249,8 @@ class ToolExecutor:
                     result = tool.execute(action, context)
                 finally:
                     current_invocation.reset(token)
-                context.checkpoint()
+                if action.kind != "submit_render" or invocation.external_job_id is None:
+                    context.checkpoint()
                 if not isinstance(result, ToolResult) or not isinstance(result.stage, StageResult):
                     raise TypeError("Tool must return a typed StageResult and patch")
                 if not isinstance(result.stage.value, tool.output_model):
@@ -322,7 +326,17 @@ class ToolExecutor:
             revision = self.adapters.commit(intent, invocation, result)
         except Exception:
             intent = intent.model_copy(update={"status": "unknown"})
-            self.adapters.persist_intent(intent)
+            try:
+                if (
+                    action.kind == "submit_render"
+                    and invocation.external_job_id is not None
+                    and self.adapters.compensate_submission is not None
+                ):
+                    # This remains compensation for the authorized submission,
+                    # not a scheduler side effect in a persistence adapter.
+                    self.adapters.compensate_submission(intent, invocation, result)
+            finally:
+                self.adapters.persist_intent(intent)
             raise
         invocation = invocation.model_copy(update={"status": "completed", "finished_at": utc_now()})
         intent = intent.model_copy(update={"status": "completed"})

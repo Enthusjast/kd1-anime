@@ -61,7 +61,7 @@ from kd1_anime.cluster.resource_estimator import estimate_render_resources
 from kd1_anime.cluster.status import TERMINAL_STATES
 from kd1_anime.commits import CommitCommand, RunCommitter, RunPatch, ScenePatch
 from kd1_anime.config import resolve_runtime_path, settings
-from kd1_anime.control import RunControl
+from kd1_anime.control import CURRENT_CONTROL, RunCancelled, RunControl
 from kd1_anime.domain.dependencies import DependencyGraph, WorkIdentity, digest
 from kd1_anime.domain.diagnostics import Diagnostic
 from kd1_anime.domain.execution import SubmissionAttempt
@@ -115,6 +115,7 @@ from kd1_anime.prompt_identity import capture_generation_identity, verify_genera
 from kd1_anime.rag.service import RagService
 from kd1_anime.rendering import MergeProfile, RenderProfile, sha256_file
 from kd1_anime.request_budget import RequestBudget, RequestContext, RequestReservation
+from kd1_anime.resources import ResourceCoordinator
 from kd1_anime.run_store import (
     AGENT_MANIFEST_SCHEMA_VERSION,
     RunManifest,
@@ -149,6 +150,23 @@ def _serialized(method):
     return locked
 
 
+def _runtime_operation(method):
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        with self._operation_lock:
+            self._operation_active = True
+            try:
+                return method(self, *args, **kwargs)
+            except RunCancelled:
+                return None
+            finally:
+                self._operation_active = False
+                if self.control.cancelled.is_set() and hasattr(self, "committer"):
+                    self._cancel_active_renders()
+
+    return run
+
+
 def _preflight(profile, backend):
     RenderingService(backend, backend.name).preflight(profile)
 
@@ -180,13 +198,112 @@ class CompletionOutput(RuntimeRecord):
 
 
 class AgentRuntime:
-    """One lock, one manifest authority, and one declared tool per durable stage."""
+    """Manifest authority with shared request lifetimes and fail-closed render claims."""
 
-    def __init__(self, *, dependencies: AgentDependencies | None = None):
+    def __init__(
+        self,
+        *,
+        dependencies: AgentDependencies | None = None,
+        resource_coordinator: ResourceCoordinator | None = None,
+    ):
         self.dependencies = dependencies or AgentDependencies()
         self.control = RunControl(Event())
         self._callback = None
         self._runtime_lock = RLock()
+        self._operation_lock = RLock()
+        self._operation_active = False
+        self._cancel_cleanup_done = False
+        self.resources = resource_coordinator or ResourceCoordinator(
+            llm_limit=settings.LLM_PARALLEL_WORKERS,
+            visual_llm_limit=settings.VISUAL_LLM_PARALLEL_WORKERS,
+            rag_limit=settings.RAG_PARALLEL_WORKERS,
+            slurm_limit=settings.SLURM_MAX_IN_FLIGHT,
+            local_limit=settings.LOCAL_RENDER_MAX_IN_FLIGHT,
+        )
+
+    def cancel_all(self):
+        """Signal workers; the owning operation performs authorized durable cleanup."""
+        self.control.cancelled.set()
+        if not self._operation_active:
+            with self._operation_lock:
+                if hasattr(self, "committer"):
+                    self._cancel_active_renders()
+
+    def _cancel_active_renders(self):
+        if self._cancel_cleanup_done:
+            return
+        with lock_run(self.root):
+            session = self.sessions.load(self.manifest.agent.session_id)
+            if not session.commands or session.commands[-1].kind != "cancel":
+                self.sessions.command(
+                    session.session_id,
+                    UserCommand(session_id=session.session_id, kind="cancel"),
+                )
+            for identifier in sorted(self.manifest.scenes):
+                job = self.manifest.scenes[identifier].slurm_job
+                if job is None or self._render_terminal(job) or job.status == "CANCEL_FAILED":
+                    continue
+                action = self._make_action("cancel_render", self._snapshot(), identifier)
+                decision = Policy().evaluate(
+                    self._snapshot(),
+                    action,
+                    self.registry.get(action.kind).policy,
+                    self.sessions.load(self.manifest.agent.session_id),
+                    self._budget(),
+                )
+                if decision.effect == "allow":
+                    with suppress(Exception):
+                        self.executor.execute(action, self.manifest.agent.session_id, decision)
+            if self.manifest.state != "DONE":
+                uncertain = any(
+                    not self._render_terminal(scene.slurm_job)
+                    if scene.slurm_job is not None
+                    else (
+                        self._pending_submission(identifier) is not None
+                        and not self._submission_cancelled(identifier)
+                    )
+                    for identifier, scene in self.manifest.scenes.items()
+                )
+                self._stop(
+                    "Run cancelled; unconfirmed external work remains reserved"
+                    if uncertain
+                    else "Run cancelled"
+                )
+            self._cancel_cleanup_done = True
+
+    @staticmethod
+    def _render_terminal(job):
+        return job.status in TERMINAL_STATES or (job.cancelled and job.status != "CANCEL_FAILED")
+
+    def _render_key(self, scene_id, manifest=None):
+        manifest = manifest or self.manifest
+        scene = manifest.scenes[scene_id]
+        attempt = scene.submission or self._pending_submission(scene_id, manifest=manifest)
+        identity = attempt.token if attempt is not None else f"job:{scene.slurm_job.job_id}"
+        return (manifest.run_id, identity)
+
+    def _submission_cancelled(self, scene_id):
+        attempt = self._pending_submission(scene_id)
+        return attempt is not None and any(
+            item.attempt.token == attempt.token and item.cancellation_status == "succeeded"
+            for item in self.manifest.agent.submissions
+        )
+
+    def _restore_render_capacity(self):
+        for identifier, scene in self.manifest.scenes.items():
+            pending = self._pending_submission(identifier)
+            if pending is not None and self._submission_cancelled(identifier):
+                self.resources.release_render(self._render_key(identifier))
+                continue
+            if scene.slurm_job is not None:
+                if self._render_terminal(scene.slurm_job):
+                    self.resources.release_render(self._render_key(identifier))
+                    continue
+            elif pending is None:
+                continue
+            self.resources.claim_render(
+                self._render_key(identifier), self.manifest.backend, existing=True
+            )
 
     def generate(
         self,
@@ -392,6 +509,7 @@ class AgentRuntime:
                 return False
         return True
 
+    @_runtime_operation
     def resume(
         self,
         run_id: str,
@@ -547,6 +665,7 @@ class AgentRuntime:
             ],
         }
 
+    @_runtime_operation
     def _start(
         self,
         prompt,
@@ -752,10 +871,13 @@ class AgentRuntime:
         self._backend = None
         self._render_pipeline = None
         self._rag = (
-            self.dependencies.rag_factory(manifest.run_config.resolve())
+            self.dependencies.rag_factory(
+                manifest.run_config.resolve(), rag_semaphore=self.resources.rag
+            )
             if manifest.run_config.resolve().RAG_ENABLED
             else None
         )
+        self._restore_render_capacity()
         self.planning = PlanningPipeline(
             self.dependencies.planner_factory,
             self.dependencies.plan_reviewer_factory,
@@ -856,6 +978,7 @@ class AgentRuntime:
             ),
             self._commit_result,
             self._emit_committed,
+            self._compensate_submission,
         )
         self.executor = ToolExecutor(self.registry, adapters)
         self.events.reconcile(manifest, lock_held=True)
@@ -1128,38 +1251,72 @@ class AgentRuntime:
                 ),
             }
         )
-        try:
-            manifest = self._patch(RunPatch(**updates), phase=intent.action.kind)
-        except Exception:
-            if intent.action.kind == "submit_render" and invocation.external_job_id is not None:
-
-                def record_cancellation(status):
-                    self._patch(
-                        RunPatch(
-                            agent=self._agent_update(
-                                submissions=tuple(
-                                    item.model_copy(update={"cancellation_status": status})
-                                    if item.intent_id == intent.intent_id
-                                    else item
-                                    for item in self.manifest.agent.submissions
-                                )
-                            )
-                        )
-                    )
-
-                with suppress(Exception):
-                    record_cancellation("unknown")
-                cancelled = False
-                with suppress(Exception):
-                    cancelled = bool(self._render().backend.cancel_job(invocation.external_job_id))
-                with suppress(Exception):
-                    record_cancellation("succeeded" if cancelled else "failed")
-                # The durable attempt and returned ID remain reserved even when
-                # cancellation fails; recovery must reconcile, never resubmit.
-            raise
+        job = getattr(result.stage.value, "job", None)
+        terminal_key = (
+            self._render_key(intent.action.scene_id)
+            if job is not None and self._render_terminal(job) and intent.action.scene_id is not None
+            else None
+        )
+        manifest = self._patch(RunPatch(**updates), phase=intent.action.kind)
+        if terminal_key is not None:
+            self.resources.release_render(terminal_key)
         if "rag_profile" in updates and manifest.rag_profile.enabled:
             self.scene_pipeline.pin_profile(manifest.rag_profile)
         return manifest.revision
+
+    def _compensate_submission(self, intent, invocation, result):
+        """Stop the exact returned job when its authorized submission cannot commit.
+
+        Neither checkpoint failure may prevent the emergency stop attempt. A
+        successful backend response only frees capacity after durable confirmation.
+        """
+        action = intent.action
+        if (
+            action.kind != "submit_render"
+            or action.run_id != self.manifest.run_id
+            or invocation.intent_id != intent.intent_id
+            or invocation.resource_id != action.resource_id
+            or invocation.work_identity != action.work_identity
+            or invocation.external_job_id is None
+        ):
+            raise ValueError("Submission compensation requires its exact authorized invocation")
+
+        def record(status):
+            with self._runtime_lock:
+                matching = [
+                    item
+                    for item in self.manifest.agent.submissions
+                    if item.intent_id == intent.intent_id
+                    and item.scene_id == action.scene_id
+                    and item.attempt.job_id == invocation.external_job_id
+                ]
+                if len(matching) != 1:
+                    raise ValueError("Submission compensation lost its exact reserved job identity")
+                self._patch(
+                    RunPatch(
+                        agent=self._agent_update(
+                            submissions=tuple(
+                                item.model_copy(update={"cancellation_status": status})
+                                if item.intent_id == intent.intent_id
+                                else item
+                                for item in self.manifest.agent.submissions
+                            )
+                        )
+                    )
+                )
+                return (self.manifest.run_id, matching[0].attempt.token)
+
+        with suppress(Exception):
+            record("unknown")
+        cancelled = False
+        with suppress(Exception):
+            cancelled = bool(self._render().backend.cancel_job(invocation.external_job_id))
+        try:
+            key = record("succeeded" if cancelled else "failed")
+        except Exception:
+            return
+        if cancelled:
+            self.resources.release_render(key)
 
     def _invalidate_consumers(self, proposed, patches):
         """Publish dependency invalidations with the producer, never after it."""
@@ -1240,6 +1397,8 @@ class AgentRuntime:
         )
 
     def _request_context(self, scene_id, stage):
+        leases = {}
+
         def reserve(profile, model, **metadata):
             invocation = current_invocation.get()
             with self._runtime_lock:
@@ -1275,9 +1434,18 @@ class AgentRuntime:
                     },
                 )
                 self._patch(RunPatch(reservation_additions=(receipt,)))
-                return receipt
+            control = CURRENT_CONTROL.get() or self.control
+            semaphore = (
+                self.resources.visual_llm
+                if profile == settings.visual_llm_profile().label
+                else self.resources.llm
+            )
+            lease = control.slot(semaphore)
+            lease.__enter__()
+            leases[receipt.request_id] = lease
+            return receipt
 
-        def emit(name, data):
+        def persist_event(name, data):
             if name == "agent_diagnostic":
                 with self._runtime_lock:
                     event = self.events.append(
@@ -1332,6 +1500,15 @@ class AgentRuntime:
                 self._patch(
                     RunPatch(agent=self._agent_update(usage=(*self.manifest.agent.usage, usage)))
                 )
+
+        def emit(name, data):
+            try:
+                persist_event(name, data)
+            finally:
+                if name == "model_request_finished":
+                    lease = leases.pop(data["request_id"], None)
+                    if lease is not None:
+                        lease.__exit__(None, None, None)
 
         return RequestContext(reserve, emit)
 
@@ -1934,7 +2111,12 @@ class AgentRuntime:
         # Reservations are transport-only; they never change a scene identity.
         with self._runtime_lock:
             token = _active_work.set((action, self.manifest))
+        control = (RunControl(Event()) if action.kind == "cancel_render" else self.control).child(
+            context.remaining_seconds
+        )
+        control_token = CURRENT_CONTROL.set(control)
         try:
+            control.check()
             self._reserve_stage(action)
             return self._execute_stage(action, context)
         except Exception as error:
@@ -1966,6 +2148,7 @@ class AgentRuntime:
             raise
         finally:
             _active_work.reset(token)
+            CURRENT_CONTROL.reset(control_token)
 
     def _execute_stage(self, action, context):
         manifest = _active_work.get()[1]
@@ -2717,20 +2900,32 @@ class AgentRuntime:
                 scene_revision=scene.revision,
                 code_sha256=scene.code_sha256,
             )
-            self._patch(
-                RunPatch(
-                    agent=self._agent_update(
-                        submissions=(
-                            *self.manifest.agent.submissions,
-                            AgentSubmission(
-                                scene_id=action.scene_id,
-                                attempt=attempt,
-                                intent_id=current_invocation.get().intent_id,
-                            ),
+            key = (manifest.run_id, attempt.token)
+            while not self.resources.claim_render(key, manifest.backend):
+                self.control.wait(0.1)
+            try:
+                self.control.check()
+            except BaseException:
+                self.resources.release_render(key)
+                raise
+            try:
+                self._patch(
+                    RunPatch(
+                        agent=self._agent_update(
+                            submissions=(
+                                *self.manifest.agent.submissions,
+                                AgentSubmission(
+                                    scene_id=action.scene_id,
+                                    attempt=attempt,
+                                    intent_id=current_invocation.get().intent_id,
+                                ),
+                            )
                         )
                     )
                 )
-            )
+            except BaseException:
+                self.resources.release_render(key)
+                raise
             output = self._render().submit(
                 self._scene_inputs(action.scene_id, manifest=manifest), context, attempt
             )
@@ -2841,9 +3036,11 @@ class AgentRuntime:
             patches = (self._scene_patch(scene),)
             updates["artifact_refs"] = {f"render_repair:{action.scene_id}": output.report.path}
         elif kind == "cancel_render":
-            output = self._render().cancel(
-                self._scene_inputs(action.scene_id, manifest=manifest), context
-            )
+            output = RenderPipeline(
+                self._render().backend,
+                preflight=self.dependencies.preflight,
+                control=CURRENT_CONTROL.get(),
+            ).cancel(self._scene_inputs(action.scene_id, manifest=manifest), context)
             scene = manifest.scenes[action.scene_id].model_copy(deep=True)
             scene.slurm_job = output.job
             scene.failed, scene.phase = True, "failed"
@@ -3556,7 +3753,11 @@ class AgentRuntime:
             else None,
         )
         with self.manifest.run_config.activate():
-            return loop.step(cancelled=self.control.cancelled.is_set)
+            return loop.step(
+                cancelled=(lambda: False)
+                if action.kind in {"submit_render", "cancel_render"}
+                else self.control.cancelled.is_set
+            )
 
     @_serialized
     def _stop(self, reason):
@@ -3574,6 +3775,7 @@ class AgentRuntime:
 
     def _drive(self, *, approve_plan, interactive):
         while True:
+            self.control.check()
             if self.manifest.state == "DONE":
                 return self._completed_video()
             if self.manifest.state == "ERROR":

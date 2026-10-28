@@ -875,6 +875,9 @@ def resume(
     run_id: str = typer.Argument(..., help="要恢复的运行 ID"),
     force: bool = typer.Option(False, "--force", help="合并阶段允许覆盖原输出"),
     interactive: bool = typer.Option(False, "--interactive", help="失败时允许终端询问重试"),
+    approve_plan: bool = typer.Option(
+        False, "--approve-plan", help="批准当前完整计划，不批准代码 diff"
+    ),
 ):
     """恢复中断运行；复用已有代码和 Slurm Job ID。"""
 
@@ -896,7 +899,53 @@ def resume(
             settings.OVERWRITE_OUTPUT = True
         from kd1_anime.application import Application
 
-        final_video = Application().resume(run_id, interactive=interactive)
+        application = Application()
+        final_video = application.resume(run_id, interactive=interactive)
+        if manifest.agent is not None:
+            while True:
+                if application.run_view(run_id).status == "failed":
+                    break
+                requests = [
+                    item
+                    for item in application.approval_requests(run_id)
+                    if item.status == "pending"
+                ]
+                if not requests:
+                    break
+                request = requests[-1]
+                approved = (
+                    approve_plan and request.action == "review_plan" and request.scene_id is None
+                )
+                if not approved and interactive and sys.stdin.isatty():
+                    from rich.prompt import Confirm
+
+                    console.print(
+                        f"等待批准 {request.action} / {request.resource_id} / {request.input_sha256}",
+                        markup=False,
+                    )
+                    diff = application.approval_diff(run_id)
+                    if diff:
+                        console.print(diff, markup=False)
+                    approved = Confirm.ask("批准此精确输入?", default=False, console=console)
+                    if not approved:
+                        application.decide_approval(
+                            run_id,
+                            False,
+                            input_sha256=request.input_sha256,
+                            resource_id=request.resource_id,
+                            work_identity=request.work_identity,
+                        )
+                        break
+                if not approved:
+                    break
+                application.decide_approval(
+                    run_id,
+                    True,
+                    input_sha256=request.input_sha256,
+                    resource_id=request.resource_id,
+                    work_identity=request.work_identity,
+                )
+                final_video = application.resume(run_id, interactive=interactive)
     except typer.Exit:
         raise
     except KeyboardInterrupt as exc:
@@ -1125,6 +1174,11 @@ def batch(
         "--dry-run",
         help="只生成场景代码，不提交 Slurm 渲染",
     ),
+    approve_plan: bool = typer.Option(
+        False,
+        "--approve-plan",
+        help="代表本地用户批准每个任务的完整计划；不批准代码修复",
+    ),
     output_dir: Path = typer.Option(
         None,
         "--output-dir",
@@ -1152,6 +1206,7 @@ def batch(
             max_parallel=max_parallel,
             dry_run=dry_run,
             output_dir=output_dir,
+            approve_plan=approve_plan,
             backend=backend,
         )
         processor = BatchProcessor(config)
@@ -1164,16 +1219,20 @@ def batch(
 
         # 输出摘要
         summary = processor.generate_summary(tasks)
-        console.print(summary)
+        console.print(summary, markup=False)
 
         # 检查是否有失败的任务
         failed_count = sum(1 for t in tasks if t.status == "failed")
         interrupted_count = sum(1 for t in tasks if t.status == "interrupted")
+        waiting_count = sum(1 for t in tasks if t.status == "waiting")
+        if interrupted_count > 0:
+            raise typer.Exit(130)
         if failed_count > 0:
             console.print(f"[bold red]{failed_count} 个任务失败[/]")
             raise typer.Exit(1)
-        if interrupted_count > 0:
-            raise typer.Exit(130)
+        if waiting_count > 0:
+            console.print(f"[yellow]{waiting_count} 个任务等待批准[/]")
+            raise typer.Exit(1)
 
     except typer.Exit:
         raise
