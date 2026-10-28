@@ -589,6 +589,25 @@ class Settings(BaseSettings):
     # 各 Agent 的 user message 统一使用区块预算；代码和结构化合同不会被
     # 裁剪，低优先级的 RAG/自然语言说明会优先让出空间。
     LLM_MAX_CONTEXT_TOKENS: int = Field(default=262_000, ge=10_000, le=2_000_000)
+    MAX_RUN_LLM_TOKENS: int | None = Field(default=None, ge=1)
+    MAX_RUN_LLM_COST_USD: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    LLM_MODEL_PRICES_USD: dict[str, tuple[float, float]] = Field(
+        default_factory=dict, description="Per-model input/output USD per million tokens"
+    )
+    LLM_CONTEXT_SAFETY_TOKENS: int = Field(default=1024, ge=0, le=1_000_000)
+
+    @field_validator("LLM_MODEL_PRICES_USD")
+    @classmethod
+    def validate_model_prices(cls, prices):
+        import math
+
+        if any(
+            not name.strip() or any(not math.isfinite(price) or price < 0 for price in rates)
+            for name, rates in prices.items()
+        ):
+            raise ValueError("Model prices must have nonempty names and finite nonnegative rates")
+        return prices
+
     # 可选的字符安全上限；默认由 LLM_MAX_CONTEXT_TOKENS 按约 4 字符/token 换算。
     # RAG_MAX_CONTEXT_CHARS 是独立的检索注入上限，不受此字段影响。
     LLM_MAX_CONTEXT_CHARS: int | None = Field(default=None, ge=10_000, le=2_000_000)

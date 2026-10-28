@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from kd1_anime.cluster.render_backend import RenderBackendName
 from kd1_anime.config import settings
+from kd1_anime.domain.dependencies import WorkIdentity
 from kd1_anime.domain.planning import ScenePlan
 from kd1_anime.events import CallbackAdapter, PipelineEvent
 from kd1_anime.run_store import RunRepository, atomic_write_json
@@ -48,6 +49,195 @@ class Application:
         return _agent_runtime() if agent else _legacy_runtime()
 
     @staticmethod
+    def _sessions():
+        from kd1_anime.agent_runtime.session import SessionStore
+        from kd1_anime.config import resolve_runtime_path
+
+        secrets = tuple(
+            value
+            for key, value in settings.model_dump().items()
+            if key.endswith("API_KEY") and value
+        )
+        return SessionStore(
+            resolve_runtime_path(settings.WORKSPACE_DIR) / "sessions", secrets=secrets
+        )
+
+    def create_session(self, goal: str) -> str:
+        from kd1_anime.domain.runtime import RunConfig
+        from kd1_anime.request_budget import RequestBudget
+
+        config = RunConfig.capture()
+        budget = RequestBudget(
+            scene_limit=settings.MAX_SCENE_LLM_REQUESTS,
+            run_limit=settings.MAX_RUN_LLM_REQUESTS,
+            token_limit=settings.MAX_RUN_LLM_TOKENS,
+            cost_limit_usd=settings.MAX_RUN_LLM_COST_USD,
+        )
+        return self._sessions().create(goal, draft_config=config, draft_budget=budget).session_id
+
+    def session_request_context(self, session_id: str):
+        from kd1_anime.agent_runtime.contracts import UsageReceipt
+        from kd1_anime.request_budget import RequestContext, RequestReservation
+
+        store = self._sessions()
+        session = store.load(session_id)
+        if session.draft_config is None:
+            raise ValueError("Clarification session lacks its pinned configuration")
+        config = session.draft_config.resolve()
+
+        def reserve(profile, model, **metadata):
+            prices = config.LLM_MODEL_PRICES_USD.get(model)
+            prompt = metadata.get("estimated_prompt_tokens")
+            output = metadata.get("reserved_output_tokens")
+            cost = (
+                (prompt * prices[0] + output * prices[1]) / 1_000_000
+                if prices is not None and prompt is not None and output is not None
+                else None
+            )
+            receipt = RequestReservation(
+                stage="clarification",
+                profile=profile,
+                model=model,
+                prompt_sha256=metadata.get("prompt_sha256"),
+                estimated_prompt_tokens=prompt,
+                reserved_output_tokens=output,
+                reserved_cost_usd=cost,
+                input_price_usd_per_million=prices[0] if prices else None,
+                output_price_usd_per_million=prices[1] if prices else None,
+                **{
+                    key: metadata[key]
+                    for key in ("call_id", "parent_span_id", "attempt", "json_repair_attempt")
+                    if key in metadata
+                },
+            )
+            store.reserve_draft(session_id, receipt)
+            return receipt
+
+        def emit(name, data):
+            if name != "model_request_finished":
+                return
+            receipt = next(
+                item
+                for item in store.load(session_id).draft_budget.reservations
+                if item.request_id == data["request_id"]
+            )
+            reported = data.get("usage") or {}
+            tokens = reported or data.get("estimated_usage") or {}
+            cost = None
+            if (
+                tokens.get("prompt_tokens") is not None
+                and tokens.get("completion_tokens") is not None
+                and receipt.input_price_usd_per_million is not None
+                and receipt.output_price_usd_per_million is not None
+            ):
+                cost = (
+                    tokens["prompt_tokens"] * receipt.input_price_usd_per_million
+                    + tokens["completion_tokens"] * receipt.output_price_usd_per_million
+                ) / 1_000_000
+            store.complete_draft(
+                session_id,
+                UsageReceipt(
+                    request_id=receipt.request_id,
+                    prompt_sha256=receipt.prompt_sha256,
+                    usage_source="provider_reported"
+                    if reported
+                    else "locally_estimated"
+                    if tokens
+                    else "unknown",
+                    cost_status="estimated" if cost is not None else "unknown",
+                    cost=cost,
+                    **tokens,
+                ),
+            )
+
+        return RequestContext(reserve, emit)
+
+    def session_command(self, session_id: str, kind: str, content: str = "") -> None:
+        from kd1_anime.agent_runtime.session import UserCommand
+
+        if kind not in {"clarification", "ready", "confirm", "cancel"}:
+            raise ValueError("Unsupported clarification command")
+        self._sessions().command(
+            session_id, UserCommand(session_id=session_id, kind=kind, content=content)
+        )
+
+    def run_view(self, run_id: str, *, lock_held: bool = False):
+        from kd1_anime.queries import QueryService
+
+        return QueryService(RunRepository(settings.WORKSPACE_DIR), self._sessions()).run(
+            run_id, lock_held=lock_held
+        )
+
+    def approval_requests(self, run_id: str):
+        from kd1_anime.queries import QueryService
+
+        return QueryService(RunRepository(settings.WORKSPACE_DIR), self._sessions()).approvals(
+            run_id
+        )
+
+    def approval_diff(self, run_id: str) -> str:
+        from difflib import unified_diff
+
+        from kd1_anime.rendering import sha256_file
+        from kd1_anime.run_store import lock_run, restore_run_path
+
+        repository = RunRepository(settings.WORKSPACE_DIR)
+        with lock_run(repository.run_root(run_id)):
+            manifest = repository.load_for_agent_resume(run_id)
+            action = manifest.agent.pending_approval
+            if action is None or action.kind != "inspect_candidate" or action.proposal is None:
+                return ""
+            if action.proposal.digest() != action.input_sha256:
+                raise ValueError("Pending diff identity mismatch")
+            texts = []
+            for reference in (action.proposal.base_source, action.proposal.candidate_source):
+                path = restore_run_path(repository.run_root(run_id), reference.path)
+                if (
+                    reference.kind != "code"
+                    or not path.is_file()
+                    or sha256_file(path) != reference.sha256
+                ):
+                    raise ValueError("Pending diff source identity mismatch")
+                texts.append(path.read_text(encoding="utf-8").splitlines(keepends=True))
+            return "".join(unified_diff(texts[0], texts[1], fromfile="base", tofile="candidate"))
+
+    def decide_approval(
+        self,
+        run_id: str,
+        approve: bool,
+        *,
+        input_sha256: str,
+        resource_id: str,
+        work_identity: WorkIdentity | None,
+    ) -> None:
+        from kd1_anime.agent_runtime.session import UserCommand
+        from kd1_anime.run_store import lock_run
+
+        repository = RunRepository(settings.WORKSPACE_DIR)
+        repository.load_for_agent_resume(run_id)
+        with lock_run(repository.run_root(run_id)):
+            manifest = repository.load_for_agent_resume(run_id)
+            action = manifest.agent.pending_approval
+            if action is None:
+                raise ValueError("No pending approval for this run")
+            if (
+                action.input_sha256 != input_sha256
+                or action.resource_id != resource_id
+                or action.work_identity != work_identity
+            ):
+                raise ValueError("Displayed approval no longer matches the current pending action")
+            command = UserCommand(
+                session_id=manifest.agent.session_id,
+                kind="approve" if approve else "reject",
+                action=action,
+            )
+            store = self._sessions()
+            if approve:
+                store.issue_grant(manifest.agent.session_id, command)
+            else:
+                store.command(manifest.agent.session_id, command)
+
+    @staticmethod
     def load_for_resume(run_id: str):
         repository = RunRepository(settings.WORKSPACE_DIR)
         version = repository.schema_version(run_id)
@@ -74,6 +264,7 @@ class Application:
         approve_plan: bool = False,
         smoke: bool = False,
         backend: RenderBackendName | None = None,
+        session_id: str | None = None,
     ) -> Path | None:
         options = {"dry_run": dry_run}
         if callback is not None:
@@ -88,6 +279,8 @@ class Application:
             options["smoke"] = True
         if backend is not None:
             options["backend"] = backend
+        if session_id is not None:
+            options["session_id"] = session_id
         runtime = self._runtime()
         generate = getattr(runtime, "generate", None) or runtime.run
         return generate(user_prompt, **options)

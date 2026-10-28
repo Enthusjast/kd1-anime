@@ -256,7 +256,10 @@ class PipelineContext:
     manifest_revision: int = 0
     request_budget: RequestBudget = field(
         default_factory=lambda: RequestBudget(
-            scene_limit=settings.MAX_SCENE_LLM_REQUESTS, run_limit=settings.MAX_RUN_LLM_REQUESTS
+            scene_limit=settings.MAX_SCENE_LLM_REQUESTS,
+            run_limit=settings.MAX_RUN_LLM_REQUESTS,
+            token_limit=settings.MAX_RUN_LLM_TOKENS,
+            cost_limit_usd=settings.MAX_RUN_LLM_COST_USD,
         )
     )
     dependency_graph: DependencyGraph = field(default_factory=DependencyGraph)

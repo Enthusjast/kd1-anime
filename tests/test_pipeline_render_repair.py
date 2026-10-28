@@ -67,7 +67,9 @@ def context(cancelled=lambda: False):
 
 def pipeline(*, candidate=FIXED, service=None, callback=None):
     calls = SimpleNamespace(agents=[], fixes=[], records=[], contexts=[], requests=[])
-    request = object()
+    from kd1_anime.request_budget import RequestContext
+
+    request = RequestContext(reserve=lambda *a, **k: None, emit=lambda *a: None)
     control = SimpleNamespace(checkpoint=lambda: None)
 
     class Fixer:

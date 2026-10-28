@@ -72,7 +72,11 @@ URL。API Key 不会写入 manifest 或事件日志。
 | LLM_CODE_TEMPERATURE | 0.2 | Coder 温度 |
 | LLM_REVIEW_TEMPERATURE | 0.0 | Plan/Code/Continuity Review 温度 |
 | LLM_FIX_TEMPERATURE | 0.1 | AutoFix 温度 |
-| LLM_MAX_CONTEXT_TOKENS | 262000 | LLM 输入上下文 token 预算；PromptBuilder 按约 4 字符/token 换算 |
+| LLM_MAX_CONTEXT_TOKENS | 262000 | 文本输入、输出预留与安全余量合计上限；使用保守 UTF-8 本地估算 |
+| LLM_CONTEXT_SAFETY_TOKENS | 1024 | 发送前预留的上下文安全余量 |
+| MAX_RUN_LLM_TOKENS | 空 | 可选运行级硬 token 上限，按输入估算及输出上限预占 |
+| MAX_RUN_LLM_COST_USD | 空 | 可选运行级硬成本上限；未知价格或无输出上限时拒绝请求 |
+| LLM_MODEL_PRICES_USD | `{}` | 模型名到 `[输入, 输出]` 美元/百万 token 价格的映射 |
 | LLM_MAX_CONTEXT_CHARS | 空 | 可选的更保守字符上限；不填则使用 token 预算换算值 |
 | LLM_MAX_TOKENS | 32000 | 默认 LLM 输出上限 |
 | LLM_PLANNING_MAX_TOKENS | 32000 | 规划、澄清和计划审查预算 |

@@ -23,6 +23,22 @@ class PromptSection:
     atomic: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class PromptBuildReport:
+    text: str
+    estimated_prompt_tokens: int
+    clipped_sections: tuple[str, ...]
+    omitted_sections: tuple[str, ...]
+    output_reserve: int
+    safety_margin: int
+    total_budget: int | None
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative provider-neutral UTF-8 byte upper estimate; not actual usage."""
+    return len(text.encode("utf-8"))
+
+
 class PromptContextBuilder:
     """在不破坏代码/合同区块的前提下构造有界上下文。"""
 
@@ -50,7 +66,7 @@ class PromptContextBuilder:
             return ""
         return f"### {section.name}\n{value.strip()}"
 
-    def build(self, sections: list[PromptSection]) -> str:
+    def _build_text(self, sections: list[PromptSection]) -> tuple[str, dict[str, str]]:
         normalized: list[PromptSection] = []
         names: set[str] = set()
         for section in sections:
@@ -92,7 +108,9 @@ class PromptContextBuilder:
             rendered.append(self._render(section, content))
         separator_length = 2 * max(0, len(rendered) - 1)
         if sum(len(item) for item in rendered) + separator_length <= self.max_chars:
-            return "\n\n".join(rendered)
+            return "\n\n".join(rendered), {
+                section.name: value for section, value in zip(normalized, rendered, strict=True)
+            }
 
         required = [
             self._render(section, section.content) for section in normalized if section.required
@@ -128,17 +146,78 @@ class PromptContextBuilder:
             remaining -= len(clipped) + 2
 
         result: list[str] = []
+        selected_values: dict[str, str] = {}
         for section in normalized:
             if section.required:
                 value = self._render(section, section.content)
             else:
                 value = selected.get(section.name, "")
+            selected_values[section.name] = value
             if value:
                 result.append(value)
         final = "\n\n".join(result)
         if len(final) > self.max_chars:
             raise PromptBudgetError(f"Prompt 区块裁剪后仍超过上下文预算 {self.max_chars} 字符")
-        return final
+        return final, selected_values
+
+    def build(
+        self,
+        sections: list[PromptSection],
+        *,
+        system_prompt: str = "",
+        output_reserve: int = 0,
+        safety_margin: int = 0,
+        total_budget: int | None = None,
+    ) -> PromptBuildReport:
+        if (
+            output_reserve < 0
+            or safety_margin < 0
+            or (total_budget is not None and total_budget < 1)
+        ):
+            raise ValueError("Invalid prompt budget")
+        available = (
+            None
+            if total_budget is None
+            else total_budget - output_reserve - safety_margin - estimate_tokens(system_prompt)
+        )
+        if available is not None and available < 0:
+            raise PromptBudgetError("System prompt and output reserve exceed context budget")
+        text, selected_values = self._build_text(sections)
+        if available is not None and estimate_tokens(text) > available:
+            low, high, best = 1, self.max_chars, None
+            while low <= high:
+                middle = (low + high) // 2
+                try:
+                    candidate, candidate_values = PromptContextBuilder(middle)._build_text(sections)
+                except PromptBudgetError:
+                    low = middle + 1
+                    continue
+                if estimate_tokens(candidate) <= available:
+                    best = (candidate, candidate_values)
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best is None:
+                raise PromptBudgetError("Required prompt sections exceed token budget")
+            text, selected_values = best
+        clipped, omitted = [], []
+        for section in sections:
+            if not section.content.strip():
+                continue
+            value = selected_values.get(section.name.strip(), "")
+            if not value:
+                omitted.append(section.name)
+            elif value != f"### {section.name.strip()}\n{section.content.strip()}":
+                clipped.append(section.name)
+        return PromptBuildReport(
+            text=text,
+            estimated_prompt_tokens=estimate_tokens(system_prompt) + estimate_tokens(text),
+            clipped_sections=tuple(clipped),
+            omitted_sections=tuple(omitted),
+            output_reserve=output_reserve,
+            safety_margin=safety_margin,
+            total_budget=total_budget,
+        )
 
 
 def build_bounded_prompt(
@@ -148,4 +227,4 @@ def build_bounded_prompt(
 ) -> str:
     """便捷函数，供 Agent 构造最终 user message。"""
 
-    return PromptContextBuilder(max_chars).build(sections)
+    return PromptContextBuilder(max_chars).build(sections).text

@@ -493,6 +493,9 @@ class Orchestrator:
             call_id: str = "",
             attempt: int = 1,
             json_repair_attempt: int = 0,
+            prompt_sha256: str | None = None,
+            estimated_prompt_tokens: int | None = None,
+            reserved_output_tokens: int | None = None,
         ) -> RequestReservation:
             ctx = self._ctx
             if ctx is None:
@@ -501,6 +504,15 @@ class Orchestrator:
                 if self._checkpoint_error is not None:
                     raise RuntimeError("Run persistence failed") from self._checkpoint_error
                 scene = ctx.scene_states.get(scene_id) if scene_id is not None else None
+                prices = settings.LLM_MODEL_PRICES_USD.get(model)
+                reserved_cost = (
+                    (estimated_prompt_tokens * prices[0] + reserved_output_tokens * prices[1])
+                    / 1_000_000
+                    if prices is not None
+                    and estimated_prompt_tokens is not None
+                    and reserved_output_tokens is not None
+                    else None
+                )
                 receipt = RequestReservation(
                     call_id=call_id,
                     parent_span_id=CURRENT_SPAN.get(),
@@ -512,6 +524,12 @@ class Orchestrator:
                     or (self._manifest.state.lower() if self._manifest else "initializing"),
                     profile=profile,
                     model=model,
+                    prompt_sha256=prompt_sha256,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    reserved_output_tokens=reserved_output_tokens,
+                    reserved_cost_usd=reserved_cost,
+                    input_price_usd_per_million=prices[0] if prices else None,
+                    output_price_usd_per_million=prices[1] if prices else None,
                 )
                 ctx.request_budget.reserve(receipt)
                 try:

@@ -84,6 +84,44 @@ class BaseAgent:
         context = self.request_context
         receipt = None
         if context is not None:
+            import hashlib
+            import json
+
+            envelope = json.dumps(
+                kwargs.get("messages", []),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+            prompt_sha256 = hashlib.sha256(envelope).hexdigest()
+            estimated_prompt_tokens = len(envelope)
+            output_tokens = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
+            from kd1_anime.agents.prompt_context import PromptBudgetError
+
+            has_images = any(
+                isinstance(message.get("content"), list)
+                and any(
+                    isinstance(part, dict) and part.get("type") == "image_url"
+                    for part in message["content"]
+                )
+                for message in kwargs.get("messages", [])
+            )
+            if has_images:
+                estimated_prompt_tokens = None
+            else:
+                output_reserve = (
+                    output_tokens
+                    if isinstance(output_tokens, int)
+                    else self.profile.max_tokens or 0
+                )
+                if (
+                    estimated_prompt_tokens + output_reserve + settings.LLM_CONTEXT_SAFETY_TOKENS
+                    > settings.LLM_MAX_CONTEXT_TOKENS
+                ):
+                    raise PromptBudgetError(
+                        "System/user prompt, output reserve and safety margin exceed context budget"
+                    )
             self._request_attempt += 1
             receipt = context.reserve(
                 self.profile.label,
@@ -91,6 +129,11 @@ class BaseAgent:
                 call_id=self._request_call_id,
                 attempt=self._request_attempt,
                 json_repair_attempt=self._json_repair_attempt,
+                prompt_sha256=prompt_sha256,
+                estimated_prompt_tokens=estimated_prompt_tokens,
+                reserved_output_tokens=output_tokens
+                if isinstance(output_tokens, int) and output_tokens > 0
+                else None,
             )
         started = time.monotonic()
         try:
@@ -286,6 +329,9 @@ class BaseAgent:
 
     def _log(self, message: str, style: str = "bold cyan") -> None:
         """打印 Agent 思考过程（仪表盘激活时抑制，避免破坏 Live 渲染）"""
+        if self.request_context is not None:
+            self.request_context.emit("agent_diagnostic", {"agent": self.name, "message": message})
+            return
         # 延迟导入避免循环依赖
         from kd1_anime.dashboard import suppress_agent_logs
 

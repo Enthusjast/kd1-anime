@@ -20,6 +20,7 @@ from kd1_anime.agent_runtime.contracts import (
     RunId,
     RuntimeRecord,
     Sha256,
+    UsageReceipt,
     sanitize_record,
     utc_now,
 )
@@ -27,8 +28,11 @@ from kd1_anime.agent_runtime.policy import grant_is_current
 from kd1_anime.agent_runtime.session import SessionStore, UserCommand
 from kd1_anime.domain.dependencies import WorkIdentity
 from kd1_anime.domain.execution import FSMState, RunPhase
+from kd1_anime.domain.runtime import RunConfig
 from kd1_anime.event_store import EventStore
+from kd1_anime.request_budget import RequestBudget
 from kd1_anime.run_store import RunRepository, RunStatus, ScenePhase, VisualStatus
+from kd1_anime.verification import VerificationStatus, VisualVerificationStatus
 
 
 class SceneView(RuntimeRecord):
@@ -41,6 +45,9 @@ class SceneView(RuntimeRecord):
     rendered: bool
     failed: bool
     visual_status: VisualStatus
+    static_verification: VerificationStatus = "not_run"
+    execution_verification: VerificationStatus = "not_run"
+    visual_verification: VisualVerificationStatus = "not_run"
     visual_score: float | None = None
     job_id: str | None = None
     job_status: str | None = None
@@ -68,6 +75,9 @@ class SessionView(RuntimeRecord):
     messages: tuple[AgentMessage, ...]
     commands: tuple[UserCommand, ...]
     grants: tuple[ApprovalGrant, ...]
+    draft_config: RunConfig | None = None
+    draft_budget: RequestBudget
+    draft_usage: tuple[UsageReceipt, ...] = ()
     run_ids: tuple[RunId, ...]
     permissions: tuple[PermissionScope, ...]
 
@@ -128,6 +138,9 @@ class QueryService:
                     rendered=scene.rendered,
                     failed=scene.failed,
                     visual_status=scene.visual_status,
+                    static_verification=scene.static_verification.status,
+                    execution_verification=scene.execution_verification.status,
+                    visual_verification=scene.visual_verification.status,
                     visual_score=scene.visual_score,
                     job_id=scene.slurm_job.job_id if scene.slurm_job is not None else None,
                     job_status=scene.slurm_job.status if scene.slurm_job is not None else None,

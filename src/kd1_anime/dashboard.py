@@ -231,6 +231,55 @@ class SceneDashboard:
     # 事件处理
     # ------------------------------------------------------------------
 
+    def on_view(self, view) -> None:
+        """Rebuild display state from the authoritative committed query snapshot."""
+        stages = {
+            "pending": "",
+            "detailed": "分镜",
+            "plan_reviewing": "计划审查",
+            "plan_reviewed": "计划审查",
+            "technical_planning": "技术",
+            "coded": "编码",
+            "reviewed": "代码审查",
+            "monitoring": "渲染",
+            "rendered": "渲染",
+            "visual_evaluating": "视觉评估",
+            "visual_accepted": "视觉评估",
+            "failed": "",
+        }
+        with self._state_lock:
+            self.run_id = view.run_id
+            self.stage = view.run_phase
+            self.stage_label = view.state
+            self.total = len(view.scenes)
+            self.scenes = {}
+            for scene in view.scenes:
+                status = SceneStatus(
+                    scene_id=scene.scene_id, title=scene.title, stage=stages.get(scene.phase, "")
+                )
+                status.state = (
+                    "failed"
+                    if scene.failed
+                    else "completed"
+                    if scene.rendered or (view.status == "dry_run_complete" and scene.reviewed)
+                    else "running"
+                    if scene.phase not in {"pending", "failed"}
+                    else "pending"
+                )
+                status.static_verification = scene.static_verification
+                status.execution_verification = scene.execution_verification
+                status.visual_verification = scene.visual_verification
+                status.message = scene.job_status or scene.visual_status or scene.phase
+                if scene.reviewed:
+                    status.mark_done("代码审查")
+                if scene.rendered:
+                    status.mark_done("渲染")
+                self.scenes[scene.scene_id] = status
+            live = self.live
+        with suppress(Exception):
+            if live is not None:
+                live.refresh()
+
     def on_event(self, event: str, data: dict) -> None:
         """根据 orchestrator 事件更新仪表盘状态 (线程安全)。"""
         if not self.live:

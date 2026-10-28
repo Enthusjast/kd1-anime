@@ -48,8 +48,8 @@
 
 CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
 `plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
-`run_incremental`。生成、规划、直接渲染、恢复、重试及增量执行使用 v11 Agent Runtime；
-TUI 和 batch 暂留 legacy v10，旧运行仍按清单版本选择对应运行时。
+`run_incremental`。生成、规划、直接渲染、恢复、重试、增量及 TUI 使用 v11 Agent Runtime；
+batch 暂留 legacy v10，旧运行仍按清单版本选择对应运行时。
 计划导出只读取已提交 manifest，不把 worker Context 暴露给 CLI。
 
 `domain/scene_fields.py` 是运行态字段所有权和 v10 存储投影的唯一元数据；领域
@@ -80,6 +80,11 @@ action/resource/input/run/session/WorkIdentity，同一 intent 可幂等消费�
 正文。私有 sequence reservation 在 run lock 内原子预留，允许崩溃造成间隙，不允许倒退；
 v2 只读，中间损坏或身份冲突拒绝，尾部半行作为中断处理。`queries.py` 返回已提交视图和
 高水位，不读取 worker Context，不凭事件重放执行工具。
+TUI 将需求、澄清、READY 与确认写入私有 Session；Clarifier 请求在 run 创建前先持久化
+Session 预算，生成时合并到运行账本。审批显示精确 action/resource/hash 和代码 diff，用户决定
+绑定 WorkIdentity；非 TTY 不读 stdin。Dashboard 溢出时从 `RunView` 重建场景和三类验证状态。
+可选 token/cost 硬限额在 SDK 调用前按保守输入估算和输出上限预占；未知价格或不可估算的
+多模态请求在启用硬成本限额时拒绝。可见文本本地估算与 provider usage 明确区分。
 
 `prompt_identity.py` 分别计算稳定 generation identity 和单次最终消息 hash；schema、
 prompt pack、generator、validator 或策略变化使旧身份不兼容，旧 v10 缺失身份不会伪造。

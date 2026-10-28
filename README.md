@@ -402,7 +402,9 @@ kd1-anime test-llm --no-json-mode --verbose
 | --- | ---: | --- |
 | `LLM_BASE_URL` / `LLM_MODEL` | API 地址 / 空 | 主模型端点和模型名；必须配置 |
 | `LLM_HEALTHCHECK_TIMEOUT` | `15` | 启动前主模型探测超时（秒） |
-| `LLM_MAX_CONTEXT_TOKENS` | `262000` | LLM 输入上下文预算；PromptBuilder 按约 4 字符/token 换算 |
+| `LLM_MAX_CONTEXT_TOKENS` | `262000` | 文本输入、输出预留与安全余量的总预算（保守本地估算） |
+| `MAX_RUN_LLM_TOKENS` / `MAX_RUN_LLM_COST_USD` | 空 | 可选运行级硬上限；未知用量保留预占，未知价格拒绝成本受限请求 |
+| `LLM_MODEL_PRICES_USD` | `{}` | 每模型 `[输入, 输出]` 美元/百万 token 价格 |
 | `LLM_MAX_CONTEXT_CHARS` | 空 | 可选的更保守字符上限；不填则使用 token 预算换算值 |
 | `LLM_MAX_TOKENS` | `32000` | 默认 LLM 输出上限 |
 | `LLM_PLANNING_MAX_TOKENS` | `32000` | 计划和澄清阶段输出预算 |

@@ -489,6 +489,21 @@ class RunManifest(BaseModel):
             ):
                 errors.append("执行合同与固定渲染配置不一致")
             errors.extend(self.request_budget.integrity_errors())
+            if self.schema_version == AGENT_MANIFEST_SCHEMA_VERSION:
+                limits = json.loads(self.run_config.values_json)
+                if self.request_budget.token_limit != limits.get(
+                    "MAX_RUN_LLM_TOKENS"
+                ) or self.request_budget.cost_limit_usd != limits.get("MAX_RUN_LLM_COST_USD"):
+                    errors.append("模型 token/cost 限额与固定配置不一致")
+                if self.request_budget.cost_limit_usd is not None:
+                    prices = limits.get("LLM_MODEL_PRICES_USD", {})
+                    for reservation in self.request_budget.reservations:
+                        if prices.get(reservation.model) != [
+                            reservation.input_price_usd_per_million,
+                            reservation.output_price_usd_per_million,
+                        ]:
+                            errors.append("模型请求价格与固定配置不一致")
+                            break
             if set(self.retry_limits) != set(RETRY_LIMIT_NAMES):
                 errors.append("运行缺少完整的重试限额快照或包含未知限额")
             for name, value in self.retry_limits.items():

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -199,6 +198,7 @@ class AgentRuntime:
         approve_plan=False,
         smoke=False,
         backend=None,
+        session_id=None,
     ):
         return self._start(
             user_prompt,
@@ -208,6 +208,7 @@ class AgentRuntime:
             output_path=output_path,
             approve_plan=approve_plan,
             smoke=smoke,
+            session_id=session_id,
             backend=backend,
         )
 
@@ -564,6 +565,7 @@ class AgentRuntime:
         direct_source=None,
         no_wait=False,
         base_manifest=None,
+        session_id=None,
     ):
         prompt = actions.sanitize_record(prompt, self._secrets())
         config = RunConfig.capture()
@@ -586,14 +588,23 @@ class AgentRuntime:
             sessions = SessionStore(
                 resolve_runtime_path(settings.WORKSPACE_DIR) / "sessions", secrets=self._secrets()
             )
-            session = sessions.create(
-                prompt,
-                run_ids=(run_id,),
-                permissions=tuple(
-                    actions.PermissionScope(permission=name, resource_id=f"run:{run_id}")
-                    for name in ("read", "write", "exec", "cluster")
-                ),
+            permissions = tuple(
+                actions.PermissionScope(permission=name, resource_id=f"run:{run_id}")
+                for name in ("read", "write", "exec", "cluster")
             )
+            if session_id is None:
+                session = sessions.create(prompt, run_ids=(run_id,), permissions=permissions)
+            else:
+                existing = sessions.load(session_id)
+                if (
+                    not existing.commands
+                    or existing.commands[-1].kind != "confirm"
+                    or existing.commands[-1].content != prompt
+                ):
+                    raise ValueError("Run requires an explicitly confirmed session prompt")
+                if existing.draft_config != config:
+                    raise ValueError("Clarification and generation configuration identities differ")
+                session = sessions.link_run(session_id, run_id, permissions=permissions)
             manifest = RunManifest(
                 schema_version=AGENT_MANIFEST_SCHEMA_VERSION,
                 run_id=run_id,
@@ -623,9 +634,13 @@ class AgentRuntime:
                     repair_enabled=settings.GENERATION_MODE != "relaxed"
                     or settings.RELAXED_VISUAL_AUTO_FIX,
                 ),
-                request_budget=RequestBudget(
+                request_budget=session.draft_budget.model_copy(deep=True)
+                if session_id is not None
+                else RequestBudget(
                     scene_limit=settings.MAX_SCENE_LLM_REQUESTS,
                     run_limit=settings.MAX_RUN_LLM_REQUESTS,
+                    token_limit=settings.MAX_RUN_LLM_TOKENS,
+                    cost_limit_usd=settings.MAX_RUN_LLM_COST_USD,
                 ),
                 agent=AgentRunState(
                     session_id=session.session_id,
@@ -634,6 +649,7 @@ class AgentRuntime:
                     planning_review=planning_review,
                     planning_preflight=planning_preflight,
                     smoke_requested=smoke,
+                    usage=session.draft_usage if session_id is not None else (),
                     run_input_sha256=digest(
                         {
                             "prompt": prompt,
@@ -1194,7 +1210,7 @@ class AgentRuntime:
     @_serialized
     def _emit_committed(self, intent, invocation, revision):
         self.events.reconcile(self.manifest, lock_held=True)
-        self.events.append(
+        event = self.events.append(
             name="action_completed",
             durability="committed",
             manifest_revision=revision,
@@ -1203,6 +1219,7 @@ class AgentRuntime:
             payload=EventPayload(action=intent.action.kind, state=self.manifest.state),
             lock_held=True,
         )
+        self._notify("agent_event", event.model_dump(mode="json"))
 
     @staticmethod
     def _secrets():
@@ -1226,12 +1243,31 @@ class AgentRuntime:
         def reserve(profile, model, **metadata):
             invocation = current_invocation.get()
             with self._runtime_lock:
+                self.manifest.request_budget.check_reported_usage(self.manifest.agent.usage)
+                config = self.manifest.run_config.resolve()
+                prices = config.LLM_MODEL_PRICES_USD.get(model)
+                prompt_tokens = metadata.get("estimated_prompt_tokens")
+                output_tokens = metadata.get("reserved_output_tokens")
+                estimated_cost = (
+                    (prompt_tokens * prices[0] + output_tokens * prices[1]) / 1_000_000
+                    if prices is not None
+                    and prompt_tokens is not None
+                    and output_tokens is not None
+                    else None
+                )
                 receipt = RequestReservation(
                     scene_id=scene_id,
                     scene_revision=invocation.work_identity.revision if invocation else 0,
                     stage=stage,
                     profile=profile,
                     model=model,
+                    invocation_id=invocation.invocation_id if invocation else None,
+                    prompt_sha256=metadata.get("prompt_sha256"),
+                    estimated_prompt_tokens=prompt_tokens,
+                    reserved_output_tokens=output_tokens,
+                    reserved_cost_usd=estimated_cost,
+                    input_price_usd_per_million=prices[0] if prices else None,
+                    output_price_usd_per_million=prices[1] if prices else None,
                     **{
                         key: value
                         for key, value in metadata.items()
@@ -1242,14 +1278,55 @@ class AgentRuntime:
                 return receipt
 
         def emit(name, data):
+            if name == "agent_diagnostic":
+                with self._runtime_lock:
+                    event = self.events.append(
+                        name="diagnostic",
+                        durability="ephemeral",
+                        manifest_revision=self.manifest.revision,
+                        payload=EventPayload(
+                            scene_id=scene_id,
+                            message=actions.sanitize_record(
+                                data.get("message", ""), self._secrets()
+                            ),
+                            metadata={"agent": data.get("agent", "")},
+                        ),
+                        lock_held=True,
+                    )
+                    self._notify("agent_event", event.model_dump(mode="json"))
+                return
             if name != "model_request_finished":
                 return
-            invocation = current_invocation.get()
+            reservation = next(
+                item
+                for item in self.manifest.request_budget.reservations
+                if item.request_id == data["request_id"]
+            )
+            reported = data.get("usage") or {}
+            tokens = reported or data.get("estimated_usage") or {}
+            cost = None
+            if (
+                tokens.get("prompt_tokens") is not None
+                and tokens.get("completion_tokens") is not None
+                and reservation.input_price_usd_per_million is not None
+                and reservation.output_price_usd_per_million is not None
+            ):
+                cost = (
+                    tokens["prompt_tokens"] * reservation.input_price_usd_per_million
+                    + tokens["completion_tokens"] * reservation.output_price_usd_per_million
+                ) / 1_000_000
             usage = UsageReceipt(
                 request_id=data["request_id"],
-                invocation_id=invocation.invocation_id if invocation else None,
-                usage_source="provider_reported" if data.get("usage") else "unknown",
-                **(data.get("usage") or {}),
+                invocation_id=reservation.invocation_id,
+                prompt_sha256=reservation.prompt_sha256,
+                usage_source="provider_reported"
+                if reported
+                else "locally_estimated"
+                if tokens
+                else "unknown",
+                cost_status="estimated" if cost is not None else "unknown",
+                cost=cost,
+                **tokens,
             )
             with self._runtime_lock:
                 self._patch(
@@ -3516,13 +3593,6 @@ class AgentRuntime:
                     approved = (
                         approve_plan and action.kind == "review_plan" and action.scene_id is None
                     )
-                    if not approved and interactive and sys.stdin.isatty():
-                        description = (
-                            "complete plan" if action.kind == "review_plan" else "exact code diff"
-                        )
-                        approved = input(
-                            f"Approve this {description} ({action.input_sha256})? [y/N] "
-                        ).strip().lower() in {"y", "yes"}
                     if not approved:
                         return None
                     self.sessions.issue_grant(

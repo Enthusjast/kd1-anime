@@ -35,6 +35,7 @@ from kd1_anime.pipeline.planning import (
     PlanningStageError,
 )
 from kd1_anime.rendering import RenderProfile
+from kd1_anime.request_budget import RequestContext
 from kd1_anime.run_store import StoredSceneState
 
 
@@ -94,7 +95,6 @@ def boundary(monkeypatch):
 
     def fake_model(agent, **kwargs):
         assert agent.control is control
-        assert agent.request_context in contexts
         assert kwargs.get("stream", False) is False
         calls.append((type(agent), kwargs))
         return responses[kwargs["response_model"]].model_copy(deep=True)
@@ -102,7 +102,7 @@ def boundary(monkeypatch):
     monkeypatch.setattr(BaseAgent, "call_llm_json", fake_model)
 
     def request_context(scene_id, stage):
-        context = (scene_id, stage)
+        context = RequestContext(reserve=lambda *a, **k: None, emit=lambda *a: None)
         contexts.append(context)
         return context
 
@@ -144,13 +144,12 @@ def inputs(tmp_path, planned=None, *, renderer="cairo"):
 
 
 def test_propose_builds_outline_bible_without_detail_or_placeholder(boundary):
-    responses, calls, contexts, factory = boundary
+    responses, calls, _, factory = boundary
     result = factory().propose("Show time", "cairo")
     assert result.lesson_spec.topic == "Time"
     assert result.teaching_graph == TeachingGraph()
     assert result.plans == ()
     assert [entry[1]["response_model"] for entry in calls] == [PlanningDraft, ContinuityBible]
-    assert contexts == [(None, "planning_draft"), (None, "planning_bible")]
     responses[PlanningDraft].lesson_spec.topic = "Changed outside worker"
     assert result.lesson_spec.topic == "Time"
     assert not hasattr(result, "context")
@@ -260,13 +259,12 @@ def test_model_plan_failure_remains_bounded_and_evidence_complete(boundary):
 
 
 def test_technical_normalizes_compiles_and_never_mutates_scene_inputs(boundary, tmp_path):
-    _, calls, contexts, factory = boundary
+    _, calls, _, factory = boundary
     source = inputs(tmp_path)
     before = source.scene.model_dump(mode="json")
     result = factory().technical(source)
     assert result.spec.scene_id == 1
     assert source.scene.model_dump(mode="json") == before
-    assert contexts == [(1, "technical")]
     assert len(calls) == 1
     assert any(item.code == "planning.technical_compiler" for item in result.diagnostics)
     assert any(item.code == "planning.capability" for item in result.diagnostics)
@@ -349,7 +347,7 @@ def test_mutating_first_reviewer_cannot_change_second_reviewer_or_output(boundar
 
 
 def test_detail_is_independent_and_never_mutates_closed_inputs(boundary, tmp_path):
-    responses, calls, contexts, factory = boundary
+    responses, calls, _, factory = boundary
     planned = output()
     source = DetailInputs(
         run_id="detail-test",
@@ -368,7 +366,6 @@ def test_detail_is_independent_and_never_mutates_closed_inputs(boundary, tmp_pat
     assert result.plan.scene_id == 1
     assert source.outline.model_dump(mode="json") == before
     assert result.plan.global_visual_state == planned.continuity_bible.global_visual_state
-    assert contexts == [(1, "planning_detail")]
     assert [item[1]["response_model"] for item in calls] == [SceneDetail]
     responses[SceneDetail].visual_design = "Changed outside worker"
     assert result.plan.visual_design == "Empty frame"

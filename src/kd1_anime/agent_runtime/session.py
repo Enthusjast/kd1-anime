@@ -22,9 +22,12 @@ from kd1_anime.agent_runtime.contracts import (
     PermissionScope,
     RunId,
     RuntimeRecord,
+    UsageReceipt,
     sanitize_record,
     utc_now,
 )
+from kd1_anime.domain.runtime import RunConfig
+from kd1_anime.request_budget import RequestBudget, RequestReservation
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _RUN_RESOURCE = re.compile(r"run:(\d{8}-\d{6}-[0-9a-f]{8})(?:/scene:([1-9]\d*))?\Z")
@@ -61,7 +64,15 @@ class UserCommand(RuntimeRecord):
     command_id: str = Field(default_factory=lambda: uuid4().hex, min_length=1)
     session_id: str = Field(min_length=1)
     kind: Literal[
-        "goal", "clarification", "ready", "approve", "reject", "cancel", "resume", "retry"
+        "goal",
+        "clarification",
+        "ready",
+        "confirm",
+        "approve",
+        "reject",
+        "cancel",
+        "resume",
+        "retry",
     ]
     role: Literal["user"] = "user"
     content: str = ""
@@ -90,6 +101,9 @@ class Session(RuntimeRecord):
     grants: tuple[ApprovalGrant, ...] = ()
     run_ids: tuple[RunId, ...] = ()
     permissions: tuple[PermissionScope, ...] = ()
+    draft_config: RunConfig | None = None
+    draft_budget: RequestBudget = Field(default_factory=RequestBudget)
+    draft_usage: tuple[UsageReceipt, ...] = ()
     revision: int = Field(default=0, ge=0, strict=True)
 
     @model_validator(mode="after")
@@ -108,6 +122,11 @@ class Session(RuntimeRecord):
             for record in records:
                 if record.session_id != self.session_id:
                     raise ValueError("Session record binding mismatch")
+        if self.draft_budget.integrity_errors() or any(
+            item.request_id not in {entry.request_id for entry in self.draft_budget.reservations}
+            for item in self.draft_usage
+        ):
+            raise ValueError("Session request receipts do not match durable budget reservations")
         for message in self.messages:
             if message.run_id is not None and message.run_id not in self.run_ids:
                 raise ValueError("Message run must be linked to the session")
@@ -308,6 +327,8 @@ class SessionStore:
         session_id: str | None = None,
         permissions: tuple[PermissionScope, ...] = (),
         run_ids: tuple[str, ...] = (),
+        draft_config: RunConfig | None = None,
+        draft_budget: RequestBudget | None = None,
     ) -> Session:
         session_id = _session_id(session_id or uuid4().hex)
         command = self._sanitize(UserCommand(session_id=session_id, kind="goal", content=goal))
@@ -326,6 +347,8 @@ class SessionStore:
             messages=(message,),
             permissions=permissions,
             run_ids=run_ids,
+            draft_config=draft_config,
+            draft_budget=draft_budget or RequestBudget(),
         )
         with self._locked_directory(session_id, create=True) as directory_fd:
             try:
@@ -390,12 +413,44 @@ class SessionStore:
             session = self._load(directory_fd, session_id)
             return self._add_command(directory_fd, session, command)
 
-    def link_run(self, session_id: str, run_id: str) -> Session:
+    def reserve_draft(self, session_id: str, reservation: RequestReservation) -> None:
         with self._locked_directory(session_id) as directory_fd:
             session = self._load(directory_fd, session_id)
+            if session.run_ids:
+                raise ValueError("Clarification requests cannot use a session after run linkage")
+            session.draft_budget.check_reported_usage(session.draft_usage)
+            budget = session.draft_budget.model_copy(deep=True)
+            budget.reserve(reservation)
+            self._replace(directory_fd, session, draft_budget=budget)
+
+    def complete_draft(self, session_id: str, receipt: UsageReceipt) -> None:
+        with self._locked_directory(session_id) as directory_fd:
+            session = self._load(directory_fd, session_id)
+            if not any(
+                item.request_id == receipt.request_id for item in session.draft_budget.reservations
+            ):
+                raise ValueError("Unreserved clarification usage")
+            if any(item.request_id == receipt.request_id for item in session.draft_usage):
+                raise ValueError("Duplicate clarification usage")
+            self._replace(directory_fd, session, draft_usage=(*session.draft_usage, receipt))
+
+    def link_run(
+        self, session_id: str, run_id: str, *, permissions: tuple[PermissionScope, ...] = ()
+    ) -> Session:
+        with self._locked_directory(session_id) as directory_fd:
+            session = self._load(directory_fd, session_id)
+            if any(scope.resource_id != f"run:{run_id}" for scope in permissions):
+                raise ValueError("New run permissions must bind the exact run")
             if run_id in session.run_ids:
+                if any(scope not in session.permissions for scope in permissions):
+                    raise ValueError("Existing run permissions cannot be broadened")
                 return session
-            return self._replace(directory_fd, session, run_ids=(*session.run_ids, run_id))
+            return self._replace(
+                directory_fd,
+                session,
+                run_ids=(*session.run_ids, run_id),
+                permissions=(*session.permissions, *permissions),
+            )
 
     def issue_grant(
         self, session_id: str, command: UserCommand, *, expires_at: datetime | None = None

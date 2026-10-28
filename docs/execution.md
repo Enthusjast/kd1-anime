@@ -14,13 +14,15 @@
 
 `MAX_SCENE_LLM_REQUESTS=64` 与 `MAX_RUN_LLM_REQUESTS=512` 都必须为正整数。一次实际主/视觉模型请求，在 SDK 调用之前于运行锁内预占、写入清单；探测、兼容回退、网络重试、JSON 修复分别计数。未确认结果的请求不退还。运行级请求消耗全片限额，带 scene ID 的请求同时消耗场景限额。RAG 使用独立检索配额。
 
+可选 `MAX_RUN_LLM_TOKENS` 和 `MAX_RUN_LLM_COST_USD` 在请求发送前按输入估算和最大输出预占；预占不因失败或未知结果退还。硬成本上限要求 `LLM_MODEL_PRICES_USD` 提供对应模型的输入/输出价格，未知价格、多模态未知输入或不受限输出均 fail closed。Clarifier 在创建 run 前也使用私有 Session 持久化预算，确认后并入同一运行账本。
+
 两种生成模式都遵守有限 `MAX_*` 配置。新运行捕获重试限额，恢复和 retry 沿用原请求计数、修复计数及限额；增量运行拥有新的请求账本。原本支持零的配置继续以零禁用，例如 `MAX_FIX_ATTEMPTS=0` 不调用 AutoFixer，也不执行自动补丁。`relaxed` 仅将主观意见降级为 warning，确定性错误仍阻断。
 
 代码验证与技术规划按逻辑输入摘要预占并保存内部尝试次数。恢复同一输入会继续原计数；计划、交接输入或有界审查重写轮次变化才建立新的计数。写入失败时不发送请求。
 
 达到请求上限时不再发送新请求，未完成场景按失败与 `ALLOW_PARTIAL_OUTPUT` 策略收尾。视觉请求无法完成时记录 `unknown` 并保留视频。运行初始化后才进行计入预算的网络探测，CLI 的前置检查仅校验模型配置。
 
-每次请求记录逻辑调用 ID、实际请求 ID、重试序号、scene revision、父跨度、延迟及可用 token 用量。缺少用量保持 `null`。并发阶段耗时按场景跨度汇总，表示累计工作时间，可能超过运行墙钟时间；旧事件推断结果标记为 `legacy_estimate`。
+每次请求记录最终消息 hash、逻辑调用 ID、实际请求 ID、重试序号、scene revision 和可用 token 用量。provider 返回的 usage 标记 `provider_reported`，仅本地可见文本估算标记 `locally_estimated`；无证据为 `unknown`，未知成本不显示为零。并发阶段耗时按场景跨度汇总，可能超过运行墙钟时间。
 
 ## 服务边界
 

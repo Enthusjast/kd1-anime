@@ -6,7 +6,6 @@ import pytest
 from prompt_toolkit.keys import Keys
 from rich.console import Console
 
-import kd1_anime.orchestrator as orchestrator_module
 import kd1_anime.tui as tui_module
 from kd1_anime.config import settings
 from kd1_anime.tui import ChatSession, Clarifier, _input_bindings, _insert_newline, _submit_input
@@ -304,12 +303,12 @@ def test_clarifier_follow_up_input_uses_standard_prompt(monkeypatch):
 
 
 def test_pipeline_error_is_concise_and_does_not_render_markup(monkeypatch):
-    class BrokenOrchestrator:
-        def run(self, *args, **kwargs):
+    class BrokenApplication:
+        def generate(self, *args, **kwargs):
             raise FileNotFoundError(2, "No such file or directory")
 
     output = StringIO()
-    monkeypatch.setattr(orchestrator_module, "Orchestrator", BrokenOrchestrator)
+    monkeypatch.setattr("kd1_anime.application.Application", BrokenApplication)
     monkeypatch.setattr(tui_module, "console", Console(file=output, force_terminal=False))
     monkeypatch.setattr(settings, "LLM_DEBUG", False)
 

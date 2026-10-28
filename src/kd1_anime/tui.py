@@ -24,8 +24,10 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from kd1_anime.agents.prompt_context import PromptBudgetError
 from kd1_anime.config import settings
 from kd1_anime.logo import COLORED_ASCII_LOGO
+from kd1_anime.request_budget import RequestBudgetExceeded
 
 console = Console()
 
@@ -142,6 +144,9 @@ class Clarifier:
                     console.print("[dim cyan]AI:[/]")
                     console.print(Markdown(response))
                 return response
+            except (PromptBudgetError, RequestBudgetExceeded):
+                self.history.pop()
+                raise
             except Exception as e:
                 console.print()
                 console.print(f"Clarifier LLM 错误: {e}", style="yellow", markup=False)
@@ -322,6 +327,8 @@ class ChatSession:
         # 交互模式也必须向 shell 传递流水线失败/中断语义，不能只在终端
         # 打印红字后以退出码 0 结束。
         self.exit_code = 0
+        self.application = None
+        self.session_id = None
 
     def run(self) -> int:
         """启动完整的交互会话"""
@@ -356,25 +363,41 @@ class ChatSession:
             user_prompt = self._get_initial_prompt()
             if not user_prompt:
                 return self.exit_code
+            from kd1_anime.application import Application
+
+            self.application = Application()
+            self.session_id = self.application.create_session(user_prompt)
 
             # 此刻才构造 Clarifier (Key 已确认存在)
             self.clarifier = Clarifier()
+            self.clarifier.agent.request_context = self.application.session_request_context(
+                self.session_id
+            )
 
             # 需求澄清 + 确认 (可循环: 不满意就继续讨论)
             while True:
                 refined_prompt = self._run_clarification(user_prompt)
                 if not refined_prompt:
+                    self.application.session_command(
+                        self.session_id, "cancel", "Clarification cancelled"
+                    )
                     return self.exit_code
+                self.application.session_command(self.session_id, "ready", refined_prompt)
 
                 if self._confirm_prompt(refined_prompt):
+                    self.application.session_command(self.session_id, "confirm", refined_prompt)
                     break
 
                 # 用户选 n → 让用户说出哪里不满意, 再喂给 Clarifier
                 console.print("[dim]哪里需要调整? (输入后回车)[/]")
                 feedback = _read_multiline(">>> ")
                 if not feedback or feedback.lower() in ("quit", "exit", "q"):
+                    self.application.session_command(
+                        self.session_id, "cancel", "User left clarification"
+                    )
                     console.print("[dim]已退出[/]")
                     return self.exit_code
+                self.application.session_command(self.session_id, "clarification", feedback)
                 user_prompt = (
                     f"用户对当前需求描述不满意: {feedback}\n\n"
                     f"当前的需求描述是: {refined_prompt}\n\n"
@@ -385,7 +408,15 @@ class ChatSession:
             self._run_pipeline(refined_prompt)
             return self.exit_code
 
+        except (PromptBudgetError, RequestBudgetExceeded) as exc:
+            console.print(f"请求预算已停止: {exc}", style="red", markup=False)
+            self.exit_code = 1
+            return self.exit_code
         except KeyboardInterrupt:
+            if self.application is not None and self.session_id is not None:
+                self.application.session_command(
+                    self.session_id, "cancel", "User interrupted session"
+                )
             console.print("\n[dim]已取消[/]")
             self.exit_code = 130
             return self.exit_code
@@ -467,6 +498,8 @@ class ChatSession:
         try:
             # 第一轮: LLM 根据初始描述提问
             response = self.clarifier.ask(initial_prompt)
+        except RequestBudgetExceeded:
+            raise
         except RuntimeError:
             # Clarifier 失败, 用户选择退出 → 直接用初始 prompt 走 pipeline
             console.print("[yellow]跳过需求澄清, 使用原始描述继续.[/]")
@@ -504,9 +537,13 @@ class ChatSession:
                     f"[yellow]本轮输入过长，最大允许 {settings.MAX_PROMPT_CHARS} 字符。[/]"
                 )
                 continue
+            if self.application is not None and self.session_id is not None:
+                self.application.session_command(self.session_id, "clarification", user_input)
 
             try:
                 response = self.clarifier.ask(user_input)
+            except RequestBudgetExceeded:
+                raise
             except RuntimeError:
                 fallback = self.clarifier.build_fallback_prompt(initial_prompt)
                 console.print(
@@ -559,37 +596,86 @@ class ChatSession:
         console.print(Rule("开始生成", style="bold magenta"))
         console.print()
 
+        from kd1_anime.application import Application
         from kd1_anime.dashboard import SceneDashboard
-        from kd1_anime.orchestrator import Orchestrator
+        from kd1_anime.events import BufferedCallback
 
-        # 并行阶段使用 Rich Live 仪表盘；非 TTY 自动降级为普通输出
+        application = self.application or Application()
         dashboard = SceneDashboard()
         dashboard_active = dashboard.start()
+        run_id = None
+
+        def resync():
+            if run_id is not None:
+                dashboard.on_view(application.run_view(run_id, lock_held=True))
 
         def callback(event: str, data: dict) -> None:
-            if dashboard_active:
-                dashboard.on_event(event, data)
-            else:
+            nonlocal run_id
+            if event == "run_started":
+                run_id = data["run_id"]
+            if event == "agent_event":
+                if dashboard_active:
+                    resync()
+                else:
+                    payload = data.get("payload", {})
+                    console.print(
+                        f"  {payload.get('action', '')}: {payload.get('state', '')}", markup=False
+                    )
+            elif not dashboard_active:
                 self._pipeline_callback(event, data)
 
         try:
-            orchestrator = Orchestrator()
-            from kd1_anime.events import BufferedCallback
-
-            def resync():
-                snapshot = orchestrator._committed_context
-                if snapshot is not None:
-                    orchestrator._emit_scene_snapshot(snapshot)
-
             with BufferedCallback(callback, resync=resync) as buffered:
-                final_video = orchestrator.run(
-                    prompt,
-                    callback=buffered,
-                    dry_run=self.dry_run,
-                    interactive=True,
+                final_video = application.generate(
+                    prompt, callback=buffered, dry_run=self.dry_run, session_id=self.session_id
                 )
+            while run_id is not None:
+                view = application.run_view(run_id)
+                if view.status in {"completed", "dry_run_complete"}:
+                    break
+                if view.status == "failed":
+                    raise RuntimeError(view.stop_reason or "Run failed")
+                pending = [
+                    request
+                    for request in application.approval_requests(run_id)
+                    if request.status == "pending"
+                ]
+                if not pending:
+                    console.print(f"运行已暂停：{run_id}", markup=False)
+                    self.exit_code = 1
+                    return False
+                request = pending[-1]
+                if dashboard_active:
+                    dashboard.stop()
+                    dashboard_active = False
+                console.print(
+                    f"等待批准 {request.action} / {request.resource_id} / {request.input_sha256}",
+                    markup=False,
+                )
+                diff = application.approval_diff(run_id)
+                if diff:
+                    console.print(diff, markup=False)
+                if not sys.stdin.isatty():
+                    self.exit_code = 1
+                    return False
+                approved = Confirm.ask("批准此精确输入?", default=False, console=console)
+                application.decide_approval(
+                    run_id,
+                    approved,
+                    input_sha256=request.input_sha256,
+                    resource_id=request.resource_id,
+                    work_identity=request.work_identity,
+                )
+                if not approved:
+                    self.exit_code = 1
+                    return False
+                dashboard_active = dashboard.start()
+                with BufferedCallback(callback, resync=resync) as buffered:
+                    final_video = application.resume(run_id, callback=buffered)
             if dashboard_active:
                 dashboard.stop()
+            if run_id is None:
+                raise RuntimeError("Run did not publish its identity")
             self._show_completion(final_video, dry_run=self.dry_run)
             self.exit_code = 0
             return True
