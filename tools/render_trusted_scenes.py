@@ -12,11 +12,11 @@ import tempfile
 import time
 from pathlib import Path
 
+from kd1_anime.application import Application
 from kd1_anime.candidate_acceptor import CandidateAcceptor
 from kd1_anime.config import settings
 from kd1_anime.domain.program import SceneProgram
 from kd1_anime.eval.benchmark import fixed_tasks, task_plan
-from kd1_anime.orchestrator import Orchestrator
 from kd1_anime.rendering import RenderProfile, sha256_file
 from kd1_anime.run_store import RunRepository, atomic_write_json
 from kd1_anime.services.program_compiler import compile_program
@@ -60,42 +60,35 @@ def main() -> None:
             manim_version=profile.manim_version,
         )
         started = time.monotonic()
-        workflow = Orchestrator()
-        try:
-            job, video, run_id = workflow.submit_existing_scene(
-                accepted.code, accepted.class_name, wait=True, backend="local"
-            )
-            if video is None:
-                raise RuntimeError("Trusted render did not publish a final video")
-            manifest = RunRepository(root).load_for_resume(run_id)
-            restored = Orchestrator._context_from_manifest(manifest, root / "runs" / run_id)
-            if manifest.request_budget.reservations:
-                raise RuntimeError("Trusted integration unexpectedly dispatched a model request")
-            artifact = restored.scene_states[1].artifact
-            if artifact is None or not manifest.execution_spec.matches_environment(
-                artifact.environment_fingerprint
-            ):
-                raise RuntimeError("Trusted fixture lacks a complete execution identity")
-            rows.append(
-                {
-                    "task_id": task_id,
-                    "run_id": run_id,
-                    "manifest": str(root / "runs" / run_id / "manifest.json"),
-                    "job_id": job.job_id,
-                    "code_sha256": accepted.code_sha256,
-                    "video": str(video),
-                    "video_sha256": sha256_file(video),
-                    "metadata": artifact.metadata.model_dump(mode="json"),
-                    "execution_sha256": artifact.execution_sha256,
-                    "environment": artifact.environment_fingerprint,
-                    "elapsed_seconds": time.monotonic() - started,
-                    "model_requests": 0,
-                }
-            )
-        finally:
-            close = getattr(workflow.slurm, "close", None)
-            if callable(close):
-                close()
+        job, video, run_id = Application().submit_existing_scene(
+            accepted.code, accepted.class_name, wait=True, backend="local"
+        )
+        if video is None:
+            raise RuntimeError("Trusted render did not publish a final video")
+        manifest = RunRepository(root).load_for_agent_resume(run_id)
+        if manifest.request_budget.reservations:
+            raise RuntimeError("Trusted integration unexpectedly dispatched a model request")
+        artifact = manifest.scenes[1].artifact
+        if artifact is None or not manifest.execution_spec.matches_environment(
+            artifact.environment_fingerprint
+        ):
+            raise RuntimeError("Trusted fixture lacks a complete execution identity")
+        rows.append(
+            {
+                "task_id": task_id,
+                "run_id": run_id,
+                "manifest": str(root / "runs" / run_id / "manifest.json"),
+                "job_id": job.job_id,
+                "code_sha256": accepted.code_sha256,
+                "video": str(video),
+                "video_sha256": sha256_file(video),
+                "metadata": artifact.metadata.model_dump(mode="json"),
+                "execution_sha256": artifact.execution_sha256,
+                "environment": artifact.environment_fingerprint,
+                "elapsed_seconds": time.monotonic() - started,
+                "model_requests": 0,
+            }
+        )
         atomic_write_json(
             root / "report.json",
             {"scope": "trusted_fixture_render", "tasks": rows, "semantic_quality_evaluated": False},

@@ -372,7 +372,7 @@ kd1-anime stats <run-id> --json
 kd1-anime clean --older-than 30d --yes
 ```
 
-使用 `status` 找到 run ID，再显式执行 `resume`。当前执行清单为 manifest schema v10；恢复沿用清单中的生成模式、请求计数及预算。v4–v9 仅支持只读查看与 JSON 导出，禁止恢复、重试及增量复用，不会自动改写版本。
+使用 `status` 找到 run ID，再显式执行 `resume`。默认 Agent Runtime 使用 manifest schema v11；既有 v10 运行仍由 legacy 路径执行，v4–v9 只读。恢复沿用原运行的配置、身份和请求预算，不自动转换清单版本。
 
 ### 环境和模型诊断
 
@@ -562,8 +562,7 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 └── workspace/
     ├── eval_results/            # 独立 evaluate 命令的报告
     └── runs/<run-id>/
-        ├── prompt.md            # 需求文件；不是 prompt.txt
-        ├── manifest.json        # 当前为 schema v10
+        ├── manifest.json        # 默认 schema v11；包含受保护的需求与状态
         ├── events.jsonl         # 脱敏事件轨迹
         ├── scenes/              # Python Scene 与 sbatch 脚本
         ├── logs/                # stdout/stderr
@@ -585,7 +584,7 @@ kd1-anime status
 kd1-anime resume 20260831-120000-1234abcd
 ```
 
-用户配置统一放在 `~/.kd1-anime/`；相对 `workspace/` 路径按当前配置解析，程序不会自动复制大型运行目录。manifest schema v10 保存每次运行的 `generation_mode`，恢复时沿用该模式。
+用户配置统一放在 `~/.kd1-anime/`；相对 `workspace/` 路径按当前配置解析，程序不会自动复制大型运行目录。v10/v11 清单均保存运行配置；v11 还保存 Session、生成身份与工具执行凭据。
 
 ## 增量渲染与批量处理
 

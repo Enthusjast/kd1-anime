@@ -126,8 +126,8 @@ Scene、boundary 和 final visual gate 保持独立端点，报告/帧/视频按
 kd1_anime.cli / kd1_anime.tui
        │
        ▼
-kd1_anime.orchestrator ───── callback events ───────────▶ TUI/Rich
-       │
+kd1_anime.application ─────▶ Agent Runtime (v11) / Orchestrator (v10 legacy)
+       │                        └── AgentEvent / RunView ───▶ TUI/Rich
        ├── services/rendering.py 后端预检、提交、监控边界
        ├── domain/                 计划、技术、审查、边界、执行与程序合同
        ├── request_budget.py       持久化模型请求预占与用量诊断
@@ -178,7 +178,7 @@ kd1_anime.orchestrator ───── callback events ────────�
        ├── domain/state_ledger.py  场景边界语义账本与渲染证据
        ├── api_catalog.py         精确版本公开 API 核验，与语义 RAG 分工
        ├── security.py             脱敏和 JSON-safe 诊断序列化
-       └── run_store.py            Manifest v10、原子检查点、运行锁
+       └── run_store.py            Manifest v10/v11、原子检查点、运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
@@ -355,7 +355,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。schema v10 包含单调 revision、`generation_mode`、LessonSpec、TeachingGraph、StateLedger、场景 phase、能力合同、代码哈希、审查/修复次数、候选版本、精确 Job、RenderProfile、资源配置、MergeProfile、场景产物凭据、视觉 profile/收据/最佳候选、ElementManifest 和最终视频哈希。计划编译、计划审查、代码审查和 Smoke 结果也以私有阶段快照保存。API Key 不写入清单；端点与非敏感配置经脱敏后固定在 RunConfig；`events.jsonl` 只保存脱敏后的事件轨迹。恢复后的 Agent、确定性校验、Slurm 脚本和 FFmpeg 始终使用清单里捕获的 RenderProfile/MergeProfile；视觉策略也使用清单里捕获的模型、帧数、阈值和修复上限。
+运行在关键阶段和每次 Slurm 提交后原子更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。v10/v11 均记录场景和产物状态；v11 额外记录 Session、生成身份、intent、invocation 和 usage。API Key 不写入清单；恢复沿用捕获的配置、渲染及视觉策略。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -364,9 +364,9 @@ Orchestrator 在关键阶段和每次 Slurm 提交后更新 `manifest.json`：�
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v10 清单保存当前教学合同、`generation_mode`、StateLedger、结构化计划、能力合同、候选版本、ElementManifest、阶段状态和最终合并配置。LLM 响应只在当前调用中保留，既不写入磁盘，也不会在不同运行之间复用。结构化运行报告写入每个 run 的 `run_report.json`；渲染修复摘要写入用户级脱敏案例库，并按错误类别限制保存数量。
+v10 和 v11 清单均保存教学合同、StateLedger、结构化计划、能力合同、场景状态及最终合并配置。v11 的模型请求保存消息 hash 和用量收据，而非隐藏分析或持久化响应缓存。
 
-`resume` 先只读检查格式，拒绝 v4–v9；随后持有 `.run.lock` 重新读取 v10 清单：
+`resume` 先只读检查格式，拒绝 v4–v9；随后持有 `.run.lock` 重新读取对应版本清单，v11 还验证 generation identity：
 
 - 代码必须位于规范 run 路径且 SHA-256 匹配；
 - 未确认终态或成功取消前不会复用/重提 Job ID；
@@ -483,9 +483,9 @@ python -m build --sdist --wheel
 测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v10、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
 
 
-## v10 提交与任务边界
+## v10 / v11 提交与任务边界
 
-运行配置与执行身份由不可变 `RunConfig` / `ExecutionSpec` 固定；镜像、资源、隔离及工具身份参与复用判定。场景运行态分为计划、代码修订、执行尝试、验证收据和生命周期，兼容属性从分组投影。`stage_transactions.py` 在编排边界隔离阶段提案，服务仅接收明确快照并返回绑定输入身份的结果；`CommitCommand` 校验修订、合并计数、归一化、验证、持久化不可变对象、原子发布清单，再替换内存及发布事件。
+运行配置与执行身份由不可变 `RunConfig` / `ExecutionSpec` 固定。v11 使用 typed patch 和 `CommitCommand` 校验工作身份并原子发布；v10 legacy 路径暂时保留 `StageTransaction`。两种实现不会在同一运行中切换。
 
 源码位于 `scenes/revisions/scene_<id>/<sha256>.py`；报告按内容摘要保存。展示副本不参与执行或恢复。未确认的外部提交继续保留 attempt，Job ID 落盘失败尝试取消并保留紧急诊断身份，禁止自动重提。
 

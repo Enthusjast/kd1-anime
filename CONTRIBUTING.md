@@ -22,7 +22,10 @@
     ├── media/        # FFmpeg 合并
     ├── rag/          # 本地索引、Embedding、Reranker
     ├── cli.py        # Typer 命令
-    ├── orchestrator.py
+    ├── agent_runtime/ # v11 动作、Policy、Session 和有界执行
+    ├── pipeline/     # 规划、生成、渲染、恢复和最终处理
+    ├── application.py # 公开用例与运行时选择
+    ├── orchestrator.py # v10 legacy 执行路径
     ├── run_store.py  # manifest、原子检查点和运行锁
     └── tui.py        # Rich + prompt_toolkit 交互界面
 

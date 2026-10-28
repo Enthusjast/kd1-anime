@@ -278,7 +278,7 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
 恢复使用原子 manifest 和运行级锁。它会重新核对代码 SHA-256、Renderer/Merge Profile、精确
 Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因为重启而默认为未开始。
 
-恢复要求 manifest schema v10。请保留运行目录用于诊断，不要手工修改 manifest；如果清单损坏，重新生成新的运行。
+恢复支持与各自运行时匹配的 manifest v10 或 v11；v4–v9 只读。v11 还要求生成器、验证器、策略及执行环境身份一致。请保留运行目录用于诊断，不要手工修改 manifest；如果清单损坏，重新生成新的运行。
 
 ## 12. 运行很慢或看起来卡住
 

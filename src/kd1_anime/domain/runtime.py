@@ -61,15 +61,28 @@ class RunConfig(ValidatedModel):
 
         values = json.loads(value)
         expected = {name for name in Settings.model_fields if not name.endswith("API_KEY")}
-        if not isinstance(values, dict) or set(values) != expected:
+        if not isinstance(values, dict):
             raise ValueError("RunConfig requires all non-sensitive configuration fields")
+        # These fields did not exist in older executable v10 snapshots. Their
+        # fixed defaults preserve its uncapped request policy; never infer prices.
+        introduced = {
+            "MAX_RUN_LLM_TOKENS",
+            "MAX_RUN_LLM_COST_USD",
+            "LLM_MODEL_PRICES_USD",
+            "LLM_CONTEXT_SAFETY_TOKENS",
+        }
+        if set(values) - expected or expected - set(values) - introduced:
+            raise ValueError("RunConfig requires all non-sensitive configuration fields")
+        missing = expected - set(values)
+        for name in missing:
+            values[name] = Settings.model_fields[name].get_default(call_default_factory=True)
         # Rebuild every field without reading credential defaults into the snapshot.
         Settings(
             _env_file=None,
             **values,
             **{name: "" for name in Settings.model_fields if name.endswith("API_KEY")},
         )
-        return value
+        return json.dumps(values, sort_keys=True, ensure_ascii=False) if missing else value
 
     @classmethod
     def capture(cls):

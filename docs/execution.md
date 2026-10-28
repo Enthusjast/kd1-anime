@@ -2,9 +2,9 @@
 
 ## 状态提交
 
-运行使用 manifest v10。源码只写入 `scenes/revisions/scene_<id>/<sha256>.py`，阶段报告写入 `artifacts/objects/<sha256>.json`。清单中的路径与摘要是执行、修复、交接及恢复的依据；固定的 `scene_N.py` 与命名报告仅为展示副本。未被清单引用的对象可以保留，本轮不自动清理。
+默认 Agent Runtime 使用 manifest v11；已有 v10 运行仍由 legacy 路径执行。源码只写入 `scenes/revisions/scene_<id>/<sha256>.py`，阶段报告写入 `artifacts/objects/<sha256>.json`。清单中的路径与摘要是执行、修复、交接及恢复的依据；展示副本不授权执行。未被清单引用的对象可以保留，本轮不自动清理。
 
-`CommitCommand` 是状态提交入口。任务先在隔离快照上产生提案；提交时校验预期修订和完整输入身份，再合并到副本。传输期间已写入的请求及阶段计数独立合并，不能被旧 worker 快照覆盖。嵌套状态按 planning、code、execution、verification、lifecycle 分组，兼容字段必须与分组投影一致。Orchestrator 在锁内应用结构化服务结果，归一化渲染凭据及计划状态，检查运行/场景合法转移，构造独立深拷贝快照，校验跨字段不变量，然后原子替换 manifest。只有持久化成功才更新清单 revision 并发布完成事件。写盘失败会停止 worker，后续检查点与模型请求均被拒绝。
+v11 领域动作先持久化 intent 和 invocation，再执行工具；结果通过 `StageResult` 与 typed `RunPatch`/`ScenePatch` 经 `CommitCommand` 原子发布。提交校验 revision、输入及依赖身份，并保留并发请求预占；持久化成功后才发布内存状态和 committed 事件。v10 的 legacy 编排继续使用独立的 StageTransaction，二者不会在同一运行中切换。
 
 运行生命周期使用 `RunPhase`；场景阶段独立记录，原有 `State` 保留为界面投影。`StaticVerification`、`ExecutionVerification` 和 `VisualVerification` 分别记录代码接纳、执行及视觉证据。视觉 `unknown` 允许表达缺少证据，不能计为已验证，也不能删除有效视频。
 
