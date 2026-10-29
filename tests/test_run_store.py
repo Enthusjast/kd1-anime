@@ -8,16 +8,22 @@ import pytest
 from typer.testing import CliRunner
 
 import kd1_anime.run_store as store_module
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.agents.planner import ContinuityBible, ScenePlan
 from kd1_anime.agents.technical_planner import TechnicalObject, TechnicalSpec
 from kd1_anime.cli import app
+from kd1_anime.commits import CommitCommand, RunCommitter, RunPatch
 from kd1_anime.config import settings
 from kd1_anime.domain.candidates import CodeCandidate
+from kd1_anime.domain.dependencies import StaleWorkError
 from kd1_anime.domain.execution import is_valid_fsm_transition
 from kd1_anime.domain.runtime import VisualEvalProfile
 from kd1_anime.domain.scene_fields import SCENE_FIELDS, SCENE_STORAGE_FIELDS
-from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
-from kd1_anime.rendering import sha256_file
+from kd1_anime.objects import ObjectStore
+from kd1_anime.pipeline.contracts import FinalizationInputs, FinalizationOutput
+from kd1_anime.pipeline.finalization import FinalizationPipeline
+from kd1_anime.prompt_identity import capture_generation_identity
+from kd1_anime.rendering import RenderProfile, sha256_file
 from kd1_anime.run_store import (
     RunManifest,
     RunRepository,
@@ -49,69 +55,73 @@ def make_plan(scene_id: int = 1) -> ScenePlan:
     )
 
 
-def make_paths(workspace: Path) -> RunPaths:
+def make_manifest(**values) -> RunManifest:
+    run_id = values.get("run_id", RUN_ID)
+    return RunManifest(
+        agent=AgentRunState(
+            session_id=f"session-{run_id}",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
+        **values,
+    )
+
+
+def test_manifest_round_trip_preserves_immutable_code_identity(tmp_path):
+    workspace = tmp_path / "workspace"
     root = workspace / "runs" / RUN_ID
-    return RunPaths(
-        RUN_ID,
-        root,
-        root / "scenes",
-        root / "logs",
-        root / "videos",
-        root / "output_final.mp4",
-    )
-
-
-def test_checkpoint_round_trip_rejects_tampered_code(tmp_path):
-    workspace = tmp_path / "workspace"
-    paths = make_paths(workspace)
-    paths.scenes.mkdir(parents=True)
+    objects = ObjectStore(root)
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    code_path = paths.scenes / "scene_1.py"
-    code_path.write_text(code, encoding="utf-8")
-    ctx = PipelineContext(
-        "prompt",
-        paths=paths,
-        scene_states={1: SceneState(plan=make_plan(), code=code, class_name="Demo")},
+    code_file = objects.source(1, code)
+    manifest = make_manifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
+        scenes={
+            1: StoredSceneState(
+                plan=make_plan(),
+                code_file=code_file,
+                code_sha256=sha256_text(code),
+                class_name="Demo",
+            )
+        },
     )
-    orchestrator = Orchestrator()
-
-    orchestrator._checkpoint(ctx, State.CODING)
-
-    manifest_path = paths.root / "manifest.json"
+    manifest_path = root / "manifest.json"
+    write_manifest(manifest_path, manifest)
     assert manifest_path.stat().st_mode & 0o777 == 0o600
-    manifest = RunRepository(workspace).load(RUN_ID)
-    restored = orchestrator._context_from_manifest(manifest, paths.root)
-    assert restored.scene_states[1].code == code
+    restored = RunRepository(workspace).load_for_resume(RUN_ID)
+    stored = restored.scenes[1]
+    assert stored.code_file == code_file
+    assert sha256_file(root / stored.code_file) == stored.code_sha256
 
-    # Display aliases cannot affect recovery; only the manifest object is authoritative.
-    code_path.write_text(code + "# display changed\n", encoding="utf-8")
-    assert orchestrator._context_from_manifest(manifest, paths.root).scene_states[1].code == code
-    (paths.root / manifest.scenes[1].code_file).write_text(code + "# changed\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="哈希"):
-        orchestrator._context_from_manifest(manifest, paths.root)
+    (root / "scenes" / "scene_1.py").write_text("# display changed\n", encoding="utf-8")
+    assert (root / stored.code_file).read_text(encoding="utf-8") == code
+    (root / stored.code_file).write_text(code + "# changed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        objects.source(1, code)
 
 
-def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
+def test_manifest_round_trip_persists_continuity_bible(tmp_path):
     workspace = tmp_path / "workspace"
-    paths = make_paths(workspace)
-    paths.scenes.mkdir(parents=True)
+    root = workspace / "runs" / RUN_ID
     bible = ContinuityBible(
         background="#101010",
         palette=["蓝色=输入"],
         persistent_elements=["公式"],
         transition_rules=["保留公式"],
     )
-    ctx = PipelineContext(
-        "prompt",
-        paths=paths,
+    manifest = make_manifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
         continuity_bible=bible,
         plan_review_status="passed",
         continuity_review_status="pending",
         continuity_review_round=1,
         continuity_resume_recheck_used=True,
         continuity_warnings=["warning"],
-        scene_states={
-            1: SceneState(
+        scenes={
+            1: StoredSceneState(
                 plan=make_plan(),
                 safe_fallback_used=True,
                 safe_fallback_reason="几何方案无法验证",
@@ -122,33 +132,29 @@ def test_checkpoint_round_trip_persists_continuity_bible(tmp_path):
             )
         },
     )
-    orchestrator = Orchestrator()
+    write_manifest(root / "manifest.json", manifest)
 
-    orchestrator._checkpoint(ctx, State.DETAILING)
-
-    manifest = RunRepository(workspace).load(RUN_ID)
-    restored = orchestrator._context_from_manifest(manifest, paths.root)
+    restored = RunRepository(workspace).load_for_resume(RUN_ID)
     assert restored.continuity_bible == bible
     assert restored.continuity_review_status == "pending"
     assert restored.continuity_review_round == 1
     assert restored.continuity_resume_recheck_used is True
     assert restored.continuity_warnings == ["warning"]
-    assert restored.scene_states[1].safe_fallback_used is True
-    assert restored.scene_states[1].safe_fallback_reason == "几何方案无法验证"
-    assert restored.scene_states[1].failure_category == "review"
-    assert restored.scene_states[1].plan_reviewed is True
+    assert restored.scenes[1].safe_fallback_used is True
+    assert restored.scenes[1].safe_fallback_reason == "几何方案无法验证"
+    assert restored.scenes[1].failure_category == "review"
+    assert restored.scenes[1].plan_reviewed is True
 
 
-def test_checkpoint_round_trip_persists_technical_spec_identity(tmp_path):
+def test_manifest_round_trip_persists_technical_spec_identity(tmp_path):
     workspace = tmp_path / "workspace"
-    paths = make_paths(workspace)
-    paths.scenes.mkdir(parents=True)
+    root = workspace / "runs" / RUN_ID
     spec = TechnicalSpec(
         scene_id=1,
         objects=[TechnicalObject(element_id="formula", variable_name="formula", exported=True)],
         export_element_ids=["formula"],
     )
-    state = SceneState(
+    state = StoredSceneState(
         plan=make_plan(),
         plan_ready=True,
         plan_reviewed=True,
@@ -157,21 +163,20 @@ def test_checkpoint_round_trip_persists_technical_spec_identity(tmp_path):
         technical_input_sha256="a" * 64,
         technical_status="passed",
     )
-    ctx = PipelineContext(
-        "prompt",
-        paths=paths,
+    manifest = make_manifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
         plan_review_status="passed",
-        scene_states={1: state},
+        scenes={1: state},
     )
+    write_manifest(root / "manifest.json", manifest)
 
-    Orchestrator()._checkpoint(ctx, State.REVIEWING)
-
-    manifest = RunRepository(workspace).load(RUN_ID)
-    restored = Orchestrator._context_from_manifest(manifest, paths.root)
-    restored_spec = restored.scene_states[1].technical_spec
+    restored = RunRepository(workspace).load_for_resume(RUN_ID)
+    restored_spec = restored.scenes[1].technical_spec
     assert restored_spec == spec
-    assert restored.scene_states[1].technical_status == "passed"
-    assert manifest.integrity_errors() == []
+    assert restored.scenes[1].technical_status == "passed"
+    assert restored.integrity_errors() == []
 
 
 def test_legacy_technical_spec_is_readable_but_cannot_resume():
@@ -191,7 +196,7 @@ def test_legacy_technical_spec_is_readable_but_cannot_resume():
 
     assert legacy.technical_spec is None
     assert legacy.technical_contract_stale is True
-    manifest = RunManifest(
+    manifest = make_manifest(
         run_id=RUN_ID,
         user_prompt="prompt",
         output_path="/tmp/output.mp4",
@@ -202,7 +207,7 @@ def test_legacy_technical_spec_is_readable_but_cannot_resume():
 
 
 def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():
-    manifest = RunManifest(
+    manifest = make_manifest(
         run_id=RUN_ID,
         user_prompt="prompt",
         output_path="/tmp/output.mp4",
@@ -214,7 +219,7 @@ def test_manifest_integrity_rejects_passed_plan_review_with_pending_scene():
 
 
 def test_manifest_validate_for_resume_rejects_semantic_corruption():
-    manifest = RunManifest(
+    manifest = make_manifest(
         run_id=RUN_ID,
         user_prompt="prompt",
         output_path="/tmp/output.mp4",
@@ -249,7 +254,7 @@ def test_fsm_transition_table_is_explicit(previous, current, expected):
     ],
 )
 def test_manifest_integrity_rejects_status_state_mismatch(status, state, message):
-    manifest = RunManifest(
+    manifest = make_manifest(
         run_id=RUN_ID,
         status=status,
         state=state,
@@ -273,7 +278,7 @@ def test_restore_run_path_rejects_internal_symlink(tmp_path):
 
 
 def test_manifest_integrity_rejects_unverified_rendered_artifact():
-    profile = PipelineContext("prompt", paths=make_paths(Path("/tmp"))).render_profile
+    profile = RenderProfile.current()
     code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
     scene = StoredSceneState(
         plan=make_plan(),
@@ -301,7 +306,7 @@ def test_manifest_integrity_rejects_unverified_rendered_artifact():
             "verified": False,
         },
     )
-    manifest = RunManifest(
+    manifest = make_manifest(
         run_id=RUN_ID,
         user_prompt="prompt",
         output_path="/tmp/output.mp4",
@@ -311,62 +316,58 @@ def test_manifest_integrity_rejects_unverified_rendered_artifact():
     assert any("artifact 未验证" in error for error in manifest.integrity_errors())
 
 
-def test_resume_completed_run_rejects_tampered_final_video(monkeypatch, tmp_path):
+@pytest.mark.parametrize("tamper", ["content", "output_identity"])
+def test_completed_manifest_rejects_tampered_final_video(tmp_path, tamper):
     workspace = tmp_path / "workspace"
-    paths = make_paths(workspace)
-    paths.root.mkdir(parents=True)
-    paths.output.write_bytes(b"original")
-    manifest = RunManifest(
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    output = root / "output.mp4"
+    output.write_bytes(b"original")
+    manifest = make_manifest(
         run_id=RUN_ID,
         status="completed",
         state="DONE",
         user_prompt="prompt",
-        output_path=str(paths.output.resolve()),
-        final_video=str(paths.output.resolve()),
-        final_video_sha256=sha256_file(paths.output),
-    )
-    write_manifest(paths.root / "manifest.json", manifest)
-    paths.output.write_bytes(b"tampered")
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
-
-    with pytest.raises(RuntimeError, match="哈希"):
-        Orchestrator().resume(RUN_ID)
-
-
-def test_context_rejects_manifest_final_video_different_from_output(tmp_path):
-    workspace = tmp_path / "workspace"
-    paths = make_paths(workspace)
-    paths.root.mkdir(parents=True)
-    output = paths.root / "output.mp4"
-    other = paths.root / "other.mp4"
-    manifest = RunManifest(
-        run_id=RUN_ID,
-        status="failed",
-        state="MERGING",
-        user_prompt="prompt",
         output_path=str(output.resolve()),
-        final_video=str(other.resolve()),
+        final_video=str(output.resolve()),
+        final_video_sha256=sha256_file(output),
     )
+    write_manifest(root / "manifest.json", manifest)
+    if tamper == "content":
+        output.write_bytes(b"tampered")
 
-    with pytest.raises(ValueError, match="final_video"):
-        Orchestrator._context_from_manifest(manifest, paths.root)
+    restored = RunRepository(workspace).load_for_resume(RUN_ID)
+    result = FinalizationOutput(
+        video={
+            "path": "output.mp4",
+            "sha256": restored.final_video_sha256,
+            "kind": "video",
+        },
+        output_path=str(root / "other.mp4")
+        if tamper == "output_identity"
+        else restored.final_video,
+    )
+    inputs = FinalizationInputs(
+        restored.run_id,
+        root,
+        restored.run_config,
+        restored.render_profile,
+        restored.merge_profile,
+        (),
+        Path(restored.output_path),
+    )
+    with pytest.raises(ValueError, match="hash or output identity mismatch"):
+        FinalizationPipeline._validate_video(inputs, result)
 
 
 def test_restore_rejects_slurm_job_with_different_code_identity(tmp_path):
-    workspace = tmp_path / "workspace"
-    paths = make_paths(workspace)
-    paths.scenes.mkdir(parents=True)
-    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    (paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
-    ctx = PipelineContext(
-        "prompt",
-        paths=paths,
-        scene_states={1: SceneState(plan=make_plan(), code=code, class_name="Demo")},
+    root = tmp_path / "runs" / RUN_ID
+    stored = StoredSceneState(
+        plan=make_plan(),
+        code_file="scenes/scene_1.py",
+        code_sha256="a" * 64,
+        class_name="Demo",
     )
-    orchestrator = Orchestrator()
-    orchestrator._checkpoint(ctx, State.CODING)
-    manifest = RunRepository(workspace).load(RUN_ID)
-    stored = manifest.scenes[1]
     stored.slurm_job = StoredSlurmJob(
         job_id="123",
         scene_id=1,
@@ -380,8 +381,14 @@ def test_restore_rejects_slurm_job_with_different_code_identity(tmp_path):
         status="PENDING",
     )
 
+    manifest = make_manifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
+        scenes={1: stored},
+    )
     with pytest.raises(ValueError, match="Job 代码哈希"):
-        orchestrator._context_from_manifest(manifest, paths.root)
+        manifest.validate_for_resume()
 
 
 def test_repository_rejects_symlink_run_directory(tmp_path):
@@ -436,7 +443,7 @@ def test_status_and_clean_remove_only_run_directory(monkeypatch, tmp_path):
     outside_output = tmp_path / "keep.mp4"
     outside_output.write_bytes(b"video")
     old = datetime.now(timezone.utc) - timedelta(days=60)
-    manifest = RunManifest(
+    manifest = make_manifest(
         run_id=RUN_ID,
         created_at=old,
         updated_at=old,
@@ -467,14 +474,14 @@ def test_repository_lists_most_recently_updated_run_first(tmp_path):
     resumed_id = RUN_ID
     newer_created_id = "20260729-120000-deadbeef"
     manifests = [
-        RunManifest(
+        make_manifest(
             run_id=resumed_id,
             created_at=now - timedelta(days=10),
             updated_at=now,
             user_prompt="resumed",
             output_path=str(tmp_path / "resumed.mp4"),
         ),
-        RunManifest(
+        make_manifest(
             run_id=newer_created_id,
             created_at=now - timedelta(days=1),
             updated_at=now - timedelta(days=1),
@@ -530,32 +537,24 @@ def test_repository_rejects_previous_manifest_schema_with_actionable_message(tmp
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_current_manifest_uses_v10_schema_and_merge_profile():
-    assert (
-        RunManifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4").schema_version
-        == 10
-    )
-    assert (
-        RunManifest(
-            run_id=RUN_ID,
-            user_prompt="test",
-            output_path="/tmp/out.mp4",
-        ).merge_profile.video_codec
-        == "libx264"
-    )
+def test_current_manifest_uses_v11_schema_and_merge_profile():
+    manifest = make_manifest(run_id=RUN_ID, user_prompt="test", output_path="/tmp/out.mp4")
+    assert manifest.schema_version == 11
+    assert manifest.merge_profile.video_codec == "libx264"
 
 
 def test_v7_manifest_remains_read_only_without_version_upgrade(tmp_path):
     workspace = tmp_path / "workspace"
     root = workspace / "runs" / RUN_ID
     root.mkdir(parents=True)
-    raw = RunManifest(
+    raw = make_manifest(
         run_id=RUN_ID,
         user_prompt="legacy v7",
         output_path=str((root / "output.mp4").resolve()),
     ).model_dump(mode="json")
     raw["schema_version"] = 7
     raw.pop("generation_mode")
+    raw.pop("agent")
     (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
 
     repository = RunRepository(workspace)
@@ -571,12 +570,13 @@ def test_v4_manifest_is_readable_but_read_only(tmp_path):
     workspace = tmp_path / "workspace"
     root = workspace / "runs" / RUN_ID
     root.mkdir(parents=True)
-    raw = RunManifest(
+    raw = make_manifest(
         run_id=RUN_ID,
         user_prompt="legacy",
         output_path=str((root / "output.mp4").resolve()),
     ).model_dump(mode="json")
     raw["schema_version"] = 4
+    raw.pop("agent")
     path = root / "manifest.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
 
@@ -593,12 +593,13 @@ def test_v5_manifest_must_persist_teaching_contract_fields(tmp_path):
     workspace = tmp_path / "workspace"
     root = workspace / "runs" / RUN_ID
     root.mkdir(parents=True)
-    raw = RunManifest(
+    raw = make_manifest(
         run_id=RUN_ID,
         user_prompt="prompt",
         output_path=str((root / "output.mp4").resolve()),
     ).model_dump(mode="json")
     raw["schema_version"] = 5
+    raw.pop("agent")
     for field_name in ("lesson_spec", "teaching_graph", "state_ledger"):
         raw.pop(field_name)
     (root / "manifest.json").write_text(json.dumps(raw), encoding="utf-8")
@@ -629,7 +630,7 @@ def _write_v1_manifest(workspace: Path, *, reused_job: bool = False) -> Path:
             status="COMPLETED",
         ),
     )
-    raw = RunManifest(
+    raw = make_manifest(
         run_id=RUN_ID,
         user_prompt="legacy",
         output_path=str(root / "output.mp4"),
@@ -692,32 +693,44 @@ def test_v1_rendered_scene_without_job_is_forced_to_rerender(tmp_path):
         RunRepository(workspace).load(RUN_ID)
 
 
-def test_checkpoint_revision_is_monotonic_under_threads(tmp_path):
+def test_commit_revision_is_monotonic_under_threads(tmp_path):
     workspace = tmp_path / "workspace"
-    paths = make_paths(workspace)
-    paths.scenes.mkdir(parents=True)
-    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    (paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
-    ctx = PipelineContext(
-        "prompt",
-        paths=paths,
-        scene_states={1: SceneState(plan=make_plan(), code=code, class_name="Demo")},
+    root = workspace / "runs" / RUN_ID
+    manifest = make_manifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
     )
-    orchestrator = Orchestrator()
+    write_manifest(root / "manifest.json", manifest)
+    committer = RunCommitter(root, manifest)
+
+    def commit():
+        while True:
+            current = committer.current
+            command = CommitCommand(
+                current.revision,
+                "INIT",
+                patch=RunPatch(error="checkpoint"),
+            )
+            try:
+                committer.commit(command)
+                return
+            except StaleWorkError:
+                continue
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(orchestrator._checkpoint, ctx, State.CODING) for _ in range(20)]
+        futures = [pool.submit(commit) for _ in range(20)]
         for future in futures:
             future.result()
 
-    manifest = RunRepository(workspace).load(RUN_ID)
-    assert manifest.revision == 20
-    assert json.loads((paths.root / "manifest.json").read_text())["revision"] == 20
+    restored = RunRepository(workspace).load_for_resume(RUN_ID)
+    assert restored.revision == 20
+    assert json.loads((root / "manifest.json").read_text())["revision"] == 20
 
 
 def test_manifest_rejects_unknown_fsm_state_and_scene_phase():
     with pytest.raises(ValueError):
-        RunManifest(
+        make_manifest(
             run_id=RUN_ID,
             user_prompt="prompt",
             output_path="/tmp/output.mp4",
@@ -732,7 +745,7 @@ def test_manifest_rejects_unknown_fsm_state_and_scene_phase():
 
 
 def test_scene_storage_metadata_is_complete_and_explicit():
-    stored_fields = set(StoredSceneState.model_fields) - {"snapshot"}
+    stored_fields = set(StoredSceneState.model_fields)
     assert set(SCENE_STORAGE_FIELDS) == stored_fields
     assert sum(len(metadata.stored_names) for metadata in SCENE_FIELDS.values()) == len(
         stored_fields
@@ -768,11 +781,11 @@ def test_scene_snapshot_preserves_v10_groups_and_exact_flat_projection():
     assert snapshot["lifecycle"]["failure_reason"] == "failure"
     flattened = {name: value for group in snapshot.values() for name, value in group.items()}
     assert len(flattened) == sum(len(group) for group in snapshot.values())
-    assert flattened == scene.model_dump(mode="json", exclude={"snapshot"})
+    assert flattened == scene.model_dump(mode="json")
     assert StoredSceneState.model_validate(flattened) == scene
 
 
-def test_extracted_domain_schemas_round_trip_v10_without_shape_changes(tmp_path):
+def test_extracted_domain_schemas_round_trip_v11_with_one_scene_projection(tmp_path):
     candidate_payload = {
         "code_file": "objects/source.py",
         "code_sha256": "a" * 64,
@@ -798,25 +811,141 @@ def test_extracted_domain_schemas_round_trip_v10_without_shape_changes(tmp_path)
     assert candidate.model_dump(mode="json") == candidate_payload
     assert profile.model_dump(mode="json") == profile_payload
     assert profile.digest() == sha256_text(json.dumps(profile_payload, separators=(",", ":")))
-    paths = make_paths(tmp_path / "workspace")
-    manifest = RunManifest(
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    manifest = make_manifest(
         run_id=RUN_ID,
         user_prompt="prompt",
-        output_path=str(paths.output),
+        output_path=str(root / "output.mp4"),
         visual_eval_profile=profile,
         scenes={1: StoredSceneState(plan=make_plan(), candidates=[candidate])},
     )
-    manifest_path = paths.root / "manifest.json"
+    manifest_path = root / "manifest.json"
     write_manifest(manifest_path, manifest)
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == 10
+    assert raw["schema_version"] == 11
     assert raw["visual_eval_profile"] == profile_payload
     assert raw["scenes"]["1"]["candidates"] == [candidate_payload]
-    assert raw["scenes"]["1"]["snapshot"]["code"]["candidates"] == [candidate_payload]
-    assert "code_revision" not in raw["scenes"]["1"]["snapshot"]
+    assert "snapshot" not in raw["scenes"]["1"]
     restored = RunRepository(tmp_path / "workspace").load(RUN_ID)
     assert restored.model_dump(mode="json") == raw
     assert restored.integrity_errors() == []
     assert isinstance(restored.scenes[1].candidates[0], CodeCandidate)
     assert isinstance(restored.visual_eval_profile, VisualEvalProfile)
-    assert scene_snapshot(restored.scenes[1]) == restored.scenes[1].snapshot
+    assert not hasattr(restored.scenes[1], "snapshot")
+
+
+@pytest.mark.parametrize("version", range(4, 11))
+def test_legacy_manifests_are_exactly_read_only_before_resume_side_effects(
+    tmp_path, monkeypatch, version
+):
+    workspace = tmp_path / "workspace"
+    root = workspace / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    root.chmod(0o755)
+    scene = StoredSceneState(plan=make_plan(), revision=3, input_sha256="b" * 64)
+    raw = make_manifest(
+        run_id=RUN_ID,
+        user_prompt=f"legacy v{version}",
+        output_path=str(root / "output.mp4"),
+        scenes={1: scene},
+    ).model_dump(mode="json")
+    raw["schema_version"] = version
+    raw.pop("agent")
+    raw["approve_plan"] = True
+    raw["plan_approved"] = True
+    raw["scenes"]["1"]["snapshot"] = scene_snapshot(scene).model_dump(mode="json")
+    path = root / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+    repository = RunRepository(workspace)
+
+    loaded = repository.load(RUN_ID)
+    assert loaded.schema_version == version
+    assert loaded.agent is None
+    assert loaded.model_dump(mode="json") == raw
+    assert json.loads(loaded.model_dump_json()) == raw
+    assert [item.run_id for item in repository.list()] == [RUN_ID]
+    timestamp = loaded.updated_at
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Read-only rejection must precede migration, mutation, and writes")
+
+    monkeypatch.setattr(store_module, "migrate_manifest_data", forbidden)
+    monkeypatch.setattr(store_module, "atomic_write_text", forbidden)
+    monkeypatch.setattr(store_module, "utc_now", forbidden)
+    with pytest.raises(ValueError, match=rf"schema_version={version}.*只读"):
+        repository.load_for_resume(RUN_ID)
+    with pytest.raises(ValueError, match="只读"):
+        loaded.validate_for_resume()
+    with pytest.raises(ValueError, match="只读"):
+        RunCommitter(root, loaded)
+    with pytest.raises(ValueError, match="只读"):
+        write_manifest(path, loaded)
+    assert loaded.updated_at == timestamp
+    assert loaded.scenes[1].revision == 3
+    assert path.read_bytes() == before
+    assert root.stat().st_mode & 0o777 == 0o755
+    assert not (root / ".run.lock").exists()
+
+
+def test_v11_historical_snapshot_is_validated_then_removed_without_identity_changes(tmp_path):
+    root = tmp_path / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    scene = StoredSceneState(
+        plan=make_plan(),
+        revision=7,
+        input_sha256="b" * 64,
+        code_file="scenes/revisions/scene_1/source.py",
+        code_sha256="c" * 64,
+    )
+    manifest = make_manifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
+        revision=9,
+        scenes={1: scene},
+    )
+    raw = manifest.model_dump(mode="json")
+    raw["scenes"]["1"]["snapshot"] = scene_snapshot(scene).model_dump(mode="json")
+    path = root / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = RunRepository(tmp_path).load_for_resume(RUN_ID)
+    assert loaded.revision == 9
+    assert loaded.agent == manifest.agent
+    assert loaded.scenes[1] == scene
+    assert loaded.execution_spec == manifest.execution_spec
+    assert "snapshot" not in loaded.scenes[1].model_dump(mode="json")
+    write_manifest(path, loaded)
+    canonical = json.loads(path.read_text(encoding="utf-8"))
+    assert canonical["scenes"]["1"] == scene.model_dump(mode="json")
+    assert canonical["agent"] == raw["agent"]
+    assert canonical["revision"] == raw["revision"]
+
+
+def test_v11_historical_snapshot_mismatch_is_rejected_without_rewriting(tmp_path):
+    root = tmp_path / "runs" / RUN_ID
+    root.mkdir(parents=True)
+    scene = StoredSceneState(plan=make_plan(), input_sha256="b" * 64)
+    raw = make_manifest(
+        run_id=RUN_ID,
+        user_prompt="prompt",
+        output_path=str(root / "output.mp4"),
+        scenes={1: scene},
+    ).model_dump(mode="json")
+    raw["scenes"]["1"]["snapshot"] = scene_snapshot(scene).model_dump(mode="json")
+    raw["scenes"]["1"]["snapshot"]["code"]["code_sha256"] = "d" * 64
+    path = root / "manifest.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="嵌套状态与兼容投影不一致"):
+        RunRepository(tmp_path).load_for_resume(RUN_ID)
+    assert path.read_bytes() == before
+    assert not (root / ".run.lock").exists()
+
+
+def test_v11_default_requires_agent_identity_and_session_state():
+    with pytest.raises(ValueError, match="v11 requires complete agent"):
+        RunManifest(run_id=RUN_ID, user_prompt="prompt", output_path="output.mp4")

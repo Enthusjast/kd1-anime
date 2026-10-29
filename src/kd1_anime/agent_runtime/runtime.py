@@ -117,7 +117,7 @@ from kd1_anime.rendering import MergeProfile, RenderProfile, sha256_file
 from kd1_anime.request_budget import RequestBudget, RequestContext, RequestReservation
 from kd1_anime.resources import ResourceCoordinator
 from kd1_anime.run_store import (
-    AGENT_MANIFEST_SCHEMA_VERSION,
+    MANIFEST_SCHEMA_VERSION,
     RunManifest,
     RunRepository,
     StoredSceneState,
@@ -232,7 +232,23 @@ class AgentRuntime:
     def _cancel_active_renders(self):
         if self._cancel_cleanup_done:
             return
+        previous = self.manifest
+        repository = RunRepository(self.root.parent.parent)
+        repository.load_for_resume(previous.run_id)
         with lock_run(self.root):
+            # An idle runtime can outlive another recovery of the same run.
+            # Rebase cancellation on the current durable authority before writing
+            # intents or touching an external job; never restore a historical PID.
+            current = repository.load_for_resume(previous.run_id)
+            if (
+                current.run_config != previous.run_config
+                or current.execution_spec != previous.execution_spec
+                or current.backend != previous.backend
+                or current.agent.session_id != previous.agent.session_id
+                or current.agent.generation_identity != previous.agent.generation_identity
+            ):
+                raise ValueError("Cancellation execution identity changed")
+            self.committer = RunCommitter(self.root, current)
             session = self.sessions.load(self.manifest.agent.session_id)
             if not session.commands or session.commands[-1].kind != "cancel":
                 self.sessions.command(
@@ -521,13 +537,13 @@ class AgentRuntime:
         base_manifest=None,
     ):
         repository = RunRepository(settings.WORKSPACE_DIR)
-        before = repository.load_for_agent_resume(run_id)
+        before = repository.load_for_resume(run_id)
         verify_generation_identity(before.agent.generation_identity)
         if retry_scene_id is not None and (before.state == "DONE" or before.status == "completed"):
             raise RuntimeError("Completed runs cannot retry in place; create a new incremental run")
         root = repository.run_root(run_id)
         with lock_run(root):
-            manifest = repository.load_for_agent_resume(run_id)
+            manifest = repository.load_for_resume(run_id)
             verify_generation_identity(manifest.agent.generation_identity)
             with manifest.run_config.activate():
                 self._verify_resume_inputs(root, manifest)
@@ -725,7 +741,7 @@ class AgentRuntime:
                     raise ValueError("Clarification and generation configuration identities differ")
                 session = sessions.link_run(session_id, run_id, permissions=permissions)
             manifest = RunManifest(
-                schema_version=AGENT_MANIFEST_SCHEMA_VERSION,
+                schema_version=MANIFEST_SCHEMA_VERSION,
                 run_id=run_id,
                 user_prompt=prompt,
                 run_config=config,

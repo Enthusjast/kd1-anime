@@ -137,7 +137,6 @@ def plan_retry(manifest: RunManifest, scene_id: int) -> RecoveryPlan:
             )
         )
     scene = previous.model_copy(deep=True)
-    scene.snapshot = None
     scene.slurm_job = scene.submission = None
     _clear_artifact(scene, visual_enabled=manifest.visual_eval_profile.enabled)
     scene.failed = scene.give_up = False
@@ -221,7 +220,6 @@ def plan_resume(
                 blocked.append(scene_id)
             continue
         scene = previous.model_copy(deep=True)
-        scene.snapshot = None
         scene.failed = scene.give_up = False
         scene.failure_reason = scene.failure_category = ""
         if invalidate:

@@ -23,10 +23,12 @@
     ├── rag/          # 本地索引、Embedding、Reranker
     ├── cli.py        # Typer 命令
     ├── agent_runtime/ # v11 动作、Policy、Session 和有界执行
-    ├── pipeline/     # 规划、生成、渲染、恢复和最终处理
-    ├── application.py # 公开用例与运行时选择
-    ├── orchestrator.py # v10 legacy 执行路径
-    ├── run_store.py  # manifest、原子检查点和运行锁
+    ├── pipeline/     # 明确输入/输出的规划、场景、修复、渲染和最终处理工具
+    ├── application.py # 公开用例；执行入口仅接受 v11
+    ├── commits.py    # typed patch、工作身份与原子状态提交
+    ├── event_store.py # v3 已提交事实通知与 ephemeral 序号
+    ├── queries.py    # RunView、SessionView 和精确批准查询
+    ├── run_store.py  # v11 写入、v4–v10 只读、检查点和运行锁
     └── tui.py        # Rich + prompt_toolkit 交互界面
 
 ARCHITECTURE.md 描述模块之间的依赖、状态机、阶段合同和安全边界。新增模块前先确认是否能保持显式 FSM，不要引入新的 Agent 编排框架。
@@ -66,6 +68,10 @@ ARCHITECTURE.md 描述模块之间的依赖、状态机、阶段合同和安全�
 - 所有重试、审查、重规划、修复和 UNKNOWN 等待都必须有上限。
 - manifest 使用原子写入；改变字段或 schema 时同步更新完整性校验和恢复测试。
 - 不要绕过运行锁，也不要手工复用未验证的 Slurm Job ID 或视频。
+- 只有 manifest v11 可执行；v4–v10 仅只读查看和 JSON 导出，不迁移、不选用旧运行时。恢复、retry 和增量基础运行必须在模型探测、作业访问、运行锁和文件修改前拒绝旧版本。
+- `Orchestrator` 与 whole-context `StageTransaction` 已删除，不新增兼容入口或全量 Context 拷贝。动作结果统一用 `StageResult`、typed patch 和 `CommitCommand` 发布，提交成功后才能更新显示。
+- `AgentEvent` 是已提交事实的通知而非恢复命令；ephemeral 正文不落盘。UI 溢出从已提交视图重同步，事件或回调失败不能更改执行事实。
+- Session grant 必须由可信用户命令签发并绑定精确动作、资源、输入与工作身份；计划批准不授权代码 diff，批准也不能绕过候选检查和 Review。模型不得自我批准。
 
 ### 生成代码安全
 

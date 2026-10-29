@@ -1,4 +1,4 @@
-"""Public animation use cases and version-aware runtime composition.
+"""Public animation use cases composed exclusively with the agent runtime.
 
 Callers provide goals, commands and callbacks, never a mutable pipeline context.
 The runtime factory is the injection boundary for isolated execution backends.
@@ -21,15 +21,8 @@ from kd1_anime.run_store import RunRepository, atomic_write_json
 if TYPE_CHECKING:
     from kd1_anime.agent_runtime.runtime import AgentRuntime
     from kd1_anime.cluster.jobs import RenderJob
-    from kd1_anime.orchestrator import Orchestrator
 
 Callback = Callable[[str, dict], None]
-
-
-def _legacy_runtime() -> Orchestrator:
-    from kd1_anime.orchestrator import Orchestrator
-
-    return Orchestrator()
 
 
 def _agent_runtime(*, resource_coordinator=None) -> AgentRuntime:
@@ -39,11 +32,11 @@ def _agent_runtime(*, resource_coordinator=None) -> AgentRuntime:
 
 
 class Application:
-    """Stable use-case boundary; legacy state remains owned by its runtime."""
+    """Stable use-case boundary; durable state remains owned by the agent runtime."""
 
     def __init__(
         self,
-        runtime_factory: Callable[[], Orchestrator | AgentRuntime] | None = None,
+        runtime_factory: Callable[[], AgentRuntime] | None = None,
         *,
         resource_coordinator=None,
     ):
@@ -52,13 +45,13 @@ class Application:
         self._active_runtime = None
         self._cancel_requested = Event()
 
-    def _runtime(self, *, agent: bool = True):
+    def _runtime(self):
         if self._runtime_factory is not None:
             runtime = self._runtime_factory()
-        elif agent and self._resource_coordinator is not None:
+        elif self._resource_coordinator is not None:
             runtime = _agent_runtime(resource_coordinator=self._resource_coordinator)
         else:
-            runtime = _agent_runtime() if agent else _legacy_runtime()
+            runtime = _agent_runtime()
         self._active_runtime = runtime
         if self._cancel_requested.is_set():
             runtime.cancel_all()
@@ -204,8 +197,9 @@ class Application:
         from kd1_anime.run_store import lock_run, restore_run_path
 
         repository = RunRepository(settings.WORKSPACE_DIR)
+        repository.load_for_resume(run_id)
         with lock_run(repository.run_root(run_id)):
-            manifest = repository.load_for_agent_resume(run_id)
+            manifest = repository.load_for_resume(run_id)
             action = manifest.agent.pending_approval
             if action is None or action.kind != "inspect_candidate" or action.proposal is None:
                 return ""
@@ -236,9 +230,9 @@ class Application:
         from kd1_anime.run_store import lock_run
 
         repository = RunRepository(settings.WORKSPACE_DIR)
-        repository.load_for_agent_resume(run_id)
+        repository.load_for_resume(run_id)
         with lock_run(repository.run_root(run_id)):
-            manifest = repository.load_for_agent_resume(run_id)
+            manifest = repository.load_for_resume(run_id)
             action = manifest.agent.pending_approval
             if action is None:
                 raise ValueError("No pending approval for this run")
@@ -262,18 +256,10 @@ class Application:
     @staticmethod
     def load_for_resume(run_id: str):
         repository = RunRepository(settings.WORKSPACE_DIR)
-        version = repository.schema_version(run_id)
-        if version not in {10, 11}:
-            raise ValueError(f"manifest schema_version={version} 仅支持只读查看")
-        manifest = (
-            repository.load_for_agent_resume(run_id)
-            if version == 11
-            else repository.load_for_resume(run_id)
-        )
-        if manifest.agent is not None:
-            from kd1_anime.prompt_identity import verify_generation_identity
+        manifest = repository.load_for_resume(run_id)
+        from kd1_anime.prompt_identity import verify_generation_identity
 
-            verify_generation_identity(manifest.agent.generation_identity)
+        verify_generation_identity(manifest.agent.generation_identity)
         return manifest
 
     def generate(
@@ -288,9 +274,16 @@ class Application:
         backend: RenderBackendName | None = None,
         session_id: str | None = None,
     ) -> Path | None:
-        options = {"dry_run": dry_run}
-        if callback is not None:
-            options["callback"] = callback
+        run_id: str | None = None
+        adapter = CallbackAdapter(callback)
+
+        def observe(name: str, data: dict) -> None:
+            nonlocal run_id
+            if name == "run_started":
+                run_id = data["run_id"]
+            adapter.publish(PipelineEvent(name, data))
+
+        options = {"dry_run": dry_run, "callback": observe}
         if interactive:
             options["interactive"] = True
         if output_path is not None:
@@ -303,9 +296,12 @@ class Application:
             options["backend"] = backend
         if session_id is not None:
             options["session_id"] = session_id
-        runtime = self._runtime()
-        generate = getattr(runtime, "generate", None) or runtime.run
-        return generate(user_prompt, **options)
+        result = self._runtime().generate(user_prompt, **options)
+        if result is None and run_id is not None:
+            manifest = RunRepository(settings.WORKSPACE_DIR).load(run_id)
+            if manifest.status == "failed" and not self._cancel_requested.is_set():
+                raise RuntimeError(manifest.error or manifest.agent.stop_reason or "运行失败")
+        return result
 
     def plan_only(
         self,
@@ -410,8 +406,7 @@ class Application:
             and manifest.base_run_id
             and manifest.state != "DONE"
             and (
-                manifest.agent is None
-                or not manifest.scenes
+                not manifest.scenes
                 or any(
                     not scene.rendered
                     and manifest.agent.incremental_checked.get(identifier) != scene.input_sha256
@@ -420,7 +415,7 @@ class Application:
             )
         ):
             options["base_manifest"] = self.load_for_resume(manifest.base_run_id)
-        return self._runtime(agent=manifest.schema_version == 11).resume(run_id, **options)
+        return self._runtime().resume(run_id, **options)
 
     def retry(
         self,
@@ -438,14 +433,13 @@ class Application:
             manifest.incremental
             and manifest.base_run_id
             and (
-                manifest.agent is None
-                or scene_id not in manifest.scenes
+                scene_id not in manifest.scenes
                 or manifest.agent.incremental_checked.get(scene_id)
                 != manifest.scenes[scene_id].input_sha256
             )
         ):
             options["base_manifest"] = self.load_for_resume(manifest.base_run_id)
-        return self._runtime(agent=manifest.schema_version == 11).resume(run_id, **options)
+        return self._runtime().resume(run_id, **options)
 
     def run_incremental(
         self,

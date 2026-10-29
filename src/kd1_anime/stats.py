@@ -187,6 +187,13 @@ def summarize_manifest(manifest: RunManifest, *, root: Path | None = None) -> di
 
 def write_run_report(manifest: RunManifest, root: Path) -> Path:
     """把离线统计写入当前 run，供用户和后续调参直接查看。"""
+    manifest.validate_for_resume()
+    root = Path(root)
+    if (root / "manifest.json").exists():
+        repository = RunRepository(root.parent.parent)
+        if repository.run_root(manifest.run_id) != root.absolute():
+            raise ValueError("运行目录与清单身份不一致")
+        repository.load_for_resume(manifest.run_id)
 
     report_path = root / "run_report.json"
     report = summarize_manifest(manifest, root=root)

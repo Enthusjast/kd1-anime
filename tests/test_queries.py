@@ -8,8 +8,11 @@ from pydantic import ValidationError
 
 from kd1_anime.agent_runtime.contracts import EventPayload, ReviewPlan
 from kd1_anime.agent_runtime.session import SessionStore, UserCommand
+from kd1_anime.agent_runtime.state import AgentRunState
+from kd1_anime.domain.dependencies import WorkIdentity
 from kd1_anime.domain.planning import ScenePlan
 from kd1_anime.event_store import EventStore
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.queries import QueryService
 from kd1_anime.run_store import RunManifest, RunRepository, StoredSceneState, write_manifest
 
@@ -33,6 +36,12 @@ def saved_run(tmp_path):
         dependencies_complete=True,
     )
     manifest = RunManifest(
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="query-session",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id=RUN_ID,
         user_prompt="private-credential visible goal",
         output_path="output.mp4",
@@ -90,10 +99,18 @@ def test_session_view_is_loaded_from_independent_session_store(tmp_path):
 
 
 def test_approval_view_matches_exact_committed_request_to_user_grant(tmp_path):
-    root, _ = saved_run(tmp_path)
+    root, manifest = saved_run(tmp_path)
     sessions = SessionStore(tmp_path / "sessions")
     session = sessions.create("goal", run_ids=(RUN_ID,))
-    action = ReviewPlan(run_id=RUN_ID, resource_id=f"run:{RUN_ID}", input_sha256="a" * 64)
+    manifest.agent = manifest.agent.model_copy(update={"session_id": session.session_id})
+    write_manifest(root / "manifest.json", manifest)
+    identity = WorkIdentity(0, "a" * 64)
+    action = ReviewPlan(
+        run_id=RUN_ID,
+        resource_id=f"run:{RUN_ID}",
+        input_sha256=identity.input_sha256,
+        work_identity=identity,
+    )
     store = EventStore(root, RUN_ID)
     request = store.append(
         name="approval_requested",
@@ -105,6 +122,7 @@ def test_approval_view_matches_exact_committed_request_to_user_grant(tmp_path):
                 "session_id": session.session_id,
                 "resource_id": action.resource_id,
                 "input_sha256": action.input_sha256,
+                "work_identity": {"revision": 0, "input_sha256": "a" * 64},
             },
         ),
     )
@@ -127,10 +145,17 @@ def test_approval_view_matches_exact_committed_request_to_user_grant(tmp_path):
 
 
 def test_approval_query_does_not_accept_grant_for_different_input(tmp_path):
-    root, _ = saved_run(tmp_path)
+    root, manifest = saved_run(tmp_path)
     sessions = SessionStore(tmp_path / "sessions")
     session = sessions.create("goal", run_ids=(RUN_ID,))
-    action = ReviewPlan(run_id=RUN_ID, resource_id=f"run:{RUN_ID}", input_sha256="b" * 64)
+    manifest.agent = manifest.agent.model_copy(update={"session_id": session.session_id})
+    write_manifest(root / "manifest.json", manifest)
+    action = ReviewPlan(
+        run_id=RUN_ID,
+        resource_id=f"run:{RUN_ID}",
+        input_sha256="b" * 64,
+        work_identity=WorkIdentity(0, "b" * 64),
+    )
     sessions.issue_grant(
         session.session_id,
         UserCommand(session_id=session.session_id, kind="approve", action=action),
@@ -145,6 +170,7 @@ def test_approval_query_does_not_accept_grant_for_different_input(tmp_path):
                 "session_id": session.session_id,
                 "resource_id": action.resource_id,
                 "input_sha256": "a" * 64,
+                "work_identity": {"revision": 0, "input_sha256": "a" * 64},
             },
         ),
     )

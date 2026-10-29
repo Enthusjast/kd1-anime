@@ -507,8 +507,9 @@ def test_identical_reuse_reopens_only_exact_immutable_objects(incremental):
     assert not incremental.current.scene.rendered
 
 
-def test_readonly_base_version_rejected_before_copy(incremental):
-    base = incremental.base.model_copy(update={"schema_version": 10, "agent": None})
+@pytest.mark.parametrize("schema_version", range(4, 11))
+def test_readonly_base_version_rejected_before_copy(incremental, schema_version):
+    base = incremental.base.model_copy(update={"schema_version": schema_version, "agent": None})
     with pytest.raises(ValueError, match="schema_version"):
         IncrementalPipeline().reuse(replace(incremental, base=base), context())
     assert not (incremental.current.root / "artifacts").exists()

@@ -1066,7 +1066,7 @@ class ChatSession:
     def _show_completion(output_path, *, dry_run: bool = False) -> None:
         """显示完成信息和 Logo。"""
         if output_path is None and not dry_run:
-            return  # 流水线失败, orchestrator 已输出错误
+            return  # 流水线失败时不显示完成信息
         console.print()
         console.print(Rule("[bold green]完成[/]", style="green"))
         if output_path is None:

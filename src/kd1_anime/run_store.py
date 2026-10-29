@@ -1,4 +1,4 @@
-"""持久化运行状态，支持查询和安全恢复中断的流水线。"""
+"""v11 单一可执行清单；v4–v10 保留原始只读诊断，不升级运行语义。"""
 
 from __future__ import annotations
 
@@ -56,9 +56,8 @@ from kd1_anime.request_budget import RequestBudget
 from kd1_anime.verification import ExecutionVerification, StaticVerification, VisualVerification
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 10
-AGENT_MANIFEST_SCHEMA_VERSION = 11
-WRITABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({10, 11})
+MANIFEST_SCHEMA_VERSION = 11
+WRITABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({MANIFEST_SCHEMA_VERSION})
 READABLE_MANIFEST_SCHEMA_VERSIONS = frozenset({4, 5, 6, 7, 8, 9, 10, 11})
 RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{8}")
 RESUME_LLM_STATES = frozenset(
@@ -171,6 +170,20 @@ class StoredSceneState(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def read_legacy_snapshot(cls, value: object) -> object:
+        """Validate historical duplicate projections, then retain only canonical fields."""
+        if not isinstance(value, dict) or "snapshot" not in value:
+            return value
+        canonical = {name: item for name, item in value.items() if name != "snapshot"}
+        snapshot = value["snapshot"]
+        if snapshot is not None and (
+            SceneSnapshot.model_validate(snapshot) != scene_snapshot(cls.model_validate(canonical))
+        ):
+            raise ValueError("嵌套状态与兼容投影不一致")
+        return canonical
+
+    @model_validator(mode="before")
+    @classmethod
     def mark_legacy_technical_contract(cls, value: object) -> object:
         """读取旧技术合同但绝不按新语义猜测其生命周期。
 
@@ -198,7 +211,6 @@ class StoredSceneState(BaseModel):
         updated["technical_contract_stale"] = True
         return updated
 
-    snapshot: SceneSnapshot | None = None
     plan: ScenePlan
     revision: int = Field(default=0, ge=0)
     input_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
@@ -291,8 +303,8 @@ def scene_field_group(name: str) -> str:
     return SCENE_STORAGE_FIELDS[name].snapshot_group
 
 
-# Each nested group uses the exact validated field schemas of the compatibility
-# projection. Rebuilding the full state revalidates all nested model values.
+# Historical nested projections use the canonical field schemas solely to
+# validate existing manifests; new v11 manifests never persist duplicate state.
 _groups = {}
 for _group in ("planning", "code", "execution", "verification", "lifecycle"):
     _groups[_group] = create_model(
@@ -301,7 +313,7 @@ for _group in ("planning", "code", "execution", "verification", "lifecycle"):
         **{
             name: (field.annotation, field)
             for name, field in StoredSceneState.model_fields.items()
-            if name != "snapshot" and scene_field_group(name) == _group
+            if scene_field_group(name) == _group
         },
     )
 SceneSnapshot = create_model(
@@ -309,12 +321,11 @@ SceneSnapshot = create_model(
     __config__=ConfigDict(extra="forbid"),
     **{name: (model, ...) for name, model in _groups.items()},
 )
-StoredSceneState.model_rebuild()
 
 
 def scene_snapshot(scene: StoredSceneState):
     groups = {name: {} for name in _groups}
-    for name, value in scene.model_dump(mode="json", exclude={"snapshot"}).items():
+    for name, value in scene.model_dump(mode="json").items():
         groups[scene_field_group(name)][name] = value
     return SceneSnapshot.model_validate(groups)
 
@@ -400,7 +411,7 @@ class RunManifest(BaseModel):
         if not isinstance(value, dict):
             return value
         version = value.get("schema_version", MANIFEST_SCHEMA_VERSION)
-        if version == AGENT_MANIFEST_SCHEMA_VERSION:
+        if version == MANIFEST_SCHEMA_VERSION:
             if value.get("agent") is None:
                 raise ValueError("v11 requires complete agent runtime identity and session state")
             if value.get("plan_approved") or value.get("approve_plan"):
@@ -472,7 +483,7 @@ class RunManifest(BaseModel):
         """
 
         errors: list[str] = []
-        if self.schema_version == AGENT_MANIFEST_SCHEMA_VERSION:
+        if self.schema_version == MANIFEST_SCHEMA_VERSION:
             if self.agent is None:
                 errors.append("v11 is missing its agent runtime identity")
             else:
@@ -489,7 +500,7 @@ class RunManifest(BaseModel):
             ):
                 errors.append("执行合同与固定渲染配置不一致")
             errors.extend(self.request_budget.integrity_errors())
-            if self.schema_version == AGENT_MANIFEST_SCHEMA_VERSION:
+            if self.schema_version == MANIFEST_SCHEMA_VERSION:
                 limits = json.loads(self.run_config.values_json)
                 if self.request_budget.token_limit != limits.get(
                     "MAX_RUN_LLM_TOKENS"
@@ -520,8 +531,6 @@ class RunManifest(BaseModel):
             errors.append(f"不支持的 manifest schema_version: {self.schema_version}")
         for scene_id, scene in self.scenes.items():
             if self.schema_version in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
-                if scene.snapshot is not None and scene.snapshot != scene_snapshot(scene):
-                    errors.append(f"Scene {scene_id} 嵌套状态与兼容投影不一致")
                 attempt_keys = set()
                 for counter in scene.stage_attempts:
                     key = (counter.operation, counter.input_sha256)
@@ -777,18 +786,17 @@ class RunManifest(BaseModel):
             errors.append(f"运行状态 {self.status} 不能与 FSM 终态 DONE 同时出现")
         return errors
 
-    def validate_for_resume(self, *, runtime: Literal["legacy", "agent"] = "legacy") -> None:
+    def validate_for_resume(self) -> None:
         """在恢复/增量复用前拒绝语义损坏的清单。
 
         ``status`` 命令仍允许读取并展示损坏清单，便于诊断；真正复用其中
         的代码、Job 或元素交接时必须 fail-closed，不能只依赖字段类型校验。
         """
 
-        expected = AGENT_MANIFEST_SCHEMA_VERSION if runtime == "agent" else MANIFEST_SCHEMA_VERSION
-        if self.schema_version != expected:
+        if self.schema_version != MANIFEST_SCHEMA_VERSION or self._legacy_raw is not None:
             raise ValueError(
                 f"manifest schema_version={self.schema_version} 仅支持只读查看；"
-                f"{runtime} 恢复需要 v{expected}，不能自动切换运行时。"
+                f"恢复需要 v{MANIFEST_SCHEMA_VERSION}，不能自动切换运行时。"
             )
         errors = self.integrity_errors()
         if errors:
@@ -952,10 +960,15 @@ def atomic_write_json(path: Path, payload: Any, *, mode: int = 0o600) -> None:
 def write_manifest(path: Path, manifest: RunManifest) -> None:
     """以同目录临时文件 + os.replace 原子更新清单。"""
 
-    if manifest.schema_version not in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
+    if (
+        manifest.schema_version not in WRITABLE_MANIFEST_SCHEMA_VERSIONS
+        or manifest._legacy_raw is not None
+    ):
         raise ValueError(f"不能修改只读 v{manifest.schema_version} 清单")
-    for scene in manifest.scenes.values():
-        scene.snapshot = scene_snapshot(scene)
+    if manifest.agent is None:
+        raise ValueError("v11 requires complete agent runtime identity and session state")
+    if manifest.plan_approved or manifest.approve_plan:
+        raise ValueError("v11 approvals are Session grants, never manifest booleans")
     manifest.updated_at = utc_now()
     atomic_write_text(path, manifest.model_dump_json(indent=2) + "\n")
 
@@ -1014,15 +1027,10 @@ class RunRepository:
         return self._load(run_id)
 
     def load_for_resume(self, run_id: str) -> RunManifest:
-        """读取并验证可修改恢复的当前版本清单。"""
+        """只恢复 v11；在模型迁移、运行锁、任务访问和外部探测前拒绝旧版本。"""
 
         manifest = self._load(run_id, MANIFEST_SCHEMA_VERSION)
         manifest.validate_for_resume()
-        return manifest
-
-    def load_for_agent_resume(self, run_id: str) -> RunManifest:
-        manifest = self._load(run_id, AGENT_MANIFEST_SCHEMA_VERSION)
-        manifest.validate_for_resume(runtime="agent")
         return manifest
 
     def list(self) -> list[RunManifest]:
@@ -1150,7 +1158,7 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError(f"manifest schema_version 必须是整数: {version!r}")
     if version in READABLE_MANIFEST_SCHEMA_VERSIONS:
-        if version == AGENT_MANIFEST_SCHEMA_VERSION and (
+        if version == MANIFEST_SCHEMA_VERSION and (
             "agent" not in raw or "plan_approved" in raw or "approve_plan" in raw
         ):
             raise ValueError(
@@ -1177,7 +1185,6 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
                 raise ValueError(f"v{version} manifest 缺少必需字段: " + ", ".join(missing_fields))
         if version in WRITABLE_MANIFEST_SCHEMA_VERSIONS and isinstance(raw.get("scenes"), dict):
             scene_fields = {
-                "snapshot",
                 "revision",
                 "input_sha256",
                 "submission",
@@ -1205,11 +1212,12 @@ def migrate_manifest_data(raw: dict, root: Path) -> dict:
             if "values_json" not in raw["run_config"]:
                 raise ValueError(f"v{version} requires a complete run configuration")
             for scene_id, data in raw.get("scenes", {}).items():
-                if not isinstance(data.get("snapshot"), dict):
-                    raise ValueError(f"v{version} Scene {scene_id} requires a nested snapshot")
-                parsed = StoredSceneState.model_validate(data)
-                if parsed.snapshot != scene_snapshot(parsed):
-                    raise ValueError(f"v{version} Scene {scene_id} 嵌套状态与兼容投影不一致")
+                if (
+                    isinstance(data, dict)
+                    and "snapshot" in data
+                    and not isinstance(data["snapshot"], dict)
+                ):
+                    raise ValueError(f"v{version} Scene {scene_id} has an invalid nested snapshot")
         return raw
     if version < MANIFEST_SCHEMA_VERSION:
         raise ValueError(

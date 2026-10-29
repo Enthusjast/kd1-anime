@@ -1,7 +1,7 @@
 """Consumer contracts against the real workflow and deterministic boundary collaborators.
 
 No generated Python, model endpoint, scheduler command, or media executable runs here.
-The existing autouse endpoint-probe isolation also applies to these tests.
+All external effects are injected through the public agent dependency contracts.
 """
 
 from __future__ import annotations
@@ -14,18 +14,24 @@ from types import SimpleNamespace
 
 import pytest
 
-import kd1_anime.orchestrator as workflow
+from kd1_anime.agent_runtime.runtime import AgentDependencies, AgentRuntime
 from kd1_anime.application import Application
 from kd1_anime.cluster.jobs import PollObservation, RenderJob
 from kd1_anime.config import settings
 from kd1_anime.domain.plan_review import ContinuityReviewResult, PlanReviewResult
-from kd1_anime.domain.planning import ContinuityBible, SceneOutline, ScenePlan
+from kd1_anime.domain.planning import (
+    ContinuityBible,
+    LessonSpec,
+    PlanningDraft,
+    SceneOutline,
+    ScenePlan,
+    TeachingGraph,
+)
 from kd1_anime.domain.review import ReviewResult
 from kd1_anime.domain.technical import TechnicalSpec
 from kd1_anime.rendering import RenderProfile, VideoMetadata, sha256_file
 from kd1_anime.request_budget import RequestBudgetExceeded
 from kd1_anime.run_store import RunRepository, sha256_text
-from kd1_anime.services.rendering import RenderingService
 
 SOURCE = (
     "from manim import *\nclass Pause(Scene):\n    def construct(self):\n        self.wait(1)\n"
@@ -127,13 +133,6 @@ class ArtifactMerger:
         return output
 
 
-class IsolatedRenderingService(RenderingService):
-    """The fake backend has no host Slurm/Manim installation to preflight."""
-
-    def preflight(self, profile):
-        return None
-
-
 @pytest.fixture
 def application_boundary(monkeypatch, tmp_path):
     for name, value in {
@@ -182,6 +181,13 @@ def application_boundary(monkeypatch, tmp_path):
         agent.request_context.complete(receipt, time.monotonic())
 
     class Planner:
+        def plan_draft(self, prompt, **kwargs):
+            return PlanningDraft(
+                items=self.plan_outline(prompt, **kwargs),
+                lesson_spec=LessonSpec(topic=prompt),
+                teaching_graph=TeachingGraph(),
+            )
+
         def plan_outline(self, prompt, **kwargs):
             reserve(self, "outline")
             return [
@@ -260,20 +266,26 @@ def application_boundary(monkeypatch, tmp_path):
             reserve(self, "code_review")
             return ReviewResult(is_valid=True)
 
-    for name, collaborator in {
-        "PlannerAgent": Planner,
-        "PlanReviewerAgent": PlanReviewer,
-        "ContinuityReviewerAgent": ContinuityReviewer,
-        "TechnicalPlannerAgent": TechnicalPlanner,
-        "CoderAgent": Coder,
-        "ReviewerAgent": Reviewer,
-        "VideoMerger": ArtifactMerger,
-        "RenderingService": IsolatedRenderingService,
-    }.items():
-        monkeypatch.setattr(workflow, name, collaborator)
-    monkeypatch.setattr(workflow, "create_render_backend", lambda *args, **kwargs: backend)
+    dependencies = AgentDependencies(
+        planner_factory=Planner,
+        plan_reviewer_factory=PlanReviewer,
+        continuity_reviewer_factory=ContinuityReviewer,
+        technical_factory=TechnicalPlanner,
+        coder_factory=Coder,
+        reviewer_factory=Reviewer,
+        backend_factory=lambda name: backend,
+        merger_factory=ArtifactMerger,
+        preflight=lambda profile, backend: None,
+        probe=lambda agent: None,
+    )
+
+    def runtime_factory():
+        return AgentRuntime(dependencies=dependencies)
+
     return SimpleNamespace(
-        app=Application(runtime_factory=workflow.Orchestrator),
+        app=Application(runtime_factory=runtime_factory),
+        dependencies=dependencies,
+        runtime_factory=runtime_factory,
         backend=backend,
         calls=calls,
         rejecting=rejecting,
@@ -304,6 +316,7 @@ def test_generate_publishes_video_manifest_events_and_request_receipts(applicati
     result = boundary.app.generate(
         "Show a one-second pause",
         output_path=output,
+        approve_plan=True,
         callback=lambda name, data: events.append((name, data)),
     )
     assert result == output
@@ -332,15 +345,17 @@ def test_generate_publishes_video_manifest_events_and_request_receipts(applicati
     assert len(requests) <= manifest.request_budget.run_limit
     durable = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
     assert all(event["run_id"] == manifest.run_id for event in durable)
-    names = {event["event"] for event in durable}
-    assert {"run_started", "scene_rendered", "merge_complete", "model_request_finished"} <= names
-    assert {"run_started", "scene_rendered", "merge_complete"} <= {name for name, _ in events}
+    completed = {
+        event["payload"]["action"] for event in durable if event["name"] == "action_completed"
+    }
+    assert {"submit_render", "poll_render", "merge_video", "finish"} <= completed
+    assert {"run_started", "agent_event"} <= {name for name, _ in events}
     assert all(event["manifest_revision"] <= manifest.revision for event in durable)
 
 
 def test_dry_run_is_durably_complete_without_rendering(application_boundary):
     boundary = application_boundary
-    assert boundary.app.generate("Show a one-second pause", dry_run=True) is None
+    assert boundary.app.generate("Show a one-second pause", dry_run=True, approve_plan=True) is None
     root, manifest = saved_run(boundary)
     assert manifest.status == "dry_run_complete"
     assert manifest.dry_run
@@ -352,7 +367,7 @@ def test_dry_run_is_durably_complete_without_rendering(application_boundary):
     assert not boundary.backend.sources
     previous_calls = list(boundary.calls)
     previous_manifest = (root / "manifest.json").read_bytes()
-    assert Application(runtime_factory=workflow.Orchestrator).resume(manifest.run_id) is None
+    assert Application(runtime_factory=boundary.runtime_factory).resume(manifest.run_id) is None
     assert boundary.calls == previous_calls
     assert (root / "manifest.json").read_bytes() == previous_manifest
 
@@ -374,7 +389,6 @@ def test_plan_only_exports_committed_plan_and_never_generates_code(application_b
     assert payload["teaching_graph"] == manifest.teaching_graph.model_dump(mode="json")
     assert payload["continuity_bible"] == manifest.continuity_bible.model_dump(mode="json")
     assert manifest.status == "dry_run_complete"
-    assert manifest.plan_review_status == ("passed" if review else "skipped")
     assert ("plan_review" in boundary.calls) is review
     assert not {"code", "technical", "code_review"}.intersection(boundary.calls)
     assert not manifest.scenes[1].code_file
@@ -386,10 +400,11 @@ def test_rejected_plan_does_not_publish_export_or_source(application_boundary):
     boundary = application_boundary
     boundary.rejecting.plan = True
     export = boundary.workspace / "rejected.json"
-    with pytest.raises(RuntimeError, match="计划"):
+    with pytest.raises(RuntimeError):
         boundary.app.plan_only("Show a one-second pause", export_path=export)
     root, manifest = saved_run(boundary)
     assert manifest.status == "failed"
+    assert manifest.error
     assert not export.exists()
     assert not list(root.rglob("*.py"))
     assert not {"technical", "code", "code_review"}.intersection(boundary.calls)
@@ -401,7 +416,9 @@ def test_run_from_exported_plan_finishes_without_replanning_outline(application_
     export = boundary.workspace / "plan.json"
     boundary.app.plan_only("Show a one-second pause", export_path=export)
     boundary.calls.clear()
-    result = Application(runtime_factory=workflow.Orchestrator).run_from_plan(export)
+    result = Application(runtime_factory=boundary.runtime_factory).run_from_plan(
+        export, approve_plan=True
+    )
     assert result is not None
     assert result.read_bytes() == b"merged:" + VIDEO
     assert "outline" not in boundary.calls
@@ -417,7 +434,7 @@ def test_run_from_exported_plan_finishes_without_replanning_outline(application_
 @pytest.mark.parametrize("damage", [None, "missing", "hash"])
 def test_completed_resume_requires_original_final_video(application_boundary, damage):
     boundary = application_boundary
-    result = boundary.app.generate("Show a one-second pause")
+    result = boundary.app.generate("Show a one-second pause", approve_plan=True)
     root, manifest = saved_run(boundary)
     original_manifest = (root / "manifest.json").read_bytes()
     calls = list(boundary.calls)
@@ -426,11 +443,11 @@ def test_completed_resume_requires_original_final_video(application_boundary, da
         result.unlink()
     elif damage == "hash":
         result.write_bytes(b"tampered final video")
-    resumed = Application(runtime_factory=workflow.Orchestrator)
+    resumed = Application(runtime_factory=boundary.runtime_factory)
     if damage is None:
         assert resumed.resume(manifest.run_id) == result
     else:
-        with pytest.raises(RuntimeError, match="最终视频"):
+        with pytest.raises((RuntimeError, ValueError)):
             resumed.resume(manifest.run_id)
     assert boundary.calls == calls
     assert boundary.backend.sources == submissions
@@ -465,7 +482,7 @@ def test_direct_render_needs_no_llm_and_owns_private_source(application_boundary
     assert stat.S_IMODE(supplied.stat().st_mode) == 0o644
     supplied.write_text("caller changed its source", encoding="utf-8")
     assert owned_source.read_text(encoding="utf-8") == SOURCE
-    assert Application(runtime_factory=workflow.Orchestrator).resume(run_id) == final_video
+    assert Application(runtime_factory=boundary.runtime_factory).resume(run_id) == final_video
     assert not boundary.calls
 
 
@@ -484,7 +501,7 @@ def test_unsafe_run_identifier_is_rejected_before_external_work(application_boun
 
 def test_completed_run_cannot_be_retried_in_place(application_boundary):
     boundary = application_boundary
-    video = boundary.app.generate("Show a one-second pause")
+    video = boundary.app.generate("Show a one-second pause", approve_plan=True)
     root, manifest = saved_run(boundary)
     before = (root / "manifest.json").read_bytes()
     calls = list(boundary.calls)
@@ -501,7 +518,7 @@ def test_request_budget_exhaustion_is_durable_and_blocks_generation(
 ):
     boundary = application_boundary
     monkeypatch.setattr(settings, "MAX_RUN_LLM_REQUESTS", 1)
-    with pytest.raises((RequestBudgetExceeded, RuntimeError), match=r"预算|未能完成|计划"):
+    with pytest.raises((RequestBudgetExceeded, RuntimeError), match=r"预算|未能完成|计划|budget"):
         boundary.app.generate("Show a one-second pause", dry_run=True)
     root, manifest = saved_run(boundary)
     assert manifest.status == "failed"
@@ -512,38 +529,70 @@ def test_request_budget_exhaustion_is_durable_and_blocks_generation(
     assert not list(root.rglob("*.py"))
 
 
-@pytest.mark.parametrize("entry", ["retry", "incremental"])
-def test_legacy_manifest_is_read_only_at_execution_entries(application_boundary, entry):
-    boundary = application_boundary
-    boundary.app.plan_only("Show a one-second pause")
-    root, manifest = saved_run(boundary)
+@pytest.mark.parametrize("version", range(4, 11))
+@pytest.mark.parametrize(
+    "entry", ["load", "resume", "retry", "incremental", "approval_diff", "decide_approval"]
+)
+def test_legacy_manifest_is_read_only_before_execution_side_effects(
+    monkeypatch, tmp_path, version, entry
+):
+    run_id = "20260728-120000-1234abcd"
+    root = tmp_path / "runs" / run_id
+    root.mkdir(parents=True)
     manifest_path = root / "manifest.json"
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    payload["schema_version"] = 9
-    original = json.dumps(payload)
-    manifest_path.write_text(original, encoding="utf-8")
-    calls = list(boundary.calls)
+    original = json.dumps({"schema_version": version, "run_id": run_id}).encode()
+    manifest_path.write_bytes(original)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Read-only versions must be rejected before runtime, lock or session access")
+
+    monkeypatch.setattr("kd1_anime.run_store.lock_run", forbidden)
+    app = Application(runtime_factory=forbidden)
+    monkeypatch.setattr(app, "_sessions", forbidden)
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
     with pytest.raises(ValueError, match="只读"):
-        if entry == "retry":
-            boundary.app.retry(manifest.run_id, 1)
+        if entry == "load":
+            app.load_for_resume(run_id)
+        elif entry == "resume":
+            app.resume(run_id)
+        elif entry == "retry":
+            app.retry(run_id, 1)
+        elif entry == "incremental":
+            app.run_incremental("Show a different pause", run_id)
+        elif entry == "approval_diff":
+            app.approval_diff(run_id)
         else:
-            boundary.app.run_incremental("Show a different pause", manifest.run_id)
-    assert manifest_path.read_text(encoding="utf-8") == original
-    assert boundary.calls == calls
-    assert not boundary.backend.sources
-    assert len(list((boundary.workspace / "runs").glob("*/manifest.json"))) == 1
+            app.decide_approval(
+                run_id,
+                True,
+                input_sha256="a" * 64,
+                resource_id=f"run:{run_id}",
+                work_identity=None,
+            )
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert manifest_path.read_bytes() == original
 
 
 def test_incremental_reuses_verified_artifact_without_mutating_base_or_request_budget(
     application_boundary,
 ):
     boundary = application_boundary
-    boundary.app.generate("Show a one-second pause")
+    boundary.app.generate("Show a one-second pause", approve_plan=True)
     base_root, base = saved_run(boundary)
     base_bytes = (base_root / "manifest.json").read_bytes()
     base_requests = {item.request_id for item in base.request_budget.reservations}
 
-    video = boundary.app.run_incremental("Show a one-second pause", base.run_id)
+    video = boundary.app.run_incremental("Show a one-second pause", base.run_id, approve_plan=True)
 
     assert video is not None and video.read_bytes() == b"merged:" + VIDEO
     roots = [path for path in (boundary.workspace / "runs").iterdir() if path != base_root]

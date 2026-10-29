@@ -35,7 +35,7 @@ class JobMonitor:
     - poll_once(): 推进一次轮询, 返回本轮是否有作业结束
     - pending/results: 查询未结束/已结束作业
 
-    供 orchestrator 的场景级调度器使用, 让渲染与其他场景的 LLM 阶段并行推进。
+    供场景级调度使用，让渲染与其他场景的 LLM 阶段并行推进。
     """
 
     def __init__(

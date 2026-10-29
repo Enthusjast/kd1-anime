@@ -1,4 +1,4 @@
-"""代码、视觉和运行效率的统一评估入口。"""
+"""代码、视觉和 v11 运行的统一评估入口；历史运行仅允许只读查看。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,12 @@ from kd1_anime.eval.metrics import ComparisonResult, EvalMetric, EvalResult, Qua
 from kd1_anime.eval.visual_eval import FrameSample, VisualAnalysisResult, VisualEvaluator
 from kd1_anime.exceptions import KD1Error
 from kd1_anime.rendering import probe_video, sha256_file
-from kd1_anime.run_store import RunRepository, atomic_write_json, restore_run_path
+from kd1_anime.run_store import (
+    MANIFEST_SCHEMA_VERSION,
+    RunRepository,
+    atomic_write_json,
+    restore_run_path,
+)
 
 
 class EvaluationError(KD1Error):
@@ -37,6 +42,30 @@ def _validate_run_id_for_base_dir(run_id: str) -> None:
         raise ValueError(f"run_id 包含不安全路径: {run_id!r}")
 
 
+def require_evaluable_run(run_id: str, run_dir: Path | None = None) -> None:
+    """Reject historical manifests before evaluation requests or artifact writes.
+
+    Explicit directories without a manifest remain standalone evaluation inputs.
+    """
+    if run_dir is None:
+        version = RunRepository(settings.WORKSPACE_DIR).schema_version(run_id)
+    else:
+        _validate_run_id_for_base_dir(run_id)
+        path = run_dir / "manifest.json"
+        if path.is_symlink():
+            raise ValueError("运行清单不能是符号链接")
+        if not path.exists():
+            return
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or type(raw.get("schema_version")) is not int:
+            raise ValueError("manifest schema_version 必须是整数")
+        version = raw["schema_version"]
+    if version != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"manifest schema_version={version} 仅支持只读查看；评估需要 v{MANIFEST_SCHEMA_VERSION}"
+        )
+
+
 class Evaluator:
     def __init__(
         self,
@@ -49,8 +78,6 @@ class Evaluator:
         self.output_dir = output_dir or (
             resolve_runtime_path(settings.WORKSPACE_DIR) / "eval_results"
         )
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.chmod(0o700)
 
     def evaluate_code(
         self,
@@ -329,6 +356,8 @@ class Evaluator:
     ) -> EvalResult:
         """按 manifest 的精确 SceneArtifact 评估单个已渲染场景。"""
 
+        require_evaluable_run(run_id)
+
         if self.visual_evaluator is None:
             raise EvaluationError("Visual evaluation is disabled")
         repository = RunRepository(settings.WORKSPACE_DIR)
@@ -398,6 +427,7 @@ class Evaluator:
         description: str = "",
         enable_visual: bool = True,
     ) -> EvalResult:
+        require_evaluable_run(run_id, run_dir)
         repository = RunRepository(settings.WORKSPACE_DIR)
         if run_dir is None:
             manifest = repository.load(run_id)
@@ -708,6 +738,8 @@ class Evaluator:
                     candidate.relative_to(base_dir)
                 except ValueError as exc:
                     raise ValueError(f"run_id 越出 base_dir: {run_id!r}") from exc
+        for run_id in run_ids:
+            require_evaluable_run(run_id, base_dir / run_id)
         results: dict[int, EvalResult] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -751,6 +783,8 @@ class Evaluator:
                     candidate.relative_to(base_dir)
                 except ValueError as exc:
                     raise ValueError(f"run_id 越出 base_dir: {run_id!r}") from exc
+        for run_id in (baseline_run_id, current_run_id):
+            require_evaluable_run(run_id, base_dir / run_id)
         baseline = self.evaluate_run(baseline_run_id, base_dir / baseline_run_id)
         current = self.evaluate_run(current_run_id, base_dir / current_run_id)
         improvements: list[str] = []
@@ -775,6 +809,9 @@ class Evaluator:
         results: list[EvalResult],
         output_path: Path | None = None,
     ) -> Path:
+        if output_path is None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.output_dir.chmod(0o700)
         output_path = output_path or (
             self.output_dir / f"eval_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         )

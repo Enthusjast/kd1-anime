@@ -30,24 +30,31 @@ def test_v11_roundtrip_requires_identity_and_never_serializes_boolean_approval(t
     write_manifest(root / "manifest.json", manifest)
     raw = json.loads((root / "manifest.json").read_text())
     assert "plan_approved" not in raw and "approve_plan" not in raw
-    loaded = RunRepository(tmp_path).load_for_agent_resume(RUN)
+    loaded = RunRepository(tmp_path).load_for_resume(RUN)
     assert loaded.agent == manifest.agent
     assert loaded.model_dump(mode="json") == raw
-    with pytest.raises(ValueError):
-        RunRepository(tmp_path).load_for_resume(RUN)
     for invalid in ({**raw, "agent": None}, {**raw, "plan_approved": True}, {**raw, "agent": {}}):
         with pytest.raises(ValueError):
             RunManifest.model_validate(invalid)
 
 
-def test_v10_shape_and_runtime_ownership_remain_separate(tmp_path):
-    manifest = RunManifest(run_id=RUN, user_prompt="Circle", output_path="output.mp4")
+def test_v10_manifest_is_inspectable_but_not_executable_or_writable(tmp_path):
     root = tmp_path / "runs" / RUN
-    write_manifest(root / "manifest.json", manifest)
+    write_manifest(root / "manifest.json", agent_manifest())
     raw = json.loads((root / "manifest.json").read_text())
-    assert "agent" not in raw and "plan_approved" in raw
+    raw["schema_version"] = 10
+    raw.pop("agent")
+    raw["plan_approved"] = False
+    (root / "manifest.json").write_text(json.dumps(raw))
+    before = (root / "manifest.json").read_bytes()
+    repository = RunRepository(tmp_path)
+    loaded = repository.load(RUN)
+    assert loaded.schema_version == 10
     with pytest.raises(ValueError):
-        RunRepository(tmp_path).load_for_agent_resume(RUN)
+        repository.load_for_resume(RUN)
+    with pytest.raises(ValueError):
+        write_manifest(root / "manifest.json", loaded)
+    assert (root / "manifest.json").read_bytes() == before
 
 
 def test_v11_typed_transport_updates_preserve_pending_intent_and_budget(tmp_path):
@@ -72,13 +79,13 @@ def test_v11_typed_transport_updates_preserve_pending_intent_and_budget(tmp_path
     committer.commit(
         CommitCommand(1, "PLANNING", patch=RunPatch(reservation_additions=(reservation,)))
     )
-    loaded = RunRepository(tmp_path).load_for_agent_resume(RUN)
+    loaded = RunRepository(tmp_path).load_for_resume(RUN)
     assert loaded.agent.intents == (intent,)
     assert loaded.request_budget.reservations == [reservation]
     # A stage draft predating a transport reservation may advance its stage,
     # but cannot erase the request/intent that was durably reserved meanwhile.
     stale_agent = manifest.agent.model_copy(update={"next_action": "review_plan"})
     committer.commit(CommitCommand(2, "PLAN_REVIEWING", patch=RunPatch(agent=stale_agent)))
-    latest = RunRepository(tmp_path).load_for_agent_resume(RUN)
+    latest = RunRepository(tmp_path).load_for_resume(RUN)
     assert latest.agent.intents == (intent,)
     assert latest.request_budget.reservations == [reservation]

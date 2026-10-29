@@ -2,7 +2,7 @@ import pytest
 
 import kd1_anime.config as config_module
 from kd1_anime.config import Settings
-from kd1_anime.orchestrator import RunPaths
+from kd1_anime.domain.state import RunPaths
 
 
 def test_llm_config_rejects_placeholder_model():

@@ -1,3 +1,4 @@
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.agents.plan_compiler import (
     PlanCompiler,
     expressions_are_equivalent,
@@ -17,6 +18,7 @@ from kd1_anime.agents.planner import (
     TimelineEvent,
     VisualElementState,
 )
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.run_store import RunManifest, StoredSceneState
 
 
@@ -458,6 +460,12 @@ def test_element_manifest_keeps_latest_export_and_dependencies():
     assert manifest.scene_exports == {1: ["formula"]}
 
     stored_manifest = RunManifest(
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="compiler-session",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id="20260828-120000-1234abcd",
         user_prompt="test",
         output_path="/tmp/output.mp4",

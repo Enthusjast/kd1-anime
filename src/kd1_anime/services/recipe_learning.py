@@ -8,7 +8,7 @@ from kd1_anime.rag.recipes import RecipeRecord, RecipeStore
 
 
 class RecipeLearningService:
-    """把配方存储从 Orchestrator 中隔离出来。"""
+    """隔离配方存储操作。"""
 
     def __init__(self, store: RecipeStore | None = None) -> None:
         self.store = store or RecipeStore()

@@ -1,26 +1,13 @@
-from pathlib import Path
+"""Independent verification receipts remain bound to exact source and media."""
 
-from kd1_anime.agents.planner import ScenePlan
-from kd1_anime.agents.reviewer import ReviewResult
-from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState, State
-from kd1_anime.rendering import RenderProfile, SceneArtifact, VideoMetadata
-from kd1_anime.run_store import RunManifest, RunRepository, StoredSceneState, sha256_text
+import pytest
+from test_agent_vertical_slice import agent_boundary as agent_boundary
+from test_runtime_reliability import completed_run
+
+from kd1_anime.application import Application
+from kd1_anime.run_store import StoredSceneState
+from kd1_anime.stats import summarize_manifest
 from kd1_anime.verification import ExecutionVerification, StaticVerification, VisualVerification
-
-
-def make_plan() -> ScenePlan:
-    return ScenePlan(
-        scene_id=1,
-        title="测试",
-        duration_seconds=1,
-        purpose="验证收据",
-        math_concept="等待",
-        visual_design="简洁",
-        camera_movement="固定",
-        visual_flow=["等待"],
-        key_moments=["等待"],
-        computation="无",
-    )
 
 
 def test_static_execution_visual_receipts_are_independent():
@@ -29,146 +16,81 @@ def test_static_execution_visual_receipts_are_independent():
     assert VisualVerification().status == "not_run"
 
 
-def test_checkpoint_persists_three_verification_conclusions(tmp_path: Path):
-    workspace = tmp_path / "workspace"
-    root = workspace / "runs" / "20260905-120000-1234abcd"
-    paths = RunPaths(
-        "20260905-120000-1234abcd",
-        root,
-        root / "scenes",
-        root / "logs",
-        root / "videos",
-        root / "output.mp4",
-    )
-    paths.scenes.mkdir(parents=True)
-    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    (paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
-    state = SceneState(plan=make_plan(), code=code, class_name="Demo", reviewed=True)
-    orchestrator = Orchestrator()
-    context = PipelineContext(
-        "prompt",
-        paths=paths,
-        scene_states={1: state},
-    )
-    orchestrator._mark_static_verification(state, status="passed")
-    orchestrator._mark_execution_verification(state, status="unknown", scope="formal_video")
-    state.visual_verification = VisualVerification(status="unknown")
-    orchestrator._checkpoint(context, State.REVIEWING)
-
-    manifest = RunRepository(workspace).load(paths.run_id)
-    stored = manifest.scenes[1]
-    assert stored.static_verification.status == "passed"
-    assert stored.execution_verification.status == "unknown"
-    assert stored.visual_verification.status == "unknown"
+def test_public_run_persists_separate_verification_conclusions(agent_boundary):
+    _, manifest = completed_run(agent_boundary)
+    scene = manifest.scenes[1]
+    assert scene.static_verification.status == "passed"
+    assert scene.static_verification.code_sha256 == scene.code_sha256
+    assert scene.execution_verification.status == "passed"
+    assert scene.execution_verification.scope == "formal_video"
+    assert scene.execution_verification.code_sha256 == scene.code_sha256
+    assert scene.execution_verification.artifact_sha256 == scene.artifact.video_sha256
+    assert scene.visual_verification.status == "not_run"
+    assert scene.visual_verification.score is None
+    assert manifest.integrity_errors() == []
 
 
-def test_integrity_catches_stale_static_receipt():
-    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    scene = StoredSceneState(
-        plan=make_plan(),
-        code_sha256=sha256_text(code),
-        class_name="Demo",
-        static_verification=StaticVerification(status="passed", code_sha256="a" * 64),
-    )
-    manifest = RunManifest(
-        run_id="20260905-120000-1234abcd",
-        user_prompt="prompt",
-        output_path="/tmp/output.mp4",
-        scenes={1: scene},
-    )
+def test_stored_receipts_round_trip_without_collapsing_unknown_into_success(agent_boundary):
+    _, manifest = completed_run(agent_boundary)
+    scene = manifest.scenes[1].model_copy(deep=True)
+    scene.execution_verification = ExecutionVerification(status="unknown", scope="formal_video")
+    scene.visual_verification = VisualVerification(status="unknown")
+    restored = StoredSceneState.model_validate_json(scene.model_dump_json())
+    assert restored.static_verification.status == "passed"
+    assert restored.execution_verification.status == "unknown"
+    assert restored.visual_verification.status == "unknown"
+    assert restored.visual_verification.score is None
 
+
+def test_integrity_catches_stale_static_receipt(agent_boundary):
+    _, manifest = completed_run(agent_boundary)
+    manifest.scenes[1].static_verification.code_sha256 = "a" * 64
     assert any("静态验证代码哈希不一致" in error for error in manifest.integrity_errors())
 
 
-def test_review_invalidation_clears_formal_execution_receipt(tmp_path: Path):
-    """代码重写不能把已失效的视频继续记作正式执行成功。"""
-
-    workspace = tmp_path / "workspace"
-    root = workspace / "runs" / "20260905-120000-1234abcd"
-    paths = RunPaths(
-        "20260905-120000-1234abcd",
-        root,
-        root / "scenes",
-        root / "logs",
-        root / "videos",
-        root / "output.mp4",
-    )
-    paths.scenes.mkdir(parents=True)
-    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    (paths.scenes / "scene_1.py").write_text(code, encoding="utf-8")
-    profile = RenderProfile.current()
-    state = SceneState(plan=make_plan(), code=code, class_name="Demo", reviewed=True)
-    state.rendered = True
-    state.artifact = SceneArtifact(
-        origin="rendered",
-        source_run_id=paths.run_id,
-        job_id="12345",
-        scene_id=1,
-        scene_class_name="Demo",
-        code_sha256=sha256_text(code),
-        render_profile_sha256=profile.digest(),
-        video_path="videos/scene_1/Demo.mp4",
-        video_sha256="a" * 64,
-        metadata=VideoMetadata(
-            size_bytes=1,
-            duration_seconds=1,
-            width=profile.pixel_width,
-            height=profile.pixel_height,
-            frame_rate=profile.frame_rate,
-        ),
-    )
-    orchestrator = Orchestrator()
-    orchestrator._mark_execution_verification(
-        state,
-        status="passed",
-        scope="formal_video",
-        artifact_sha256=state.artifact.video_sha256,
-        duration_seconds=1,
-    )
-    context = PipelineContext(
-        "prompt",
-        paths=paths,
-        scene_states={1: state},
-        render_profile=profile,
-    )
-
-    orchestrator._apply_review_result(
-        context,
-        1,
-        state,
-        ReviewResult(is_valid=False, severity="major", feedback="需要重写代码"),
-    )
-
-    assert state.rendered is False
-    assert state.artifact is None
-    assert state.execution_verification.status == "not_run"
-    manifest = RunRepository(workspace).load(paths.run_id)
-    assert manifest.integrity_errors() == []
-
-
-def test_resume_repair_clears_orphaned_formal_receipt():
-    scene = StoredSceneState(
-        plan=make_plan(),
-        code_file="scenes/scene_1.py",
-        code_sha256="b" * 64,
-        class_name="Demo",
-        reviewed=True,
-        execution_verification=ExecutionVerification(
+@pytest.mark.parametrize("receipt", ["static", "execution", "visual"])
+def test_code_change_cannot_retain_old_verification_success(agent_boundary, receipt):
+    _, manifest = completed_run(agent_boundary)
+    scene = manifest.scenes[1]
+    scene.code_sha256 = "b" * 64
+    if receipt == "static":
+        marker = "静态验证代码哈希不一致"
+    elif receipt == "execution":
+        marker = "执行验证代码哈希不一致"
+    else:
+        scene.visual_verification = VisualVerification(
             status="passed",
-            scope="formal_video",
-            code_sha256="b" * 64,
+            code_sha256="a" * 64,
             artifact_sha256="c" * 64,
-        ),
-    )
-    manifest = RunManifest(
-        run_id="20260905-120000-1234abcd",
-        user_prompt="prompt",
-        output_path="/tmp/output.mp4",
-        scenes={1: scene},
-    )
+            score=4,
+        )
+        marker = "视觉验证视频哈希不一致"
+    assert any(marker in error for error in manifest.integrity_errors())
 
-    repairs = Orchestrator._repair_incomplete_execution_receipts(manifest)
 
-    assert repairs == ["Scene 1: 清除无产物的正式执行收据并重新排队"]
-    assert manifest.scenes[1].execution_verification.status == "not_run"
-    assert manifest.integrity_errors() == []
+def test_resume_rejects_orphaned_formal_receipt_before_external_actions(agent_boundary):
+    root, manifest = completed_run(agent_boundary)
+    scene = manifest.scenes[1]
+    scene.rendered = False
+    scene.artifact = None
+    path = root / "manifest.json"
+    path.write_text(manifest.model_dump_json())
+    before = path.read_bytes()
+
+    def forbidden():
+        pytest.fail("invalid verification receipt reached executable runtime")
+
+    with pytest.raises(ValueError, match="正式执行验证通过但没有渲染产物"):
+        Application(runtime_factory=forbidden).resume(root.name)
+    assert path.read_bytes() == before
+
+
+def test_visual_unknown_is_not_counted_as_verified_or_accepted(agent_boundary):
+    _, manifest = completed_run(agent_boundary)
+    scene = manifest.scenes[1]
+    scene.visual_verification = VisualVerification(status="unknown")
+    scene.visual_status = "unknown"
+    report = summarize_manifest(manifest)
+    assert report["scenes"]["visual_unknown"] == 1
+    assert report["scenes"]["visual_verified"] == 0
+    assert report["scenes"]["visual_accepted"] == 0

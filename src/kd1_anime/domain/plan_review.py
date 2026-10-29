@@ -92,7 +92,7 @@ class ContinuityIssue(BaseModel):
     message: str = Field(min_length=1, max_length=5_000)
     fix_instruction: str = Field(default="", max_length=5_000)
     # 让重规划只改真正冲突的字段；旧版 Reviewer 没有输出此字段时由
-    # Orchestrator 根据 message/fix_instruction 里的字段名兼容推断。
+    # 计划服务根据 message/fix_instruction 里的字段名兼容推断。
     target_fields: list[str] = Field(default_factory=list, max_length=12)
 
 

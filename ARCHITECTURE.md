@@ -48,21 +48,22 @@
 
 CLI 的执行命令统一调用 `application.Application` 的公开用例：`generate`、
 `plan_only`、`run_from_plan`、`submit_existing_scene`、`resume`、`retry` 和
-`run_incremental`。生成、规划、直接渲染、恢复、重试、增量、TUI 与新批处理使用 v11 Agent Runtime；
-既有 v10 运行仍由 legacy 路径执行，不在同一运行中切换。
+`run_incremental`。生成、规划、直接渲染、恢复、重试、增量、TUI 与批处理只使用
+manifest v11 的 Agent Runtime；v4–v10 仅供只读查看和 JSON 导出，不迁移、不执行，
+也不按清单版本切换运行时。旧版本必须在模型探测、作业访问、运行锁和文件修改前被拒绝。
 计划导出只读取已提交 manifest，不把 worker Context 暴露给 CLI。
 
-`domain/scene_fields.py` 是运行态字段所有权和 v10 存储投影的唯一元数据；领域
+`domain/scene_fields.py` 是运行态字段所有权和 manifest 场景存储投影的唯一元数据；领域
 `code_revision` 单向映射为原有 snapshot `code` 键。`CodeCandidate` 与
 `VisualEvalProfile` 分别由 `domain/candidates.py`、`domain/runtime.py` 定义，领域
 Context 不持有基础运行 manifest。FSM 状态和转移规则集中到 `domain/execution.py`。
 
-新 `RunCommitter` 仅接受闭合 `RunPatch` / `ScenePatch`，按场景 revision、完整输入摘要
+`commits.RunCommitter` 仅接受闭合 `RunPatch` / `ScenePatch`，按场景 revision、完整输入摘要
 和依赖 revision 验证工作身份；无关场景结果可显式 rebase，不重新执行工具。副作用由
 应用/工具层执行，依赖失效由纯服务计算并要求显式 consumer patch。请求预占按
 `request_id` 追加、尝试计数取已提交最大值；原子 manifest 写入成功后才发布状态。
-该路径只复制被修改的场景及 run 字段；新的 v11 路径不复制全量 Context。旧 Orchestrator
-暂时仍使用 legacy StageTransaction，v10/v11 同时可执行，但同一 run 从不切换实现或双写。
+提交只复制被修改的场景及 run 字段，不复制全量 Context。
+旧 `Orchestrator` 与 whole-context `StageTransaction` 已删除，没有兼容执行入口。
 
 ### 2.1 专用 Runtime 协议与多场景执行
 
@@ -87,7 +88,9 @@ Session 预算，生成时合并到运行账本。审批显示精确 action/reso
 多模态请求在启用硬成本限额时拒绝。可见文本本地估算与 provider usage 明确区分。
 
 `prompt_identity.py` 分别计算稳定 generation identity 和单次最终消息 hash；schema、
-prompt pack、generator、validator 或策略变化使旧身份不兼容，旧 v10 缺失身份不会伪造。
+prompt pack、runtime/pipeline/domain/commits 源码、generator、validator 或策略变化均可能改变
+`GenerationIdentity` 的内容哈希。v11 只是可执行格式条件，历史 v11 的身份不匹配仍须拒绝恢复；
+本次切换不承诺跨实现版本自动兼容，不补造或替换旧身份。
 v11 必须包含 `agent` 元数据、Session、完整 generation identity、intent/invocation 和 usage；
 不写入 `plan_approved`/`approve_plan` 布尔字段。默认路径覆盖概要、并行 Detail、RAG、
 数学和连续性编译、完整 Plan Review、TechnicalSpec 屏障、并行 Coding/Review、继承上下文、
@@ -114,7 +117,7 @@ Scene、boundary 和 final visual gate 保持独立端点，报告/帧/视频按
 合并只有旧输出 hash 完全匹配时才能原子替换。完成恢复也核验成片和报告身份。
 
 直接渲染将外部源码复制进私有内容对象，只做只读静态验收，不调用生成/Review LLM，且
-持久化禁用自动改码。恢复先只读检查版本及生成身份，再持运行锁重新验证配置、源码和执行身份。
+持久化禁用自动改码。恢复先只读检查版本及生成身份；只接受 v11，再持运行锁重新验证配置、源码和执行身份。
 未知提交通过单独的 reconciliation intent 核实；历史 local 进程不按 PID 认领，取消未确认禁止重提。
 显式 retry 保留请求预占、轮次和失败计数，完成运行不能原地重试。
 
@@ -126,8 +129,12 @@ Scene、boundary 和 final visual gate 保持独立端点，报告/帧/视频按
 kd1_anime.cli / kd1_anime.tui
        │
        ▼
-kd1_anime.application ─────▶ Agent Runtime (v11) / Orchestrator (v10 legacy)
+kd1_anime.application ─────▶ agent_runtime.runtime.AgentRuntime (仅 v11)
        │                        └── AgentEvent / RunView ───▶ TUI/Rich
+       ├── agent_runtime/         Action、Policy、ToolExecutor、AgentLoop、Session
+       ├── pipeline/              明确输入/输出的规划、场景、修复、渲染及最终处理工具
+       ├── commits.py             typed patch、工作身份校验与原子状态提交
+       ├── event_store.py / queries.py  v3 已提交通知、重同步与只读视图
        ├── services/rendering.py 后端预检、提交、监控边界
        ├── domain/                 计划、技术、审查、边界、执行与程序合同
        ├── request_budget.py       持久化模型请求预占与用量诊断
@@ -178,7 +185,7 @@ kd1_anime.application ─────▶ Agent Runtime (v11) / Orchestrator (v10
        ├── domain/state_ledger.py  场景边界语义账本与渲染证据
        ├── api_catalog.py         精确版本公开 API 核验，与语义 RAG 分工
        ├── security.py             脱敏和 JSON-safe 诊断序列化
-       └── run_store.py            Manifest v10/v11、原子检查点、运行锁
+       └── run_store.py            v11 写入、v4–v10 只读、原子检查点和运行锁
 ```
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
@@ -217,7 +224,7 @@ CODING → Code REVIEWING，彼此并行；共享 ElementManifest/StateLedger �
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-运行生命周期和场景生命周期分别记录，原有 FSM 枚举保留为兼容检查点与 TUI 投影。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。分镜和初始计划审查使用有界工作池；Technical Planner 按依赖链生成结构化 TechnicalSpec。每份合同的 `handoff_out` 只包含当前场景最终导出的对象状态，下一场景以 `handoff_in` 接收相同的 element ID、变量名、对象类型和最终状态，不必等待前一场景的生成代码。FIFO 就绪队列按依赖派发技术规划、编码、审查、提交及结果处理任务，每场景最多一个改变状态的在途任务，远端等待不占用工作线程。具备完整结构化交接的场景可并行生成和渲染；需要源码上下文或全片审查的路径保留必要屏障。代码审查结果提交后，Orchestrator 按 Scene ID 顺序更新 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。v4–v9 清单仅供查看和导出。默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则使用受控本地进程（默认一个在途任务）。每个任务使用独立 Agent 实例并关闭流式终端输出，也不读取共享 stdin。后端边界统一执行产物定位、ffprobe 和哈希验证。
+运行生命周期和场景生命周期分别记录，原有 FSM 枚举仅用于检查点与 TUI 投影。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。Agent Runtime 从已提交快照选择依赖就绪的领域动作；Detail 和代码候选任务按 `LLM_PARALLEL_WORKERS` 有界批量执行，其余动作逐项推进，每场景最多一个改变状态的在途动作。Technical Planner 按依赖链生成结构化 TechnicalSpec，`handoff_out` 与下一场景的 `handoff_in` 绑定相同的 element ID、变量名、对象类型和最终状态。具备完整结构化交接的场景可独立生成；需要源码上下文或全片审查的路径保留必要屏障。Agent Runtime 按 Scene ID 顺序发布 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则使用受控本地进程（默认一个在途任务）。独立 worker 使用不可变输入、独立 Agent 和 `stream=False`，不读取共享 stdin；后端统一执行产物定位、ffprobe 和哈希验证。
 
 主模型、视觉模型和 RAG 使用独立并发配额；批处理中的 v11 运行共享 `ResourceCoordinator`，Slurm/local 名额在外部作业确认终态前持续占用。不确定提交和取消失败保留名额，不能借释放配额触发重复提交。
 CLI 先检查模型配置；运行建立并保存预算后探测主模型，探测同样占用持久化请求计数。视觉评估使用独立 Key、URL、模型、超时和并发配置；视觉端点故障可记为 `unknown`。批处理默认等待计划批准，`--approve-plan` 仅代表本地用户批准完整计划。
@@ -355,7 +362,7 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 
 ### 3.5 持久化与恢复
 
-运行在关键阶段和每次 Slurm 提交后原子更新 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。v10/v11 均记录场景和产物状态；v11 额外记录 Session、生成身份、intent、invocation 和 usage。API Key 不写入清单；恢复沿用捕获的配置、渲染及视觉策略。
+运行在关键阶段和每次 Slurm 提交后原子更新 v11 `manifest.json`：写同目录临时文件、文件 `fsync`、`os.replace()`、目录 `fsync`。清单记录场景、产物、Session、生成身份、intent、invocation 和 usage。API Key 不写入清单；恢复沿用捕获的配置、渲染及视觉策略。v4–v10 清单保持原版本，只读查看与导出。
 
 每个成功场景保存 `SceneArtifact`：
 
@@ -364,9 +371,9 @@ Job 只有在最终 MP4 通过 ffprobe、目标分辨率和帧率验证后才算
 - run 内相对视频路径、视频 SHA-256；
 - ffprobe 验证的大小、时长、分辨率和帧率。
 
-v10 和 v11 清单均保存教学合同、StateLedger、结构化计划、能力合同、场景状态及最终合并配置。v11 的模型请求保存消息 hash 和用量收据，而非隐藏分析或持久化响应缓存。
+v11 清单保存教学合同、StateLedger、结构化计划、能力合同、场景状态及最终合并配置。模型请求保存消息 hash 和用量收据，而非隐藏分析或持久化响应缓存。
 
-`resume` 先只读检查格式，拒绝 v4–v9；随后持有 `.run.lock` 重新读取对应版本清单，v11 还验证 generation identity：
+`resume`、`retry` 和增量基础运行加载先只读检查格式，拒绝 v4–v10，不进行模型探测、作业访问、运行锁获取或文件修改；v11 还验证 generation identity，并在持有 `.run.lock` 后重新读取、验证清单：
 
 - 代码必须位于规范 run 路径且 SHA-256 匹配；
 - 未确认终态或成功取消前不会复用/重提 Job ID；
@@ -397,7 +404,7 @@ AST/API/生命周期和渲染错误；保留脱敏原始证据及源码/视频 h
 
 `SceneState`/manifest 分别记录 `static_verification`、`execution_verification` 和
 `visual_verification`；三者的 `unknown`、`warning` 和 `failed` 语义不互相替代。
-VideoMerger 不扫描目录猜测输入。Orchestrator 先从每个
+VideoMerger 不扫描目录猜测输入。Agent Runtime 的最终处理工具先从每个
 `SceneArtifact` 解析精确路径，再核对 scene ID、类名、代码哈希、渲染配置（含
 Manim/FFmpeg/XeLaTeX 版本）和视频哈希。
 
@@ -480,15 +487,15 @@ pytest -q
 python -m build --sdist --wheel
 ```
 
-测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v10、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
+测试覆盖结构化输出、教学合同/依赖图、截断重试、能力合同、renderer 提示词、AST 安全、辅助函数生命周期、AutoFix 补丁/回滚、Slurm GONE/UNKNOWN、超时取消、ffprobe 与产物身份、Manifest v11 执行与 v4–v10 只读拒绝、增量复用、视觉边界/unknown/路由、RAG 文档切分/索引/排序/降级/失败案例、批量资源配额、资源估算、事件脱敏和 FFmpeg 原子输出。手动或定时运行 `Integration` workflow 可在真实 Ubuntu 环境验证 Cairo、XeLaTeX、CJK、MathTex 和 FFmpeg。
 
 
-## v10 / v11 提交与任务边界
+## v11 提交与任务边界
 
-运行配置与执行身份由不可变 `RunConfig` / `ExecutionSpec` 固定。v11 使用 typed patch 和 `CommitCommand` 校验工作身份并原子发布；v10 legacy 路径暂时保留 `StageTransaction`。两种实现不会在同一运行中切换。
+运行配置与执行身份由不可变 `RunConfig` / `ExecutionSpec` 固定。唯一执行路径为 Agent Runtime：闭合 Action 经纯 Policy 检查，通过持久化 Intent/Invocation 调用工具，结果以 `StageResult`、typed patch 和 `CommitCommand` 校验工作身份并原子发布。不存在旧编排器、whole-context transaction、双写或运行时回退。
 
 源码位于 `scenes/revisions/scene_<id>/<sha256>.py`；报告按内容摘要保存。展示副本不参与执行或恢复。未确认的外部提交继续保留 attempt，Job ID 落盘失败尝试取消并保留紧急诊断身份，禁止自动重提。
 
-有界 FIFO 阶段队列替代场景常驻线程。依赖决定就绪性，每场景只派发一个状态任务，远端等待由统一监控器承担。监控器提供公开观测，最终结果先提交再发布。`RunControl` 控制配额、请求、退避和总截止时间；模型与 RAG 客户端由端点隔离的运行连接池管理。TUI 使用 4096 容量队列、进度合并和快照重同步，显示异常不改变流水线结果。
+依赖决定动作就绪性，每场景只派发一个状态动作；独立 Detail/代码候选使用有界 worker 批次，作业等待不占用模型 worker。外部监控观测先提交，再发布通知。`RunControl` 控制配额、请求、退避和总截止时间；模型与 RAG 客户端由端点隔离的运行连接池管理。TUI 使用 4096 容量队列、进度合并和已提交快照重同步，显示异常不改变执行结果。
 
 性能及证据说明见 `docs/benchmarks/runtime-comparison.md`；完整执行合同见 `docs/execution.md`。

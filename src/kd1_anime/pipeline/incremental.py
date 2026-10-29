@@ -30,7 +30,6 @@ from kd1_anime.run_store import (
     StoredSceneState,
     get_reusable_video_path,
     restore_run_path,
-    scene_snapshot,
     sha256_text,
 )
 from kd1_anime.services.dependencies import DependencyService
@@ -327,7 +326,7 @@ class IncrementalPipeline:
         backend: Literal["slurm", "local"],
     ) -> None:
         """Validate every referenced base source/media before any new-run side effect."""
-        base.validate_for_resume(runtime="agent")
+        base.validate_for_resume()
         if base.agent.generation_identity != generation_identity:
             raise ValueError("Incompatible incremental generation identity")
         if root.is_symlink() or not root.is_dir() or root.name != base.run_id:
@@ -528,7 +527,6 @@ class IncrementalPipeline:
         scene.visual_report_file = scene.visual_report_sha256 = scene.visual_artifact_sha256 = ""
         scene.visual_feedback = ""
         scene.visual_best_candidate = None
-        scene.snapshot = scene_snapshot(scene)
         validate_reused_artifact(
             current.root, current.run_id, scene, current.render_profile, provenance=provenance_ref
         )

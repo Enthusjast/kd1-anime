@@ -184,7 +184,7 @@ class SceneDashboard:
         self.visual_enabled: bool = False
         self.rag_status: str = "disabled"
         self.backend: str = "slurm"
-        # Rich 的自动刷新线程会和 Orchestrator 的事件线程同时读取/修改
+        # Rich 的自动刷新线程会和流水线事件线程同时读取/修改
         # 场景状态。使用可重入锁：_render() 需要持锁读取状态，而事件
         # 线程在更新后还要主动触发一次刷新。
         self._state_lock = threading.RLock()
@@ -281,7 +281,7 @@ class SceneDashboard:
                 live.refresh()
 
     def on_event(self, event: str, data: dict) -> None:
-        """根据 orchestrator 事件更新仪表盘状态 (线程安全)。"""
+        """根据流水线事件更新仪表盘状态 (线程安全)。"""
         if not self.live:
             return
         # 先原子更新状态，再让 Rich 按 get_renderable 重新取最新 Panel。

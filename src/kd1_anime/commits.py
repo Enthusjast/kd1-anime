@@ -1,10 +1,8 @@
-"""Commands and snapshots at the single durable state boundary."""
+"""Typed proposals at the single durable v11 state boundary."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from copy import deepcopy
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Literal
@@ -28,7 +26,6 @@ from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.request_budget import RequestReservation
 from kd1_anime.run_store import (
     MANIFEST_NAME,
-    WRITABLE_MANIFEST_SCHEMA_VERSIONS,
     RunManifest,
     RunStatus,
     StoredSceneState,
@@ -89,7 +86,6 @@ class RunPatch(ValidatedModel):
     expected_final_duration: float | None = Field(default=None, ge=0, le=3_600)
     continuity_bible: ContinuityBible | None = None
     element_manifest: ElementManifest | None = None
-    plan_approved: bool | None = None
     plan_review_status: Literal["pending", "reviewing", "passed", "failed", "skipped"] | None = None
     plan_review_cycle_signature: str | None = Field(default=None, pattern=r"^(?:[0-9a-f]{64})?$")
     plan_review_cycle_count: int | None = Field(default=None, ge=0)
@@ -130,7 +126,6 @@ class CommitCommand:
     error: str = ""
     scene_id: int | None = None
     identity: WorkIdentity | None = None
-    apply: Callable | None = None
     queued_at: float | None = None
     patch: RunPatch | None = None
 
@@ -141,20 +136,12 @@ class CommitCommand:
             or self.expected_revision < 0
         ):
             raise ValueError("Expected manifest revision must be a nonnegative integer")
-        if self.patch is not None and self.apply is not None:
-            raise ValueError("CommitCommand cannot mix patch and legacy apply")
         if self.patch is not None and not isinstance(self.patch, RunPatch):
             raise TypeError("CommitCommand patch must be a typed RunPatch")
 
-    def check(self, context, current_identity=None):
-        if self.expected_revision != context.manifest_revision:
-            raise StaleWorkError("Commit was built from a superseded manifest")
-        if self.identity is not None and self.identity != current_identity:
-            raise StaleWorkError("Commit was built from superseded scene inputs")
-
 
 class RunCommitter:
-    """Serialize typed proposals and publish memory only after a durable v10 write.
+    """Serialize typed proposals and publish memory only after a durable v11 write.
 
     The application owns the run lock and external operations. This boundary owns
     only manifest publication; workers must explicitly rebase independent scene
@@ -162,9 +149,7 @@ class RunCommitter:
     """
 
     def __init__(self, run_root: Path, manifest: RunManifest):
-        if manifest.schema_version not in WRITABLE_MANIFEST_SCHEMA_VERSIONS:
-            raise ValueError("Typed commits require an executable manifest")
-        manifest.validate_for_resume(runtime="agent" if manifest.schema_version == 11 else "legacy")
+        manifest.validate_for_resume()
         self._run_root = Path(run_root)
         self._current = manifest
         self._lock = RLock()
@@ -176,8 +161,8 @@ class RunCommitter:
 
     @staticmethod
     def _typed_patch(command: CommitCommand) -> RunPatch:
-        if command.apply is not None or command.patch is None:
-            raise ValueError("Typed commits require a patch, never legacy apply")
+        if command.patch is None:
+            raise ValueError("Typed commits require a patch")
         # Revalidate only the proposal's touched values. Keeping top-level field
         # presence separately preserves nested factory defaults such as request
         # IDs/timestamps, while still distinguishing null from unset run outputs.
@@ -196,8 +181,6 @@ class RunCommitter:
                 raise StaleWorkError("Command identity does not match its scene patch")
         elif command.scene_id is not None and command.scene_id not in proposed:
             raise ValueError("Command scene_id has no scene patch")
-        if patch.scene_removals and current.schema_version != 11:
-            raise ValueError("Scene retirement requires agent runtime ownership")
         for scene_id, identity in patch.scene_removals.items():
             stored = current.scenes.get(scene_id)
             if stored is None or identity != WorkIdentity(stored.revision, stored.input_sha256):
@@ -215,8 +198,8 @@ class RunCommitter:
                 raise ValueError("Uncertain submission forbids scene retirement")
         for scene in patch.scenes:
             stored = current.scenes.get(scene.scene_id)
-            if stored is None and current.schema_version == 11:
-                known = current.agent.outline_identities if current.agent is not None else {}
+            if stored is None:
+                known = current.agent.outline_identities
                 importing = (
                     patch.outlines is not None
                     and patch.agent is not None
@@ -228,15 +211,11 @@ class RunCommitter:
             identity = (
                 WorkIdentity(stored.revision, stored.input_sha256)
                 if stored is not None
-                else (
-                    current.agent.outline_identities.get(scene.scene_id, WorkIdentity(0, ""))
-                    if current.schema_version == 11 and current.agent is not None
-                    else WorkIdentity(0, "")
-                )
+                else current.agent.outline_identities.get(scene.scene_id, WorkIdentity(0, ""))
             )
             if scene.identity != identity:
                 raise StaleWorkError("Commit was built from superseded scene inputs")
-            if stored is None and current.schema_version == 11:
+            if stored is None:
                 for source, revision in scene.dependency_revisions.items():
                     dependency = current.scenes.get(source)
                     if dependency is None or dependency.revision != revision:
@@ -295,7 +274,6 @@ class RunCommitter:
                 or scene.code_sha256
                 or scene.class_name
                 or scene.reviewed
-                or (scene.plan_reviewed and candidate.schema_version != 11)
                 or scene.local_smoke_status not in {"pending", "skipped"}
                 or scene.technical_spec is not None
                 or scene.technical_status != "pending"
@@ -344,8 +322,6 @@ class RunCommitter:
             self._check_inputs(command, patch)
             current = self._current
             candidate = current.model_copy()
-            if candidate.schema_version == 11 and "plan_approved" in patch.model_fields_set:
-                raise ValueError("Agent approvals belong to Session grants")
             for name in patch.model_fields_set - {
                 "scenes",
                 "scene_removals",
@@ -354,8 +330,6 @@ class RunCommitter:
             }:
                 setattr(candidate, name, getattr(patch, name))
             if patch.agent is not None:
-                if current.agent is None:
-                    raise ValueError("Legacy runs cannot acquire agent identity")
                 candidate.agent = merge_transport_state(current.agent, patch.agent)
             if patch.scenes or patch.scene_removals:
                 scenes = {
@@ -367,7 +341,6 @@ class RunCommitter:
                     replacement = scene.replacement
                     # The proposal was reconstructed above, so all nested values
                     # are private to this commit, including plan/job structures.
-                    replacement.snapshot = None
                     replacement.revision = scene.identity.revision + 1
                     previous = current.scenes.get(scene.scene_id)
                     attempts = {}
@@ -404,44 +377,6 @@ class RunCommitter:
                 raise ValueError("运行清单完整性校验失败: " + "; ".join(errors))
             self._check_invalidations(candidate, patch)
 
-            # write_manifest assigns EVERY scene.snapshot before writing. Shallow
-            # persistence-only envelopes isolate those assignments for untouched
-            # scenes without cloning their plans/jobs or mutating published state
-            # on write failure. Only the touched scenes are actually replaced.
-            durable = candidate.model_copy()
-            touched = {scene.scene_id for scene in patch.scenes}
-            durable.scenes = {
-                scene_id: scene if scene_id in touched else scene.model_copy()
-                for scene_id, scene in candidate.scenes.items()
-            }
-            write_manifest(self._run_root / MANIFEST_NAME, durable)
-            candidate.updated_at = durable.updated_at
+            write_manifest(self._run_root / MANIFEST_NAME, candidate)
             self._current = candidate
             return candidate
-
-
-def restore_snapshot(target, snapshot):
-    """Preserve worker-held scene identities while replacing all proposed values."""
-    existing = target.scene_states
-    restored = {}
-    for scene_id, stored in snapshot.scene_states.items():
-        scene = existing.get(scene_id)
-        if scene is None:
-            restored[scene_id] = deepcopy(stored)
-        else:
-            values = deepcopy(stored.__dict__)
-            previous_job = scene.slurm_job
-            if (
-                previous_job is not None
-                and stored.slurm_job is not None
-                and previous_job.job_id == stored.slurm_job.job_id
-            ):
-                previous_job.__dict__.update(deepcopy(stored.slurm_job.__dict__))
-                values["execution"].slurm_job = previous_job
-            scene.__dict__.clear()
-            scene.__dict__.update(values)
-            restored[scene_id] = scene
-    for item in fields(target):
-        if item.name != "scene_states":
-            setattr(target, item.name, deepcopy(getattr(snapshot, item.name)))
-    target.scene_states = restored

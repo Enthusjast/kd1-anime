@@ -7,6 +7,7 @@ import pytest
 from test_application import ArtifactBackend
 from test_pipeline_render import stage as stage
 
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.cluster.jobs import PollObservation, RenderJob
 from kd1_anime.domain.dependencies import WorkIdentity
 from kd1_anime.domain.execution import StageAttempts
@@ -17,6 +18,7 @@ from kd1_anime.pipeline.recovery import (
     plan_retry,
     validate_completed_run,
 )
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.rag.models import RagReceipt, RagRuntimeProfile
 from kd1_anime.run_store import RunManifest
 
@@ -186,7 +188,12 @@ def adopted(recovery):
 
 def manifest_for(inputs):
     return RunManifest(
-        schema_version=10,
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="session-one",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id=inputs.run_id,
         user_prompt="Pause",
         output_path="final.mp4",

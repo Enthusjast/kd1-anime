@@ -3,36 +3,14 @@ import json
 import pytest
 from test_application import SOURCE, VIDEO, application_boundary
 
-import kd1_anime.orchestrator as legacy
-from kd1_anime.agent_runtime.runtime import AgentDependencies, AgentRuntime
-from kd1_anime.domain.planning import LessonSpec, PlanningDraft, TeachingGraph
+from kd1_anime.agent_runtime.runtime import AgentRuntime
 from kd1_anime.run_store import RunRepository
 
 
 @pytest.fixture
 def agent_boundary(monkeypatch, tmp_path):
     boundary = application_boundary.__wrapped__(monkeypatch, tmp_path)
-
-    class DraftPlanner(legacy.PlannerAgent):
-        def plan_draft(self, prompt, **kwargs):
-            return PlanningDraft(
-                items=self.plan_outline(prompt, **kwargs),
-                lesson_spec=LessonSpec(topic=prompt),
-                teaching_graph=TeachingGraph(),
-            )
-
-    dependencies = AgentDependencies(
-        planner_factory=DraftPlanner,
-        plan_reviewer_factory=legacy.PlanReviewerAgent,
-        continuity_reviewer_factory=legacy.ContinuityReviewerAgent,
-        technical_factory=legacy.TechnicalPlannerAgent,
-        coder_factory=legacy.CoderAgent,
-        reviewer_factory=legacy.ReviewerAgent,
-        backend_factory=lambda name: boundary.backend,
-        merger_factory=legacy.VideoMerger,
-        preflight=lambda profile, backend: None,
-        probe=lambda agent: None,
-    )
+    dependencies = boundary.dependencies
     return boundary, dependencies
 
 

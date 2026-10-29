@@ -1,4 +1,4 @@
-"""Typed scene commits exercise the real v10 durable manifest boundary."""
+"""Typed scene commits exercise the real v11 durable manifest boundary."""
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 import kd1_anime.commits as commits
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.commits import CommitCommand, RunCommitter, RunPatch, ScenePatch
 from kd1_anime.domain.dependencies import (
     DependencyBinding,
@@ -16,7 +17,8 @@ from kd1_anime.domain.dependencies import (
     WorkIdentity,
 )
 from kd1_anime.domain.execution import StageAttempts
-from kd1_anime.domain.planning import ScenePlan
+from kd1_anime.domain.planning import SceneOutline, ScenePlan
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.request_budget import RequestBudget, RequestBudgetExceeded, RequestReservation
 from kd1_anime.run_store import RunManifest, RunRepository, StoredSceneState, write_manifest
 
@@ -46,6 +48,15 @@ def durable_run(tmp_path, **changes):
     root = tmp_path / "runs" / RUN_ID
     root.mkdir(parents=True)
     manifest = RunManifest(
+        schema_version=11,
+        agent=changes.pop(
+            "agent",
+            AgentRunState(
+                session_id="commit-session",
+                generation_identity=capture_generation_identity(),
+                run_input_sha256="a" * 64,
+            ),
+        ),
         run_id=RUN_ID,
         user_prompt="prompt",
         output_path="output.mp4",
@@ -59,7 +70,7 @@ def durable_run(tmp_path, **changes):
 
 def proposal(manifest, scene_id, *, dependencies=None, **changes):
     current = manifest.scenes[scene_id]
-    replacement = current.model_copy(update={"snapshot": None, **changes})
+    replacement = current.model_copy(update=changes)
     patch = ScenePatch(
         scene_id=scene_id,
         identity=WorkIdentity(current.revision, current.input_sha256),
@@ -71,7 +82,7 @@ def proposal(manifest, scene_id, *, dependencies=None, **changes):
 
 def load(tmp_path):
     saved = RunRepository(tmp_path).load(RUN_ID)
-    assert saved.schema_version == 10
+    assert saved.schema_version == 11
     assert saved.integrity_errors() == []
     return saved
 
@@ -282,11 +293,11 @@ def test_invalid_manifest_is_rejected_instead_of_persisted(tmp_path):
     assert (root / "manifest.json").read_bytes() == before
 
 
-def test_write_failure_does_not_publish_or_mutate_original_snapshots(monkeypatch, tmp_path):
+def test_write_failure_does_not_publish_or_mutate_original_scenes(monkeypatch, tmp_path):
     root, original, committer = durable_run(tmp_path)
     before = original.model_dump_json()
     disk_before = (root / "manifest.json").read_bytes()
-    snapshots = {scene_id: value.snapshot for scene_id, value in original.scenes.items()}
+    scenes = dict(original.scenes)
 
     def fail_after_writer_mutation(path, text):
         raise OSError("disk full")
@@ -296,7 +307,7 @@ def test_write_failure_does_not_publish_or_mutate_original_snapshots(monkeypatch
         committer.commit(proposal(original, 1, phase="detailed"))
     assert committer.current is original
     assert original.model_dump_json() == before
-    assert all(original.scenes[key].snapshot is value for key, value in snapshots.items())
+    assert all(original.scenes[key] is value for key, value in scenes.items())
     assert (root / "manifest.json").read_bytes() == disk_before
 
 
@@ -342,16 +353,11 @@ def test_duplicate_scene_patches_rejected():
         RunPatch(scenes=(item, item))
 
 
-def test_legacy_apply_is_preserved_but_never_accepted_by_new_committer(tmp_path):
+def test_legacy_apply_is_rejected_by_command_constructor(tmp_path):
     _, original, committer = durable_run(tmp_path)
-    called = []
-    legacy = CommitCommand(0, "CODING", apply=called.append)
-    with pytest.raises(ValueError, match="patch"):
-        committer.commit(legacy)
-    assert called == []
+    with pytest.raises(TypeError, match="apply"):
+        CommitCommand(0, "CODING", apply=lambda draft: None)
     assert committer.current is original
-    with pytest.raises(ValueError, match="apply"):
-        CommitCommand(0, "CODING", apply=lambda draft: None, patch=RunPatch())
 
 
 def test_command_identity_cannot_disagree_with_typed_scene_patch(tmp_path):
@@ -397,7 +403,7 @@ def test_changed_upstream_teaching_requires_transitive_consumer_patches(tmp_path
         {"exported_elements_code": "stale export"},
         {"local_smoke_status": "passed"},
         {"capability_status": "passed"},
-        {"plan_ready": True, "plan_reviewed": True},
+        {"reviewed": True, "code_file": "scenes/scene_2.py"},
         {"visual_score": 4.0},
     ],
 )
@@ -426,6 +432,38 @@ def test_consumer_patch_must_clear_reusable_receipts_not_just_increment_revision
             CommitCommand(0, "CODING", patch=RunPatch(scenes=(source, reusable, third)))
         )
     assert load(tmp_path).revision == 0
+
+
+def test_consumer_invalidation_preserves_plan_review_but_clears_execution_outputs(tmp_path):
+    from kd1_anime.services.dependencies import DependencyService
+
+    graph = DependencyGraph(
+        bindings=[
+            DependencyBinding(
+                source_scene_id=1,
+                consumer_scene_id=2,
+                kind="teaching",
+                source_sha256=DependencyService.teaching(scene(1).plan),
+            )
+        ]
+    )
+    _, original, committer = durable_run(tmp_path, dependency_graph=graph)
+    changed_plan = original.scenes[1].plan.model_copy(update={"computation": "radius=2"})
+    source = proposal(original, 1, plan=changed_plan).patch.scenes[0]
+    consumer = proposal(
+        original, 2, dependencies={1: 0}, plan_ready=True, plan_reviewed=True
+    ).patch.scenes[0]
+    current = committer.commit(
+        CommitCommand(0, "CODING", patch=RunPatch(scenes=(source, consumer)))
+    )
+    invalidated = current.scenes[2]
+    assert invalidated.plan_ready and invalidated.plan_reviewed
+    assert not invalidated.reviewed and not invalidated.rendered
+    assert invalidated.technical_status == "pending"
+    assert invalidated.visual_status == "skipped"
+    assert invalidated.static_verification.status == "not_run"
+    assert invalidated.execution_verification.status == "not_run"
+    assert invalidated.visual_verification.status == "not_run"
 
 
 def test_manifest_dependency_analysis_is_pure_and_ignores_revision_only_changes(tmp_path):
@@ -471,10 +509,24 @@ def test_untyped_patch_is_not_accepted_by_the_new_command():
 
 
 def test_typed_commit_can_add_a_new_scene_without_replacing_existing_scenes(tmp_path):
-    _, original, committer = durable_run(tmp_path)
+    outline_identity = WorkIdentity(0, "d" * 64)
+    agent = AgentRunState(
+        session_id="commit-session",
+        generation_identity=capture_generation_identity(),
+        run_input_sha256="a" * 64,
+        outline_identities={4: outline_identity},
+    )
+    outline = SceneOutline(
+        scene_id=4,
+        title="scene 4",
+        duration_seconds=10,
+        purpose="test",
+        math_concept="circle",
+    )
+    _, original, committer = durable_run(tmp_path, agent=agent, outlines=[outline])
     addition = ScenePatch(
         scene_id=4,
-        identity=WorkIdentity(0, ""),
+        identity=outline_identity,
         replacement=scene(4),
     )
     current = committer.commit(CommitCommand(0, "DETAILING", patch=RunPatch(scenes=(addition,))))

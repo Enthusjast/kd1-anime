@@ -77,7 +77,7 @@ Key invariants:
 19. A visual endpoint failure is `unknown`, never a fabricated low score or a reason to delete a valid render.
 20. Main/visual requests, probes, retries and compatibility fallbacks reserve and checkpoint their budget before dispatch; unknown outcomes still count.
 21. Resume/retry preserve request limits, reservations and retry counters. Incremental runs have independent budgets.
-22. Manifests v10 and v11 are executable by their respective runtimes; v4-v9 are read-only and must be rejected before probes, job access, run locking or file changes. Never switch runtimes for a run.
+22. Manifests v11 are executable. v4–v10 are read-only and must be rejected before probes, job access, run locking or file changes. Never switch runtimes for a run.
 23. Commit worker results only when their scene revision and complete input digest match; invalidate consumers by teaching, handoff or source dependencies.
 24. Persist a unique submission attempt before external submission and the returned Job ID immediately afterward. Uncertain submission or failed cancellation prohibits automatic resubmission.
 25. Slurm, local rendering and smoke use the same environment whitelist and container policy. Never adopt a local process by historical PID.
@@ -96,10 +96,9 @@ Key invariants:
 - `src/kd1_anime/agent_runtime/`: v11 action contracts, deterministic Policy, bounded loop, Session and durable tool lifecycle.
 - `src/kd1_anime/pipeline/`: immutable planning, scene, render, repair, recovery, incremental and finalization stages.
 - `src/kd1_anime/event_store.py`: v3 committed/ephemeral event sequences and replay.
-- `src/kd1_anime/orchestrator.py`: legacy v10 FSM, per-run paths and parallel stages.
-- `src/kd1_anime/run_store.py`: v10/v11 manifests, read-only older formats, atomic checkpoints, code hashes and run locks.
+- `src/kd1_anime/run_store.py`: v11 manifests, read-only older formats, atomic checkpoints, code hashes and run locks.
 - `src/kd1_anime/domain/`: planning, technical, review, execution, dependency, boundary and program contracts; old Agent paths re-export them.
-- `src/kd1_anime/commits.py`, `stage_transactions.py`, `objects.py`: isolated stage proposals, durable state commit and immutable objects.
+- `src/kd1_anime/commits.py`, `objects.py`: isolated stage proposals, durable state commit and immutable objects.
 - `src/kd1_anime/control.py`, `scheduling.py`, `clients.py`: cancellation/deadlines, bounded workers and run-owned clients.
 - `src/kd1_anime/request_budget.py`: durable request reservations and request-scoped usage diagnostics.
 - `src/kd1_anime/services/`: explicit planning/generation/review/recovery/visual inputs and results, dependency calculations and v2 compiler.
@@ -130,7 +129,7 @@ Key invariants:
 - Keep `Settings` assignment validation enabled so CLI overrides cannot bypass field validators.
 - Use `default_factory` for mutable model/dataclass fields.
 - Do not weaken AST validation merely to accept a model hallucination; feed the deterministic error back to the Coder instead.
-- Keep TUI display logic behind orchestrator callback events.
+- Keep TUI display logic behind public application events and read-only queries.
 - In concurrent stages, instantiate independent Agent objects per worker and set `stream=False`.
 - Add a regression test for every state-machine, parser, path-selection, or timeout bug.
 

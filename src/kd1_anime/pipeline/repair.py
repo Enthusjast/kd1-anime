@@ -199,7 +199,7 @@ class RenderRepairPipeline:
             self._checkpoint(context)
             self._bind(inputs)
             # Freeze nested mutable models before passing anything to agents.
-            scene = inputs.scene.model_copy(update={"snapshot": None}, deep=True)
+            scene = inputs.scene.model_copy(deep=True)
             inputs = replace(inputs, scene=scene)
             original = self._read_source(inputs, scene.code_file, scene.code_sha256)
             original_hash = scene.code_sha256

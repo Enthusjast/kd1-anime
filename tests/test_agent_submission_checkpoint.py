@@ -53,11 +53,25 @@ def test_submission_result_checkpoint_failure_cancels_and_preserves_attempt_iden
     if released:
         resources.release_slurm()
     restored = AgentRuntime(dependencies=dependencies, resource_coordinator=resources)
-    restored._bind(runtime.root, manifest, None)
+    started = []
+
+    def cancel_on_start(name, data):
+        if name == "run_started":
+            started.append(data["run_id"])
+            assert resources.try_acquire_slurm() is released
+            if released:
+                resources.release_slurm()
+            restored.cancel_all()
+
+    assert restored.resume(manifest.run_id, callback=cancel_on_start) is None
+    assert started == [manifest.run_id]
+    persisted = RunRepository(boundary.workspace).load(manifest.run_id)
+    assert persisted.agent.submissions[-1].attempt.token == attempt.token
+    assert attempt.token not in persisted.agent.retired_submissions
+    assert len(boundary.backend.sources) == 1
     assert resources.try_acquire_slurm() is released
     if released:
         resources.release_slurm()
-    assert runtime._pending_submission(1).token == attempt.token
 
 
 def test_failed_attempt_reservation_releases_capacity_before_dispatch(agent_boundary, monkeypatch):

@@ -29,6 +29,7 @@ from kd1_anime.agent_runtime.contracts import (
     sanitize_record,
 )
 from kd1_anime.run_store import (
+    MANIFEST_SCHEMA_VERSION,
     RUN_ID_PATTERN,
     RunManifest,
     atomic_write_json,
@@ -71,6 +72,17 @@ class EventStore:
         if not self.root.is_dir():
             raise EventStoreError("Committed run directory does not exist")
         self.root.chmod(0o700)
+
+    def _manifest_before_lock(self) -> RunManifest:
+        if any(path.is_symlink() for path in (self.root, *self.root.parents)):
+            raise EventStoreError("Run directory cannot contain symbolic links")
+        if not self.root.is_dir():
+            raise EventStoreError("Committed run directory does not exist")
+        return self._manifest()
+
+    def _require_writable(self) -> None:
+        if self._manifest_before_lock().schema_version != MANIFEST_SCHEMA_VERSION:
+            raise EventStoreError("Historical run events are read-only")
 
     @contextmanager
     def locked(self, *, lock_held: bool = False) -> Iterator[None]:
@@ -219,6 +231,10 @@ class EventStore:
             raise EventStoreError("Corrupt sequence reservation") from exc
 
     def watermark(self, *, lock_held: bool = False) -> int:
+        manifest = self._manifest_before_lock()
+        if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+            events, _, version = self._scan(manifest)
+            return 0 if version == 2 else self._watermark(events)
         with self.locked(lock_held=lock_held):
             events, _, version = self._scan(self._manifest())
             return 0 if version == 2 else self._watermark(events)
@@ -232,20 +248,27 @@ class EventStore:
     ) -> tuple[AgentEvent | LegacyEvent, ...]:
         if after is not None and (type(after) is not int or after < 0):
             raise EventStoreError("Replay cursor must be a nonnegative integer")
+        manifest = self._manifest_before_lock()
+        if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+            return self._replay(manifest, after)
         with self.locked(lock_held=lock_held):
-            events, _, version = self._scan(self._manifest())
-            if version == 2:
-                if after is not None:
-                    raise EventStoreError("v2 events do not support sequence cursors")
-                return events
-            self._watermark(events)
-            return tuple(event for event in events if after is None or event.sequence > after)
+            return self._replay(self._manifest(), after)
+
+    def _replay(self, manifest: RunManifest, after: int | None):
+        events, _, version = self._scan(manifest)
+        if version == 2:
+            if after is not None:
+                raise EventStoreError("v2 events do not support sequence cursors")
+            return events
+        self._watermark(events)
+        return tuple(event for event in events if after is None or event.sequence > after)
 
     def append(
         self, event: AgentEvent | Mapping | None = None, *, lock_held: bool = False, **draft_fields
     ) -> AgentEvent:
         if event is not None and draft_fields:
             raise EventStoreError("Supply either an envelope or draft fields")
+        self._require_writable()
         fields = (
             event.model_dump(mode="json")
             if isinstance(event, AgentEvent)
@@ -320,6 +343,7 @@ class EventStore:
 
     def reconcile(self, manifest: RunManifest, *, lock_held: bool = False) -> AgentEvent:
         """Repair only a missing notification of the current on-disk snapshot."""
+        self._require_writable()
         with self.locked(lock_held=lock_held):
             committed = self._manifest()
             if committed.model_dump(mode="json") != manifest.model_dump(mode="json"):

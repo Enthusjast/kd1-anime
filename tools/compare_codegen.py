@@ -6,9 +6,9 @@ import argparse
 import json
 from pathlib import Path
 
+from kd1_anime.agent_runtime.runtime import AgentRuntime
 from kd1_anime.config import settings
 from kd1_anime.eval.benchmark import compare_modes, fixed_tasks, offline_baseline
-from kd1_anime.orchestrator import Orchestrator
 from kd1_anime.run_store import atomic_write_json
 
 
@@ -37,35 +37,42 @@ def main():
     elif args.run_models:
         selected = set(args.task or [task.task_id for task in fixed_tasks()])
         bindings = {}
-        for mode in ("llm", "compiler_first"):
-            settings.SCENE_CODEGEN_MODE = mode
-            bindings[mode] = {}
-            for task in fixed_tasks():
-                if task.task_id not in selected:
-                    continue
-                workflow = Orchestrator()
-                try:
-                    workflow.run(task.prompt, dry_run=args.dry_run, backend=args.backend)
-                except Exception as exc:
-                    # The run manifest contains the redacted failure evidence.
-                    print(
-                        json.dumps(
-                            {"task": task.task_id, "mode": mode, "outcome": type(exc).__name__}
+        original_mode = settings.SCENE_CODEGEN_MODE
+        try:
+            for mode in ("llm", "compiler_first"):
+                settings.SCENE_CODEGEN_MODE = mode
+                bindings[mode] = {}
+                for task in fixed_tasks():
+                    if task.task_id not in selected:
+                        continue
+                    runtime = AgentRuntime()
+                    try:
+                        runtime.generate(
+                            task.prompt,
+                            dry_run=args.dry_run,
+                            backend=args.backend,
+                            approve_plan=True,
                         )
-                    )
-                if (
-                    workflow._ctx is not None
-                    and (workflow._ctx.paths.root / "manifest.json").is_file()
-                ):
-                    bindings[mode][task.task_id] = workflow._ctx.paths.root
-                if args.output:
-                    atomic_write_json(
-                        args.output.with_suffix(".bindings.json"),
-                        {
-                            mode: {task: str(root) for task, root in rows.items()}
-                            for mode, rows in bindings.items()
-                        },
-                    )
+                    except Exception as exc:
+                        # The run manifest contains the redacted failure evidence.
+                        print(
+                            json.dumps(
+                                {"task": task.task_id, "mode": mode, "outcome": type(exc).__name__}
+                            )
+                        )
+                    root = getattr(runtime, "root", None)
+                    if root is not None and (root / "manifest.json").is_file():
+                        bindings[mode][task.task_id] = root
+                    if args.output:
+                        atomic_write_json(
+                            args.output.with_suffix(".bindings.json"),
+                            {
+                                mode: {task: str(root) for task, root in rows.items()}
+                                for mode, rows in bindings.items()
+                            },
+                        )
+        finally:
+            settings.SCENE_CODEGEN_MODE = original_mode
         report = compare_modes(bindings)
     else:
         report = offline_baseline()

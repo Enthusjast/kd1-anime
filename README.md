@@ -298,7 +298,7 @@ INIT
 
 场景不是清单条目的机械切分单位。若用户要求在同一画布中同时展示一组对象，且这些对象需要共同变化或最终对比，Planner 应将其合并为一个场景；只有镜头、布局或叙事弧线确实独立时才拆分。
 
-分镜 Detail 和初始 Plan Review 可以并行。TechnicalSpec 按连续性依赖传递 `TechnicalHandoff`；前一场景的技术设计完成后，后一场景即可开始技术设计，同时前一场景继续 Code→Code Review。每个 Scene 拥有技术合同后即可独立执行 Code→Code Review，不再等待其它无关场景的生成代码。共享 `ElementManifest`/`StateLedger` 仍按 Scene ID 顺序发布，确保边界校验确定；缺少新 handoff 的旧运行会安全回退到顺序代码屏障。每个 Scene 的 Code Review 通过后立即进入自己的渲染 worker，其他 Scene 可以继续编码/审查，`SLURM_MAX_IN_FLIGHT` 继续限制同时排队/运行的场景数量。
+分镜 Detail 和独立代码候选任务由 Agent Runtime 按 `LLM_PARALLEL_WORKERS` 有界并行。TechnicalSpec 按连续性依赖传递 `TechnicalHandoff`；共享 `ElementManifest`/`StateLedger` 按 Scene ID 顺序发布，确保边界校验确定。需要源码上下文或全片审查的路径仍保留必要屏障。每个 Scene 最多一个改变状态的在途动作；就绪场景可独立提交渲染，`SLURM_MAX_IN_FLIGHT` 限制同时排队/运行的场景数量。
 
 ## 常用命令
 
@@ -321,7 +321,7 @@ kd1-anime plan "解释傅里叶级数" --no-review
 kd1-anime plan "解释傅里叶级数" --output fourier-plan.json
 kd1-anime generate --plan fourier-plan.json --dry-run
 
-# 计划审查后暂停人工确认；非交互环境视为批准
+# 完整计划审查后代表本地用户批准该计划；不授权代码 diff
 kd1-anime generate "解释勾股定理" --approve-plan
 ```
 
@@ -372,7 +372,7 @@ kd1-anime stats <run-id> --json
 kd1-anime clean --older-than 30d --yes
 ```
 
-使用 `status` 找到 run ID，再显式执行 `resume`。默认 Agent Runtime 使用 manifest schema v11；既有 v10 运行仍由 legacy 路径执行，v4–v9 只读。恢复沿用原运行的配置、身份和请求预算，不自动转换清单版本。
+使用 `status` 找到 run ID，再显式执行 `resume`。所有执行入口只使用 manifest schema v11 的 Agent Runtime；v4–v10 仅支持只读查看和 JSON 导出，不能恢复、retry 或作为增量基础运行。旧格式在模型探测、作业访问、运行锁和文件修改前被拒绝，不转换版本，也不切换到旧运行时。v11 是必要格式条件，不保证所有历史 v11 都可恢复：`GenerationIdentity` 绑定运行时代码、schema、提示词、生成器、验证器和策略等内容，本次切换也会改变相关代码哈希；旧身份与当前实现不匹配时拒绝恢复，不自动兼容。请保留旧目录，用 `status <run-id> --json` 导出信息，并根据原需求或已导出的计划创建新运行；不要改写版本号或身份哈希。只有身份核验通过的 v11 恢复才沿用原配置和请求预算。
 
 ### 环境和模型诊断
 
@@ -562,8 +562,8 @@ kd1-anime evaluate <run-id> --visual --json --output visual-report.json
 └── workspace/
     ├── eval_results/            # 独立 evaluate 命令的报告
     └── runs/<run-id>/
-        ├── manifest.json        # 默认 schema v11；包含受保护的需求与状态
-        ├── events.jsonl         # 脱敏事件轨迹
+        ├── manifest.json        # 可执行 schema v11；包含受保护的需求与状态
+        ├── events.jsonl         # v3 已提交事实通知；不是执行重放日志
         ├── scenes/              # Python Scene 与 sbatch 脚本
         ├── logs/                # stdout/stderr
         ├── videos/              # 当前 run 的媒体目录
@@ -584,13 +584,13 @@ kd1-anime status
 kd1-anime resume 20260831-120000-1234abcd
 ```
 
-用户配置统一放在 `~/.kd1-anime/`；相对 `workspace/` 路径按当前配置解析，程序不会自动复制大型运行目录。v10/v11 清单均保存运行配置；v11 还保存 Session、生成身份与工具执行凭据。
+用户配置统一放在 `~/.kd1-anime/`；相对 `workspace/` 路径按当前配置解析，程序不会自动复制大型运行目录。v11 清单保存运行配置、关联 Session、生成身份、intent/invocation 与用量收据；私有 Session 保存可见用户命令和一次性批准，不保存隐藏推理。计划批准与代码 diff 批准分别绑定精确动作、资源、输入 hash 和工作身份，不能互相替代。事件只是已提交状态的通知；日志缺失或显示回调失败不会重放工具、重置预算或改变运行事实。
 
 ## 增量渲染与批量处理
 
 ### 增量渲染
 
-增量渲染会执行新运行的规划、代码生成和审查，只在以下身份全部一致时复用基准运行中的场景视频：代码哈希、Render Profile 哈希、视频哈希、场景 ID/类名以及环境验证结果。
+增量渲染仅接受 v11 基准运行；它会执行新运行的规划、代码生成和审查，只在以下身份全部一致时复用基准运行中的场景视频：代码哈希、Render Profile 哈希、视频哈希、场景 ID/类名以及环境验证结果。
 
 ```bash
 kd1-anime generate \

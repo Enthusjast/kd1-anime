@@ -1,9 +1,17 @@
+from kd1_anime.agent_runtime.state import AgentRunState
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.run_store import RunManifest, StoredSceneState, write_manifest
 from kd1_anime.stats import collect_stats, summarize_manifest, write_run_report
 
 
 def test_summarize_manifest_counts_scene_outcomes(tmp_path):
     manifest = RunManifest(
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="stats-session",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id="20260728-120000-1234abcd",
         status="failed",
         state="ERROR",
@@ -39,6 +47,12 @@ def test_collect_stats_reads_event_stage_durations(tmp_path):
     root = tmp_path / "runs" / "20260728-120000-1234abcd"
     root.mkdir(parents=True)
     manifest = RunManifest(
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="stats-session",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id="20260728-120000-1234abcd",
         status="completed",
         state="DONE",
@@ -58,8 +72,14 @@ def test_collect_stats_reads_event_stage_durations(tmp_path):
 
 def test_write_run_report_persists_scene_diagnostics(tmp_path):
     manifest = RunManifest(
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="stats-session",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id="20260728-120000-1234abcd",
-        status="completed",
+        status="dry_run_complete",
         state="DONE",
         user_prompt="prompt",
         output_path=str(tmp_path / "output.mp4"),

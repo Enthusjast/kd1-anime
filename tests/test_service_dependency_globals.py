@@ -1,7 +1,9 @@
 import pytest
 from test_pipeline_scene import inputs
 
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.domain.dependencies import DependencyBinding, digest
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.rag.models import RagRuntimeProfile
 from kd1_anime.run_store import RunManifest
 from kd1_anime.services.dependencies import DependencyService
@@ -19,6 +21,11 @@ from kd1_anime.services.dependencies import DependencyService
 def test_fixed_rag_changes_invalidate_global_consumers_and_transitive_scenes(tmp_path, changed):
     scene = inputs(tmp_path).scene
     before = RunManifest(
+        agent=AgentRunState(
+            session_id="session-one",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id="20260101-000000-1234abcd",
         user_prompt="Circle",
         output_path="output.mp4",

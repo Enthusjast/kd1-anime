@@ -65,7 +65,7 @@ def main() -> None:
         )
         if video is None:
             raise RuntimeError("Trusted render did not publish a final video")
-        manifest = RunRepository(root).load_for_agent_resume(run_id)
+        manifest = RunRepository(root).load_for_resume(run_id)
         if manifest.request_budget.reservations:
             raise RuntimeError("Trusted integration unexpectedly dispatched a model request")
         artifact = manifest.scenes[1].artifact

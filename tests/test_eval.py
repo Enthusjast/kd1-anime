@@ -346,7 +346,7 @@ class TestScene(Scene):
             run_dir.mkdir(parents=True)
 
             # 创建模拟代码文件
-            code_file = run_dir / "scene.py"
+            code_file = run_dir / "scene_1.py"
             code_file.write_text("""
 from manim import *
 
@@ -355,16 +355,6 @@ class TestScene(Scene):
         circle = Circle()
         self.play(Create(circle))
 """)
-
-            # 创建模拟 manifest
-            manifest = {
-                "render_time_seconds": 30 + i * 10,
-                "total_scenes": 3,
-                "successful_scenes": 3 - i,
-                "retry_count": i,
-            }
-            manifest_path = run_dir / "manifest.json"
-            manifest_path.write_text(json.dumps(manifest))
 
             run_ids.append(run_id)
 

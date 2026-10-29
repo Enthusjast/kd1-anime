@@ -10,7 +10,7 @@
 
 - 增加 `relaxed`/`strict` 双生成模式：默认 relaxed 放宽 LLM-only Review 阻断，
   但保留 AST、生命周期、数学合同和渲染产物硬校验；strict 模式将各阶段审查/修复限制在最多 8 轮。
-- Manifest 升级到 v8，保存生成模式并安全迁移 v7 清单；TUI 启动时显示实际生成模式。
+- Manifest 可执行格式升级为 v11，保存生成模式、Session 和工具执行身份；v4–v10 保留原格式，只读查看与 JSON 导出。
 
 - 可靠性增强：场景能力合同、分级 import/frame/短视频 Smoke、受限数学采样与矩阵乘法核验、
   完整边界状态校验、风险自适应 Slurm 资源配置和结构化 `run_report.json`。
@@ -26,13 +26,22 @@
   - 支持明确的“退出后重新创建”生命周期。
 - 计划审查的最小上下文重试和截断兜底：保留确定性问题时继续有限重规划，
   确定性检查通过但语义响应被截断时以 warning 继续，不把网络/输出截断误报为结构错误。
-- 生成、配置、故障排查和贡献文档，统一说明当前 CLI、manifest v8、RAG、
+- 生成、配置、故障排查和贡献文档，统一说明当前 CLI、manifest v11、RAG、
   视觉评估、OpenGL/Cairo 和 dry-run 行为。
 
 ### 改进
 
-- 增加公开 `Application` 用例入口，CLI 的生成、规划、直接渲染、恢复、重试和
-  增量执行统一经应用层调用；保持现有参数、退出码和 v10 运行格式不变。
+- 完成 v11-only 执行切换：公开 `Application` 用例统一覆盖生成、规划、直接渲染、
+  恢复、重试、增量、TUI 和批处理；不再按版本选择运行时，也不回退 legacy。
+- 空闲运行时取消前持锁重新加载最新清单，并核对固定执行身份，避免其他恢复操作完成后用旧 revision 覆盖已提交状态。
+- v4–v10 仅只读查看与 JSON 导出；恢复、retry 和增量基础运行在模型探测、
+  作业访问、运行锁及任何文件修改前拒绝旧格式，不自动迁移或补造身份。
+  历史运行的查询不创建锁或更改目录权限；清理与重新评估也不会修改这些运行。
+- `GenerationIdentity` 继续按实现内容严格校验；runtime、pipeline、domain 和 commits
+  源码切换会改变哈希，历史 v11 身份不匹配也会拒绝恢复，不承诺跨实现版本自动兼容。
+  用户应保留旧目录并导出诊断信息，以原需求或已导出的计划创建新运行，不得改写身份。
+- 删除旧 `Orchestrator` 与 whole-context `StageTransaction`，仅保留
+  Action/Policy/Intent/Tool/StageResult/typed Commit 执行链及变更字段复制。
 - 结构化计划导出只读取已提交 manifest，不再由 CLI 访问流水线私有 Context。
 - 增加 fake 模型/渲染边界下的公开行为合同，覆盖持久化请求预算、私有源码、
   产物身份和完成运行恢复；版本不匹配测试不再依赖本机安装 Manim。
@@ -41,24 +50,23 @@
 - 增加闭合 `Diagnostic` 展示合同及计划、代码、视觉、静态检查和渲染错误适配器，
   保留脱敏证据、源码/产物身份和位置，不修改现有 LLM 输出 schema。
 - Scene 字段分组改为单一领域元数据，代码候选和视觉策略不再由存储层定义；
-  FSM 集中到 `domain/execution.py`，增量 base manifest 改由应用层加载，v10 序列化形状不变。
+  FSM 集中到 `domain/execution.py`，增量 base manifest 由应用层加载。
 - 增加 typed `RunPatch` / `ScenePatch` 和 `RunCommitter` 提交边界：校验 revision、
   输入摘要及依赖版本，保留并发请求预占和最大尝试计数，落盘成功后才发布内存状态。
-  legacy 暂时保留原有 StageTransaction，新提交路径为后续运行时使用。
 - 修复并行代码审查后、增量复用决定前已经提交新渲染的顺序错误；经过核验的复用产物
   在提交前发布，不再重复渲染，基础运行和新运行的独立请求预算保持不变。
 - 增加专用 Agent Runtime 协议、纯 Policy、领域工具注册/执行器和有界 Loop；权限按
   run/scene 默认拒绝，等待批准或作业时停止，不空转，也不为外部副作用套通用重试。
 - 增加私有 Session 和一次性 `ApprovalGrant`，精确绑定动作、资源、输入和工作版本；
   保存可见目标/命令/批准，不保存隐藏推理。新增 v3 committed/ephemeral 事件、单调序号、
-  缺失通知补发和只读查询，v2 日志保持只读。此阶段尚未产生 v11 执行运行。
+  缺失通知补发和只读查询，v2 日志保持只读；事件不驱动执行重放或替代 manifest 恢复。
 - 提供 prompt pack、响应 schema、上下文构造器、生成器、验证器和策略的内容身份捕获，
   以及独立的单次最终消息 hash 计算；旧运行缺少身份时不填造当前值。
-- 单场景 `generate`、`plan` 和计划文件继续执行默认走 v11 Agent Runtime；每个持久化
-  阶段通过 Action/Policy/Intent/Tool/StageResult/typed Commit，恢复验证生成身份和精确产物。
-  v11 使用 Session grant，不序列化布尔计划批准，也不会自动回退 legacy。
-- `--approve-plan` 在完整计划 hash 计算后创建本地用户 grant；非交互等待批准时保存状态，
-  CLI 不再把缺少视频的暂停报告为成功。直接渲染和增量入口暂留 v10，按清单版本选择恢复。
+- `generate`、`plan`、计划文件继续执行、直接渲染和增量统一走 v11 Agent Runtime；
+  每个持久化阶段通过 Action/Policy/Intent/Tool/StageResult/typed Commit，
+  恢复验证生成身份和精确产物。v11 使用 Session grant，不序列化布尔计划批准。
+- `--approve-plan` 在完整计划 hash 计算后创建本地用户 grant，不授权代码 diff；
+  非交互等待批准时保存状态，CLI 不再把缺少视频的暂停报告为成功。
 - 增加单场景全部已提交阶段的中断恢复与过期 worker 回归；修复新运行时输出路径优先级，
   保持 `--output`/配置行为，并隔离显示回调失败与配置凭据。
 - v11 默认路径完成多场景规划、独立 Detail/Coding worker、RAG、数学/连续性/技术合同屏障和

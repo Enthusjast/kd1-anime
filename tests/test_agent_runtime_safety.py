@@ -101,7 +101,6 @@ def test_concurrent_scene_revision_rejects_older_codegen_result(agent_boundary):
             scene = current.scenes[1]
             replacement = scene.model_copy(deep=True)
             replacement.failure_reason = "Concurrent scene update"
-            replacement.snapshot = None
             runtime.committer.commit(
                 CommitCommand(
                     current.revision,

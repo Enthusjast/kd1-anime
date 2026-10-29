@@ -31,7 +31,13 @@ from kd1_anime.domain.execution import FSMState, RunPhase
 from kd1_anime.domain.runtime import RunConfig
 from kd1_anime.event_store import EventStore
 from kd1_anime.request_budget import RequestBudget
-from kd1_anime.run_store import RunRepository, RunStatus, ScenePhase, VisualStatus
+from kd1_anime.run_store import (
+    MANIFEST_SCHEMA_VERSION,
+    RunRepository,
+    RunStatus,
+    ScenePhase,
+    VisualStatus,
+)
 from kd1_anime.verification import VerificationStatus, VisualVerificationStatus
 
 
@@ -124,50 +130,57 @@ class QueryService:
         return manifest
 
     def run(self, run_id: str, *, lock_held: bool = False) -> RunView:
+        # Older manifests have no active writer and must not acquire/create a
+        # lock or change permissions merely to inspect their saved state.
+        if self.repository.schema_version(run_id) != MANIFEST_SCHEMA_VERSION:
+            return self._run_view(self._manifest(run_id), 0)
         events = self._events(run_id)
         with events.locked(lock_held=lock_held):
             manifest = self._manifest(run_id)
-            scenes = tuple(
-                SceneView(
-                    scene_id=scene_id,
-                    revision=scene.revision,
-                    input_sha256=scene.input_sha256,
-                    title=scene.plan.title,
-                    phase=scene.phase,
-                    reviewed=scene.reviewed,
-                    rendered=scene.rendered,
-                    failed=scene.failed,
-                    visual_status=scene.visual_status,
-                    static_verification=scene.static_verification.status,
-                    execution_verification=scene.execution_verification.status,
-                    visual_verification=scene.visual_verification.status,
-                    visual_score=scene.visual_score,
-                    job_id=scene.slurm_job.job_id if scene.slurm_job is not None else None,
-                    job_status=scene.slurm_job.status if scene.slurm_job is not None else None,
-                )
-                for scene_id, scene in sorted(manifest.scenes.items())
+            return self._run_view(manifest, events.watermark(lock_held=True))
+
+    def _run_view(self, manifest, high_watermark: int) -> RunView:
+        scenes = tuple(
+            SceneView(
+                scene_id=scene_id,
+                revision=scene.revision,
+                input_sha256=scene.input_sha256,
+                title=scene.plan.title,
+                phase=scene.phase,
+                reviewed=scene.reviewed,
+                rendered=scene.rendered,
+                failed=scene.failed,
+                visual_status=scene.visual_status,
+                static_verification=scene.static_verification.status,
+                execution_verification=scene.execution_verification.status,
+                visual_verification=scene.visual_verification.status,
+                visual_score=scene.visual_score,
+                job_id=scene.slurm_job.job_id if scene.slurm_job is not None else None,
+                job_status=scene.slurm_job.status if scene.slurm_job is not None else None,
             )
-            return RunView.model_validate(
-                sanitize_record(
-                    dict(
-                        run_id=manifest.run_id,
-                        schema_version=manifest.schema_version,
-                        revision=manifest.revision,
-                        high_watermark=events.watermark(lock_held=True),
-                        state=manifest.state,
-                        status=manifest.status,
-                        run_phase=manifest.run_phase,
-                        goal=manifest.user_prompt,
-                        stop_reason=manifest.agent.stop_reason
-                        if manifest.agent is not None
-                        else manifest.error,
-                        created_at=manifest.created_at,
-                        updated_at=manifest.updated_at,
-                        scenes=scenes,
-                    ),
-                    self.secrets,
-                )
+            for scene_id, scene in sorted(manifest.scenes.items())
+        )
+        return RunView.model_validate(
+            sanitize_record(
+                dict(
+                    run_id=manifest.run_id,
+                    schema_version=manifest.schema_version,
+                    revision=manifest.revision,
+                    high_watermark=high_watermark,
+                    state=manifest.state,
+                    status=manifest.status,
+                    run_phase=manifest.run_phase,
+                    goal=manifest.user_prompt,
+                    stop_reason=manifest.agent.stop_reason
+                    if manifest.agent is not None
+                    else manifest.error,
+                    created_at=manifest.created_at,
+                    updated_at=manifest.updated_at,
+                    scenes=scenes,
+                ),
+                self.secrets,
             )
+        )
 
     def scenes(self, run_id: str, *, lock_held: bool = False) -> tuple[SceneView, ...]:
         return self.run(run_id, lock_held=lock_held).scenes
@@ -190,6 +203,9 @@ class QueryService:
     ) -> tuple[ApprovalRequestView, ...]:
         if now is not None and now.utcoffset() is None:
             raise ValueError("Approval query time requires a timezone")
+        if self.repository.schema_version(run_id) != MANIFEST_SCHEMA_VERSION:
+            self._manifest(run_id)
+            return ()
         instant = now or utc_now()
         events = self._events(run_id)
         with events.locked(lock_held=lock_held):

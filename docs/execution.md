@@ -2,13 +2,23 @@
 
 ## 状态提交
 
-默认 Agent Runtime 使用 manifest v11；已有 v10 运行仍由 legacy 路径执行。源码只写入 `scenes/revisions/scene_<id>/<sha256>.py`，阶段报告写入 `artifacts/objects/<sha256>.json`。清单中的路径与摘要是执行、修复、交接及恢复的依据；展示副本不授权执行。未被清单引用的对象可以保留，本轮不自动清理。
+唯一可执行格式为 manifest v11，所有公开执行入口均使用 `agent_runtime.runtime.AgentRuntime`。v4–v10 仅供只读查看和 JSON 导出；不会迁移清单、切换运行时或回退旧执行器。源码只写入 `scenes/revisions/scene_<id>/<sha256>.py`，阶段报告写入 `artifacts/objects/<sha256>.json`。清单中的路径与摘要是执行、修复、交接及恢复的依据；展示副本不授权执行。未被清单引用的对象可以保留，不自动清理。
 
-v11 领域动作先持久化 intent 和 invocation，再执行工具；结果通过 `StageResult` 与 typed `RunPatch`/`ScenePatch` 经 `CommitCommand` 原子发布。提交校验 revision、输入及依赖身份，并保留并发请求预占；持久化成功后才发布内存状态和 committed 事件。v10 的 legacy 编排继续使用独立的 StageTransaction，二者不会在同一运行中切换。
+领域动作先持久化 intent 和 invocation，再执行工具；结果通过 `StageResult` 与 typed `RunPatch`/`ScenePatch` 经 `CommitCommand` 原子发布。提交校验 revision、输入及依赖身份，并保留并发请求预占；持久化成功后才发布内存状态和 committed 事件。`commits.RunCommitter` 只复制变更场景及 run 字段；旧 `Orchestrator` 与 whole-context `StageTransaction` 已删除。
 
 运行生命周期使用 `RunPhase`；场景阶段独立记录，原有 `State` 保留为界面投影。`StaticVerification`、`ExecutionVerification` 和 `VisualVerification` 分别记录代码接纳、执行及视觉证据。视觉 `unknown` 允许表达缺少证据，不能计为已验证，也不能删除有效视频。
 
-`events.py` 将结构化事件适配到现有 TUI 两参数回调。成功事件附带已持久化的 manifest/scene revision；进度事件用于诊断。TUI 队列容量为 4096，合并同场景进度，溢出后用最新已提交快照重同步；回调异常只记诊断。清单负责恢复；JSONL 仅诊断，即使日志缺失也不能据此重置预算或认领作业。
+`event_store.py` 发布 v3 `AgentEvent`：committed 只通知 manifest 已提交事实，ephemeral 正文不写入 JSONL。序号在运行锁内私有持久化预留，允许中断留下间隙但不倒退；旧 v2 日志仅供读取。通知失败可补发，不回滚已提交执行。`queries.py` 从已提交 manifest/Session 构建 `RunView`、`SessionView` 与 `ApprovalRequestView`，返回事件高水位，不读取 worker Context，也不访问模型或远端作业。
+
+`events.py` 将显示事件适配到现有 TUI 两参数回调。TUI 队列容量为 4096，合并同场景进度，溢出后用最新已提交 `RunView` 重同步；回调异常只记诊断。清单负责恢复；JSONL 不是执行重放引擎，日志缺失不能据此重置预算或认领作业。
+
+## 批准与权限
+
+`agent_runtime/contracts.py` 定义闭合 Action、Intent、Invocation、Grant 和 Usage 合同；`policy.py` 只根据已提交状态、FSM、依赖、默认拒绝的 run/scene 权限、预算和精确批准做纯检查。模型没有任意 shell/Python/文件工具，也不能批准自己的提案。`tools.py` 负责声明工具及执行边界，`loop.py` 在等待用户、作业或耗尽预算时停止推进。
+
+`session.py` 保存私有 Session 的可见目标、澄清、命令和一次性 `ApprovalGrant`，不保存隐藏推理。批准绑定 session/run/action/resource/input hash/`WorkIdentity`；先持久化 intent 再消费 grant，仅同一 intent 的消费可幂等重入，不能据此重复派发外部副作用。`--approve-plan` 仅在完整计划屏障后代表本地用户批准该计划，不授权代码 diff，也不写入布尔 `plan_approved`/`approve_plan` 字段。
+
+代码修改批准绑定不可变 base/candidate/inspection diff 及工作身份；批准后仍须重新检查与 Review。无关 transport checkpoint 不会使逻辑批准过期，相关输入变化则会失效。非交互等待保存 pending 状态，不读 stdin，也不把无输出的暂停报告为视频成功；可用 `resume --interactive` 查看并确认，或 `resume --approve-plan` 仅批准计划。
 
 ## 请求与修复预算
 
@@ -35,15 +45,15 @@ v11 领域动作先持久化 intent 和 invocation，再执行工具；结果通
 - `VisualEvaluationService` 返回绑定源码、继承上下文、视频和帧的视觉结果。
 - `RenderingService` 使用独立 `RenderJob`、轮询观测与监控接口，连接本地或 Slurm 后端。本地后端不继承 Slurm 调度器。
 
-上述阶段通过 `StageResult` 绑定修订、输入摘要和结构化结果；`services/policies.py` 提供独立的接受、停止、候选选择和重规划路由规则。编排器负责预算、调度、接受结果和状态提交。模型计算期间不持有状态锁；结果提交前重新检查 revision 与完整输入摘要。已过期的代码、计划、审查、技术规划、修复及视觉结果不能覆盖新状态。
+上述阶段通过 `StageResult` 绑定修订、输入摘要和结构化结果；`services/policies.py` 提供独立的接受、停止、候选选择和重规划路由规则。`pipeline/` 提供明确输入/输出的规划、场景、修复、渲染和最终处理工具；Agent Runtime 负责动作选择、预算、调度及 typed commit。模型计算期间不持有状态锁；结果提交前重新检查 revision 与完整输入摘要。已过期的代码、计划、审查、技术规划、修复及视觉结果不能覆盖新状态。
 
 ## 有界调度、连接及截止时间
 
-FIFO 就绪队列按教学、结构化交接和源码依赖派发阶段任务，每场景最多一个改变状态的在途任务。固定大小的 `ContextPool` 继承运行配置与控制上下文，等待远端渲染不占用模型工作线程；计划与必要的连续性审查仍保持全片屏障。批处理继续共享模型、视觉、RAG 及渲染配额。
+Agent Runtime 从已提交快照按教学、结构化交接和源码依赖选择就绪动作，每场景最多一个改变状态的在途动作。独立 Detail 和代码候选按 `LLM_PARALLEL_WORKERS` 有界批量执行，worker 使用不可变输入、独立 Agent 和 `stream=False`；其余动作逐项推进。远端作业等待不占用模型 worker，计划与必要的连续性审查保持全片屏障。批处理共享模型、视觉、RAG 及渲染配额。
 
 `RunControl` 将取消贯穿队列、配额等待、请求和退避。`LLM_TIMEOUT_TOTAL` / `VISUAL_LLM_TIMEOUT_TOTAL` 默认 0；非零时裁剪传输超时至剩余时间。取消后返回的结果不得提交，已预占请求仍计数。同步在途请求依传输超时收敛。
 
-每次运行拥有按主模型、视觉与 RAG 端点隔离的连接池。Agent 只持有自己的调用上下文；重试不会关闭其他 Agent 正在使用的客户端，运行退出时显式关闭池。每次提交只构建一次依赖节点快照，按场景修订和输入内容缓存摘要。SQLite 快照缓存向量范数，检索用稳定并列排序的 top-k。`tools/benchmark_runtime.py` 记录 10、50、100 场景的操作次数与诊断耗时；详见 `docs/benchmarks/runtime-comparison.md`。
+每次运行拥有按主模型、视觉与 RAG 端点隔离的连接池。Agent 只持有自己的调用上下文；重试不会关闭其他 Agent 正在使用的客户端，运行退出时显式关闭池。每次提交只构建一次依赖节点快照，按场景修订和输入内容缓存摘要。SQLite 快照缓存向量范数，检索用稳定并列排序的 top-k。`tools/benchmark_runtime.py` 对 10、50、100 场景的 v11 清单执行四次 typed `RunCommitter` 提交，记录操作次数与诊断耗时，保留原指标键；详见 `docs/benchmarks/runtime-comparison.md`。
 
 ## 外部执行与提交恢复
 
@@ -53,7 +63,11 @@ Slurm、本地正式渲染及 smoke 共用 `ExecutionPolicy`。环境通过固�
 
 每次提交先持久化唯一 token、源码哈希及 scene revision，再调用外部后端；取得 Job ID 后立即保存，历史尝试留在清单。保存失败立即尝试取消；取消失败、提交状态不明或查询不完整时禁止自动重提。Slurm 只按唯一尝试名称查询并认领唯一 Job，随后核对当前源码身份。没有查到作业也不能推定上次提交没有发生。
 
-恢复必须持有运行锁、校验源码与产物身份。本地进程不凭历史 PID 重新认领；只有已确认终态的旧任务可以重启，状态不明则保留身份并阻止自动重提。v4–v9 清单只读展示与 JSON 导出，保留原版本；在 API 探测、作业访问、运行目录锁定与文件修改之前拒绝恢复、retry 和增量复用。不会执行旧格式迁移。
+`resume`、`retry` 和增量基础运行加载先只读检查版本与身份；v4–v10 在 API 探测、作业访问、运行目录锁定与文件修改之前拒绝执行，不做格式迁移。通过 v11 预检后才持有运行锁重新校验清单、源码与产物身份。本地进程不凭历史 PID 重新认领；只有已确认终态的旧任务可以重启，状态不明则保留身份并阻止自动重提。
+
+历史运行的状态、审批查询与事件回放不会创建运行锁或更改目录权限；历史事件不允许追加或补写，历史运行不能由当前版本清理或重新评估。
+
+v11 格式本身不保证可恢复。`GenerationIdentity` 绑定 schema、提示词和执行实现的内容身份；runtime、pipeline、domain、commits 等源码变化会改变相应哈希，本次切换前保存的 v11 也可能不兼容。身份不匹配时拒绝恢复，不自动重签或迁移；保留旧目录并导出状态，根据原需求或已导出的计划创建新运行，不要手工修改 identity 或清单版本。
 
 ## 依赖与失效
 
@@ -93,7 +107,7 @@ python tools/render_trusted_scenes.py
 
 已有真实运行可通过 `summarize_runs({task_id: Path(run_directory)})` 查看证据，或用 `compare_modes({"llm": {...}, "compiler_first": {...}})` 比较成功率、请求数、修复数与耗时。静态合同接纳和任务内容保持分别统计；只有源码 AST 与独立任务程序精确匹配时自动确认内容保持，其他实现保持未知，报告同时显示测量覆盖率。恢复检查也仅在清单中存在对应故障证据时给出结论。离线编译通过率不能代表真实渲染或教学质量。普通单元测试隔离模型、Slurm 与生成代码执行；可信固定场景的真实渲染应在单独显式触发的集成任务中运行。完成真实评测前保持编译默认关闭。
 
-真实模型比较须显式执行，以下命令会消耗所配置模型的请求预算，本轮未运行：
+真实模型比较须显式执行；`--run-models` 通过 v11 `AgentRuntime.generate(..., approve_plan=True)` 执行代码生成与渲染比较，代表本地用户批准完整计划，不授权代码 diff。失败时仍保留可用的部分运行清单绑定供诊断。以下命令会消耗所配置模型的请求预算，本轮未运行：
 
 ```bash
 python tools/compare_codegen.py --run-models --task geometry_circle --backend local --output /tmp/comparison.json

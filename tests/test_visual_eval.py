@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.config import settings
 from kd1_anime.eval.evaluator import Evaluator
@@ -14,6 +15,7 @@ from kd1_anime.eval.visual_eval import (
     VisualAnalysisResult,
     VisualEvaluator,
 )
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.rendering import RenderProfile, SceneArtifact, VideoMetadata, sha256_file
 from kd1_anime.run_store import RunManifest, StoredSceneState, sha256_text, write_manifest
 
@@ -287,6 +289,12 @@ def test_evaluate_run_rejects_untrusted_manifest_video(monkeypatch, tmp_path):
     run_dir.mkdir(parents=True)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
     manifest = RunManifest(
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="visual-session",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id=run_id,
         user_prompt="demo",
         output_path=str(tmp_path / "configured.mp4"),
@@ -324,6 +332,12 @@ def test_evaluate_run_rejects_scene_code_changed_after_checkpoint(monkeypatch, t
         computation="radius=1",
     )
     manifest = RunManifest(
+        schema_version=11,
+        agent=AgentRunState(
+            session_id="visual-session",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
         run_id=run_id,
         user_prompt="demo",
         output_path=str((run_dir / "output.mp4").resolve()),
@@ -393,6 +407,12 @@ def test_evaluate_run_scene_uses_exact_hashed_artifact(monkeypatch, tmp_path):
     write_manifest(
         run_dir / "manifest.json",
         RunManifest(
+            schema_version=11,
+            agent=AgentRunState(
+                session_id="visual-session",
+                generation_identity=capture_generation_identity(),
+                run_input_sha256="a" * 64,
+            ),
             run_id=run_id,
             user_prompt="demo",
             output_path=str((run_dir / "output.mp4").resolve()),

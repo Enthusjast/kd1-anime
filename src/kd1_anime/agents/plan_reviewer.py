@@ -446,7 +446,7 @@ def deterministic_plan_issues(
         )
     # 结构化字段由独立编译器处理；放在函数末尾并在这里导入，避免
     # plan_compiler 与本模块互相导入。这里仅编译当前场景，整片 ID/边界
-    # 检查由 Orchestrator 的 compile() 调用负责。
+    # 检查由 PlanningStage 的 compile() 调用负责。
     from kd1_anime.agents.plan_compiler import PlanCompiler
 
     if lesson_spec is not None and lesson_spec.claims:

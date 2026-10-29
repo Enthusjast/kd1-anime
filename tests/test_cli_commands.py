@@ -2,13 +2,15 @@ import json
 
 import pytest
 import typer
+from test_application import application_boundary as application_boundary
 from typer.testing import CliRunner
 
 from kd1_anime.agents.planner import ScenePlan
 from kd1_anime.cli import _manifest_requires_generation_apis, _print_comparison, app
 from kd1_anime.config import settings
+from kd1_anime.domain.planning import LessonSpec, PlanningDraft, TeachingGraph
 from kd1_anime.eval.metrics import ComparisonResult, EvalResult
-from kd1_anime.run_store import RunManifest, StoredSceneState, StoredSlurmJob, write_manifest
+from kd1_anime.run_store import StoredSlurmJob, write_manifest
 
 
 def test_cli_registers_all_public_commands():
@@ -108,27 +110,12 @@ def test_print_comparison_handles_unknown_scores():
     assert comparison.score_diff is None
 
 
-def test_generate_resume_does_not_require_a_dummy_prompt(monkeypatch, tmp_path):
-    from kd1_anime.config import settings
-    from kd1_anime.run_store import RunManifest, write_manifest
-
-    run_id = "20260728-120000-1234abcd"
-    root = tmp_path / "runs" / run_id
-    root.mkdir(parents=True)
-    output = root / "output_final.mp4"
-    output.write_bytes(b"video")
-    write_manifest(
-        root / "manifest.json",
-        RunManifest(
-            run_id=run_id,
-            status="completed",
-            state="DONE",
-            user_prompt="prompt",
-            output_path=str(output.resolve()),
-            final_video=str(output.resolve()),
-        ),
-    )
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
+def test_generate_resume_does_not_require_a_dummy_prompt(application_boundary, monkeypatch):
+    boundary = application_boundary
+    output = boundary.workspace / "output_final.mp4"
+    boundary.app.generate("prompt", output_path=output, approve_plan=True)
+    run_id = next((boundary.workspace / "runs").iterdir()).name
+    monkeypatch.setattr("kd1_anime.application._agent_runtime", boundary.runtime_factory)
     monkeypatch.setattr(settings, "LLM_API_KEY", "")
     monkeypatch.setattr(settings, "LLM_MODEL", "")
 
@@ -136,7 +123,51 @@ def test_generate_resume_does_not_require_a_dummy_prompt(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "成功" in result.output
-    assert "output_final.mp4" in result.output
+    assert output.read_bytes() == b"merged:deterministic-backend-video"
+
+
+@pytest.mark.parametrize("version", range(4, 11))
+@pytest.mark.parametrize("entry", ["generate_resume", "resume", "retry", "incremental"])
+def test_execution_commands_reject_read_only_versions_before_side_effects(
+    monkeypatch, tmp_path, version, entry
+):
+    run_id = "20260728-120000-1234abcd"
+    root = tmp_path / "runs" / run_id
+    root.mkdir(parents=True)
+    manifest_path = root / "manifest.json"
+    original = json.dumps({"schema_version": version, "run_id": run_id}).encode()
+    manifest_path.write_bytes(original)
+    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Read-only commands must reject before probes, runtime or run locks")
+
+    monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", forbidden)
+    monkeypatch.setattr("kd1_anime.cli._ensure_llm_api_available", forbidden)
+    monkeypatch.setattr("kd1_anime.cli._ensure_rag_apis_available", forbidden)
+    monkeypatch.setattr("kd1_anime.application._agent_runtime", forbidden)
+    monkeypatch.setattr("kd1_anime.run_store.lock_run", forbidden)
+    commands = {
+        "generate_resume": ["generate", "--resume", run_id],
+        "resume": ["resume", run_id],
+        "retry": ["retry", run_id, "--scene-id", "1"],
+        "incremental": ["generate", "Show a pause", "--incremental", run_id],
+    }
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    result = CliRunner().invoke(app, commands[entry])
+    assert result.exit_code == 1, result.output
+    assert "只读" in result.output
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert manifest_path.read_bytes() == original
 
 
 def test_global_dry_run_reports_completion_without_video(monkeypatch):
@@ -271,7 +302,7 @@ def test_evaluate_preserves_empty_code_as_an_explicit_target(monkeypatch):
     assert captured["code"] == ""
 
 
-def test_evaluate_scene_id_uses_visual_scene_artifact_path(monkeypatch):
+def test_evaluate_scene_id_uses_visual_scene_artifact_path(application_boundary, monkeypatch):
     captured = {}
 
     class FakeEvaluator:
@@ -288,15 +319,17 @@ def test_evaluate_scene_id_uses_visual_scene_artifact_path(monkeypatch):
     )
     monkeypatch.setattr("kd1_anime.eval.Evaluator", FakeEvaluator)
 
-    run_id = "20260728-120000-1234abcd"
+    boundary = application_boundary
+    boundary.app.generate("Show a one-second pause", approve_plan=True)
+    run_id = next((boundary.workspace / "runs").iterdir()).name
     result = CliRunner().invoke(
         app,
-        ["evaluate", run_id, "--scene-id", "2", "--desc", "平方差"],
+        ["evaluate", run_id, "--scene-id", "1", "--desc", "平方差"],
     )
 
     assert result.exit_code == 0, result.output
     assert captured["init"]["enable_visual_eval"] is True
-    assert captured["call"] == (run_id, 2, "平方差")
+    assert captured["call"] == (run_id, 1, "平方差")
 
 
 def test_generate_does_not_clear_configured_overwrite_setting(monkeypatch):
@@ -357,90 +390,20 @@ def test_global_dry_run_skips_direct_render_submission(tmp_path):
     assert "不提交" in result.output
 
 
-def test_resume_preflight_includes_auto_fix_after_monitoring():
-    scene = ScenePlan(
-        scene_id=1,
-        title="scene",
-        duration_seconds=10,
-        purpose="test",
-        math_concept="circle",
-        visual_design="dark",
-        camera_movement="fixed",
-        visual_flow=["show"],
-        key_moments=["pause"],
-        computation="radius=1",
-    )
-    manifest = RunManifest(
-        run_id="20260728-120000-1234abcd",
-        status="running",
-        state="MONITORING",
-        auto_fix=True,
-        user_prompt="prompt",
-        output_path="/tmp/output.mp4",
-        scenes={
-            1: StoredSceneState(
-                plan=scene,
-                plan_ready=True,
-                reviewed=True,
-                slurm_job=StoredSlurmJob(
-                    job_id="123",
-                    scene_id=1,
-                    script_path="scenes/render_1.sh",
-                    log_out="logs/scene_1.out",
-                    log_err="logs/scene_1.err",
-                    media_dir="videos/scene_1",
-                    scene_class_name="Scene1",
-                    submitted_at=1,
-                    status="RUNNING",
-                ),
-            )
-        },
-    )
+def test_resume_preflight_includes_auto_fix_after_monitoring(application_boundary):
+    _, manifest, _, _ = _running_manifest(application_boundary)
+    manifest.auto_fix = True
 
     assert _manifest_requires_generation_apis(manifest) is True
 
 
-def test_generate_resume_uses_manifest_dry_run_for_completion_message(monkeypatch, tmp_path):
-    run_id = "20260728-120000-1234abcd"
-    root = tmp_path / "runs" / run_id
-    root.mkdir(parents=True)
-    manifest = RunManifest(
-        run_id=run_id,
-        status="dry_run_complete",
-        state="DONE",
-        dry_run=True,
-        user_prompt="prompt",
-        output_path=str((root / "output.mp4").resolve()),
-        scenes={
-            1: StoredSceneState(
-                plan=ScenePlan(
-                    scene_id=1,
-                    title="scene",
-                    duration_seconds=10,
-                    purpose="test",
-                    math_concept="circle",
-                    visual_design="dark",
-                    camera_movement="fixed",
-                    visual_flow=["show"],
-                    key_moments=["pause"],
-                    computation="radius=1",
-                ),
-                plan_ready=True,
-                plan_reviewed=True,
-                reviewed=True,
-            )
-        },
-    )
-    from kd1_anime.run_store import sha256_text
-
-    code = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
-    from kd1_anime.objects import ObjectStore
-
-    manifest.scenes[1].code_file = ObjectStore(root).source(1, code)
-    manifest.scenes[1].code_sha256 = sha256_text(code)
-    manifest.scenes[1].class_name = "Demo"
-    write_manifest(root / "manifest.json", manifest)
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
+def test_generate_resume_uses_manifest_dry_run_for_completion_message(
+    application_boundary, monkeypatch
+):
+    boundary = application_boundary
+    boundary.app.generate("prompt", dry_run=True, approve_plan=True)
+    run_id = next((boundary.workspace / "runs").iterdir()).name
+    monkeypatch.setattr("kd1_anime.application._agent_runtime", boundary.runtime_factory)
 
     result = CliRunner().invoke(app, ["generate", "--resume", run_id])
 
@@ -448,59 +411,38 @@ def test_generate_resume_uses_manifest_dry_run_for_completion_message(monkeypatc
     assert "Dry-run 完成" in result.output
 
 
-def _running_manifest(tmp_path):
+def _running_manifest(boundary):
     from datetime import datetime, timedelta, timezone
 
     import kd1_anime.run_store as run_store
+    from kd1_anime.run_store import RunRepository
 
-    run_id = "20260728-120000-1234abcd"
-    root = tmp_path / "runs" / run_id
-    root.mkdir(parents=True)
-    plan = ScenePlan(
-        scene_id=1,
-        title="scene",
-        duration_seconds=10,
-        purpose="test",
-        math_concept="circle",
-        visual_design="dark",
-        camera_movement="fixed",
-        visual_flow=["show"],
-        key_moments=["pause"],
-        computation="radius=1",
-    )
+    boundary.app.plan_only("prompt")
+    root = next((boundary.workspace / "runs").iterdir())
+    manifest = RunRepository(boundary.workspace).load(root.name)
     old = datetime.now(timezone.utc) - timedelta(days=60)
-    manifest = RunManifest(
-        run_id=run_id,
-        status="running",
-        state="MONITORING",
-        user_prompt="prompt",
-        output_path=str((root / "output.mp4").resolve()),
-        created_at=old,
-        updated_at=old,
-        scenes={
-            1: StoredSceneState(
-                plan=plan,
-                plan_ready=True,
-                reviewed=True,
-                slurm_job=StoredSlurmJob(
-                    job_id="123",
-                    scene_id=1,
-                    script_path="scenes/render_1.sh",
-                    log_out="logs/scene_1.out",
-                    log_err="logs/scene_1.err",
-                    media_dir="videos/scene_1",
-                    scene_class_name="Scene1",
-                    submitted_at=1,
-                    status="RUNNING",
-                ),
-            )
-        },
+    manifest.status = "running"
+    manifest.state = "MONITORING"
+    manifest.created_at = manifest.updated_at = old
+    manifest.scenes[1].reviewed = True
+    manifest.scenes[1].slurm_job = StoredSlurmJob(
+        job_id="123",
+        scene_id=1,
+        script_path="scenes/render_1.sh",
+        log_out="logs/scene_1.out",
+        log_err="logs/scene_1.err",
+        media_dir="videos/scene_1",
+        scene_class_name="Scene1",
+        submitted_at=1,
+        status="RUNNING",
     )
     return root, manifest, old, run_store
 
 
-def test_clean_include_running_cancels_jobs_before_deleting(monkeypatch, tmp_path):
-    root, manifest, old, run_store = _running_manifest(tmp_path)
+def test_clean_include_running_cancels_jobs_before_deleting(
+    application_boundary, monkeypatch, tmp_path
+):
+    root, manifest, old, run_store = _running_manifest(application_boundary)
     monkeypatch.setattr(run_store, "utc_now", lambda: old)
     write_manifest(root / "manifest.json", manifest)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
@@ -529,8 +471,10 @@ def test_clean_include_running_cancels_jobs_before_deleting(monkeypatch, tmp_pat
     assert not root.exists()
 
 
-def test_clean_include_running_keeps_run_when_job_cancellation_fails(monkeypatch, tmp_path):
-    root, manifest, old, run_store = _running_manifest(tmp_path)
+def test_clean_include_running_keeps_run_when_job_cancellation_fails(
+    application_boundary, monkeypatch, tmp_path
+):
+    root, manifest, old, run_store = _running_manifest(application_boundary)
     monkeypatch.setattr(run_store, "utc_now", lambda: old)
     write_manifest(root / "manifest.json", manifest)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
@@ -554,8 +498,8 @@ def test_clean_include_running_keeps_run_when_job_cancellation_fails(monkeypatch
     assert "拒绝删除" in result.output
 
 
-def test_clean_cancels_job_in_failed_run_too(monkeypatch, tmp_path):
-    root, manifest, old, run_store = _running_manifest(tmp_path)
+def test_clean_cancels_job_in_failed_run_too(application_boundary, monkeypatch, tmp_path):
+    root, manifest, old, run_store = _running_manifest(application_boundary)
     manifest.status = "failed"
     monkeypatch.setattr(run_store, "utc_now", lambda: old)
     write_manifest(root / "manifest.json", manifest)
@@ -582,8 +526,10 @@ def test_clean_cancels_job_in_failed_run_too(monkeypatch, tmp_path):
     assert not root.exists()
 
 
-def test_clean_keeps_run_when_job_status_cannot_be_confirmed(monkeypatch, tmp_path):
-    root, manifest, old, run_store = _running_manifest(tmp_path)
+def test_clean_keeps_run_when_job_status_cannot_be_confirmed(
+    application_boundary, monkeypatch, tmp_path
+):
+    root, manifest, old, run_store = _running_manifest(application_boundary)
     monkeypatch.setattr(run_store, "utc_now", lambda: old)
     write_manifest(root / "manifest.json", manifest)
     monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path)
@@ -606,7 +552,7 @@ def test_clean_keeps_run_when_job_status_cannot_be_confirmed(monkeypatch, tmp_pa
     assert "无法确认" in result.output
 
 
-def test_plan_command_reviews_generated_plans(monkeypatch):
+def test_plan_command_reviews_generated_plans(application_boundary, monkeypatch):
     from kd1_anime.agents.plan_reviewer import PlanReviewResult
     from kd1_anime.agents.planner import ContinuityBible, SceneOutline
 
@@ -636,6 +582,13 @@ def test_plan_command_reviews_generated_plans(monkeypatch):
     calls = []
 
     class FakePlanner:
+        def plan_draft(self, prompt, **kwargs):
+            return PlanningDraft(
+                items=self.plan_outline(prompt, **kwargs),
+                lesson_spec=LessonSpec(topic=prompt),
+                teaching_graph=TeachingGraph(),
+            )
+
         def plan_outline(self, prompt, **kwargs):
             return [outline]
 
@@ -667,14 +620,13 @@ def test_plan_command_reviews_generated_plans(monkeypatch):
             )
 
     monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", lambda **kwargs: None)
-    # plan 命令现在复用 Orchestrator 的统一计划屏障，因此必须替换
-    # orchestrator 模块持有的依赖，而不是只替换定义模块中的类名。
-    monkeypatch.setattr("kd1_anime.orchestrator.PlannerAgent", FakePlanner)
-    monkeypatch.setattr("kd1_anime.orchestrator.PlanReviewerAgent", FakePlanReviewer)
-    monkeypatch.setattr("kd1_anime.orchestrator.ContinuityReviewerAgent", FakeContinuityReviewer)
-    from kd1_anime.orchestrator import Orchestrator
-
-    monkeypatch.setattr("kd1_anime.application._agent_runtime", Orchestrator)
+    dependencies = application_boundary.dependencies
+    dependencies.planner_factory = FakePlanner
+    dependencies.plan_reviewer_factory = FakePlanReviewer
+    dependencies.continuity_reviewer_factory = FakeContinuityReviewer
+    monkeypatch.setattr(
+        "kd1_anime.application._agent_runtime", application_boundary.runtime_factory
+    )
     result = CliRunner().invoke(app, ["plan", "解释圆"])
 
     assert result.exit_code == 0, result.output
@@ -682,7 +634,7 @@ def test_plan_command_reviews_generated_plans(monkeypatch):
     assert calls == [(1, [planned])]
 
 
-def test_plan_command_exports_structured_plan(monkeypatch, tmp_path):
+def test_plan_command_exports_structured_plan(application_boundary, monkeypatch, tmp_path):
     from kd1_anime.agents.planner import ContinuityBible, SceneOutline
     from kd1_anime.run_store import RunRepository
 
@@ -704,9 +656,20 @@ def test_plan_command_exports_structured_plan(monkeypatch, tmp_path):
         visual_flow=["显示圆"],
         key_moments=["停顿"],
         computation="半径=1",
+        opening_state=["画面为空"],
+        closing_state=["圆和面积结论保留"],
+        transition_in="从空画面淡入",
+        transition_out="保留圆和结论交给下一场景",
     )
 
     class FakePlanner:
+        def plan_draft(self, prompt, **kwargs):
+            return PlanningDraft(
+                items=self.plan_outline(prompt, **kwargs),
+                lesson_spec=LessonSpec(topic=prompt),
+                teaching_graph=TeachingGraph(),
+            )
+
         def plan_outline(self, prompt, **kwargs):
             return [outline]
 
@@ -717,11 +680,10 @@ def test_plan_command_exports_structured_plan(monkeypatch, tmp_path):
             return plan
 
     monkeypatch.setattr("kd1_anime.cli._ensure_generation_apis", lambda **kwargs: None)
-    monkeypatch.setattr("kd1_anime.orchestrator.PlannerAgent", FakePlanner)
-    from kd1_anime.orchestrator import Orchestrator
-
-    monkeypatch.setattr("kd1_anime.application._agent_runtime", Orchestrator)
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", tmp_path / "workspace")
+    application_boundary.dependencies.planner_factory = FakePlanner
+    monkeypatch.setattr(
+        "kd1_anime.application._agent_runtime", application_boundary.runtime_factory
+    )
     output = tmp_path / "plan.json"
 
     result = CliRunner().invoke(

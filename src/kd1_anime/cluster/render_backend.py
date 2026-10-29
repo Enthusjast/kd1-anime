@@ -1,7 +1,7 @@
 """统一的场景渲染后端。
 
 渲染生命周期只依赖这里的最小协议：提交、轮询、验证、取消和读取日志。
-Slurm 与本地前台进程因此可以复用同一套 Orchestrator/JobMonitor 逻辑，
+Slurm 与本地前台进程因此可以复用同一套运行时和 JobMonitor 逻辑，
 而不会让本地模式绕过产物哈希、ffprobe 或恢复检查。
 """
 
@@ -39,7 +39,7 @@ RenderBackendName = Literal["slurm", "local"]
 
 
 class RenderBackend(Protocol):
-    """Orchestrator 使用的渲染后端最小接口。"""
+    """运行时使用的渲染后端最小接口。"""
 
     name: RenderBackendName
 
@@ -368,7 +368,7 @@ class LocalRenderBackend(RenderArtifactValidator):
                 process = self._processes.get(job_id)
                 job = self._jobs.get(job_id)
                 if process is None or job is None:
-                    # 只有当前进程创建的句柄可被认领；恢复时由 Orchestrator
+                    # 只有当前进程创建的句柄可被认领；恢复时由运行时
                     # 在进入这里前清除旧 local Job 并重新提交。
                     statuses[job_id] = "GONE"
                     diagnostics.append(f"本地 Job {job_id} 不属于当前进程")

@@ -7,7 +7,9 @@ from threading import Barrier
 import pytest
 
 from kd1_anime.agent_runtime.contracts import EventPayload
+from kd1_anime.agent_runtime.state import AgentRunState
 from kd1_anime.event_store import EventStore, EventStoreError, LegacyEvent
+from kd1_anime.prompt_identity import capture_generation_identity
 from kd1_anime.run_store import RunManifest, lock_run, write_manifest
 
 RUN_ID = "20261027-120000-1234abcd"
@@ -16,7 +18,16 @@ RUN_ID = "20261027-120000-1234abcd"
 def durable_run(tmp_path):
     root = tmp_path / "runs" / RUN_ID
     root.mkdir(parents=True)
-    manifest = RunManifest(run_id=RUN_ID, user_prompt="private goal", output_path="out.mp4")
+    manifest = RunManifest(
+        run_id=RUN_ID,
+        user_prompt="private goal",
+        output_path="out.mp4",
+        agent=AgentRunState(
+            session_id="session-one",
+            generation_identity=capture_generation_identity(),
+            run_input_sha256="a" * 64,
+        ),
+    )
     write_manifest(root / "manifest.json", manifest)
     return root, manifest
 

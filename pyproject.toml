@@ -82,4 +82,3 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/kd1_anime/cli.py" = ["B008", "BLE001"]
-"src/kd1_anime/orchestrator.py" = ["BLE001"]

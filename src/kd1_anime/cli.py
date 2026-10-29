@@ -31,6 +31,7 @@ from rich.text import Text
 from kd1_anime.config import settings
 from kd1_anime.eval.metrics import ComparisonResult, EvalResult
 from kd1_anime.run_store import (
+    MANIFEST_SCHEMA_VERSION,
     RESUME_LLM_STATES,
     RunManifest,
     RunRepository,
@@ -1085,7 +1086,7 @@ def clean(
         help="也尝试清理状态为 running 的陈旧记录；仍会跳过持锁运行",
     ),
 ):
-    """清理过期的私有运行目录，不删除目录外的自定义输出。"""
+    """清理过期的 v11 私有运行目录；历史运行保持只读。"""
 
     try:
         retention = _parse_retention(older_than)
@@ -1096,11 +1097,18 @@ def clean(
         raise typer.Exit(2) from exc
     repository = RunRepository(settings.WORKSPACE_DIR)
     cutoff = datetime.now(timezone.utc) - retention
-    candidates = [
-        manifest
-        for manifest in repository.list()
-        if manifest.updated_at <= cutoff and (include_running or manifest.status != "running")
-    ]
+    candidates = []
+    for manifest in repository.list():
+        if manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+            console.print(
+                f"跳过 {manifest.run_id}: manifest schema_version={manifest.schema_version} "
+                "仅支持只读查看",
+                markup=False,
+                style="yellow",
+            )
+            continue
+        if manifest.updated_at <= cutoff and (include_running or manifest.status != "running"):
+            candidates.append(manifest)
     if repository.list_errors:
         console.print(
             f"[yellow]警告: {len(repository.list_errors)} 个运行清单损坏，已跳过清理。[/]"
@@ -1120,19 +1128,23 @@ def clean(
             if not root.is_dir() or root.is_symlink():
                 skipped += 1
                 continue
+            version = repository.schema_version(manifest.run_id)
+            if version != MANIFEST_SCHEMA_VERSION:
+                raise ValueError(f"manifest schema_version={version} 仅支持只读查看")
             with lock_run(root):
                 # 候选列表生成与真正删除之间可能有很长的用户确认窗口；
                 # 加锁后重新读取，避免误删刚恢复/刚更新的运行。
                 current = repository.load(manifest.run_id)
+                if current.schema_version != MANIFEST_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"manifest schema_version={current.schema_version} 仅支持只读查看"
+                    )
                 if current.updated_at > cutoff or (
                     not include_running and current.status == "running"
                 ):
                     skipped += 1
                     continue
-                # 清理的安全边界是“持锁 + 确认并取消远端作业”，不应因为
-                # 某个旧版本的瞬时字段不完整而跳过取消，留下孤儿 Job。
-                # 清单完整性问题仍展示给用户，但不会被当成删除许可；下面
-                # 的作业状态核对失败时依然会保留整个 run 目录。
+                # v11 一致性提示不代替作业状态核对；确认并取消作业后才能删除。
                 integrity_errors = current.integrity_errors()
                 if integrity_errors:
                     console.print(
@@ -1727,6 +1739,7 @@ def evaluate(
     - 对比运行: kd1-anime evaluate <run-id> --compare <baseline-id>
     """
     from kd1_anime.eval import Evaluator
+    from kd1_anime.eval.evaluator import require_evaluable_run
 
     # 一个命令只能有一个评估目标。此前多个参数同时传入时会按内部
     # if/elif 顺序静默忽略，容易让用户误评估了另一个对象。
@@ -1759,6 +1772,22 @@ def evaluate(
     if image is not None and not image.is_file():
         console.print(f"[red]图片不存在: {image}[/]")
         raise typer.Exit(1)
+
+    recent = not selected_targets
+    try:
+        if recent:
+            manifests = RunRepository(settings.WORKSPACE_DIR).list()
+            if not manifests:
+                console.print("[red]没有找到运行记录[/]")
+                raise typer.Exit(1)
+            run_id = manifests[0].run_id
+        # Admit every target before probing endpoints or constructing an evaluator.
+        for target in (run_id, compare):
+            if target is not None:
+                require_evaluable_run(target)
+    except (OSError, ValueError) as exc:
+        console.print(f"评估失败: {exc}", markup=False, style="red")
+        raise typer.Exit(1) from exc
 
     # 截图评估本身就是视觉评估。即使配置默认关闭视觉评估，也不能让
     # 文档中公开的 `evaluate --image` 进入一个必然抛出“视觉评估已禁用”的路径。
@@ -1821,7 +1850,8 @@ def evaluate(
 
         # 评估运行
         elif run_id is not None:
-            console.print(f"[bold]评估运行: {run_id}[/]")
+            label = "评估最近的运行" if recent else "评估运行"
+            console.print(f"[bold]{label}: {run_id}[/]")
             if scene_id is not None:
                 result = evaluator.evaluate_run_scene(
                     run_id,
@@ -1832,19 +1862,6 @@ def evaluate(
                 result = evaluator.evaluate_run(
                     run_id, description=description, enable_visual=visual_enabled
                 )
-
-        # 评估最近的运行
-        else:
-            # 查找最近的运行
-            manifests = RunRepository(settings.WORKSPACE_DIR).list()
-            if not manifests:
-                console.print("[red]没有找到运行记录[/]")
-                raise typer.Exit(1)
-            recent_run = manifests[0].run_id
-            console.print(f"[bold]评估最近的运行: {recent_run}[/]")
-            result = evaluator.evaluate_run(
-                recent_run, description=description, enable_visual=visual_enabled
-            )
 
         # 输出结果
         if json_output:

@@ -1,263 +1,194 @@
-"""增量复用必须同时匹配代码、渲染配置和视频内容。"""
+"""Incremental reuse binds exact code, render identity and self-contained video evidence."""
 
-from pathlib import Path
+import shutil
+import time
+from dataclasses import replace
 
-from kd1_anime.agents.planner import ScenePlan
-from kd1_anime.agents.reviewer import ReviewResult
-from kd1_anime.config import settings
-from kd1_anime.domain.runtime import ExecutionSpec
-from kd1_anime.orchestrator import Orchestrator, PipelineContext, RunPaths, SceneState
-from kd1_anime.rendering import RenderProfile, SceneArtifact, VideoMetadata, sha256_file
-from kd1_anime.run_store import RunManifest, StoredSceneState, get_reusable_video_path, sha256_text
+import pytest
+from test_agent_vertical_slice import agent_boundary as agent_boundary
+from test_cross_module import scene_inputs
 
-RUN_ID = "20260728-120000-1234abcd"
-NEW_RUN_ID = "20260729-120000-deadbeef"
-CODE = "from manim import *\nclass Demo(Scene):\n    def construct(self): self.wait()\n"
+from kd1_anime.agent_runtime.runtime import AgentRuntime
+from kd1_anime.agent_runtime.tools import ToolContext
+from kd1_anime.application import Application
+from kd1_anime.objects import ObjectStore
+from kd1_anime.pipeline.incremental import (
+    IncrementalInputs,
+    IncrementalPipeline,
+    validate_reused_artifact,
+)
+from kd1_anime.rendering import sha256_file
+from kd1_anime.run_store import RunRepository, get_reusable_video_path, sha256_text
+from kd1_anime.verification import ExecutionVerification, StaticVerification, VisualVerification
+
+NEW_RUN_ID = "20261029-120000-deadbeef"
+GOAL = "Show a one-second pause"
 
 
-def make_plan(scene_id: int = 1) -> ScenePlan:
-    return ScenePlan(
-        scene_id=scene_id,
-        title=f"Scene {scene_id}",
-        duration_seconds=30,
-        purpose="Test",
-        math_concept="Test",
-        visual_design="Test",
-        camera_movement="Test",
-        visual_flow=["Step 1"],
-        key_moments=["Moment 1"],
-        computation="Test",
+def incremental_inputs(agent_boundary):
+    boundary, dependencies = agent_boundary
+    app = Application(runtime_factory=lambda: AgentRuntime(dependencies=dependencies))
+    assert app.generate(GOAL, approve_plan=True) is not None
+    base_root = next((boundary.workspace / "runs").iterdir())
+    base = RunRepository(boundary.workspace).load_for_resume(base_root.name)
+    current_root = boundary.workspace / "runs" / NEW_RUN_ID
+    current_root.mkdir(mode=0o700)
+    scene = base.scenes[1].model_copy(deep=True)
+    code = (base_root / scene.code_file).read_text()
+    scene.code_file = ObjectStore(current_root).source(1, code)
+    scene.slurm_job = scene.submission = scene.artifact = None
+    scene.rendered = False
+    scene.phase = "reviewed"
+    scene.execution_verification = ExecutionVerification()
+    scene.visual_verification = VisualVerification()
+    current = replace(
+        scene_inputs(base, base_root), run_id=NEW_RUN_ID, root=current_root, scene=scene
+    )
+    return IncrementalInputs(
+        base=base,
+        base_root=base_root,
+        current=current,
+        generation_identity=base.agent.generation_identity,
+        current_scenes=(scene,),
+        rag_profile=base.rag_profile,
+        continuity_ready=True,
+        backend=base.backend,
     )
 
 
-def make_paths(workspace: Path) -> RunPaths:
-    root = workspace / "runs" / NEW_RUN_ID
-    for directory in (root, root / "scenes", root / "logs", root / "videos"):
-        directory.mkdir(parents=True, exist_ok=True)
-    return RunPaths(
-        NEW_RUN_ID,
-        root,
-        root / "scenes",
-        root / "logs",
-        root / "videos",
-        root / "output.mp4",
+def tool_context():
+    return ToolContext(
+        deadline=time.monotonic() + 30,
+        cancelled=lambda: False,
+        record_external_id=lambda external_id: pytest.fail("reuse dispatched a render"),
     )
 
 
-def make_base(workspace: Path, profile: RenderProfile) -> tuple[RunManifest, Path]:
-    root = workspace / "runs" / RUN_ID
-    video = root / "videos" / "scene_1" / "Demo.mp4"
-    video.parent.mkdir(parents=True)
-    video.write_bytes(b"verified old video")
-    spec = ExecutionSpec.capture(profile)
-    fingerprint = {
-        "execution_sha256": spec.digest(),
-        "container_sha256": spec.image_sha256,
-        "python": spec.python_version or "3.12.0",
-        "manim": profile.manim_version or "0.20.1",
-        "ffmpeg": profile.ffmpeg_version or "test",
-        "xelatex": profile.xelatex_version or "test",
-        "renderer": profile.renderer,
-    }
-    artifact = SceneArtifact(
-        execution_sha256=spec.digest(),
-        environment_fingerprint=fingerprint,
-        origin="rendered",
-        source_run_id=RUN_ID,
-        job_id="12345",
-        scene_id=1,
-        scene_class_name="Demo",
-        code_sha256=sha256_text(CODE),
-        render_profile_sha256=profile.digest(),
-        video_path=video.relative_to(root).as_posix(),
-        video_sha256=sha256_file(video),
-        metadata=VideoMetadata(
-            size_bytes=video.stat().st_size,
-            duration_seconds=1,
-            width=profile.pixel_width,
-            height=profile.pixel_height,
-            frame_rate=profile.frame_rate,
-        ),
-    )
-    manifest = RunManifest(
-        run_id=RUN_ID,
-        status="completed",
-        state="DONE",
-        user_prompt="base",
-        output_path=str(root / "output.mp4"),
-        render_profile=profile,
-        scenes={
-            1: StoredSceneState(
-                plan=make_plan(),
-                code_file="scenes/scene_1.py",
-                code_sha256=sha256_text(CODE),
-                class_name="Demo",
-                reviewed=True,
-                rendered=True,
-                artifact=artifact,
+def test_public_incremental_reuses_verified_matching_artifact(agent_boundary):
+    boundary, dependencies = agent_boundary
+    app = Application(runtime_factory=lambda: AgentRuntime(dependencies=dependencies))
+    assert app.generate(GOAL, approve_plan=True) is not None
+    base_root = next((boundary.workspace / "runs").iterdir())
+    before = (base_root / "manifest.json").read_bytes()
+    published = []
+
+    def require_exact_receipt(manifest):
+        for scene in manifest.scenes.values():
+            if scene.rendered:
+                assert scene.artifact is not None
+                assert scene.execution_verification.status == "passed"
+                assert scene.execution_verification.artifact_sha256 == scene.artifact.video_sha256
+                published.append(scene.artifact.origin)
+
+    dependencies.after_commit = require_exact_receipt
+    output = app.run_incremental(GOAL, base_root.name, approve_plan=True)
+    assert output is not None
+    root = output.parent
+    saved = RunRepository(boundary.workspace).load_for_resume(root.name)
+    scene = saved.scenes[1]
+    assert scene.rendered and scene.slurm_job is None and scene.submission is None
+    assert scene.artifact.origin == "reused" and scene.artifact.source_run_id == root.name
+    assert "reused" in published and len(boundary.backend.sources) == 1
+    assert (
+        get_reusable_video_path(saved, 1, root).read_bytes()
+        == (
+            get_reusable_video_path(
+                RunRepository(boundary.workspace).load(base_root.name), 1, base_root
             )
-        },
+        ).read_bytes()
     )
-    return manifest, video
+    assert (base_root / "manifest.json").read_bytes() == before
 
 
-def test_incremental_reuses_verified_matching_artifact(monkeypatch, tmp_path):
-    workspace = tmp_path / "workspace"
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
-    profile = RenderProfile.current()
-    base, video = make_base(workspace, profile)
-    paths = make_paths(workspace)
-    state = SceneState(plan=make_plan(), code=CODE, class_name="Demo", reviewed=True)
-    ctx = PipelineContext(
-        "updated",
-        paths=paths,
-        scene_states={1: state},
-        execution_spec=ExecutionSpec.capture(profile),
-        incremental=True,
-        base_run_id=RUN_ID,
-        render_profile=profile,
+def test_incremental_copy_is_self_contained_after_base_cleanup(agent_boundary):
+    inputs = incremental_inputs(agent_boundary)
+    before = inputs.base.model_dump_json()
+    result = IncrementalPipeline().reuse(inputs, tool_context())
+    assert result.eligible and result.scene.artifact.origin == "reused"
+    assert inputs.base.model_dump_json() == before
+    assert not inputs.current.scene.rendered and inputs.current.scene.artifact is None
+    shutil.rmtree(inputs.base_root)
+    copied = validate_reused_artifact(
+        inputs.current.root,
+        inputs.current.run_id,
+        result.scene,
+        inputs.current.render_profile,
+        provenance=result.provenance,
     )
-
-    original_mark_execution = Orchestrator._mark_execution_verification
-
-    def assert_artifact_is_published_first(state, **kwargs):
-        if kwargs.get("status") == "passed":
-            assert state.artifact is not None
-        original_mark_execution(state, **kwargs)
-
-    monkeypatch.setattr(
-        Orchestrator,
-        "_mark_execution_verification",
-        staticmethod(assert_artifact_is_published_first),
-    )
-
-    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
-
-    assert state.rendered is True
-    assert state.slurm_job is None
-    assert state.artifact is not None
-    assert state.artifact.origin == "reused"
-    assert state.artifact.source_run_id == NEW_RUN_ID
-    copied = paths.root / state.artifact.video_path
-    assert copied.is_file()
-    assert copied.read_bytes() == video.read_bytes()
-    assert get_reusable_video_path(base, 1, workspace / "runs" / RUN_ID) == video
+    assert sha256_file(copied) == result.scene.artifact.video_sha256
+    assert copied.stat().st_mode & 0o777 == 0o600
 
 
-def test_incremental_reuse_is_self_contained_after_base_cleanup(monkeypatch, tmp_path):
-    workspace = tmp_path / "workspace"
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
-    profile = RenderProfile.current()
-    base, _video = make_base(workspace, profile)
-    paths = make_paths(workspace)
-    state = SceneState(plan=make_plan(), code=CODE, class_name="Demo", reviewed=True)
-    ctx = PipelineContext(
-        "updated",
-        paths=paths,
-        scene_states={1: state},
-        execution_spec=ExecutionSpec.capture(profile),
-        incremental=True,
-        base_run_id=RUN_ID,
-        render_profile=profile,
-    )
-
-    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
-    assert state.artifact is not None
-    reused_path = paths.root / state.artifact.video_path
-
-    # 新 run 的 artifact 不应继续解析 base run；删除旧 run 后仍能验证本地文件。
-    import shutil
-
-    shutil.rmtree(workspace / "runs" / RUN_ID)
-    assert reused_path.is_file()
-    assert sha256_file(reused_path) == state.artifact.video_sha256
-
-
-def test_incremental_rejects_render_profile_change(monkeypatch, tmp_path):
-    workspace = tmp_path / "workspace"
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
-    old_profile = RenderProfile.current()
-    base, _ = make_base(workspace, old_profile)
-    changed_profile = old_profile.model_copy(update={"frame_rate": old_profile.frame_rate + 1})
-    paths = make_paths(workspace)
-    state = SceneState(plan=make_plan(), code=CODE, class_name="Demo", reviewed=True)
-    ctx = PipelineContext(
-        "updated",
-        paths=paths,
-        scene_states={1: state},
-        execution_spec=ExecutionSpec.capture(changed_profile),
-        incremental=True,
-        base_run_id=RUN_ID,
-        render_profile=changed_profile,
-    )
-
-    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
-
-    assert state.rendered is False
-    assert state.artifact is None
-    assert ctx.scenes_to_render == [1]
+@pytest.mark.parametrize("change", ["code", "render_profile"])
+def test_incremental_rejects_changed_scene_inputs(agent_boundary, change):
+    inputs = incremental_inputs(agent_boundary)
+    current = inputs.current
+    if change == "code":
+        scene = current.scene.model_copy(deep=True)
+        code = (current.root / scene.code_file).read_text().replace("self.wait(1)", "self.wait(2)")
+        scene.code_file = ObjectStore(current.root).source(1, code)
+        scene.code_sha256 = sha256_text(code)
+        scene.static_verification = StaticVerification(
+            status="passed",
+            code_sha256=scene.code_sha256,
+            technical_spec_sha256=scene.technical_spec_sha256,
+        )
+        current = replace(current, scene=scene)
+        inputs = replace(inputs, current=current, current_scenes=(scene,))
+    else:
+        profile = current.render_profile.model_copy(
+            update={"frame_rate": current.render_profile.frame_rate + 1}
+        )
+        current = replace(
+            current,
+            render_profile=profile,
+            execution_spec=current.execution_spec.for_profile(profile),
+        )
+        inputs = replace(inputs, current=current)
+    original = (inputs.base_root / inputs.base.scenes[1].artifact.video_path).read_bytes()
+    result = IncrementalPipeline().reuse(inputs, tool_context())
+    assert not result.eligible and result.scene is None and result.video is None
+    assert ("code_changed" if change == "code" else "render_changed") in result.reasons
+    assert not list((current.root / "videos").glob("**/*.mp4"))
+    assert (inputs.base_root / inputs.base.scenes[1].artifact.video_path).read_bytes() == original
 
 
-def test_incremental_rejects_code_change(monkeypatch, tmp_path):
-    workspace = tmp_path / "workspace"
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
-    profile = RenderProfile.current()
-    base, _ = make_base(workspace, profile)
-    paths = make_paths(workspace)
-    changed = CODE.replace("self.wait()", "self.wait(2)")
-    state = SceneState(plan=make_plan(), code=changed, class_name="Demo", reviewed=True)
-    ctx = PipelineContext(
-        "updated",
-        paths=paths,
-        scene_states={1: state},
-        execution_spec=ExecutionSpec.capture(profile),
-        incremental=True,
-        base_run_id=RUN_ID,
-        render_profile=profile,
-    )
+@pytest.mark.parametrize("change", ["missing", "tool_version", "execution_digest", "policy"])
+def test_incomplete_or_different_environment_refuses_reuse_and_preserves_video(
+    agent_boundary, change
+):
+    inputs = incremental_inputs(agent_boundary)
+    video = inputs.base_root / inputs.base.scenes[1].artifact.video_path
+    original = video.read_bytes()
+    artifact = inputs.base.scenes[1].artifact
+    if change == "missing":
+        artifact.environment_fingerprint.clear()
+    elif change == "tool_version":
+        artifact.environment_fingerprint["manim"] = "different"
+    elif change == "execution_digest":
+        artifact.environment_fingerprint["execution_sha256"] = "b" * 64
+    else:
+        spec = inputs.current.execution_spec
+        inputs = replace(
+            inputs,
+            current=replace(
+                inputs.current,
+                execution_spec=spec.model_copy(
+                    update={"disable_network": not spec.disable_network}
+                ),
+            ),
+        )
+    with pytest.raises(ValueError):
+        IncrementalPipeline().reuse(inputs, tool_context())
+    assert video.read_bytes() == original
+    assert not list((inputs.current.root / "videos").glob("**/*.mp4"))
 
-    Orchestrator(base_manifest=base)._apply_incremental_for_scene(ctx, 1, state)
 
-    assert state.rendered is False
-    assert ctx.scenes_to_render == [1]
-
-
-def test_reviewer_code_change_invalidates_existing_artifact(monkeypatch, tmp_path):
-    workspace = tmp_path / "workspace"
-    monkeypatch.setattr(settings, "WORKSPACE_DIR", workspace)
-    profile = RenderProfile.current()
-    base, _ = make_base(workspace, profile)
-    paths = make_paths(workspace)
-    paths.scenes.joinpath("scene_1.py").write_text(CODE, encoding="utf-8")
-    artifact = base.scenes[1].artifact
-    state = SceneState(
-        plan=make_plan(),
-        code=CODE,
-        class_name="Demo",
-        artifact=artifact,
-        rendered=True,
-    )
-    ctx = PipelineContext("x", paths=paths, scene_states={1: state}, render_profile=profile)
-    orchestrator = Orchestrator()
-
-    orchestrator._apply_review_result(
-        ctx,
-        1,
-        state,
-        ReviewResult(
-            is_valid=False,
-            severity="minor",
-            feedback="增加停顿",
-            fixes=[
-                {
-                    "find": "self.wait()",
-                    "replace": "self.wait(2)",
-                    "reason": "节奏",
-                }
-            ],
-        ),
-    )
-
-    assert state.code != CODE
-    assert state.rendered is False
-    assert state.artifact is None
+def test_incremental_rejects_tampered_video_without_copying(agent_boundary):
+    inputs = incremental_inputs(agent_boundary)
+    video = inputs.base_root / inputs.base.scenes[1].artifact.video_path
+    video.write_bytes(b"tampered base video")
+    with pytest.raises(ValueError):
+        IncrementalPipeline().reuse(inputs, tool_context())
+    assert video.read_bytes() == b"tampered base video"
+    assert not list((inputs.current.root / "videos").glob("**/*.mp4"))
