@@ -92,31 +92,26 @@ Python 文件”很难稳定处理跨场景状态、数学推导和渲染故障�
 - **语义动画合同**：使用 `introduce/update/remove/camera/hold` 描述状态变化，不把具体动画类名硬编码成能力清单；
 - **真实状态交接**：下一场景消费上一场景通过 AST 提取并哈希绑定的 Mobject 定义，而不是重复猜测；
 - **三层验证收据**：静态源码、实际执行和视觉评估分别记录，避免把“代码通过”误认为“视频正确”；
-- **可恢复的 HPC 流水线**：每次提交、产物和状态转换都可检查点化，支持 Slurm 不确定状态和本地渲染降级。
+- **可恢复的渲染流程**：每次提交、产物和状态转换都可检查点化，本地运行和可选的 Slurm 集群各自保留执行身份。
 
 ## 适用场景与前提
 
-| 使用方式 | 必需条件 | 是否提交 Slurm |
+| 使用方式 | 必需条件 | 执行位置 |
 | --- | --- | --- |
-| `generate --dry-run` | 主模型、Python 依赖；启用 RAG 时还需 RAG 服务和索引 | 否 |
-| 完整生成（默认） | 主模型、Manim、XeLaTeX、FFmpeg、Slurm | 是 |
-| 完整生成 `--backend local` | 主模型、Manim、XeLaTeX、FFmpeg | 否，本地前台执行 |
-| `render scene.py` | Manim、XeLaTeX、FFmpeg、Slurm | 是（除非使用全局 `--dry-run`） |
-| `render scene.py --backend local --wait` | Manim、XeLaTeX、FFmpeg | 否，本地前台执行 |
-| 视觉评估 | 独立的多模态视觉模型 | 不一定，取决于评估的运行 |
-| RAG | 独立 Embedding、Reranker 和本地索引 | 否，索引保存在本地 |
+| `generate --backend local` | 主模型、Manim、XeLaTeX、FFmpeg | 本地前台渲染 |
+| `generate --dry-run` | 主模型和 Python 依赖；启用 RAG 时还需 RAG 服务和索引 | 不进行正式渲染 |
+| `render scene.py --backend local --wait` | Manim、XeLaTeX、FFmpeg | 本地前台渲染，不调用生成模型 |
+| 配置 `slurm` 后端 | 对应集群环境及配置 | 可选集群作业 |
+| 视觉评估 | 独立的多模态视觉模型 | 取决于评估目标 |
+| RAG | 独立 Embedding、Reranker 和本地索引 | 本地索引，调用配置的服务 |
 
-完整渲染还需要目标集群提供可用的 `sbatch`、`squeue`、`sacct` 和 `scancel`。没有 Slurm 时，可以用 `--dry-run` 验证规划、技术合同、代码生成和代码审查流程；它不会提交作业。默认不会执行生成代码，但检测到未识别动画调用时会按安全策略强制执行一次低质量 Smoke Render。
-
-如果当前主机已安装 Manim、XeLaTeX 和 FFmpeg，可显式选择本地正式渲染：
-
-```bash
-kd1-anime generate --file prompt.md --backend local
-kd1-anime render scene.py --class MyScene --backend local --wait
-```
-
+安装器为新配置选择 `local`；程序内置默认值仍为 `slurm`。使用已有配置或源码安装时，
+请在命令中显式指定 `--backend local`，或在配置中设置 `[render] backend = "local"`。
 本地后端以前台进程运行，默认最多并发一个场景；Ctrl-C 会终止整个进程组。
-本地 Job 的进程句柄不会写入 manifest，`resume` 不会凭历史 PID 认领进程。只有已确认终态的旧任务可以重新启动；状态不明的任务保留身份并阻止自动重提。
+
+`--dry-run` 不提交正式渲染任务，但检测到未识别动画调用时可能按安全策略执行低质量
+Smoke Render；`--smoke` 则明确要求运行本地预检。两者都可能执行生成代码。
+恢复不会凭历史 PID 认领本地进程；状态不明的任务保留身份并阻止自动重提。
 
 ## 快速开始
 
@@ -185,27 +180,26 @@ python -m pip install -e '.[dev]'
 
 ### 2. 配置主模型
 
-安装器会创建最小的 `~/.kd1-anime/config.toml`。也可以手动创建：
+安装器会创建最小的 `~/.kd1-anime/config.toml`。如需手动配置，先编辑现有文件；
+没有该文件时再创建。不要覆盖已有的模型或渲染配置：
 
 ```bash
 mkdir -p ~/.kd1-anime
-cat > ~/.kd1-anime/config.toml <<'EOF'
-[llm]
-api_key = "your-api-key"
-base_url = "https://your-openai-compatible-endpoint/v1"
-model = "your-model-name"
-EOF
+chmod 700 ~/.kd1-anime
+${EDITOR:-nano} ~/.kd1-anime/config.toml
 chmod 600 ~/.kd1-anime/config.toml
-$EDITOR ~/.kd1-anime/config.toml
 ```
 
-最少需要配置一个主模型：
+主模型使用 OpenAI-compatible 接口；把以下示例填写到配置文件中：
 
 ```toml
 [llm]
 api_key = "your-api-key"
 base_url = "https://your-openai-compatible-endpoint/v1"
 model = "your-model-name"
+
+[render]
+backend = "local"
 ```
 
 配置优先级为：
@@ -233,33 +227,32 @@ kd1-anime doctor --probe
 kd1-anime doctor --probe-llm
 ```
 
-启动 chat、`plan` 或 `generate` 前，程序会自动探测主模型；探测失败会在进入 Agent 流程前退出。`status`、`version`、`logs`、`clean` 等诊断命令不会自动发起业务请求。
+启动前先验证模型配置；网络探测需要时在私有 Session 或 run 建立后预占预算并发送。`status`、`version` 和 `logs` 不会自动发起模型请求。
 
 ### 4. 生成视频
 
 ```bash
-# 交互式澄清需求
+# 交互式澄清需求；如已有配置不是 local，可在本次 shell 中显式选择
+export RENDER_BACKEND=local
 kd1-anime
-# 等价写法
-kd1-anime chat
 
-# 跳过澄清，直接使用给定需求
-kd1-anime generate "解释欧拉公式的几何意义"
+# 使用本地后端生成视频；显式批准完整计划，不批准后续代码修改
+kd1-anime generate "解释欧拉公式的几何意义" \
+  --backend local --approve-plan --output ./euler.mp4
 
-# 没有 Slurm 时验证完整的计划与代码生成流程
-kd1-anime generate "解释特征值的几何意义" --dry-run
+# 只生成规划和代码，不进行正式渲染
+kd1-anime generate "解释特征值的几何意义" --dry-run --approve-plan
 
-# 默认 relaxed：确定性错误仍阻断，LLM Review 失败记录 warning
-kd1-anime generate "解释特征值的几何意义" --dry-run --relaxed
-
-# strict：启用严格的有限审查
-kd1-anime generate "解释特征值的几何意义" --dry-run --strict
-
-# 需要显式执行本地低质量 Smoke/Frame Canary 时再打开；会执行生成代码
-kd1-anime generate "解释特征值的几何意义" --dry-run --smoke
+# 已有 Manim Scene 时可直接本地渲染，无需调用生成模型
+kd1-anime render scene.py --class MyScene --backend local --wait
 ```
 
-完成后，终端会显示最终视频路径和 run ID。默认最终视频位于该 run 的私有目录；需要固定到外部路径时使用 `--output`。
+模型调用会消耗所配置服务的请求额度。`--approve-plan` 只批准完整计划；如果运行因
+代码 diff 或其他决定暂停，终端会显示 run ID，可用 `kd1-anime resume <run-id> --interactive`
+查看并决定。`--dry-run --smoke` 会实际执行生成代码进行本地预检。
+
+完成后终端显示视频路径和 run ID；默认视频位于该 run 的私有目录，`--output` 可指定外部路径。
+输出已存在时默认拒绝覆盖；确需覆盖时使用 `--force`。
 
 ## 生成流程
 
@@ -306,7 +299,7 @@ INIT
 
 ```bash
 # 交互模式；回车提交，Shift+Enter/Ctrl+Enter 换行
-kd1-anime chat
+RENDER_BACKEND=local kd1-anime chat
 
 # 从文件读取长 prompt，避免 shell 转义和多行粘贴问题
 kd1-anime generate --file prompt.md --dry-run
@@ -314,28 +307,24 @@ kd1-anime generate --file prompt.md --dry-run
 # 只生成规划；默认执行计划审查和连续性审查
 kd1-anime plan "解释傅里叶级数"
 
-# 只预览未经审查的规划
+# 跳过模型计划审查，仍保留确定性校验
 kd1-anime plan "解释傅里叶级数" --no-review
 
 # 导出结构化计划；计划文件可交给 generate --plan
 kd1-anime plan "解释傅里叶级数" --output fourier-plan.json
-kd1-anime generate --plan fourier-plan.json --dry-run
+kd1-anime generate --plan fourier-plan.json --dry-run --backend local --approve-plan
 
 # 完整计划审查后代表本地用户批准该计划；不授权代码 diff
-kd1-anime generate "解释勾股定理" --approve-plan
+kd1-anime generate "解释勾股定理" --backend local --approve-plan
 ```
 
-`plan --no-review` 只适合查看模型草案；从计划文件继续生成时，仍会重新执行确定性编译、计划审查和连续性审查。
+`plan --no-review` 跳过模型审查，但仍进行确定性编译和检查；从计划文件继续生成时，仍会执行计划与连续性审查。
 
 ### 单 Scene 渲染
 
 ```bash
-# 校验用户提供的 Scene 后提交 Slurm，并等待结果
-kd1-anime render scene.py --class MyScene --wait
-
-# 只提交，立即返回 run ID；稍后使用 resume
-kd1-anime render scene.py --class MyScene
-kd1-anime resume <run-id>
+# 校验用户提供的 Scene 后在本地前台渲染，并等待结果
+kd1-anime render scene.py --class MyScene --backend local --wait
 
 # 全局 dry-run 只校验代码，不提交作业
 kd1-anime --dry-run render scene.py --class MyScene

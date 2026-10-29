@@ -32,8 +32,8 @@ status、logs、version、clean 不会调用 LLM；使用 `status` 查询运行�
 1. LLM_API_KEY、LLM_BASE_URL、LLM_MODEL 是否都已填写；
 2. Base URL 是否为 OpenAI-compatible 地址，通常包含 /v1；
 3. 模型名是否是服务端实际支持的名称；
-4. 当前 shell 是否读取了正确的配置文件。优先级是进程环境变量、用户 config.toml、当前目录 .env、用户 .env；
-5. 集群或登录节点是否需要代理。
+4. 当前 shell 是否读取了正确的配置：存在 `~/.kd1-anime/config.toml` 时不加载 `.env`；否则依次使用当前目录和用户目录的 `.env`。环境变量优先于文件；
+5. 当前环境是否需要代理。
 
 不使用 HTTP 代理时：
 
@@ -60,10 +60,10 @@ status、logs、version、clean 不会调用 LLM；使用 `status` 查询运行�
 `mode=strict`。如果只是候选代码校验失败，relaxed 会继续生成不同候选；候选完全
 重复时仍会触发停滞保护，避免无限消耗 API。
 
-`--dry-run` 只验证计划、代码和 Smoke Render，不代表正式 Slurm 视频已经成功。正式
-渲染失败时，继续查看 `logs`、`stderr` 和具体 Job 产物。
+`--dry-run` 不进行正式渲染，不能证明本地视频已经成功；启用 `--smoke` 或触发
+未知动画安全策略时仍可能执行生成代码。正式渲染失败时，查看 `logs`、`stderr` 和对应作业产物。
 
-程序会在进入 chat、plan 或 generate 前做短超时探测；探测失败会立即退出，不会先消耗多轮澄清或规划请求。
+启动前先验证模型配置；需要网络探测时，请求在私有 Session 或 run 建立后预占预算再发送。
 
 ## 3. RAG 显示 degraded、索引过期或无法启动
 
@@ -276,7 +276,7 @@ ALLOW_PARTIAL_OUTPUT=false，因此缺少一个场景时会拒绝输出，而不
     kd1-anime resume <run-id>
 
 恢复使用原子 manifest 和运行级锁。它会重新核对代码 SHA-256、Renderer/Merge Profile、精确
-Slurm Job 和视频哈希；已完成场景会从清单补发状态，不会因为重启而默认为未开始。
+作业身份和视频哈希；已完成场景会从清单补发状态，不会因为重启而默认为未开始。
 
 只有 manifest v11 可以恢复、retry 或作为增量基础运行；v4–v10 仅支持只读查看与 JSON 导出。旧版本会在模型探测、作业访问、运行锁和文件修改前被拒绝；程序不会迁移清单或调用旧运行时。可以使用 `status <run-id> --json` 导出原清单信息，保留旧目录，再创建新的 v11 运行。不要手工改写版本号或补造生成身份。
 
@@ -286,12 +286,11 @@ v11 格式只是必要条件，不表示所有历史 v11 都可恢复。`Generat
 
 ## 12. 运行很慢或看起来卡住
 
-1. 用 status 确认是在等待 LLM、排队、渲染还是合并；
-2. 用 logs 查看远端 stdout/stderr；
-3. 降低 MANIM_QUALITY 或 Smoke Render 质量进行排查；
-4. 设置合理的 SLURM_MAX_IN_FLIGHT，避免共享队列拥堵；
-5. 适当调整阶段级 LLM_*_MAX_TOKENS，不要盲目提高所有阶段的预算；
-6. 设置 MONITOR_QUEUE_TIMEOUT、MONITOR_RUN_TIMEOUT 和 MONITOR_UNKNOWN_TIMEOUT，避免无限等待。
+1. 用 `status` 确认是在等待模型、批准、渲染还是合并；
+2. 用 `logs` 查看对应场景的 stdout/stderr；
+3. 降低 `MANIM_QUALITY` 或 Smoke Render 质量进行排查；
+4. 检查本地并发、内存与 `LOCAL_RENDER_TIMEOUT`；
+5. 适当调整阶段级 `LLM_*_MAX_TOKENS`，不要盲目提高所有阶段的预算。
 
 选择 `RENDER_BACKEND=local` 时，检查 `status <run-id>` 中的 backend、运行目录下的
 `logs/scene_*_local-*.out/.err`，以及 `LOCAL_RENDER_TIMEOUT` 和

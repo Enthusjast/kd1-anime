@@ -11,21 +11,20 @@ src/kd1_anime/config.py 校验；安装器生成最小 TOML 配置，`.env`
     有 config.toml：进程环境变量 > ~/.kd1-anime/config.toml > 程序默认值
     无 config.toml：进程环境变量 > 当前目录 .env > ~/.kd1-anime/.env > 程序默认值
 
-推荐把用户配置放在 ~/.kd1-anime/config.toml，并限制权限：
+推荐把用户配置放在 `~/.kd1-anime/config.toml`。安装器会保留现有文件；手动配置时
+请编辑现有文件，没有时再创建，不要覆盖已有内容：
 
-    mkdir -p ~/.kd1-anime
-    chmod 700 ~/.kd1-anime
-    # 安装器会自动生成最小配置；手动创建时至少填写：
-    cat > ~/.kd1-anime/config.toml <<'EOF'
-    [llm]
-    api_key = "your-api-key"
-    base_url = "https://your-openai-compatible-endpoint/v1"
-    model = "your-model-name"
-    EOF
-    chmod 600 ~/.kd1-anime/config.toml
+```bash
+mkdir -p ~/.kd1-anime
+chmod 700 ~/.kd1-anime
+${EDITOR:-nano} ~/.kd1-anime/config.toml
+chmod 600 ~/.kd1-anime/config.toml
+```
 
-安装器会保留已有用户配置，不会用模板覆盖它。可选 `.env` 文件可作为
-`config.toml` 不存在时的兼容配置来源。
+最小主模型配置见下方示例。源码安装或使用已有配置时，可在文件中添加
+`[render]` 下的 `backend = "local"`，或在生成命令中显式传入 `--backend local`。
+
+可选 `.env` 文件可作为 `config.toml` 不存在时的兼容配置来源。
 
 个人 Ubuntu 上如果没有 Conda，安装器会将 Miniconda 安装到
 `~/.kd1-anime/miniconda3`。生产环境可设置

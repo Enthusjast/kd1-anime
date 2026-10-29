@@ -1,6 +1,6 @@
 # 运行时对比记录
 
-测量日期：2026-10-19 至 2026-10-20。基线来自本轮修改前保留的完整源码快照，改后来自 v10 实现；使用同一 Python 环境与同一测量脚本。原始结果见 [runtime-comparison.json](runtime-comparison.json)。
+测量日期：2026-10-19 至 2026-10-20。下表是历史 v9 与 v10 实现的对比，原始结果见 [runtime-comparison.json](runtime-comparison.json)；这些数据不代表当前 v11 的性能。
 
 ## 固定数据与操作次数
 
@@ -24,19 +24,20 @@
 | 50 | 29.31 → 43.55 | 22.10 → 12.34 | 0.0038 → 0.0127 |
 | 100 | 108.18 → 97.49 | 105.70 → 29.42 | 0.0048 → 0.0164 |
 
-小场景检查点增加了完整校验、事务副本和不可变对象操作，耗时高于基线；该样本不能证明整体流水线加速。100 场景样本受益于减少重复摘要计算。锁使用单线程采样，不能代表高争用表现；改后每组 12 次 RLock 获取，基线为 4 次，嵌套持锁不代表额外并发请求。真实网络延迟、批处理吞吐与峰值内存未测量。
+在该历史样本中，小场景检查点增加了完整校验、事务副本和不可变对象操作，耗时高于基线；该样本不能证明整体流水线加速。100 场景样本减少了重复摘要计算。锁使用单线程采样，不能代表高争用表现；改后每组 12 次 RLock 获取，基线为 4 次。真实网络延迟、批处理吞吐与峰值内存未测量。
 
 ## 复现与证据
 
+当前脚本测量 v11 `RunCommitter`、本地 RAG 查询和客户端复用，不会重现上表使用的 v10 检查点实现，也不能将两次结果视为同一基准：
+
 ```bash
-PYTHONPATH=src python tools/benchmark_runtime.py --output /tmp/runtime-after.json
-# 对修改前源码快照，将 PYTHONPATH 指向快照的 src，使用同一脚本。
+PYTHONPATH=src python tools/benchmark_runtime.py --output /tmp/runtime-v11.json
 ```
 
-算法回归使用操作次数：`test_dependency_hashes_are_cached_for_unchanged_revisions`、`test_rag_cached_norms_and_stable_ties_require_one_norm_per_query`、`test_clients_share_only_matching_profiles_and_close_once`。全量普通测试不请求真实模型、不提交 Slurm、不执行生成场景。
+当前回归测试包括 `tests/test_benchmark_tools.py`、`tests/test_runtime_reliability.py` 和提交边界测试。普通测试不请求真实模型、不执行生成场景。
 
 24 条固定任务的静态结果见 [compiler-baseline.json](compiler-baseline.json)：20 条编译并检查合同，4 条按预期明确回退，24 条静态检查符合预期。它们不表示 24 条实际渲染成功。
 
 四条可信固定场景的本地实际执行记录见 [trusted-render-evidence.json](trusted-render-evidence.json)，公式、函数、几何与中文/TeX 均通过源码与视频身份、ffprobe、清单恢复和实际环境合同检查。每条 4 秒、320×180、15 fps，模型请求为 0；没有进行模型视觉评分或一般教学质量评测。独立 Integration workflow 保留原始私有运行目录作为短期 artifact。
 
-故障证据来自子进程终止及假后端注入，覆盖源码落盘后、清单替换前、外部提交返回、Job ID 保存失败、取消失败、错误提交身份、事件回调异常和过期结果拒绝。对应 `tests/test_v10_reliability.py` 与 `tests/test_execution_contracts.py`；真实 Slurm 故障恢复和真实模型比较没有运行，缺失证据保持未知。
+历史故障证据来自子进程终止及假后端注入，覆盖源码落盘后、清单替换前、外部提交返回、Job ID 保存失败、取消失败、错误提交身份、事件回调异常和过期结果拒绝。当前对应回归位于 `tests/test_runtime_reliability.py`、`tests/test_agent_submission_checkpoint.py` 和 `tests/test_execution_contracts.py`；真实集群故障恢复与真实模型比较没有由这些证据证明。
