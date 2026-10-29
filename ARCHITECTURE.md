@@ -1,12 +1,60 @@
 # kd1-anime Architecture
 
-本文档描述当前实现，而不是未来设计草案。
+本文档介绍 kd1-anime 当前实现的设计、接口和验证边界，可作为项目设计文档阅读；它不是未来功能承诺。系统面向数学教学动画制作，将自然语言需求转化为可审查的 Manim 场景与视频。生成结果仍需教师复核数学内容、画面和教学节奏，系统不替代专业判断。
 
 面向用户的安装、命令和配置入口见 [README.md](README.md)；完整配置项见
 [docs/configuration.md](docs/configuration.md)，常见故障见
 [docs/troubleshooting.md](docs/troubleshooting.md)，开发约定见
 [CONTRIBUTING.md](CONTRIBUTING.md)。
 执行状态、预算、提交恢复、依赖失效与编译能力详见 [docs/execution.md](docs/execution.md)。
+
+## 需求与约束
+
+教师或其他内容制作者提出数学主题、教学目标和动画需求。系统需要先组织学习目标、数学关系与分镜，再生成场景代码，经过审查、渲染和产物核验后合成视频。使用者可以审查并批准完整计划，必要时对待批准的代码修改单独作出决定；计划批准不等于代码修改批准。
+
+| 需求或风险 | 设计应对 | 边界 |
+| --- | --- | --- |
+| 公式、几何关系和教学顺序可能出错 | 先建立教学合同和依赖图，对可计算的关系做计划编译，并进行计划审查 | 数值采样不是数学证明；无法核验的内容和教学适用性仍需人工判断 |
+| 独立渲染的场景可能丢失对象或发生画面跳变 | 技术交接记录对象标识和状态，导出清单及状态账本约束场景边界 | 连续性检查提供可检查的合同，不保证所有视觉表达都符合教学意图 |
+| 模型生成的 Python 不可信 | 统一候选接纳入口执行 AST、安全、API 和生命周期检查；执行时可使用容器隔离 | 静态检查不是 Python 沙箱，共享或高安全要求环境还需配置隔离和权限控制 |
+| 渲染失败、产物过期或运行中断 | 记录工作身份、作业和产物哈希；分类修复并在身份核验后恢复 | 身份不符或外部作业状态不明时拒绝不安全的复用或重提 |
+| 本地与集群资源不同 | 使用本地前台或可选 Slurm 后端，并限制并发 | 正式渲染依赖 Manim、XeLaTeX、FFmpeg 等环境；Slurm 支持不代表已在特定集群完成实测 |
+
+主模型需要显式配置 OpenAI-compatible 服务。RAG 和视觉评估为可选能力，使用各自的服务配置；外部模型服务的使用须遵守数据管理要求，避免提交敏感信息并妥善保管凭据。`--dry-run` 不提交正式渲染作业，但安全策略触发的 Smoke Render 或显式 `--smoke` 仍可能执行生成代码。
+
+## 总体架构与数据流
+
+系统按教学设计、动画实现和渲染交付划分职责，由 Agent Runtime 根据已提交状态、依赖、权限和预算组织各阶段，而不是由模型直接执行任意操作：
+
+```text
+用户需求 → CLI / TUI → Application → Agent Runtime（动作、策略、工具和提交）
+                                         │
+教学设计：  Planner → 教学合同 / 场景计划 → 确定性编译与计划审查 → 用户批准
+                                         ↓
+动画实现：  TechnicalSpec / 场景交接 → Coder → 候选检查与代码审查
+                                         ↓
+渲染交付：  local 或 Slurm → 作业监控 / 有界修复 → 产物核验
+                                         ↓
+            可选场景视觉评估 → FFmpeg 合并 → 可选成片评估 → 教师复核
+```
+
+图中视觉评估可在场景完成后、合并前进行，也可生成成片报告，并非所有运行都启用。独立场景可以有界并行；有交接依赖的场景先取得所需状态，场景边界按顺序提交。失败可能回到计划、代码或基础设施处理阶段，不是每次都重写代码。完整执行状态和屏障见第 3 节。
+
+### 主要数据与接口
+
+| 数据或接口 | 生产与消费方 | 用途和约束 |
+| --- | --- | --- |
+| 用户需求、计划批准和代码 diff 决定 | CLI/TUI 用户 → Session / Runtime | 需求按不可信数据处理；批准绑定具体动作和工作身份，计划批准不授权代码 diff |
+| `LessonSpec`、`TeachingGraph`、`ScenePlan` | Planner → 编译器、审查和技术规划 | 分别记录学习目标与数学断言、教学依赖和场景设计；确定性计划错误阻止进入编码 |
+| `TechnicalSpec` v2、`TechnicalHandoff` | Technical Planner → Coder 和相邻场景 | 用语义动作与稳定对象标识描述场景及交接，不把具体动画类名作为协议 |
+| 场景代码、`CandidateInspection` 和审查结果 | Coder/修复器 → Candidate Acceptor、Reviewer、渲染后端 | 代码变化后旧检查证据失效，候选须重新检查和审查 |
+| `manifest.json`、intent/invocation、事件与查询视图 | Runtime / Committer → 恢复、CLI 和 TUI | v11 是可执行的持久化格式；事件通知已提交事实，不凭事件重放工具副作用 |
+| `SceneArtifact`、验证收据与成片 | 渲染及评估 → 合并、恢复和使用者 | 以作业、代码、配置和视频身份核验输入；静态、执行和视觉证据各自独立 |
+| 主模型、视觉模型、Embedding、Reranker | 各阶段客户端 → 分别配置的外部服务 | 主模型和视觉模型使用 OpenAI-compatible 接口；Embedding 和 Reranker 分别使用对应检索接口，结果均不直接获得执行权限 |
+
+### 质量与验证边界
+
+质量证据分为静态检查、实际执行和可选视觉评估。静态通过不代表已渲染，渲染成功也不代表数学内容或教学效果正确；视觉检查失败或不可用记录为 `unknown`，不能当作通过。计划和代码审查中的模型意见也按证据与策略分级，不能取代确定性安全和产物身份检查。测试与 CI 的范围见第 7 节，运行合同与性能证据分别见 [docs/execution.md](docs/execution.md) 和 [docs/benchmarks/runtime-comparison.md](docs/benchmarks/runtime-comparison.md)。这些机制说明可验证什么，不构成统一题目集下的成功率、效率提升或特定 Slurm 环境实测结论。
 
 ## 1. 设计目标
 
@@ -190,7 +238,7 @@ kd1_anime.application ─────▶ agent_runtime.runtime.AgentRuntime (仅
 
 `agents/base.py` 封装 OpenAI-compatible client、重试、静默流式传输、JSON/代码提取和 Pydantic 校验。普通文本/代码的非空 `finish_reason=length` 响应不会被消费；计划审查、连续性审查和代码审查等严格结构化响应允许先交给 JSON/Pydantic 校验，只有完整结构才会被接受，持续截断时仍抛出明确错误。
 
-### 2.1 功能模块职责
+### 2.2 功能模块职责
 
 | 模块 | 职责 | 关键边界 |
 | --- | --- | --- |
@@ -224,7 +272,7 @@ CODING → Code REVIEWING，彼此并行；共享 ElementManifest/StateLedger �
                                       → (EVALUATING → 可定位场景回到 CODING) → DONE
 ```
 
-运行生命周期和场景生命周期分别记录，原有 FSM 枚举仅用于检查点与 TUI 投影。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，确认数学关系、定义域、教学依赖、几何可行性和时间线正确，再进入编码。Agent Runtime 从已提交快照选择依赖就绪的领域动作；Detail 和代码候选任务按 `LLM_PARALLEL_WORKERS` 有界批量执行，其余动作逐项推进，每场景最多一个改变状态的在途动作。Technical Planner 按依赖链生成结构化 TechnicalSpec，`handoff_out` 与下一场景的 `handoff_in` 绑定相同的 element ID、变量名、对象类型和最终状态。具备完整结构化交接的场景可独立生成；需要源码上下文或全片审查的路径保留必要屏障。Agent Runtime 按 Scene ID 顺序发布 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。默认 Slurm 提交远端作业，`RENDER_BACKEND=local` 则使用受控本地进程（默认一个在途任务）。独立 worker 使用不可变输入、独立 Agent 和 `stream=False`，不读取共享 stdin；后端统一执行产物定位、ffprobe 和哈希验证。
+运行生命周期和场景生命周期分别记录，原有 FSM 枚举仅用于检查点与 TUI 投影。概要阶段一次性建立 LessonSpec 和 TeachingGraph；每个 Scene 必须先完成 Detail、确定性计划编译、计划审查和全片连续性审查，再进入编码。这些检查覆盖可核验的数学关系、定义域、教学依赖、几何可行性和时间线，不能代替人工确认。Agent Runtime 从已提交快照选择依赖就绪的领域动作；Detail 和代码候选任务按 `LLM_PARALLEL_WORKERS` 有界批量执行，其余动作逐项推进，每场景最多一个改变状态的在途动作。Technical Planner 按依赖链生成结构化 TechnicalSpec，`handoff_out` 与下一场景的 `handoff_in` 绑定相同的 element ID、变量名、对象类型和最终状态。具备完整结构化交接的场景可独立生成；需要源码上下文或全片审查的路径保留必要屏障。Agent Runtime 按 Scene ID 顺序发布 ElementManifest/StateLedger，避免并发完成顺序改变边界语义。程序内置默认后端为 Slurm，安装器为新配置选择 local；`RENDER_BACKEND=local` 使用受控本地进程（默认一个在途任务）。独立 worker 使用不可变输入、独立 Agent 和 `stream=False`，不读取共享 stdin；后端统一执行产物定位、ffprobe 和哈希验证。
 
 主模型、视觉模型和 RAG 使用独立并发配额；批处理中的 v11 运行共享 `ResourceCoordinator`，Slurm/local 名额在外部作业确认终态前持续占用。不确定提交和取消失败保留名额，不能借释放配额触发重复提交。
 CLI 先检查模型配置；运行建立并保存预算后探测主模型，探测同样占用持久化请求计数。视觉评估使用独立 Key、URL、模型、超时和并发配置；视觉端点故障可记为 `unknown`。批处理默认等待计划批准，`--approve-plan` 仅代表本地用户批准完整计划。
